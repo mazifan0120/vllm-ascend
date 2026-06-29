@@ -55,6 +55,12 @@ def register_connector():
     )
 
     KVConnectorFactory.register_connector(
+        "DualPathConnector",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector",
+        "DualPathConnector",
+    )
+
+    KVConnectorFactory.register_connector(
         "UCMConnector", "vllm_ascend.distributed.kv_transfer.kv_pool.ucm_connector", "UCMConnectorV1"
     )
 
