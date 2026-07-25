@@ -3,7 +3,7 @@
 > 状态：独立设计评审稿，尚未进入实现
 > 方案：外层 `AscendMultiConnector` first-positive 编排
 > 适用范围：当前 `dev/dualpath` 分支中的 vLLM Ascend 仓库
-> 核心目标：打通外层 AscendStore 路径、`DE_FULL_HIT` 与
+> 核心目标：打通外层 AscendStore 路径、`DE_LOCAL_FULL_HIT` 与
 > `DE_PARTIAL_HIT`
 > 互斥关系：不得与方案 B 的内部编排拓扑混合实现
 > 总览索引：`2026-07-23-dual-path-connector-stage1-detailed-design.md`
@@ -15,10 +15,11 @@
 
 1. 确定 Connector、Scheduler、Worker、Store adapter 和 Proxy 控制面的
    边界；
-2. 实现 PE 唯一提交的 DualPath 决策；
+2. 实现 DE 本地 Full admission 与 PE 唯一提交的跨 Engine DualPath 决策；
 3. 复用一套 Mooncake Layerwise runtime 完成 Forward 和 Reverse；
 4. 正确处理 token accounting、请求 ID、正式 KV blocks 和异步完成；
-5. 编写覆盖外层 AscendStore、两种 DualPath kind 及失败路径的测试。
+5. 编写覆盖 DE 本地 Full、外层 AscendStore、跨 Engine DualPath 及失败
+   路径的测试。
 
 本文中的内容分为：
 
@@ -37,16 +38,20 @@ Stage 1 支持三种最终执行结果：
 1. **DualPath 未采用**：PE 外层 `AscendStoreConnector` 可被选中；若它也
    未命中，则 PE 正常计算。PE 随后通过 Forward 把 DE 缺失的完整
    decode-ready KV 写回 DE。
-2. **`DE_FULL_HIT`**：DE 从 AscendStore 加载完整 decode-ready prefix，
-   在 DE 本地重算最后一个 prompt token，不进入 PE Scheduler/model。
+2. **`DE_LOCAL_FULL_HIT`**：DE 本地 HBM 与 AscendStore coverage 足以
+   准备完整 decode-ready prefix。DE 在 Connector admission 阶段冻结本地
+   路径，直接把 Store KV 加载到正式 HBM blocks，再重算最后一个 prompt
+   token；不访问 Proxy decision rendezvous，不创建 PE request。
 3. **`DE_PARTIAL_HIT`**：DE 从 AscendStore 加载命中前缀，通过 Reverse
    写入 PE；PE 计算尾部，再通过 Forward 写回 DE。
 
 同时必须满足：
 
 - 路径策略静态、确定；
-- PE 是 DualPath decision 的唯一提交方；
-- Store load、Reverse 和 Forward 只能在 commit 后启动；
+- PE 是所有跨 PE/DE DualPath decision 的唯一提交方；
+- DE local Full Store load 只能在本地路径冻结并完成 block allocation 后
+  启动；
+- Reverse、Forward 和 partial Store load 只能在 PE commit 后启动；
 - Mooncake 数据传输保持逐层；
 - 每个方向只发布请求级最终 DONE/FAILED；
 - 已提交路径的必要操作失败后，请求进入 `FINISHED_ERROR`；
@@ -82,12 +87,16 @@ Stage 1 active decision。
 
 ```text
 vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
+examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py
 tests/ut/distributed/kv_transfer/dual_path/
+tests/ut/distributed/kv_transfer/dual_path/test_dual_path_proxy.py
 tests/e2e/.../dual_path/
 docs/
 ```
 
-允许复用公开接口和现有类，不修改既有 Connector 源码。
+允许复用公开接口和现有类，不修改既有 Connector 源码。Proxy 只允许增加
+由 `control_protocol="dual_path_v1"` 显式启用的控制面分支；未携带该标记
+的普通 MooncakeLayerwise 请求必须保持现有 `/v1/metaserver` 行为不变。
 
 ### 3.2 继承与 runtime 所有权
 
@@ -145,6 +154,7 @@ Store、Reverse 和 Forward 均直接访问模型最终使用的正式 KV blocks
 ```python
 pending_candidates: dict[DualPathRequestKey, PathDecisionRequest]
 committed_decisions: dict[DualPathRequestKey, PathDecisionCommit]
+local_full_plans: dict[DualPathRequestKey, LocalFullHitPlan]
 terminal_requests: dict[DualPathRequestKey, TerminalRecord]
 ```
 
@@ -152,6 +162,8 @@ terminal_requests: dict[DualPathRequestKey, TerminalRecord]
 
 - candidate 被接受或拒绝时都产生唯一 commit；
 - commit 后不得改成另一种结果；
+- `DE_LOCAL_FULL_HIT` 不创建 candidate/commit，本地路径一经冻结不得转成
+  远端路径；
 - terminal 后禁止启动新操作；
 - transport drain 只负责资源安全，不改变请求终态。
 
@@ -168,8 +180,10 @@ Scheduler 侧仍是配置顺序的 first-positive：
    winner，也会传给所有 `MooncakeLayerwiseConnector` 子类；
 5. 真实 blocks 传递不代表该 child 赢得 accounting，也不授权数据面副作用。
 
-因此 DualPath 必须排在 `AscendStoreConnector` 前面，并以 commit 作为所有
-Store/Reverse/Forward 副作用的 gate。
+因此 PE 上 DualPath 必须排在 `AscendStoreConnector` 前面，并以 commit
+作为 PE Store/Reverse/Forward 副作用的 gate。DE 本地 Full 不依赖 sibling
+组合：Store probe/load 由 `DualPathConnectorScheduler` 内部 adapter
+拥有，避免 Layerwise real-block dispatch 误启动远端 Prefill。
 
 ### 4.2 MooncakeLayerwiseConnector
 
@@ -210,9 +224,22 @@ R = max(P - 1, 0)
 `R` 是 DE 第一次本地 forward 前必须具备的 decode-ready KV prefix。
 
 - Store coverage 最大只计到 `R`；
-- PE 模型请求也只计算到 `R`；
-- `DE_FULL_HIT` 在 DE 设置 `num_computed_tokens = R` 后重算最后一个
+- 普通 Attention 的 PE model request 保持完整 `P`，DualPath 不实现第二套
+  prompt 截断函数；
+- Attention+Mamba hybrid 是否裁剪继续完全沿用父
+  `MooncakeLayerwiseConnector` 的既有处理；
+- DualPath 的 Scheduler accounting 和逻辑 Forward 有效区间只计到 `R`；
+- `DE_LOCAL_FULL_HIT` 在 DE 设置 `num_computed_tokens = R` 后重算最后一个
   prompt token。
+
+现有普通 Attention MooncakeLayerwise 会传输覆盖完整 `P` 的 KV；vLLM 在
+远端完整命中完成后，再把 `num_computed_tokens` 从 `P` 回退到 `P - 1`
+以重新计算最后一个 token。Stage 1 保留相同的 DE 可见语义，但不要求
+DualPath 额外传输不会被 DE 采用的最后一个 token KV。
+
+传输仍以 KV block 为物理粒度。最后一个 block 可能包含 `R` 之外的容量，
+但这些字节不增加 Store coverage、Scheduler accounting 或
+`num_computed_tokens`。
 
 ## 5. 统一术语与 token accounting
 
@@ -245,19 +272,35 @@ R = max(P - 1, 0)
 | `H_PE` | `max(K_PE - L_PE, 0)` |
 | `E_DE` | `max(R - L_DE, 0)` |
 
+下面用一个 `DE_PARTIAL_HIT` 请求把上述变量映射到具体 Token 和 KV
+Block。示例取 `P = 17`、`G = 4`、`L_DE = L_PE = 4`、
+`S_DE_raw = 11`、`S_PE_raw = 7`，并为便于展示令 KV block size
+也等于 4 token；这不要求一般实现中 `G` 必须等于 KV block size：
+
+![DualPath token accounting partial-hit block example](./dualpath-token-accounting-partial-hit.png)
+
+图中区间均为左闭右开 `[a, b)`。在这个例子中：
+
+- `K_DE = 8` 是 DE 完成 Store load 后的连续可用前缀终点；
+- `E_DE = 12` 对应 DE 初始缺失区间 `[L_DE, R) = [4, 16)`，
+  由 `H_DE = 4` 个 Store token 和 8 个 Forward token 共同补齐；
+- `K_PE = L_PE = 4`，所以 PE Store 没有新增可加载 token，
+  `H_PE = 0`；PE 通过 Reverse 得到 `[4, 8)`，再计算 `[8, 16)`。
+
 Scheduler accounting：
 
 | Engine / 结果 | 返回值 | `load_async` | 含义 |
 |---|---:|---:|---|
+| DE / `DE_LOCAL_FULL_HIT` | `max(R - L_DE, 0)` | 正数时为真 | 只等待本地 Store load |
 | DE / 任意远端结果 | `E_DE` | `E_DE > 0` | DE 等待最终 KV 到达 |
 | PE / 外层 AscendStore winner | `H_PE` | `H_PE > 0` | Store 写入 PE 的新增前缀 |
 | PE / `DE_PARTIAL_HIT` | `max(K_DE - L_PE, 0)` | 正数时为真 | Reverse 写入 PE 的新增前缀 |
-| PE / `DE_FULL_HIT` | 不进入 Scheduler | 不适用 | PE ingress 短路 |
 
 边界：
 
 - `E_DE == 0`：不创建 DualPath candidate；
-- `K_DE >= R`：full-hit candidate；
+- `L_DE < R` 且 `S_DE == R`：冻结 `DE_LOCAL_FULL_HIT`，不创建
+  DualPath candidate；
 - `L_DE < K_DE < R` 且 `L_PE < K_DE`：partial-hit candidate；
 - `H_DE == 0`：拒绝 partial-hit candidate；
 - DE Store 新增区间为 `[L_DE, K_DE)`；
@@ -312,7 +355,7 @@ class DualPathTransferIds:
 
 约束：
 
-- `pe_engine_local_request_id` 在 full hit 时为 `None`；
+- `pe_engine_local_request_id` 在 DE local Full 时为 `None`；
 - Forward/Reverse wire ID 由 `request_key + direction` 确定性派生；
 - 两个方向的 wire ID 不得相同；
 - Proxy dispatch ID 和 Store request key 继续由各自子系统管理，不进入
@@ -323,21 +366,26 @@ class DualPathTransferIds:
 
 Stage 1 不支持同一 key 下重新启动第二次传输尝试。
 
-## 7. DualPath 内部结果模型
+## 7. 本地执行与 DualPath 结果模型
 
 ```python
+class DecodeLocalRoute(str, Enum):
+    DE_LOCAL_FULL_HIT = "DE_LOCAL_FULL_HIT"
+
+
 class DualPathKind(str, Enum):
-    DE_FULL_HIT = "DE_FULL_HIT"
     DE_PARTIAL_HIT = "DE_PARTIAL_HIT"
 ```
 
-外层 `AscendStoreConnector` winner 不属于该枚举。
+`DE_LOCAL_FULL_HIT` 是 DE admission outcome，不属于
+`PathDecisionCommit`。外层 `AscendStoreConnector` winner 也不属于
+`DualPathKind`。
 
 ### 7.1 结果含义
 
-| DualPath kind | Store | Reverse | PE compute | Forward | DE 成功条件 |
+| 结果 | Store | Reverse | PE compute | Forward | DE 成功条件 |
 |---|---|---|---|---|---|
-| `DE_FULL_HIT` | DE | 无 | 无 | 无 | `STORE_DONE` |
+| `DE_LOCAL_FULL_HIT` | DE | 无 | 无 | 无 | `STORE_DONE` |
 | `DE_PARTIAL_HIT` | DE | 有 | 尾部 | 有 | `STORE_DONE && FORWARD_DONE` |
 
 DualPath 未采用时：
@@ -358,10 +406,11 @@ class StaticPartialHitPolicy(str, Enum):
     PREFER_DE = "prefer_de"
 ```
 
-决策顺序：
+DE admission 与 PE decision 的顺序：
 
-1. DE coverage 满足 full hit：接受 `DE_FULL_HIT`；
-2. partial coverage、策略为 `PREFER_DE` 且所有准入条件通过：接受
+1. DE coverage 满足 local Full：冻结 `DE_LOCAL_FULL_HIT`，不进入 PE
+   decision；
+2. partial coverage、策略为 `PREFER_DE` 且所有准入条件通过：PE 接受
    `DE_PARTIAL_HIT`；
 3. 其他情况：拒绝 DualPath。
 
@@ -401,20 +450,34 @@ class PathDecisionCommit:
     request_key: DualPathRequestKey
     use_dual_path: bool
     dual_path_kind: DualPathKind | None
+
+
+@dataclass(frozen=True)
+class PathDecisionError:
+    request_key: DualPathRequestKey
+    error_code: str
+    message: str
 ```
 
 不变量：
 
-- `use_dual_path=True` 时 kind 必须非空；
+- `use_dual_path=True` 时 kind 必须是 `DE_PARTIAL_HIT`；
 - `use_dual_path=False` 时 kind 必须为 `None`；
+- `PathDecisionRequest.de_store_coverage.is_full_hit` 必须为 `False`；
+  local Full 不得序列化为 decision request；
+- Proxy 只路由和校验 commit，不自行生成或改写 PE decision；
 - 相同 key 的相同 commit 幂等；
 - 相同 key 的不同二次 commit 是协议错误。
 
 ### 8.2 调用顺序
 
-以下是调用顺序，不是四轮 barrier：
+DE local Full 与跨 Engine decision 使用两条互斥的调用顺序：
 
 ```text
+local Full:
+PROBE -> LOCAL_ROUTE_FREEZE -> ALLOCATE -> STORE_LOAD
+
+remote required:
 PROBE -> ALLOCATE_AND_DISPATCH -> COMMIT -> DATA_START
 ```
 
@@ -423,67 +486,296 @@ PROBE -> ALLOCATE_AND_DISPATCH -> COMMIT -> DATA_START
 1. DE 计算 `E_DE`；
 2. `E_DE == 0` 时返回 `(0, False)`；
 3. DE Store adapter 执行无 HBM I/O 的 probe；
-4. DE Scheduler 返回 `(E_DE, True)` 并分配正式 blocks；
-5. DE 冻结本地 block manifest，但不启动 I/O；
-6. DE 通过统一 Proxy model-request envelope 发送
-   `PathDecisionRequest`；
-7. full-hit candidate 在 PE ingress 调用 decision coordinator，提交后
-   不进入 PE Scheduler/model；
-8. 其他 candidate 进入 PE Scheduler；
-9. PE DualPath child 决定接受 partial 或返回 `(0, False)`；
-10. PE 通过 Proxy/RPC 返回唯一 `PathDecisionCommit`；
-11. DualPath 未采用时，PE Multi 继续选择外层 AscendStore；
-12. PE/DE 各自绑定本地 Worker plan；
-13. 每侧仅在本地 commit、plan 和 request terminal 条件满足后启动被授权
+4. 若 `S_DE == R`，DE 冻结 `DE_LOCAL_FULL_HIT`、消费
+   `do_remote_prefill`，返回本地 Store external tokens 并分配正式
+   blocks；
+5. DE `update_state_after_alloc()` 只提交 Store `LoadSpec`，不调用父
+   Mooncake remote-prefill 分支；Store load 完成后 DE 重算最后一个 prompt
+   token，本请求不再执行后续 decision 步骤；
+6. 若 Store probe miss/partial，或 probe 在选路前失败，DE 进入
+   remote-required；probe error 只表示本地 Store 暂不可用；
+7. remote-required 请求按 `E_DE` 分配正式 blocks，并冻结本地 block
+   manifest，但不启动 Store/P2P I/O；
+8. DE 通过 Proxy model-request envelope 发送
+   `PathDecisionRequest`，并等待 `/v1/metaserver` 的 HTTP response；
+9. Proxy 在 dispatch 前注册 decision Future，再在后台发送 PE model
+   request；
+10. PE Scheduler 由 DualPath child 决定接受
+   partial 或返回 `(0, False)`；
+11. PE `PathDecisionCoordinator` 把唯一 `PathDecisionCommit` POST 到
+    Proxy，Proxy resolve Future，并将 commit 作为 `/v1/metaserver`
+    response 返回 DE `PathDecisionCoordinator`；
+12. DualPath 未采用时，PE Multi 继续选择外层 AscendStore；
+13. PE/DE 各自绑定本地 Worker plan；
+14. 每侧仅在本地 commit、plan 和 request terminal 条件满足后启动被授权
     的操作。
 
-### 8.3 统一 Proxy request
+`PathDecisionCoordinator` 只在 PE Scheduler 侧处理
+`DE_PARTIAL_HIT` 和 DualPath 未采用，是跨 Engine decision 的唯一提交点。
+HTTP I/O 必须通过 Coordinator 内部的异步任务或 executor 执行，不能阻塞
+Scheduler 热路径。`DE_LOCAL_FULL_HIT` 不创建 Coordinator 状态，也不依赖
+Proxy 的跨进程 commit-once。
 
-三种最终结果都发送 model-request envelope：
+### 8.3 路径决策状态机
 
-- full hit：PE ingress 消费 envelope，返回 commit，不创建 PE model
-  request；
-- partial hit：创建 PE model request，DualPath 成为 first-positive
+下图只回答一个问题：请求当前走到哪一步。路径选中后具体执行哪些操作，
+由图后的表格说明。
+
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    state "检查 DE HBM" as CheckLocalHBM
+    state "Probe DE Store" as ProbeLocalStore
+    state "本地 Full 路径已冻结" as LocalFullSelected
+    state "加载 DE Store KV" as LocalStoreLoading
+    state "等待 PE 返回路径决策" as DecisionPending
+    state "路径决策已经确定" as DecisionCommitted
+    state "准备并执行所选方案" as PlanRunning
+    state "请求可以继续执行" as RequestReady
+    state "请求失败" as RequestFailed
+
+    [*] --> CheckLocalHBM
+    CheckLocalHBM --> RequestReady: L_DE == R，本地 KV 已完整
+    CheckLocalHBM --> ProbeLocalStore: L_DE < R
+    ProbeLocalStore --> LocalFullSelected: S_DE == R
+    ProbeLocalStore --> DecisionPending: S_DE < R / probe error
+
+    LocalFullSelected --> LocalStoreLoading: DE blocks allocated
+    LocalFullSelected --> LocalFullSelected: allocation deferred
+    LocalStoreLoading --> RequestReady: STORE_DONE
+
+    DecisionPending --> DecisionCommitted: PE 返回唯一决策
+    DecisionCommitted --> PlanRunning: 本地执行计划准备完成
+    PlanRunning --> RequestReady: 所需 KV 已准备完成
+
+    DecisionPending --> RequestFailed: 路径决策失败
+    LocalStoreLoading --> RequestFailed: Store load 失败或超时
+    DecisionCommitted --> RequestFailed: 执行计划准备失败
+    PlanRunning --> RequestFailed: Store 或传输失败
+
+    RequestReady --> [*]
+    RequestFailed --> [*]
+```
+
+每种情况可以按下面的方式理解：
+
+| 情况 | 直观含义 | PE 侧行为 | DE 可以继续的条件 |
+|---|---|---|---|
+| `L_DE == R` | DE HBM 中已有完整连续 KV | 不进入路径决策，也不执行 PE model | 本地 KV 已经就绪 |
+| `DE_LOCAL_FULL_HIT` | DE Store 能补齐全部缺失 KV | 不创建 PE request，不进入路径决策 | Store 加载完成（`STORE_DONE`） |
+| `DE_PARTIAL_HIT` | DE Store 先补齐一部分，PE 再计算剩余部分 | 接收 Reverse、计算剩余 token，并逐层 Forward | Store 加载和 Forward 传输都完成 |
+| DualPath 未采用 | 改由 PE 侧准备 DE 缺失的 KV | 继续选择外层 AscendStore，或正常执行 PE model | Forward 传输完成（`FORWARD_DONE`） |
+
+因此，`L_DE == R` 和 `DE_LOCAL_FULL_HIT` 都不会访问 Proxy decision
+rendezvous。区别是前者的 KV 已在 HBM 中就绪，后者仍要等待 DE Store
+load 完成。
+
+跨 Engine 路径继续通过 `pending_candidates`、`committed_decisions` 和
+`terminal_requests` 保存事实；本地 Full 使用专用
+`local_full_plans`/`LocalFullHitPhase`，不增加通用生命周期框架。
+
+### 8.4 Decode-first Proxy 调度
+
+本节先说明 DE local Full 如何在现有 rendezvous 之前结束远端调度，再说明
+remote-required 请求需要增加的控制面交互。两部分不能混为一谈。
+
+**现有 Decode-first Proxy 调度**
+
+现有 Proxy 使用 Decode-first rendezvous，流程如下：
+
+1. Proxy 收到客户端请求后，先向 DE 发送带
+   `do_remote_prefill=True` 和 `metaserver` URL 的 Decode model
+   request；
+2. DE Scheduler 完成本地 KV block 分配后，将 DE endpoint、block
+   manifest 和 Mooncake 参数 POST 到 Proxy 的 `/v1/metaserver`；
+3. Proxy 根据 request ID 找回原始 model request，选择一个 PE，将 DE
+   的 `kv_transfer_params` 附到 Prefill model request 后发送给 PE；
+4. Proxy 等待整个 Prefill model request 完成。PE 返回的最终 HTTP
+   response 只用于成功检查和释放 Prefill 负载，不会作为路径决策返回
+   DE。
+
+```mermaid
+sequenceDiagram
+    participant Proxy
+    participant DE as "DE Scheduler"
+    participant PE as "PE API / Scheduler"
+
+    Proxy->>DE: "先发送 Decode model request"
+    DE->>Proxy: "POST /v1/metaserver，携带 DE blocks"
+    Proxy->>PE: "发送 Prefill model request"
+    PE-->>Proxy: "整个 Prefill 请求完成后的 HTTP response"
+```
+
+这条现有链路只有“DE metadata 上报”和“Prefill 请求完成”两个
+rendezvous，不包含 PE 向 DE 提前返回路径决策的能力。
+
+**DE local Full：不进入 rendezvous**
+
+`DualPathConnectorScheduler.get_num_new_matched_tokens()` 在调用父
+Mooncake remote-prefill 逻辑前先执行 DE Store probe。若 coverage 满足
+`R`：
+
+1. 冻结 `DE_LOCAL_FULL_HIT`；
+2. 消费 `do_remote_prefill`；
+3. 在 allocation 后只下发 Store load metadata；
+4. 不调用 `_access_metaserver()`，Proxy 不创建 decision Future 或 PE
+   background task；
+5. `STORE_DONE` 后 DE 重算最后一个 prompt token 并继续本地 decode。
+
+初始 Decode HTTP request 和最终生成 response 仍可经由 Proxy；这里“不与
+Proxy 交互”专指不进入 PD decision/metaserver 控制面。
+
+**remote-required 的路径决策闭环（Control-plane Delta）**
+
+DualPath 继续复用上述 Decode-first 调度顺序，但需要在 Prefill model
+request 完成之前增加一次路径决策回传：
+
+1. DE Scheduler 分配 blocks 后，将候选信息交给 DE
+   `PathDecisionCoordinator`；
+2. DE `PathDecisionCoordinator` 复用 `/v1/metaserver` 请求，在既有 DE
+   metadata 之外携带 `PathDecisionRequest`；
+3. Proxy 识别 `dual_path_v1` 请求，先注册 decision Future，再把 Prefill
+   model request 作为受跟踪的后台任务发送给 PE；
+4. PE Scheduler 完成选路后，把结果提交给 PE
+   `PathDecisionCoordinator`；
+5. PE `PathDecisionCoordinator` 将唯一的 `PathDecisionCommit` 回传给
+   Proxy；
+6. Proxy resolve decision Future，并把 commit 作为原
+   `/v1/metaserver` 请求的 HTTP response 返回 DE
+   `PathDecisionCoordinator`；
+7. DE `PathDecisionCoordinator` 保存 commit，DE Scheduler 在后续
+   Scheduler step 消费该结果并生成 Worker plan；
+8. Prefill model request 的最终 HTTP response 仍只负责后台任务清理和
+   Prefill 负载释放，不承担路径决策回传。
+
+```mermaid
+sequenceDiagram
+    participant DES as "DE Scheduler"
+    participant DEC as "DE PathDecisionCoordinator"
+    participant Proxy
+    participant PE as "PE API / Scheduler"
+    participant PEC as "PE PathDecisionCoordinator"
+
+    DES->>DEC: "[新增] blocks 分配完成，提交候选信息"
+    DEC->>Proxy: "[扩展] POST /v1/metaserver<br/>DE metadata + PathDecisionRequest"
+    Proxy->>Proxy: "[新增] 先注册 decision Future"
+    Proxy->>PE: "[扩展] 后台发送 Prefill model request"
+    PE->>PEC: "[新增] 提交最终路径决策"
+    PEC->>Proxy: "[新增] POST /v1/path-decision<br/>PathDecisionCommit"
+    Proxy-->>DEC: "[新增] /v1/metaserver response<br/>PathDecisionCommit"
+    DEC-->>DES: "[新增] 保存 commit，等待 Scheduler step 消费"
+    PE-->>Proxy: "[已有] 最终 HTTP response<br/>只清理后台任务并释放负载"
+```
+
+图中的 DE/PE `PathDecisionCoordinator` 是路径决策 RPC 的职责所有者。
+Scheduler 负责分配、选路和消费 commit，但不直接与 Proxy 进行 decision
+RPC。具体 HTTP I/O 由 Coordinator 内部异步执行，不能阻塞 Scheduler
+热路径。
+
+DualPath 必须通过统一 envelope 显式 opt-in：
+
+```python
+kv_transfer_params["control_protocol"] = "dual_path_v1"
+```
+
+兼容性要求：
+
+- `DE_LOCAL_FULL_HIT`：不得调用 `/v1/metaserver`，不得创建 decision
+  Future 或 PE model request；
+- 没有 `dual_path_v1` 标记：完整执行现有 `/v1/metaserver` 分支，继续等待
+  PE model request 最终 response，不创建 decision Future；
+- 带有 `dual_path_v1` 标记：在 dispatch PE 前注册 decision Future，随后
+  把 PE model request 作为受跟踪的后台任务启动；
+- Proxy 在 PE envelope 中增加
+  `path_decision_callback="<proxy>/v1/path-decision"`，PE
+  `PathDecisionCoordinator` 不自行猜测 Proxy 地址；
+- Proxy 必须覆盖而不是信任客户端或 DE 传入的 callback URL；PE 只接受
+  经过部署认证的 Proxy envelope，避免把 callback 变成任意 HTTP 目标；
+- remote-required 的 decision Future 必须先注册、后 dispatch；
+- Prefill 负载统计只在后台 PE model request 真正结束后释放，不能在
+  decision 返回时提前释放；
+- 普通 Layerwise 和 DualPath 请求允许在同一 Proxy 并发执行，状态不得
+  串线。
+
+只有 remote-required 结果使用统一 PE model-request envelope：
+
+- `DE_PARTIAL_HIT`：创建 PE Engine request，DualPath 成为 first-positive
   winner；
-- DualPath 未采用：创建 PE model request，后续 AscendStore 可成为
+- DualPath 未采用：创建 PE Engine request，后续 AscendStore 可成为
   winner，也可能全部 miss 后正常计算。
-
-路径决策属于 Scheduler/Proxy 控制面：
-
-- 不复用 Worker `side_channel_port`；
-- 不增加 Scheduler ZMQ endpoint；
-- 不定义业务层确认消息；
-- 不实现 DualPath 自身的 retry loop；
-- Proxy dispatch 或 commit return timeout 使请求失败。
 
 `PathDecisionRequest` 只是 decision payload。DE endpoint、block manifest
 和既有 Mooncake 参数继续作为统一 `kv_transfer_params` envelope 中的同级
 字段传递，不扩充 `PathDecisionRequest`。
 
-实现前必须验证现有 Proxy/RPC 能把 PE commit 返回正确 DE Scheduler。
-若不能，必须重新评审控制面范围。
+### 8.5 路径决策回传 RPC
 
-### 8.4 PE 请求截断
+控制面使用两个 Proxy endpoint：
 
-非 full-hit PE model request 必须幂等截断到 `R`：
+| Endpoint | 调用方 | 作用 |
+|---|---|---|
+| `POST /v1/metaserver` | DE `PathDecisionCoordinator` | 发送 DE metadata 和 decision request；等待并接收 commit |
+| `POST /v1/path-decision` | PE `PathDecisionCoordinator` | 把 PE 唯一 commit 交给 Proxy |
+
+remote-required 的 DualPath `/v1/metaserver` 分支维护：
 
 ```python
-def truncate_pe_request_to_decode_ready_prefix(
-    request: Request,
-    decode_ready_tokens: int,
-) -> None:
-    ...
+decision_futures: dict[DualPathRequestKey, asyncio.Future[PathDecisionCommit]]
+prefill_tasks: dict[DualPathRequestKey, asyncio.Task[None]]
+decision_records: SizedDict[
+    DualPathRequestKey,
+    PathDecisionCommit | PathDecisionError,
+]
 ```
 
-同步更新：
+`decision_futures` 是新增的路径决策 rendezvous，不能直接复用当前
+`req_id_future`：后者只在 PE model request 最终 response 到达后尝试
+resolve，时机不满足 Reverse-before-compute。
 
-- `prompt_token_ids` 或 `prompt_embeds`；
-- `_all_token_ids`；
-- `num_prompt_tokens`；
-- `max_tokens = 1`；
-- 一个防止重复截断的内部 flag。
+处理顺序：
 
-### 8.5 本地记录
+1. 校验 `request_key`，注册 `decision_futures[request_key]`；
+2. 启动并记录后台 PE model request；
+3. 等待对应 decision Future；
+4. `/v1/path-decision` 收到 commit 后执行 commit-once 校验并 resolve
+   Future；
+5. `/v1/metaserver` 把 `PathDecisionCommit` 序列化为 HTTP response；
+6. Future timeout、Proxy dispatch 失败或 PE 在 commit 前失败时，返回明确
+   的 decision error；
+7. PE 后台任务完成后释放 Prefill 负载并清理 `prefill_tasks`；
+8. request terminal 或 timeout 后清理 Future，并在有界
+   `decision_records` 中保留结果用于迟到消息判定；
+9. `/v1/path-decision` 对相同 commit 返回成功，对冲突 commit 返回协议
+   错误，对已过期且没有 record 的 key 返回 expired。
+
+Coordinator 不在 Scheduler 调用栈中执行阻塞 HTTP：
+
+```python
+class PathDecisionCoordinator:
+    """Own commit-once and asynchronous decision RPC."""
+```
+
+DE `PathDecisionCoordinator` 通过父 Scheduler 的 executor thread 调用
+`_access_metaserver()`。DualPath override 必须解析 HTTP response，并写入
+线程安全 `decision_inbox`；executor callback 不得直接修改 Scheduler
+容器。PE `PathDecisionCoordinator` 只通过 Scheduler executor POST
+commit。
+`DualPathConnectorScheduler.build_connector_meta()` 在每个 Scheduler step
+开始构建 metadata 前 drain inbox、执行本地 commit-once；commit 对应请求
+即使仍处于 remote-KV waiting，也可以在该 step 生成已授权 Worker plan。
+然后才允许通过 data-start gate。
+
+路径决策属于 PE/DE `PathDecisionCoordinator` 与 Proxy 控制面；Scheduler
+只负责触发和消费：
+
+- 不复用 Worker `side_channel_port`；
+- 不增加 Scheduler ZMQ endpoint；
+- 不等待 PE model request 最终 response 才返回 decision；
+- 不实现 DualPath 自身的应用层 retry loop；
+- Proxy dispatch 或 commit-return timeout 使请求失败。
+
+### 8.6 本地记录
 
 ```python
 class PathDecisionCoordinator:
@@ -516,6 +808,18 @@ class PathDecisionCoordinator:
     ) -> None: ...
 ```
 
+DE `PathDecisionCoordinator` 额外维护：
+
+```python
+decision_inbox: SimpleQueue[
+    PathDecisionCommit | PathDecisionError
+]
+```
+
+只有 Scheduler thread 可以把 inbox 中的结果写入
+`committed_decisions` 或 `terminal_requests`。PE/DE HTTP executor 都不得
+直接修改 Scheduler-owned map。
+
 data-start gate：
 
 ```python
@@ -527,7 +831,22 @@ def can_start_data(
     return committed is not None and local_plan_ready and not terminal
 ```
 
-### 8.6 raw completion 早到
+该 gate 只用于跨 Engine plan。本地 Full 使用：
+
+```python
+def can_start_local_store(
+    local_plan: LocalFullHitPlan | None,
+    blocks_allocated: bool,
+    terminal: bool,
+) -> bool:
+    return (
+        local_plan is not None
+        and blocks_allocated
+        and not terminal
+    )
+```
+
+### 8.7 raw completion 早到
 
 Mooncake receiver 可能在本地 request mapping 建立前收到 wire terminal。
 Worker 必须保留：
@@ -561,6 +880,9 @@ classDiagram
     class DualPathConnectorScheduler
     class DualPathConnectorWorker
     class PathDecisionCoordinator
+    class DecisionInbox
+    class LocalFullHitPlan
+    class LocalFullHitPhase
     class DualPathStoreSchedulerAdapter
     class DualPathStoreWorkerAdapter
     class ForwardDirection
@@ -575,8 +897,11 @@ classDiagram
     DualPathConnector *-- DualPathConnectorScheduler
     DualPathConnector *-- DualPathConnectorWorker
     DualPathConnectorScheduler *-- PathDecisionCoordinator
+    DualPathConnectorScheduler *-- DecisionInbox
     DualPathConnectorScheduler *-- DualPathStoreSchedulerAdapter
     DualPathConnectorWorker *-- DualPathStoreWorkerAdapter
+    DualPathConnectorScheduler *-- LocalFullHitPlan
+    LocalFullHitPlan *-- LocalFullHitPhase
     DualPathConnectorWorker o-- ForwardDirection
     DualPathConnectorWorker o-- ReverseDirection
     DualPathStoreSchedulerAdapter o-- KVPoolScheduler
@@ -679,8 +1004,12 @@ class DualPathConnector(MooncakeLayerwiseConnector):
 Scheduler 负责：
 
 - DE probe 和统一 `E_DE` accounting；
+- DE local Full 路径冻结、`do_remote_prefill` 消费和
+  `local_full_plans`；
 - PE candidate decision 和 first-positive accounting；
 - commit 容器；
+- drain DE `decision_inbox`；
+- 把 PE partial/rejected commit 交给 `PathDecisionCoordinator` 异步回传；
 - DE block plan 冻结；
 - PE/DE local Worker metadata 构建；
 - probe handle commit/abort；
@@ -798,6 +1127,54 @@ consumer_is_to_put = false
 
 每个 probe handle 必须且只能 commit 或 abort 一次。
 
+本地 Full 计划：
+
+```python
+class LocalFullHitPhase(str, Enum):
+    LOCAL_SELECTED = "LOCAL_SELECTED"
+    ALLOCATED = "ALLOCATED"
+    LOADING = "LOADING"
+    READY = "READY"
+
+
+@dataclass
+class LocalFullHitPlan:
+    request_key: DualPathRequestKey
+    required_prefix_tokens: int
+    local_cached_tokens: int
+    store_cached_tokens: int
+    load_spec: LoadSpec
+    phase: LocalFullHitPhase
+```
+
+`LOCAL_SELECTED` 是不可逆边界。Scheduler 当步无法分配 blocks 时可以保留
+计划等待重试；一旦实际 Store load 失败，请求直接进入
+`FINISHED_ERROR`。
+
+### 9.8 DE local admission 与 Proxy
+
+DE local Full：
+
+- 在 `get_num_new_matched_tokens()` 内先于父 Mooncake remote-prefill
+  分支完成 Store probe；
+- coverage 满足 `R` 时冻结 `LocalFullHitPlan` 并消费
+  `do_remote_prefill`；
+- allocation 后只向 Store adapter 提交 load；
+- 不创建 `PathDecisionRequest`、decision Future、PE background task 或
+  `/v1/path-decision` callback。
+
+remote-required：
+
+- 现有 `/v1/metaserver` 普通分支保持不变；
+- DualPath 分支拥有 decision Future 和 PE background task；
+- `/v1/path-decision` 只接收 PE Scheduler 对 partial/rejected 的 commit；
+- 按 `request_key` 执行跨进程 commit-once；
+- decision 返回与 PE background task 的完成、清理分别管理。
+
+Stage 1 不增加 `dual_path_control_middleware`。Proxy 与 Engine Scheduler
+不共享可变 Python 对象，只通过 typed HTTP payload 和 Engine 已有 request
+envelope 关联。
+
 ## 10. 请求计划与 metadata
 
 ### 10.1 方向计划
@@ -842,13 +1219,23 @@ class DualPathWorkerPlan:
     forward: LayerwiseDirectionPlan | None
 ```
 
+本地 Full 不伪造 `PathDecisionCommit`，直接使用：
+
+```python
+@dataclass(frozen=True)
+class LocalFullHitWorkerPlan:
+    request_key: DualPathRequestKey
+    store_coverage: StoreCoverage
+    store_metadata: AscendConnectorMetadata | None
+```
+
 合法组合：
 
 | 结果 | Store metadata | Reverse | Forward |
 |---|---|---|---|
 | DualPath 未采用 / PE | 无 | 无 | send |
 | DualPath 未采用 / DE | 无 | 无 | receive |
-| `DE_FULL_HIT` / DE | 有 | 无 | 无 |
+| `DE_LOCAL_FULL_HIT` / DE | 有 | 无 | 无 |
 | `DE_PARTIAL_HIT` / DE | 有 | send | receive |
 | `DE_PARTIAL_HIT` / PE | 无 | receive | send |
 
@@ -859,7 +1246,10 @@ Scheduler-side probe handle 不序列化到 Worker。
 ```python
 @dataclass
 class DualPathConnectorMetadata(KVConnectorMetadata):
-    plans: tuple[DualPathWorkerPlan, ...]
+    plans: tuple[
+        DualPathWorkerPlan | LocalFullHitWorkerPlan,
+        ...
+    ]
 ```
 
 Worker 只能消费冻结后的 blocks 和 endpoint，不得重新根据 token 数计算
@@ -881,7 +1271,31 @@ class RequestCompletionFacts:
 
 ## 11. 数据依赖
 
-### 11.1 `DE_PARTIAL_HIT`
+### 11.1 `DE_LOCAL_FULL_HIT`
+
+```text
+metadata-only Store probe
+  -> freeze LocalFullHitPlan
+  -> consume do_remote_prefill
+  -> allocate final DE blocks
+  -> commit Store LoadSpec
+  -> Worker bulk-loads Store KV into DE HBM
+  -> STORE_DONE
+  -> DE finished_recving
+  -> recompute final prompt token
+  -> continue local decode
+```
+
+关键点：
+
+- Store probe 失败发生在路径冻结前，按 local miss 进入 remote-required；
+- `LOCAL_SELECTED` 后 allocation 可以延迟重试，但不得改走远端；
+- Store load 是唯一数据面操作和 receive completion 来源；
+- Store load 失败或超时后 invalid 目标 blocks，并直接
+  `FINISHED_ERROR`；
+- terminal 后迟到 `STORE_DONE` 幂等忽略。
+
+### 11.2 `DE_PARTIAL_HIT`
 
 ```text
 STORE_DONE
@@ -902,7 +1316,7 @@ STORE_DONE
 - PE 每执行完一层，就可按父 callback 顺序发送该层 Forward；
 - 最后一层最后一个 chunk 完成后，sender 发送请求级 DONE/FAILED。
 
-### 11.2 不增加逐层远端完成事件
+### 11.3 不增加逐层远端完成事件
 
 Reverse 不与 PE compute 重叠，PE 只关心整个 Reverse 是否完成。
 
@@ -916,7 +1330,7 @@ PE layer compute complete
 
 DE 在所有层完成前不会收到请求级 Forward terminal。
 
-### 11.3 TP rank
+### 11.4 TP rank
 
 每个 TP Worker 维护本 rank completion。公开 barrier 由框架
 `KVOutputAggregator` 完成：
@@ -929,12 +1343,20 @@ DE 在所有层完成前不会收到请求级 Forward terminal。
 
 ### 12.1 分配
 
-- DE 在 decision 前按 `E_DE` 分配最终 blocks；
+- DE local Full 在本地路径冻结后按 `max(R - L_DE, 0)` 分配最终
+  blocks；
+- remote-required 请求在 decision 前按 `E_DE` 分配最终 blocks；
 - PE 按 first-positive accounting 分配最终 blocks；
 - plan 冻结后不得替换 block IDs；
 - Store/P2P 直接写这些 blocks。
 
 ### 12.2 写入范围
+
+`DE_LOCAL_FULL_HIT`：
+
+```text
+DE Store writes [L_DE, R)
+```
 
 `DE_PARTIAL_HIT`：
 
@@ -980,11 +1402,20 @@ def de_receive_succeeded(
 ) -> bool:
     if not decision.use_dual_path:
         return facts.forward_done
-    if decision.dual_path_kind is DualPathKind.DE_FULL_HIT:
-        return facts.store_done
     if decision.dual_path_kind is DualPathKind.DE_PARTIAL_HIT:
         return facts.store_done and facts.forward_done
     raise AssertionError(decision)
+
+
+def de_local_full_succeeded(
+    plan: LocalFullHitPlan,
+    facts: RequestCompletionFacts,
+) -> bool:
+    return (
+        plan.phase is LocalFullHitPhase.READY
+        and facts.store_done
+        and not facts.failed
+    )
 ```
 
 PE partial 的 remote-KV 成功条件为 `facts.reverse_done`。
@@ -995,7 +1426,7 @@ PE partial 的 remote-KV 成功条件为 `facts.reverse_done`。
 |---|---|
 | PE / `DE_PARTIAL_HIT` | Reverse request DONE |
 | DE / DualPath 未采用 | Forward request DONE |
-| DE / `DE_FULL_HIT` | Store load DONE |
+| DE / `DE_LOCAL_FULL_HIT` | Store load DONE |
 | DE / `DE_PARTIAL_HIT` | Store DONE 且 Forward request DONE |
 
 失败请求也必须最终发布本地 receive terminal，使框架结束等待：
@@ -1018,7 +1449,7 @@ DualPath 复用父 Mooncake sender delayed-free tracking。
 
 DE Store adapter 从 `KVPoolWorker.get_finished()` 获得 completion：
 
-- full hit：满足 DE receive success；
+- local Full：满足 DE receive success；
 - partial hit：只设置 `store_done`；
 - Store failure：聚合 failed block IDs 并进入 failed terminal。
 
@@ -1039,20 +1470,26 @@ wire external ID
 ```mermaid
 sequenceDiagram
     participant DES as "DE Scheduler"
+    participant DEC as "DE PathDecisionCoordinator"
     participant Proxy as "Proxy"
-    participant PEI as "PE Ingress"
+    participant PE as "PE API / Scheduler"
     participant Multi as "PE MultiConnector"
+    participant PEC as "PE PathDecisionCoordinator"
     participant AS as "PE AscendStore"
     participant PEW as "PE Worker"
     participant DEW as "DE Worker"
 
-    DES->>DES: "probe DE Store; allocate DE blocks"
-    DES->>Proxy: "model request + PathDecisionRequest"
-    Proxy->>PEI: "dispatch"
-    PEI->>Multi: "create PE request"
+    DES->>DES: "probe DE Store, allocate DE blocks"
+    DES->>DEC: "submit candidate"
+    DEC->>Proxy: "POST /v1/metaserver + PathDecisionRequest"
+    Proxy->>Proxy: "register decision Future"
+    Proxy->>PE: "background model request"
+    PE->>Multi: "create PE Engine request"
     Multi->>Multi: "DualPath returns (0, False)"
-    PEI-->>Proxy: "PathDecisionCommit(False, None)"
-    Proxy-->>DES: "return commit"
+    Multi->>PEC: "commit-once(False, None)"
+    PEC->>Proxy: "POST /v1/path-decision"
+    Proxy-->>DEC: "/v1/metaserver response: commit"
+    DEC-->>DES: "enqueue commit"
     Multi->>AS: "continue Store lookup"
     alt "AscendStore hit"
         AS-->>PEW: "bulk load PE blocks"
@@ -1066,29 +1503,30 @@ sequenceDiagram
     DEW-->>DES: "finished_recving"
 ```
 
-### 14.2 `DE_FULL_HIT`
+### 14.2 `DE_LOCAL_FULL_HIT`
 
 ```mermaid
 sequenceDiagram
     participant DES as "DE Scheduler"
-    participant Proxy as "Proxy"
-    participant PEI as "PE Ingress"
+    participant DPC as "DE DualPath Scheduler"
     participant Store as "AscendStore"
     participant DEW as "DE Worker"
 
-    DES->>Store: "probe"
-    Store-->>DES: "coverage >= R"
+    DES->>DPC: "get_num_new_matched_tokens(L_DE)"
+    DPC->>Store: "metadata-only probe"
+    Store-->>DPC: "coverage >= R"
+    DPC->>DPC: "freeze DE_LOCAL_FULL_HIT"
+    DPC->>DPC: "consume do_remote_prefill"
+    DPC-->>DES: "external=max(R-L_DE, 0), load_async"
     DES->>DES: "allocate/freeze DE blocks"
-    DES->>Proxy: "model request + PathDecisionRequest"
-    Proxy->>PEI: "dispatch"
-    PEI->>PEI: "commit and consume request"
-    PEI-->>Proxy: "PathDecisionCommit(True, DE_FULL_HIT)"
-    Proxy-->>DES: "return commit"
-    DES->>DEW: "start Store load"
+    DES->>DPC: "update_state_after_alloc"
+    DPC->>DEW: "StoreLoadPlan only"
+    DEW->>Store: "load KV into DE HBM"
     Store-->>DEW: "STORE_DONE"
     DEW-->>DES: "finished_recving"
     DES->>DES: "num_computed_tokens = R"
     DES->>DEW: "recompute final prompt token"
+    DES->>DEW: "continue local decode"
 ```
 
 ### 14.3 `DE_PARTIAL_HIT`
@@ -1096,8 +1534,11 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant DES as "DE Scheduler"
+    participant DEC as "DE PathDecisionCoordinator"
     participant Proxy as "Proxy"
+    participant PE as "PE API / Scheduler"
     participant Multi as "PE MultiConnector"
+    participant PEC as "PE PathDecisionCoordinator"
     participant Store as "AscendStore"
     participant DEW as "DE Worker"
     participant PEW as "PE Worker"
@@ -1105,11 +1546,16 @@ sequenceDiagram
     DES->>Store: "probe"
     Store-->>DES: "partial coverage"
     DES->>DES: "allocate/freeze DE blocks"
-    DES->>Proxy: "model request + PathDecisionRequest"
-    Proxy->>Multi: "dispatch PE request"
+    DES->>DEC: "submit candidate"
+    DEC->>Proxy: "POST /v1/metaserver + PathDecisionRequest"
+    Proxy->>Proxy: "register decision Future"
+    Proxy->>PE: "background model request"
+    PE->>Multi: "create PE Engine request"
     Multi->>Multi: "DualPath wins first-positive"
-    Multi-->>Proxy: "PathDecisionCommit(True, DE_PARTIAL_HIT)"
-    Proxy-->>DES: "return commit"
+    Multi->>PEC: "commit-once(DE_PARTIAL_HIT)"
+    PEC->>Proxy: "POST /v1/path-decision"
+    Proxy-->>DEC: "/v1/metaserver response: commit"
+    DEC-->>DES: "enqueue commit"
     DES->>DEW: "start Store bulk load"
     Store-->>DEW: "STORE_DONE"
     loop "each layer"
@@ -1177,7 +1623,7 @@ def matched_tokens_from_commit(
             0,
         )
         return count, count > 0
-    raise AssertionError("full hit never enters PE Scheduler")
+    raise AssertionError(decision)
 ```
 
 ### 15.3 child 行为
@@ -1259,7 +1705,8 @@ metadata 指定。
 - active adaptive strategy；
 - multi-path slicing planner。
 
-Proxy/RPC commit return 是部署集成能力，不放入 Worker transport 配置。
+Proxy HTTP commit return 是 remote-required 的部署集成能力，不放入
+Worker transport 配置。Stage 1 不配置 DualPath middleware。
 
 ### 16.3 校验
 
@@ -1270,7 +1717,8 @@ Proxy/RPC commit return 是部署集成能力，不放入 Worker transport 配�
 - PE Multi child 顺序正确；
 - DE Store config 关闭 put/save；
 - topology 满足第 17 章；
-- Proxy/RPC 支持 commit return。
+- Proxy 支持 `dual_path_v1`、`/v1/path-decision` 和 commit response；
+- DE local Full 不调用 `/v1/metaserver`，Proxy 不创建 PE request。
 
 ## 17. Stage 1 拓扑限制
 
@@ -1302,7 +1750,7 @@ Stage 1 fail-fast：
 3. Worker 调用一次父 Worker 初始化；
 4. 创建 DE Store adapters；
 5. 校验 config/topology；
-6. 验证 Proxy/RPC commit return；
+6. 验证 remote-required 的 Proxy `dual_path_v1` capability；
 7. `register_kv_caches()` 调用父完整注册函数一次；
 8. `kv_both` runtime 启动唯一 send/recv thread；
 9. recv thread ready 后 Connector 可接收请求。
@@ -1334,6 +1782,15 @@ DE sender -> PE receiver
 
 ### 18.3 data-start ready
 
+DE local Full：
+
+- `LocalFullHitPlan` 已冻结；
+- 正式 blocks 已分配；
+- Store metadata 已绑定；
+- request 未 terminal。
+
+跨 Engine plan：
+
 - commit 已保存；
 - local plan 已绑定；
 - recv mapping 已登记；
@@ -1350,6 +1807,8 @@ class DualPathErrorCode(str, Enum):
     CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
     DECISION_PROTOCOL_ERROR = "DECISION_PROTOCOL_ERROR"
     DECISION_TIMEOUT = "DECISION_TIMEOUT"
+    PE_REQUEST_ERROR = "PE_REQUEST_ERROR"
+    PATH_EXECUTION_TIMEOUT = "PATH_EXECUTION_TIMEOUT"
     STORE_LOOKUP_ERROR = "STORE_LOOKUP_ERROR"
     STORE_LOAD_ERROR = "STORE_LOAD_ERROR"
     REVERSE_TRANSFER_ERROR = "REVERSE_TRANSFER_ERROR"
@@ -1360,9 +1819,16 @@ class DualPathErrorCode(str, Enum):
 ### 19.2 处理规则
 
 - config/topology/Proxy capability 错误：初始化失败；
-- DE probe miss/unknown：DualPath 未采用；
-- DE probe RPC 失败且未 commit：按 unknown 处理；
+- DE probe miss/partial：进入 remote-required；
+- DE probe timeout/error 且本地路径尚未冻结：视为本地 Store 暂不可用，
+  进入 remote-required；
+- `DE_LOCAL_FULL_HIT` 冻结后 Store load dispatch/get/validation/timeout
+  失败：请求以 `STORE_LOAD_ERROR` 或 `PATH_EXECUTION_TIMEOUT` 结束，不访问
+  Proxy、不恢复 `do_remote_prefill`；
 - Proxy dispatch/commit timeout：请求失败；
+- PE 后台 model request 在 commit 前失败：Proxy resolve decision error；
+- commit 后没有在执行期限内收到路径要求的 Store/Reverse/Forward
+  terminal：请求以 `PATH_EXECUTION_TIMEOUT` 失败；
 - commit 后 Store/Reverse/Forward 失败：请求失败；
 - 相同 completion 重复到达：幂等忽略；
 - identity/direction 冲突：协议错误；
@@ -1372,7 +1838,7 @@ class DualPathErrorCode(str, Enum):
 
 1. 将 request key 记入 `terminal_requests`；
 2. 禁止新 Store/P2P；
-3. abort 未 commit probe；
+3. abort 未 commit probe 或仍在执行的本地 Store task；
 4. 收集计划涉及的 block IDs；
 5. 发布 invalid block IDs；
 6. 等待现有数据面返回请求级 terminal；
@@ -1385,6 +1851,8 @@ class DualPathErrorCode(str, Enum):
 取消：
 
 - pending candidate：abort probe；
+- `DE_LOCAL_FULL_HIT`：终止本地 Store task，invalid 目标 blocks，删除
+  local plan；
 - committed 未启动：删除 plan；
 - 已启动：禁止新任务，等待 request-level terminal。
 
@@ -1402,6 +1870,7 @@ shutdown：
 
 - candidate registration 幂等；
 - commit 只接受唯一 payload；
+- local Full 路径冻结幂等且不可逆；
 - Store load 每个 key 最多启动一次；
 - Reverse request plan 最多启动一次；
 - Forward 每层沿用父 `SendReqInfo` 的单调 token 记录；
@@ -1419,6 +1888,7 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
 ├── __init__.py
 ├── connector.py
 ├── config.py
+├── control_plane.py
 ├── metadata.py
 ├── path_decision.py
 ├── store_adapter.py
@@ -1429,6 +1899,7 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
 |---|---|
 | `connector.py` | facade、Scheduler/Worker 子类和 vLLM hooks |
 | `config.py` | active/shadow config 和 fail-fast |
+| `control_plane.py` | `PathDecisionCoordinator` 的异步 RPC、DE inbox 和 RPC schema |
 | `metadata.py` | identity、coverage、commit、plan、completion facts |
 | `path_decision.py` | PE decision、commit-once、accounting |
 | `store_adapter.py` | DE KVPool probe/commit/abort/load |
@@ -1440,16 +1911,26 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
 
 开发前必须验证：
 
-1. PE→DE commit 可通过现有 Proxy/RPC 返回；
-2. full-hit request 可在 PE ingress 消费；
-3. 三种结果都发送统一 model request；
-4. KVPool 临时 lookup 状态可由 handle 安全 commit/abort；
-5. `kv_both` 父 Worker 只有一组 send/recv threads；
-6. DE 可从已注册 caches 构造 Reverse `SendTask`；
-7. PE `save_kv_layer()` 可选择正确 Forward region；
-8. 两方向 raw terminal 可映射到 Engine-local ID；
-9. first-positive 与 Layerwise real blocks 不产生双 accounting；
-10. PE Store failure 不启动模型或 Forward。
+1. 普通 Layerwise 请求在 Proxy 上保持现有 `/v1/metaserver` 行为；
+2. `DE_LOCAL_FULL_HIT` 在 DE 冻结本地路径并消费
+   `do_remote_prefill`，不调用 `/v1/metaserver`；
+3. local Full allocation 后只生成 Store load metadata，不生成
+   Reverse/Forward command；
+4. `dual_path_v1` remote-required 请求可在 dispatch 前注册 Future，并通过
+   `/v1/path-decision` resolve；
+5. `/v1/metaserver` response 可被 DE executor 解析并安全送入 Scheduler
+   inbox；
+6. partial/rejected commit 可从 PE Scheduler 非阻塞回传；
+7. KVPool 临时 lookup 状态可由 handle 安全 commit/abort；
+8. `kv_both` 父 Worker 只有一组 send/recv threads；
+9. DE 可从已注册 caches 构造 Reverse `SendTask`；
+10. PE `save_kv_layer()` 可选择正确 Forward region；
+11. 两方向 raw terminal 可映射到 Engine-local ID；
+12. first-positive 与 Layerwise real blocks 不产生双 accounting；
+13. PE Store failure 不启动模型或 Forward；
+14. local Full Store load 失败后不会迟到访问 Proxy；
+15. commit 后 PE model/transfer 未产生 terminal 时，执行期限可以结束
+    DE 等待。
 
 任一失败都必须回到评审，不能用第二个 runtime 或新增 Worker 控制通道绕过。
 
@@ -1457,25 +1938,38 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
 
 ### 23.1 决策与 accounting
 
-- full → `DE_FULL_HIT`；
+- Store coverage 满足 `R` → DE 本地 `DE_LOCAL_FULL_HIT`，不创建
+  `PathDecisionCommit`；
+- `L_DE == R` → 不执行 Store probe、不访问 Proxy，直接重算最后一个
+  prompt token；
 - partial + prefer-de → `DE_PARTIAL_HIT`；
 - partial + prefer-pe、miss、unknown → rejected；
 - outer Store 不进入 `DualPathKind`；
 - same commit duplicate 幂等；
 - different second commit 失败；
-- full 不进入 PE accounting；
+- local Full 不进入 PE accounting；
 - partial PE accounting 是 `K_DE - L_PE`；
 - DE accounting 是 `R - L_DE`；
+- 普通 Attention PE request 保持 `P`，DualPath 不执行自定义截断；
+- DualPath 的逻辑 Store/Forward coverage 仍止于 `R`；
 - coverage clamp、granularity、`P=0/1`。
 
 ### 23.2 Proxy 控制面
 
-- 三种结果使用同一 envelope；
+- `DE_LOCAL_FULL_HIT` 的 `/v1/metaserver` 调用数、PE model request 数和
+  `/v1/path-decision` 调用数均为 0；
+- 只有 remote-required 结果使用 PE model-request envelope；
+- 无 `dual_path_v1` 标记时现有 Layerwise 行为不变；
+- `dual_path_v1` 与普通 Layerwise 请求可并发；
+- decision Future 先注册、PE request 后 dispatch；
 - request/commit schema 精确；
-- full 在 PE ingress 短路；
 - partial/rejected 进入 Scheduler；
-- commit 返回相同 request key；
+- PE final response 不充当 decision；
+- `/v1/path-decision` 和 `/v1/metaserver` response 返回相同 request key；
+- DE executor 只写 inbox，Scheduler thread 才写本地 commit map；
+- PE 后台请求结束后才释放 Proxy Prefill 负载；
 - timeout 进入 `DECISION_TIMEOUT`；
+- PE serve command 不包含 `dual_path_control_middleware`；
 - 无 Worker decision 消息。
 
 ### 23.3 共享 runtime
@@ -1497,8 +1991,9 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
 - duplicate 不重复公开；
 - PE partial 等 Reverse DONE；
 - DE rejected 等 Forward DONE；
-- DE full 等 Store DONE；
+- DE local Full 等 Store DONE；
 - DE partial 等 Store + Forward；
+- commit 后缺少必要 terminal 时进入 `PATH_EXECUTION_TIMEOUT`；
 - TP rank 失败；
 - invalid blocks 不晚于 failed terminal；
 - delayed-free 只用于 sender source blocks。
@@ -1506,11 +2001,16 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
 ### 23.5 Store adapter
 
 - probe 不启动 load；
+- probe error 在本地路径冻结前进入 remote-required；
+- local Full 冻结时消费 `do_remote_prefill`；
+- allocation deferred 时保留 `LOCAL_SELECTED`；
 - handle 只 commit/abort 一次；
 - shutdown abort pending handles；
 - committed metadata 含 `loading_req_ids`；
 - async completion 转为 `STORE_DONE`；
-- Store failure 产生 invalid blocks；
+- local Full Store failure 产生 invalid blocks 和 `FINISHED_ERROR`，不触发
+  远端回退；
+- terminal 后迟到 `STORE_DONE` 幂等忽略；
 - internal save 关闭。
 
 ### 23.6 MultiConnector
@@ -1528,7 +2028,7 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/
 
 1. PE Store hit + PE tail + Forward；
 2. PE Store miss + PE compute + Forward；
-3. full hit + DE 最后 token 重算；
+3. local full hit + 零 Proxy decision 调用 + DE 最后 token 重算；
 4. partial hit + Store + Reverse + PE tail + Forward；
 5. Store failure；
 6. Reverse failure；
@@ -1552,6 +2052,7 @@ forward_wire_external_id
 reverse_wire_external_id
 use_dual_path
 dual_path_kind
+decode_local_route
 outer_connector_winner
 raw_hit_tokens
 aligned_hit_tokens
@@ -1567,13 +2068,13 @@ error_code
 指标：
 
 - accepted/rejected 请求数；
-- full/partial 成功率；
+- local-full/partial 成功率；
 - outer Store winner 数；
 - Store probe/load latency；
 - Reverse/Forward request latency；
 - decision latency；
 - Proxy timeout；
-- post-commit failure；
+- post-selection/post-commit failure；
 - pending raw completion 数量/驻留时间；
 - duplicate completion 数量。
 
@@ -1592,16 +2093,24 @@ error_code
 - [ ] 方向 wire ID 不同；
 - [ ] 数据逐层写，完成按请求发布；
 - [ ] pending raw DONE/FAILED 不丢失；
-- [ ] PE 唯一提交 decision；
+- [ ] PE 唯一提交跨 Engine decision；
+- [ ] Proxy 按 request key 执行跨进程 commit-once；
 - [ ] request/commit schema 精确；
-- [ ] DualPath kind 只有 full/partial；
-- [ ] 统一 model request；
-- [ ] full 在 PE ingress 短路；
-- [ ] commit 经 Proxy/RPC 返回；
-- [ ] commit 前无 Store/P2P I/O；
+- [ ] `DualPathKind` 只有 `DE_PARTIAL_HIT`；
+- [ ] `DE_LOCAL_FULL_HIT` 不创建 decision/candidate/PE model request；
+- [ ] 普通 Attention PE request 不做 DualPath 自定义截断；
+- [ ] 不存在 `dual_path_control_middleware`；
+- [ ] `dual_path_v1` 是显式 opt-in，普通 Layerwise 行为不变；
+- [ ] remote-required commit 经 `/v1/path-decision` 和
+  `/v1/metaserver` response 返回；
+- [ ] DE executor 通过 inbox 把 commit 交给 Scheduler thread；
+- [ ] local Full 只在本地路径冻结和 allocation 后启动 Store load；
+- [ ] remote-required 在 commit 前无 Store/P2P I/O；
 - [ ] rejected 后 outer Store/PE compute 正常；
 - [ ] external Forward 覆盖 `[L_DE, R)`；
-- [ ] full 在 DE 重算最后一个 prompt token；
+- [ ] local Full 在 DE 重算最后一个 prompt token；
+- [ ] local Full Store load 失败后不访问 Proxy，且进入
+  `FINISHED_ERROR`；
 - [ ] partial Store/Forward 区间不重叠；
 - [ ] PE 等 Reverse request DONE；
 - [ ] DE partial 等 Store + Forward；
@@ -1613,19 +2122,22 @@ error_code
 
 ## 26. 开发顺序
 
-1. Proxy ingress/commit-return spike；
-2. active config migration；
-3. decision、commit-once 和 accounting；
-4. Store probe commit/abort spike；
-5. DE Store adapter；
-6. 单 Worker shared runtime；
-7. Forward/Reverse helpers；
-8. raw completion mapping；
-9. Scheduler/Multi integration；
-10. failure、cancel、delayed-free、shutdown；
-11. UT；
-12. NPU E2E；
-13. 性能与显存审计。
+1. Store probe/handle commit-abort 与 local Full accounting spike；
+2. local Full 消费 `do_remote_prefill`、零 metaserver/PE request spike；
+3. DE Store adapter、allocation retry、load completion/failure；
+4. Proxy `dual_path_v1` remote-required opt-in、Future 和普通 Layerwise 回归
+   spike；
+5. DE `/v1/metaserver` response、decision inbox 与 Scheduler drain spike；
+6. active config migration；
+7. partial decision、commit-once 和 accounting；
+8. 单 Worker shared runtime；
+9. Forward/Reverse helpers；
+10. raw completion mapping；
+11. Scheduler/Multi integration；
+12. failure、执行期限、cancel、delayed-free、shutdown；
+13. UT；
+14. NPU E2E；
+15. 性能与显存审计。
 
 不得先实现第二套 transport、逐层确认协议或通用状态框架来绕过尚未验证的
 集成点。
