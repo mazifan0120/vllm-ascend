@@ -140,6 +140,13 @@ def _bind_receive_metadata(
 def _prepare_send_metadata(
     self, metadata: MooncakeLayerwiseConnectorMetadata
 ) -> None: ...
+def _enqueue_send_layer(
+    self,
+    layer_name: str,
+    kv_layer: list[torch.Tensor],
+    attn_metadata: AttentionMetadata | None,
+    metadata: MooncakeLayerwiseConnectorMetadata,
+) -> None: ...
 ```
 
 原 `MooncakeLayerwiseConnector` facade、metadata contract 和
@@ -223,8 +230,9 @@ Scheduler 侧仍是配置顺序的 first-positive：
 
 Stage 1 必须复用这一语义，不额外增加请求级 arm barrier 或逐层 ACK。
 
-复用需要一次父 Worker 内部重构：线程构造、receive binding 和 send
-preparation 从当前静态 role 分支提取成 protected helper。该重构会修改
+复用需要一次父 Worker 内部重构：线程构造、receive binding、send
+preparation 和 per-layer send enqueue 从当前静态 role 分支提取成
+protected helper。该重构会修改
 `mooncake_layerwise_connector.py`，但不得改变普通 Layerwise 的线程数、
 请求 mapping、传输区间、回调顺序或 completion 语义；这些行为必须由回归
 测试锁定。
@@ -2085,8 +2093,9 @@ vllm_ascend/distributed/kv_transfer/kv_p2p/
 └── mooncake_layerwise_connector.py
 ```
 
-该文件只提取 protected thread、receive-binding 和 send-preparation helper；
-不得改变普通 Layerwise contract 或可见行为。
+该文件只提取 protected thread、receive-binding、send-preparation 和
+per-layer send-enqueue helper；不得改变普通 Layerwise contract 或可见
+行为。
 
 同时更新现有 DualPath 目录：
 
