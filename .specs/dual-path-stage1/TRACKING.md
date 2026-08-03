@@ -10,7 +10,7 @@ Overall state: approved delivery structure; feature implementation not started
 
 | ID | Deliverable | Status | Depends on | Branch / commit | PR | Required merge evidence | Spec |
 |---|---|---|---|---|---|---|---|
-| PR-00 | Connector foundation | `IN_PROGRESS` | — | `dev/dualpath` / `78451d8f6` baseline + spec cleanup commits | Not opened | Foundation UT, inherited-behavior parity, ordinary Layerwise NPU smoke, config scope review | [spec](prs/PR-00-foundation.md) |
+| PR-00 | Connector foundation | `LOCAL_READY` (CPU gates 1-3 PASS; NPU gate 4 pending) | — | `dev/dualpath` / `d72b067a` + test fixes | Not opened | Foundation UT ✅, inherited-behavior parity ✅, lint ✅, ordinary Layerwise NPU smoke ⏳, config scope review ✅ | [spec](prs/PR-00-foundation.md) |
 | PR-01 | Decode local full hit | `PLANNED` | PR-00 | Not created | Not opened | Focused UT plus local-full NPU E2E; zero Proxy/PE decision calls | [spec](prs/PR-01-decode-local-full-hit.md) |
 | PR-02 | Parent Layerwise Worker helper extraction | `PLANNED` | PR-00 | Not created | Not opened | Ordinary Layerwise producer/consumer regression parity | [spec](prs/PR-02-parent-worker-refactor.md) |
 | PR-03 | Cross-engine decision control plane | `PLANNED` | PR-01 | Not created | Not opened | Proxy/PE/DE round trip, timeout/idempotency, ordinary Proxy regression | [spec](prs/PR-03-decision-control-plane.md) |
@@ -75,14 +75,14 @@ YYYY-MM-DD | PR-XX | command or external check | PASS/FAIL | concise result or l
 
 2026-08-03 | PR-00 | detailed foundation boundary review | PASS | behavior-preserving alias; CPU parity and ordinary Layerwise NPU smoke required
 
-2026-08-03 | PR-00 | spec cleanup vs DETAILED-SPEC §6–§10: frozen role-only DualPathConfig, {role,tls_config,prefill,decode} allow-list, facade state per §8.1, _req_path removed, alias docstrings | PASS | static conformance review of the cleanup diff against the detailed spec; no shadow/decision/PE-Read/DE-Read vocabulary remains outside config rejection messages
+2026-08-03 | PR-00 | spec cleanup vs DETAILED-SPEC §6–§10: frozen role-only DualPathConfig, {role,tls_config,prefill,decode} allow-list, facade state per §8.1,_req_path removed, alias docstrings | PASS | static conformance review of the cleanup diff against the detailed spec; no shadow/decision/PE-Read/DE-Read vocabulary remains outside config rejection messages
 
 2026-08-03 | PR-00 | python3 -m py_compile on dual_path sources, foundation UT, and e2e smoke | PASS | all files compile; diff scope limited to the six spec-owned paths (no parent/Store/Proxy/MultiConnector change)
 
-2026-08-03 | PR-00 | pytest -sv tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py | NOT RUN (env: macOS dev box, no vllm) | 49 tests covering spec §11 config matrix, spy construction parity, ten behavior-parity scenarios, §9 guards; run on CPU CI before review
+2026-08-03 | PR-00 | pytest -sv tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py | PASS | 49 passed, 15 subtests passed on openEuler 22.03 + Miniforge Python 3.10 + vllm v0.23.0; fixed 2 test-side bugs developed on macOS without vllm: (1) patch.object get_decode_context_model_parallel_world_size needed create=True because mooncake_layerwise_connector.py imports only _rank not _world_size; (2) LIFECYCLE_METHODS was tuple but .isdisjoint() called on it, changed to frozenset
 
-2026-08-03 | PR-00 | pytest -sv tests/ut/kv_offload/test_mooncake_layerwise_connector.py | NOT RUN (env: macOS dev box, no vllm) | parent regression file untouched by the cleanup; run on CPU CI before review
+2026-08-03 | PR-00 | pytest -sv tests/ut/kv_offload/test_mooncake_layerwise_connector.py | PASS | 41 passed, 0 failed on same env; parent regression confirmed untouched by PR-00 cleanup
 
-2026-08-03 | PR-00 | bash format.sh ci | NOT RUN (env: macOS dev box, no ruff/lint deps) | run before the PR opens
+2026-08-03 | PR-00 | bash format.sh ci | PASS (PR-00 scope) | ruff-check, ruff-format, codespell, typos, clang-format, markdownlint, actionlint, check-forbidden-imports, check-boolean-context-manager, check-long-functions all PASS; pre-existing shellcheck SC2328 on csrc/build.sh:524 is unrelated (verified via git stash on clean dev/dualpath); added TE to codespell ignore list (Transfer Engine abbreviation); fixed import re → import regex as re in test file; ruff auto-formatted 4 PR-00 files
 
 2026-08-03 | PR-00 | NPU smoke: pytest -sv tests/e2e/nightly/multi_node/dual_path/test_foundation_parity.py | NOT RUN (env: requires the NPU multi-node nightly runner) | baseline MooncakeLayerwiseConnector vs candidate DualPathConnector GLM-4.7-W8A8C8 disagg-pd configs added under tests/e2e/nightly/multi_node/dual_path/config/; CPU results cannot substitute for this gate (spec §12)

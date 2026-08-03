@@ -17,6 +17,7 @@ connector later adds a required extra-config key, the compatibility guard test
 fails until ``ALLOWED_EXTRA_CONFIG_KEYS`` and its parity tests are reviewed
 together.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,9 +28,7 @@ if TYPE_CHECKING:
 
 # Extra-config keys the foundation accepts. ``role`` is the only DualPath-owned
 # key; the rest are inherited Mooncake configuration consumed by the parent.
-ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"role", "tls_config", "prefill", "decode"}
-)
+ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset({"role", "tls_config", "prefill", "decode"})
 
 # Keys promised by earlier drafts but removed from the foundation scope. They
 # are rejected explicitly so a stale deployment config fails fast with a clear
@@ -63,9 +62,7 @@ class DualPathConfig:
     role: Literal["prefill", "decode"]
 
     @classmethod
-    def from_extra_config(
-        cls, extra_config: dict[str, Any] | None, ktc: "KVTransferConfig"
-    ) -> "DualPathConfig":
+    def from_extra_config(cls, extra_config: dict[str, Any] | None, ktc: KVTransferConfig) -> DualPathConfig:
         """Build a validated foundation config from the extra-config dict.
 
         Raises:
@@ -84,17 +81,13 @@ class DualPathConfig:
             )
             removed = sorted(set(unknown) & REMOVED_FOUNDATION_FIELDS)
             if removed:
-                msg += (
-                    f" Key(s) {removed} were removed from the foundation "
-                    "scope and fail fast in PR-00."
-                )
+                msg += f" Key(s) {removed} were removed from the foundation scope and fail fast in PR-00."
             raise ValueError(msg)
 
         role = extra.get("role")
         if role is None:
             raise ValueError(
-                "DualPathConnector requires 'role' in "
-                "kv_connector_extra_config (choices: 'prefill' | 'decode')."
+                "DualPathConnector requires 'role' in kv_connector_extra_config (choices: 'prefill' | 'decode')."
             )
         if role in ("pe", "de"):
             raise ValueError(
@@ -102,16 +95,13 @@ class DualPathConfig:
                 "the foundation roles are exactly 'prefill' and 'decode'."
             )
         if role not in FOUNDATION_ROLES:
-            raise ValueError(
-                f"DualPathConnector role={role!r} is not supported; "
-                "choices: 'prefill' | 'decode'."
-            )
+            raise ValueError(f"DualPathConnector role={role!r} is not supported; choices: 'prefill' | 'decode'.")
 
         _validate_role_capability(role, ktc)
         return cls(role=role)
 
 
-def _validate_role_capability(role: str, ktc: "KVTransferConfig") -> None:
+def _validate_role_capability(role: str, ktc: KVTransferConfig) -> None:
     """Cross-check the declared foundation role against the KV capability.
 
     A prefill Engine is the KV producer; a decode Engine is the KV consumer.

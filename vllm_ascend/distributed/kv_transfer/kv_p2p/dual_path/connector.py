@@ -24,6 +24,7 @@ Block forwarding is free:
     ``isinstance(c, MooncakeLayerwiseConnector)`` check covers subclasses). No
     change to ``AscendMultiConnector`` is required.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -59,7 +60,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: KVCacheConfig,
         engine_id: str,
         dual_path_cfg: DualPathConfig,
     ) -> None:
@@ -83,7 +84,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: KVCacheConfig,
         engine_id: str,
         dual_path_cfg: DualPathConfig,
     ) -> None:
@@ -109,7 +110,7 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
         self,
         vllm_config: VllmConfig,
         role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig | None" = None,
+        kv_cache_config: KVCacheConfig | None = None,
     ) -> None:
         # NOTE: do NOT call MooncakeLayerwiseConnector.__init__ — it hard-builds
         # the parent scheduler/worker. Call KVConnectorBase_V1.__init__ exactly
@@ -126,14 +127,10 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
         )
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler: (
-                MooncakeLayerwiseConnectorScheduler | None
-            ) = DualPathConnectorScheduler(
+            self.connector_scheduler: MooncakeLayerwiseConnectorScheduler | None = DualPathConnectorScheduler(
                 vllm_config, kv_cache_config, str(self.engine_id), dual_path_cfg
             )
-            self.connector_worker: (
-                MooncakeLayerwiseConnectorWorker | None
-            ) = None
+            self.connector_worker: MooncakeLayerwiseConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
             self.connector_worker = DualPathConnectorWorker(

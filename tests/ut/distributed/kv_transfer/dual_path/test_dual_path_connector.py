@@ -13,7 +13,6 @@ import contextlib
 import importlib
 import importlib.util
 import inspect
-import re
 import sys
 import threading
 import types
@@ -22,6 +21,7 @@ from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import regex as re
 import torch
 
 fake_engine = types.ModuleType("mooncake.engine")
@@ -268,11 +268,9 @@ def worker_environment():
             )
         )
         stack.enter_context(
-            patch.object(layerwise_module, "get_decode_context_model_parallel_world_size", return_value=1)
+            patch.object(layerwise_module, "get_decode_context_model_parallel_world_size", return_value=1, create=True)
         )
-        stack.enter_context(
-            patch.object(layerwise_module, "get_decode_context_model_parallel_rank", return_value=0)
-        )
+        stack.enter_context(patch.object(layerwise_module, "get_decode_context_model_parallel_rank", return_value=0))
         stack.enter_context(
             patch.object(
                 layerwise_module,
@@ -304,15 +302,11 @@ def metadata_snapshot(metadata):
 
 class TestDualPathConfig(unittest.TestCase):
     def test_valid_prefill_with_kv_producer(self):
-        config = DualPathConfig.from_extra_config(
-            {"role": "prefill"}, make_kv_transfer_config("kv_producer")
-        )
+        config = DualPathConfig.from_extra_config({"role": "prefill"}, make_kv_transfer_config("kv_producer"))
         self.assertEqual(config, DualPathConfig(role="prefill"))
 
     def test_valid_decode_with_kv_consumer(self):
-        config = DualPathConfig.from_extra_config(
-            {"role": "decode"}, make_kv_transfer_config("kv_consumer")
-        )
+        config = DualPathConfig.from_extra_config({"role": "decode"}, make_kv_transfer_config("kv_consumer"))
         self.assertEqual(config, DualPathConfig(role="decode"))
 
     def test_valid_prefill_with_kv_both(self):
@@ -350,18 +344,14 @@ class TestDualPathConfig(unittest.TestCase):
             ValueError,
             r"(?=.*role='prefill' requires kv_role)(?=.*kv_consumer)",
         ):
-            DualPathConfig.from_extra_config(
-                {"role": "prefill"}, make_kv_transfer_config("kv_consumer")
-            )
+            DualPathConfig.from_extra_config({"role": "prefill"}, make_kv_transfer_config("kv_consumer"))
 
     def test_decode_with_kv_producer_rejected(self):
         with self.assertRaisesRegex(
             ValueError,
             r"(?=.*role='decode' requires kv_role)(?=.*kv_producer)",
         ):
-            DualPathConfig.from_extra_config(
-                {"role": "decode"}, make_kv_transfer_config("kv_producer")
-            )
+            DualPathConfig.from_extra_config({"role": "decode"}, make_kv_transfer_config("kv_producer"))
 
     def test_tls_prefill_decode_keys_are_accepted_without_storage(self):
         config = DualPathConfig.from_extra_config(
@@ -491,12 +481,12 @@ class TestDualPathConstructionParity(unittest.TestCase):
             worker_calls.append((args, kwargs))
             return worker_init(instance, *args, **kwargs)
 
-        with worker_environment():
-            with (
-                patch.object(MooncakeLayerwiseConnectorScheduler, "__init__", new=scheduler_spy),
-                patch.object(MooncakeLayerwiseConnectorWorker, "__init__", new=worker_spy),
-            ):
-                connector = DualPathConnector(config, KVConnectorRole.WORKER, kv_cache_config)
+        with (
+            worker_environment(),
+            patch.object(MooncakeLayerwiseConnectorScheduler, "__init__", new=scheduler_spy),
+            patch.object(MooncakeLayerwiseConnectorWorker, "__init__", new=worker_spy),
+        ):
+            connector = DualPathConnector(config, KVConnectorRole.WORKER, kv_cache_config)
         self.assertEqual(scheduler_calls, [])
         self.assertEqual(len(worker_calls), 1)
         self.assertIsNone(connector.connector_scheduler)
@@ -1052,12 +1042,8 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             parent_consumer.start_load_kv(parent_meta)
             dual_consumer.start_load_kv(dual_meta)
             external_request_id = get_external_request_id(normal_request_id)
-            parent_consumer.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {
-                external_request_id
-            }
-            dual_consumer.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {
-                external_request_id
-            }
+            parent_consumer.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {external_request_id}
+            dual_consumer.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {external_request_id}
             parent_consumer.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
             dual_consumer.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
 
@@ -1184,12 +1170,8 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             external_request_id = get_external_request_id(failed_request_id)
             parent_worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
             dual_worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
-            parent_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {
-                external_request_id
-            }
-            dual_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {
-                external_request_id
-            }
+            parent_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
+            dual_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
             self.assertEqual(parent_worker.get_finished(), (set(), set()))
             self.assertEqual(dual_worker.get_finished(), (set(), set()))
             parent_invalid = parent_worker.get_block_ids_with_load_errors()
@@ -1203,19 +1185,21 @@ class TestDualPathBehaviorParity(unittest.TestCase):
 
 
 class TestDualPathFoundationGuards(unittest.TestCase):
-    LIFECYCLE_METHODS = (
-        "get_num_new_matched_tokens",
-        "update_state_after_alloc",
-        "build_connector_meta",
-        "request_finished",
-        "request_finished_all_groups",
-        "register_kv_caches",
-        "get_finished",
-        "get_block_ids_with_load_errors",
-        "start_load_kv",
-        "wait_for_layer_load",
-        "save_kv_layer",
-        "wait_for_save",
+    LIFECYCLE_METHODS = frozenset(
+        {
+            "get_num_new_matched_tokens",
+            "update_state_after_alloc",
+            "build_connector_meta",
+            "request_finished",
+            "request_finished_all_groups",
+            "register_kv_caches",
+            "get_finished",
+            "get_block_ids_with_load_errors",
+            "start_load_kv",
+            "wait_for_layer_load",
+            "save_kv_layer",
+            "wait_for_save",
+        }
     )
 
     def test_facade_lifecycle_methods_are_identical_to_parent(self):
@@ -1233,11 +1217,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
             DualPathConnectorWorker,
         ):
             with self.subTest(connector_class=connector_class.__name__):
-                own_methods = {
-                    name
-                    for name, value in connector_class.__dict__.items()
-                    if inspect.isfunction(value)
-                }
+                own_methods = {name for name, value in connector_class.__dict__.items() if inspect.isfunction(value)}
                 self.assertEqual(own_methods, {"__init__"})
                 self.assertTrue(self.LIFECYCLE_METHODS.isdisjoint(connector_class.__dict__))
 
@@ -1287,4 +1267,4 @@ class TestDualPathRegistration(unittest.TestCase):
 
     def test_registered_module_path_resolves_to_dual_path_connector(self):
         module = importlib.import_module(self.MODULE_PATH)
-        self.assertIs(getattr(module, "DualPathConnector"), DualPathConnector)
+        self.assertIs(module.DualPathConnector, DualPathConnector)

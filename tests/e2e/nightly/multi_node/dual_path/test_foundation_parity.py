@@ -41,13 +41,9 @@ from tests.e2e.nightly.multi_node.internal_dp.scripts.multi_node_config import (
 )
 
 BASELINE_CONFIG_PATH: Final = (
-    "tests/e2e/nightly/multi_node/dual_path/config/"
-    "GLM-4.7-W8A8C8-Mooncake-Layerwise-baseline.yaml"
+    "tests/e2e/nightly/multi_node/dual_path/config/GLM-4.7-W8A8C8-Mooncake-Layerwise-baseline.yaml"
 )
-CANDIDATE_CONFIG_PATH: Final = (
-    "tests/e2e/nightly/multi_node/dual_path/config/"
-    "GLM-4.7-W8A8C8-DualPath-parity.yaml"
-)
+CANDIDATE_CONFIG_PATH: Final = "tests/e2e/nightly/multi_node/dual_path/config/GLM-4.7-W8A8C8-DualPath-parity.yaml"
 
 FIXED_PROMPTS: Final[list[str]] = [
     "What is two plus three?",
