@@ -6,11 +6,22 @@ model, topology, and result are recorded in ``.specs/dual-path-stage1/TRACKING.m
 Run on that runner with:
 
 ``pytest -sv tests/e2e/nightly/multi_node/dual_path/test_foundation_parity.py``
+
+Evidence division: pairwise matched-token values, exactly-once Transfer Engine
+and KV-buffer registration, and constructor thread counts are proven by the
+CPU construction/behavior parity tests in
+``tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py``
+(spec section 11). This smoke test verifies the section 12 bullets that are
+observable from a running disaggregated deployment: token-identical outputs,
+terminal outcomes, remote-prefill admission and transfer-completion counts,
+runtime/thread sequence parity against the baseline, absence of excluded
+behavior, and clean process lifetime. All log markers below are verified
+against real parent log lines in mooncake_layerwise_connector.py; markers
+without a guaranteed log line are deliberately not used.
 """
 
 import asyncio
 import signal
-import time
 from dataclasses import dataclass
 from typing import Final
 
@@ -45,35 +56,20 @@ FIXED_PROMPTS: Final[list[str]] = [
 REQUEST_SEED: Final = 1024
 MAX_TOKENS: Final = 64
 REQUEST_TIMEOUT_SECONDS: Final = 300.0
-PROXY_READY_TIMEOUT_SECONDS: Final = 300.0
-PROXY_READY_POLL_SECONDS: Final = 1.0
 BETWEEN_RUN_SETTLE_SECONDS: Final = 5.0
 
-# The parent worker logs "Initializing Mooncake work" (sic) while the scheduler
-# logs "Initializing Mooncake Scheduler"; both sides must be counted so the
-# baseline/candidate initialization counts are comparable.
-MOONCAKE_INIT_MARKERS: Final[tuple[str, ...]] = (
-    "Initializing Mooncake Scheduler",
-    "Initializing Mooncake work",
-)
-DUAL_PATH_INIT_MARKERS: Final[tuple[str, ...]] = (
-    "Initializing DualPath Scheduler",
-    "Initializing DualPath Worker",
-)
-TRANSFER_ENGINE_MARKERS: Final[tuple[str, ...]] = ("Transfer Engine",)
-REGISTER_BUFFER_MARKERS: Final[tuple[str, ...]] = ("register_buffer",)
-# Worker wording differs by connector version, so these are deliberately
-# best-effort, case-insensitive evidence markers for a real remote prefill.
-# "metaserver" is logged by the scheduler when it posts a remote-prefill
-# request to the proxy metaserver (mooncake_layerwise_connector.py).
-REMOTE_PREFILL_EVIDENCE_MARKERS: Final[tuple[str, ...]] = (
-    "remote prefill",
-    "remote-prefill",
-    "metaserver",
-    "mooncake transfer",
-    "transfer engine",
-    "register_buffer",
-)
+# Real parent log lines (mooncake_layerwise_connector.py): scheduler init
+# (:798), worker init (:1135 and :1171 — the parent logs it twice per worker,
+# so worker-init counts are asserted > 0 on both runs but never for equality),
+# consumer recv-thread startup (:607), remote-prefill admission (:953), and
+# transfer-level recv completion (:1425).
+BASELINE_SCHEDULER_INIT_MARKERS: Final[tuple[str, ...]] = ("Initializing Mooncake Scheduler",)
+CANDIDATE_SCHEDULER_INIT_MARKERS: Final[tuple[str, ...]] = ("Initializing DualPath Scheduler",)
+BASELINE_WORKER_INIT_MARKERS: Final[tuple[str, ...]] = ("Initializing Mooncake work",)
+CANDIDATE_WORKER_INIT_MARKERS: Final[tuple[str, ...]] = ("Initializing DualPath Worker",)
+RECV_THREAD_MARKERS: Final[tuple[str, ...]] = ("KVCacheRecvingLayerThread listening on",)
+ADMISSION_MARKERS: Final[tuple[str, ...]] = ("Send request:",)
+COMPLETION_MARKERS: Final[tuple[str, ...]] = ("Number of completed KV cache recv requests",)
 CANDIDATE_NEGATIVE_MARKERS: Final[tuple[str, ...]] = (
     "AscendStore",
     "StoreConnector",
@@ -123,11 +119,11 @@ class _CompletionRecord:
 
 @dataclass(frozen=True, slots=True)
 class _MarkerCounts:
-    mooncake_initializations: int
-    dual_path_initializations: int
-    transfer_engine: int
-    register_buffer: int
-    remote_prefill_evidence: int
+    scheduler_initializations: int
+    worker_initializations: int
+    recv_threads: int
+    admissions: int
+    transfer_completions: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,56 +139,57 @@ def _count_markers(normalized_text: str, markers: tuple[str, ...]) -> int:
     return sum(normalized_text.count(marker.casefold()) for marker in markers)
 
 
-def _extract_marker_counts(text: str) -> _MarkerCounts:
+def _extract_marker_counts(
+    text: str,
+    *,
+    scheduler_init_markers: tuple[str, ...],
+    worker_init_markers: tuple[str, ...],
+) -> _MarkerCounts:
     normalized_text = text.casefold()
     return _MarkerCounts(
-        mooncake_initializations=_count_markers(normalized_text, MOONCAKE_INIT_MARKERS),
-        dual_path_initializations=_count_markers(normalized_text, DUAL_PATH_INIT_MARKERS),
-        transfer_engine=_count_markers(normalized_text, TRANSFER_ENGINE_MARKERS),
-        register_buffer=_count_markers(normalized_text, REGISTER_BUFFER_MARKERS),
-        remote_prefill_evidence=_count_markers(normalized_text, REMOTE_PREFILL_EVIDENCE_MARKERS),
+        scheduler_initializations=_count_markers(normalized_text, scheduler_init_markers),
+        worker_initializations=_count_markers(normalized_text, worker_init_markers),
+        recv_threads=_count_markers(normalized_text, RECV_THREAD_MARKERS),
+        admissions=_count_markers(normalized_text, ADMISSION_MARKERS),
+        transfer_completions=_count_markers(normalized_text, COMPLETION_MARKERS),
     )
 
 
 def _assert_worker_log_parity(baseline_log: str, candidate_log: str) -> None:
-    baseline_counts = _extract_marker_counts(baseline_log)
-    candidate_counts = _extract_marker_counts(candidate_log)
+    baseline_counts = _extract_marker_counts(
+        baseline_log,
+        scheduler_init_markers=BASELINE_SCHEDULER_INIT_MARKERS,
+        worker_init_markers=BASELINE_WORKER_INIT_MARKERS,
+    )
+    candidate_counts = _extract_marker_counts(
+        candidate_log,
+        scheduler_init_markers=CANDIDATE_SCHEDULER_INIT_MARKERS,
+        worker_init_markers=CANDIDATE_WORKER_INIT_MARKERS,
+    )
 
-    assert baseline_counts.remote_prefill_evidence > 0, (
-        "baseline logs do not show a remote prefill transfer; "
-        f"searched for {REMOTE_PREFILL_EVIDENCE_MARKERS}"
-    )
-    assert candidate_counts.remote_prefill_evidence > 0, (
-        "candidate logs do not show a remote prefill transfer; "
-        f"searched for {REMOTE_PREFILL_EVIDENCE_MARKERS}"
-    )
-    assert baseline_counts.mooncake_initializations > 0
-    assert candidate_counts.dual_path_initializations > 0
-    assert baseline_counts.mooncake_initializations == candidate_counts.dual_path_initializations
-    assert baseline_counts.transfer_engine == candidate_counts.transfer_engine
-    assert baseline_counts.register_buffer == candidate_counts.register_buffer
+    # §12: a real remote-prefill transfer must be exercised in both runs.
+    assert baseline_counts.admissions > 0, "baseline logs show no remote-prefill admission"
+    assert candidate_counts.admissions > 0, "candidate logs show no remote-prefill admission"
+    # §12: identical matched-token/admission outcomes at request granularity.
+    assert baseline_counts.admissions == candidate_counts.admissions
+    # §12: request-terminal outcomes at transfer level.
+    assert baseline_counts.transfer_completions == candidate_counts.transfer_completions
+    # §12: runtime sequences initialize once per role on both runs; counts are
+    # comparable because both runs use the identical process topology.
+    assert baseline_counts.scheduler_initializations > 0
+    assert candidate_counts.scheduler_initializations > 0
+    assert baseline_counts.scheduler_initializations == candidate_counts.scheduler_initializations
+    assert baseline_counts.worker_initializations > 0
+    assert candidate_counts.worker_initializations > 0
+    # §12: no extra send/receive thread relative to the baseline role.
+    assert baseline_counts.recv_threads > 0
+    assert baseline_counts.recv_threads == candidate_counts.recv_threads
 
 
 def _assert_markers_absent(text: str, markers: tuple[str, ...], run_name: str) -> None:
     normalized_text = text.casefold()
     present_markers = tuple(marker for marker in markers if marker.casefold() in normalized_text)
     assert not present_markers, f"{run_name} logs contain forbidden markers: {present_markers}"
-
-
-async def _wait_for_proxy_ready(health_url: str) -> None:
-    deadline = time.monotonic() + PROXY_READY_TIMEOUT_SECONDS
-    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while True:
-            try:
-                response = await client.get(health_url)
-            except httpx.RequestError:
-                response = None
-            if response is not None and response.is_success:
-                return
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"proxy not ready after {PROXY_READY_TIMEOUT_SECONDS}s: {health_url}")
-            await asyncio.sleep(PROXY_READY_POLL_SECONDS)
 
 
 async def _request_fixed_completions(endpoint: str, model: str) -> tuple[_CompletionRecord, ...]:
@@ -258,7 +255,9 @@ async def _deploy_and_collect(
         with server:
             server_was_running = server.proc.returncode is None
             if config.is_master:
-                await _wait_for_proxy_ready(f"http://{config.master_ip}:{proxy.proxy_port}/health")
+                # RemoteOpenAIServer.__enter__ already waits for the proxy at
+                # /healthcheck and for every api_server node (conftest.py), so
+                # the deployment is ready to serve when the context opens.
                 completions = await _request_fixed_completions(
                     f"http://{config.master_ip}:{proxy.proxy_port}/v1/chat/completions",
                     config.model,
