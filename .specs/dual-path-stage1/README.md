@@ -69,5 +69,5 @@ Current verified checkout baseline:
 
 - Branch: `dev/dualpath`
 - Commit: `c57e6f6e84be`
-- Current implementation: foundation/shadow only; active cross-engine decision
-  and Forward/Reverse execution are not implemented.
+- Current implementation: behavior-preserving foundation only; shadow or active
+  cross-engine decision and Forward/Reverse execution are not implemented.

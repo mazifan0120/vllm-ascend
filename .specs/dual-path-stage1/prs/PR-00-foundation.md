@@ -4,23 +4,31 @@
 - Spec status: `PLANNED`
 - Depends on: none
 - Blocks: PR-01, PR-02
-- Existing implementation: commit `78451d8f6`
-- User-visible behavior: no new routing behavior
-- Activation after merge: DualPath remains behavior-compatible with
+- Existing implementation baseline: commit `78451d8f6`
+- Implementation-task mapping: foundation work before `DP-01`
+- User-visible behavior: a new connector name with no new routing semantics
+- Activation after merge: `DualPathConnector` is a behavior-preserving alias of
   `MooncakeLayerwiseConnector`
+- Detailed implementation contract:
+  [DETAILED-SPEC.md](PR-00-foundation/DETAILED-SPEC.md)
 
 ## Goal
 
-Introduce the smallest reviewable DualPathConnector foundation without active
-path selection or data-plane changes.
+Deliver the smallest upstream-reviewable DualPath connector seam that can run an
+ordinary Mooncake Layerwise workload without changing its behavior.
 
 ## Merge-state contract
 
 After this PR merges, `DualPathConnector` can be selected in configuration and
-constructs its own Scheduler or Worker subclass, but request execution remains
-identical to the inherited Mooncake Layerwise path. No Store probe, local-full
-admission, cross-engine decision, Reverse transfer, or new Forward semantics are
-active.
+constructs its own Scheduler or Worker subclass. Replacing
+`MooncakeLayerwiseConnector` with `DualPathConnector` for the same ordinary
+Layerwise workload preserves Scheduler accounting, metadata, Worker transfer,
+completion, invalid-block, cleanup, and failure behavior.
+
+The foundation adds no Store probe, local-full admission, cross-engine decision,
+round-robin path selection, Reverse transfer, new Forward semantics, or new
+completion lifecycle. CPU parity tests and a real NPU Layerwise smoke test are
+both required before merge.
 
 ## In scope
 
@@ -28,21 +36,24 @@ active.
 - Add `DualPathConnector`, `DualPathConnectorScheduler`, and
   `DualPathConnectorWorker` subclasses.
 - Construct the DualPath subclasses without double-initializing the parent
-  runtime.
-- Parse only configuration required by the approved Stage 1 topology and
-  fail-fast rules.
-- Verify inherited behavior and parent interface compatibility.
-
-Implementation-task mapping: pre-existing foundation work before `DP-01`.
+  Scheduler, Worker, Mooncake runtime, Transfer Engine, threads, or KV buffers.
+- Parse the foundation role as exactly `prefill` or `decode` while preserving the
+  inherited Mooncake extra-configuration keys.
+- Reject removed foundation promises such as Value Function, LinkMonitor, relay,
+  planner, topology, and shadow configuration.
+- Preserve all ordinary Layerwise lifecycle methods through inheritance.
+- Verify construction, interface, behavior, error, and NPU execution parity.
 
 ## Out of scope
 
-- Store adapter composition.
-- Active static path decisions.
-- Value Function or LinkMonitor affecting execution.
-- Proxy protocol changes.
-- Bidirectional Worker capability.
-- Any new transfer plan or completion lifecycle.
+- Store adapters, Store coverage, token accounting, and `DE_LOCAL_FULL_HIT`.
+- `PathDecisionRequest`, `PathDecisionCommit`, decision RPC, or Proxy changes.
+- Round-robin, Value Function, LinkMonitor, adaptive, or shadow decisions.
+- Active first-positive accounting or `DE_PARTIAL_HIT`.
+- Bidirectional Worker capability, Reverse, or new Forward plans.
+- DualPath metadata, completion reconciliation, tombstones, or timeouts.
+- MultiConnector behavior changes.
+- Topology restrictions that the inherited Layerwise path does not require.
 
 ## Expected code surface
 
@@ -51,40 +62,61 @@ Implementation-task mapping: pre-existing foundation work before `DP-01`.
 - `vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/config.py`
 - `vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/connector.py`
 - `tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py`
+- `tests/e2e/nightly/multi_node/dual_path/test_foundation_parity.py`
 
-Before upstream review, remove or explicitly demote foundation configuration
-for active Value Function, adaptive strategy, relay data-plane, and multi-path
-slicing that is not part of the approved Stage 1 contract.
+No Store, Proxy, MultiConnector, or parent Mooncake Layerwise implementation file
+is modified by this PR.
 
 ## Required tests
 
 - Connector registration resolves `DualPathConnector`.
-- PE and DE roles build the correct Scheduler/Worker subclass.
-- Invalid role, `kv_role`, topology, and unsupported Stage 1 config fail fast.
-- Inherited Scheduler and Worker behavior matches
-  `MooncakeLayerwiseConnector` for equivalent configuration.
-- Parent method-signature guards detect incompatible upstream changes.
+- `role=prefill` and `role=decode` build the correct Scheduler or Worker
+  subclass and validate against the configured KV capability.
+- Legacy `pe`/`de`, role/capability mismatches, and removed DualPath foundation
+  fields fail fast.
+- The base connector and the selected parent Scheduler or Worker initialize
+  exactly once.
+- Facade state and parent lifecycle method ownership match
+  `MooncakeLayerwiseConnector`.
+- Equivalent Scheduler and Worker inputs produce equivalent structured outputs
+  and collaborator call traces.
+- Existing ordinary Mooncake Layerwise regression tests pass.
+- A real NPU remote-prefill smoke test produces the same tokens and terminal
+  behavior for the parent and DualPath connector configurations.
 
-Focused command:
+Focused CPU commands:
 
 ```bash
 pytest -sv tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py
+pytest -sv tests/ut/kv_offload/test_mooncake_layerwise_connector.py
+bash format.sh ci
 ```
+
+The exact NPU command, image, model, topology, and result are recorded in
+`TRACKING.md` as merge evidence.
 
 ## Acceptance gates
 
-- No active decision or additional I/O is reachable.
-- The parent runtime initializes exactly once.
-- Configuration contains no active promise that this PR cannot execute.
-- Focused UT and formatting checks pass.
+- No active decision, new request state, additional I/O, or additional thread is
+  reachable.
+- The parent runtime, Transfer Engine, threads, and KV buffers initialize once.
+- The foundation configuration contains no capability without a consumer.
+- CPU interface, construction, behavior, and regression tests pass.
+- The ordinary Layerwise NPU parity smoke test passes.
+- Formatting and lint checks pass.
+- The PR diff contains no Store, decision, round-robin, or new data-plane code.
 
 ## Rollback contract
 
-Reverting this PR removes the DualPath connector registration and leaves all
-existing connector behavior unchanged.
+Reverting this PR removes the DualPath connector registration and foundation
+subclasses. Existing `MooncakeLayerwiseConnector` behavior and configuration
+remain unchanged.
 
 ## Review focus
 
-- Is direct `KVConnectorBase_V1` initialization necessary and safe?
-- Is the configuration surface the minimum needed by later approved PRs?
-- Do inherited-behavior tests protect the intended no-op execution contract?
+- Is direct `KVConnectorBase_V1` initialization necessary and proven equivalent
+  to the parent facade initialization?
+- Is every copied facade field explicitly listed and covered by a drift guard?
+- Are all request lifecycle methods still inherited from the parent?
+- Does the NPU smoke test prove a real drop-in replacement rather than only
+  mocked construction?

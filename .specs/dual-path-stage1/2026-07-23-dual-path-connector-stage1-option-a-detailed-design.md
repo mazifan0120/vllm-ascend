@@ -1859,7 +1859,7 @@ kv_transfer_config:
         kv_role: kv_both
         kv_port: 20000
         kv_connector_extra_config:
-          role: pe
+          role: prefill
           orchestration_mode: outer_first_positive
           partial_hit_policy: prefer_de
           enable_value_function_shadow: false
@@ -1877,7 +1877,7 @@ kv_transfer_config:
   kv_port: 20000
   kv_load_failure_policy: fail
   kv_connector_extra_config:
-    role: de
+    role: decode
     orchestration_mode: outer_first_positive
     partial_hit_policy: prefer_de
     store:
@@ -1905,7 +1905,7 @@ Worker transport 配置。Stage 1 不配置 DualPath middleware。
 
 ### 16.3 校验
 
-- `role` 是 `pe` 或 `de`；
+- `role` 是 `prefill` 或 `decode`；协议与公式仍可使用 PE/DE 缩写；
 - 两侧 `kv_role=kv_both`；
 - `kv_load_failure_policy=fail`；
 - policy 是已知静态值；

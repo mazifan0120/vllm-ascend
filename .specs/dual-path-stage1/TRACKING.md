@@ -10,7 +10,7 @@ Overall state: approved delivery structure; feature implementation not started
 
 | ID | Deliverable | Status | Depends on | Branch / commit | PR | Required merge evidence | Spec |
 |---|---|---|---|---|---|---|---|
-| PR-00 | Connector foundation | `LOCAL_READY` | — | `feat/dualpath-connector` / `78451d8f6` | Not opened | Foundation UT, inherited-behavior parity, config scope review | [spec](prs/PR-00-foundation.md) |
+| PR-00 | Connector foundation | `IN_PROGRESS` | — | `feat/dualpath-connector` / `78451d8f6` baseline | Not opened | Foundation UT, inherited-behavior parity, ordinary Layerwise NPU smoke, config scope review | [spec](prs/PR-00-foundation.md) |
 | PR-01 | Decode local full hit | `PLANNED` | PR-00 | Not created | Not opened | Focused UT plus local-full NPU E2E; zero Proxy/PE decision calls | [spec](prs/PR-01-decode-local-full-hit.md) |
 | PR-02 | Parent Layerwise Worker helper extraction | `PLANNED` | PR-00 | Not created | Not opened | Ordinary Layerwise producer/consumer regression parity | [spec](prs/PR-02-parent-worker-refactor.md) |
 | PR-03 | Cross-engine decision control plane | `PLANNED` | PR-01 | Not created | Not opened | Proxy/PE/DE round trip, timeout/idempotency, ordinary Proxy regression | [spec](prs/PR-03-decision-control-plane.md) |
@@ -50,8 +50,9 @@ The following gates apply to every PR in addition to its own spec:
 - Commits follow Conventional Commits and include `Signed-off-by`.
 - The PR description records what behavior is available immediately after that
   PR is merged.
-- Unsupported PP, DP, TP mismatch, multi-KV-group, hybrid-layout, PCP, and DCP
-  topologies remain fail-fast as defined by the Stage 1 architecture.
+- A PR that activates behavior with Stage 1 topology limits enforces the
+  corresponding fail-fast checks. PR-00 remains equivalent to the inherited
+  Layerwise topology contract and does not narrow it early.
 - A PR cannot advance to `IN_REVIEW` with unresolved scope changes; update its
   spec first.
 
@@ -71,3 +72,5 @@ YYYY-MM-DD | PR-XX | command or external check | PASS/FAIL | concise result or l
 2026-08-03 | SERIES | delivery decomposition approved | PASS | PR-00 plus six ordered feature PRs
 
 2026-08-03 | SERIES | structure and required-section audit | PASS | 7 PR specs and all local links present
+
+2026-08-03 | PR-00 | detailed foundation boundary review | PASS | behavior-preserving alias; CPU parity and ordinary Layerwise NPU smoke required
