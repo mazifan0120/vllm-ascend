@@ -12,10 +12,14 @@ and KV-buffer registration, and constructor thread counts are proven by the
 CPU construction/behavior parity tests in
 ``tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py``
 (spec section 11). This smoke test verifies the section 12 bullets that are
-observable from a running disaggregated deployment: token-identical outputs,
-terminal outcomes, remote-prefill admission and transfer-completion counts,
-runtime/thread sequence parity against the baseline, absence of excluded
-behavior, and clean process lifetime. All log markers below are verified
+observable from a running disaggregated deployment. Every node captures only
+its local server's stdout, so each node compares its own baseline run against
+its own candidate run with role-appropriate markers: scheduler/worker
+initialization and KV-buffer registration sequences on every node, and
+recv-thread startup, remote-prefill admission, and transfer-completion counts
+on the decode (kv_consumer) node where those parent log lines exist. The
+master (prefill) node additionally compares token-identical outputs and
+request-terminal outcomes through the proxy API. All log markers are verified
 against real parent log lines in mooncake_layerwise_connector.py; markers
 without a guaranteed log line are deliberately not used.
 """
@@ -70,6 +74,7 @@ CANDIDATE_WORKER_INIT_MARKERS: Final[tuple[str, ...]] = ("Initializing DualPath 
 RECV_THREAD_MARKERS: Final[tuple[str, ...]] = ("KVCacheRecvingLayerThread listening on",)
 ADMISSION_MARKERS: Final[tuple[str, ...]] = ("Send request:",)
 COMPLETION_MARKERS: Final[tuple[str, ...]] = ("Number of completed KV cache recv requests",)
+REGISTRATION_MARKERS: Final[tuple[str, ...]] = ("num_blocks: ",)
 CANDIDATE_NEGATIVE_MARKERS: Final[tuple[str, ...]] = (
     "AscendStore",
     "StoreConnector",
@@ -121,6 +126,7 @@ class _CompletionRecord:
 class _MarkerCounts:
     scheduler_initializations: int
     worker_initializations: int
+    registrations: int
     recv_threads: int
     admissions: int
     transfer_completions: int
@@ -131,6 +137,7 @@ class _DeploymentResult:
     completions: tuple[_CompletionRecord, ...]
     worker_log: str
     is_master: bool
+    is_decoder: bool
     server_was_running: bool
     server_returncode: int | None
 
@@ -149,13 +156,22 @@ def _extract_marker_counts(
     return _MarkerCounts(
         scheduler_initializations=_count_markers(normalized_text, scheduler_init_markers),
         worker_initializations=_count_markers(normalized_text, worker_init_markers),
+        registrations=_count_markers(normalized_text, REGISTRATION_MARKERS),
         recv_threads=_count_markers(normalized_text, RECV_THREAD_MARKERS),
         admissions=_count_markers(normalized_text, ADMISSION_MARKERS),
         transfer_completions=_count_markers(normalized_text, COMPLETION_MARKERS),
     )
 
 
-def _assert_worker_log_parity(baseline_log: str, candidate_log: str) -> None:
+def _assert_node_log_parity(baseline_log: str, candidate_log: str, *, is_decoder: bool) -> None:
+    """Compare this node's own baseline-run log against its own candidate-run log.
+
+    Each node's pytest process captures only its local server's stdout, and the
+    consumer-side markers (recv thread, admission, transfer completion) exist
+    only on the decode node, so every node asserts the markers appropriate to
+    its configured role. Cross-run counts are comparable because both runs use
+    the identical process topology on the same node.
+    """
     baseline_counts = _extract_marker_counts(
         baseline_log,
         scheduler_init_markers=BASELINE_SCHEDULER_INIT_MARKERS,
@@ -167,20 +183,36 @@ def _assert_worker_log_parity(baseline_log: str, candidate_log: str) -> None:
         worker_init_markers=CANDIDATE_WORKER_INIT_MARKERS,
     )
 
-    # §12: a real remote-prefill transfer must be exercised in both runs.
-    assert baseline_counts.admissions > 0, "baseline logs show no remote-prefill admission"
-    assert candidate_counts.admissions > 0, "candidate logs show no remote-prefill admission"
-    # §12: identical matched-token/admission outcomes at request granularity.
-    assert baseline_counts.admissions == candidate_counts.admissions
-    # §12: request-terminal outcomes at transfer level.
-    assert baseline_counts.transfer_completions == candidate_counts.transfer_completions
-    # §12: runtime sequences initialize once per role on both runs; counts are
-    # comparable because both runs use the identical process topology.
+    # §12: the parent runtime initializes once per role on both runs.
     assert baseline_counts.scheduler_initializations > 0
     assert candidate_counts.scheduler_initializations > 0
     assert baseline_counts.scheduler_initializations == candidate_counts.scheduler_initializations
+    # The parent logs the worker init line twice per worker (:1135 and :1171)
+    # while the DualPath subclass logs it once, so worker-init counts are
+    # asserted present on both runs but never compared for equality.
     assert baseline_counts.worker_initializations > 0
     assert candidate_counts.worker_initializations > 0
+    # §12: one KV-buffer registration sequence per Worker on both runs.
+    assert baseline_counts.registrations > 0
+    assert baseline_counts.registrations == candidate_counts.registrations
+
+    if not is_decoder:
+        # The producer's send thread has no startup log line; its runtime
+        # parity follows from the identical init/registration sequences above.
+        return
+
+    # §12: a real remote-prefill transfer must be exercised in both runs.
+    assert baseline_counts.admissions > 0, "baseline logs show no remote-prefill admission"
+    assert candidate_counts.admissions > 0, "candidate logs show no remote-prefill admission"
+    # §12: identical matched-token outcomes at request granularity. The
+    # matched-token value itself cannot be logged without modifying the
+    # parent connector (forbidden by §14); its pairwise value equality is
+    # proven by the CPU behavior-parity tests (§11.3), and the NPU smoke
+    # verifies the observable admission outcome of every remote prefill.
+    assert baseline_counts.admissions == candidate_counts.admissions
+    # §12: identical request-terminal outcomes at transfer level.
+    assert baseline_counts.transfer_completions > 0
+    assert baseline_counts.transfer_completions == candidate_counts.transfer_completions
     # §12: no extra send/receive thread relative to the baseline role.
     assert baseline_counts.recv_threads > 0
     assert baseline_counts.recv_threads == candidate_counts.recv_threads
@@ -272,6 +304,7 @@ async def _deploy_and_collect(
         completions=completions,
         worker_log=captured.out + captured.err,
         is_master=config.is_master,
+        is_decoder=config.disagg_cfg.is_decoder(config.cur_index) if config.disagg_cfg else False,
         server_was_running=server_was_running,
         server_returncode=server_returncode,
     )
@@ -285,10 +318,29 @@ async def test_dual_path_matches_mooncake_layerwise_foundation(capfd: pytest.Cap
     await asyncio.sleep(BETWEEN_RUN_SETTLE_SECONDS)
     candidate = await _deploy_and_collect(CANDIDATE_CONFIG_PATH, capfd)
 
+    assert baseline.is_master == candidate.is_master
+    assert baseline.is_decoder == candidate.is_decoder
+
+    # §12 bullets 2, 4, and 5: every node compares its own two runs with the
+    # markers appropriate to its role; consumer-side evidence lives on the
+    # decode node, not on the master.
+    _assert_node_log_parity(baseline.worker_log, candidate.worker_log, is_decoder=baseline.is_decoder)
+
+    # §12 bullet 3: candidate logs must not expose excluded stage-one behavior.
+    _assert_markers_absent(candidate.worker_log, CANDIDATE_NEGATIVE_MARKERS, "candidate")
+
+    # §12 bullet 6: both runs must remain healthy and terminate cleanly.
+    # RemoteOpenAIServer teardown sends SIGTERM to the server process tree, so a
+    # clean shutdown yields 0 or -SIGTERM; any other code is an abnormal exit.
+    _assert_markers_absent(baseline.worker_log, FAILURE_MARKERS, "baseline")
+    _assert_markers_absent(candidate.worker_log, FAILURE_MARKERS, "candidate")
+    assert baseline.server_was_running
+    assert candidate.server_was_running
+    assert baseline.server_returncode in (0, -signal.SIGTERM)
+    assert candidate.server_returncode in (0, -signal.SIGTERM)
+
     if not baseline.is_master:
         return
-
-    assert candidate.is_master
 
     # §12 bullet 1: every prompt must produce identical text and token counts.
     baseline_tokens = tuple(
@@ -303,19 +355,3 @@ async def test_dual_path_matches_mooncake_layerwise_foundation(capfd: pytest.Cap
     assert tuple(record.finish_reason for record in baseline.completions) == tuple(
         record.finish_reason for record in candidate.completions
     )
-
-    # §12 bullets 2, 4, and 5: worker markers must match and prove remote prefill.
-    _assert_worker_log_parity(baseline.worker_log, candidate.worker_log)
-
-    # §12 bullet 3: candidate logs must not expose excluded stage-one behavior.
-    _assert_markers_absent(candidate.worker_log, CANDIDATE_NEGATIVE_MARKERS, "candidate")
-
-    # §12 bullet 6: both runs must remain healthy and terminate cleanly.
-    # RemoteOpenAIServer teardown sends SIGTERM to the server process tree, so a
-    # clean shutdown yields 0 or -SIGTERM; any other code is an abnormal exit.
-    _assert_markers_absent(baseline.worker_log, FAILURE_MARKERS, "baseline")
-    _assert_markers_absent(candidate.worker_log, FAILURE_MARKERS, "candidate")
-    assert baseline.server_was_running
-    assert candidate.server_was_running
-    assert baseline.server_returncode in (0, -signal.SIGTERM)
-    assert candidate.server_returncode in (0, -signal.SIGTERM)
