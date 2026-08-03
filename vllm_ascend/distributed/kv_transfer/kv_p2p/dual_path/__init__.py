@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Dual-path KV-transfer connector (Stage 1 foundation).
+"""Dual-path KV-transfer connector package (PR-00 foundation).
 
-This package adds ``DualPathConnector``, a sibling sub-connector (alongside
-``AscendStoreConnector``) for ``AscendMultiConnector`` that selects between
-PE-Read and DE-Read KV load paths. Stage 1 ships the foundation:
-``DualPathConfig`` (validated configuration) and the connector skeleton
-inheriting ``MooncakeLayerwiseConnector``. The decision subsystem
-(``PathStrategy`` / ``LinkMonitor`` / ``Topology``) and the PE/DE-Read execution
-arrive in later stages.
+This package provides ``DualPathConnector``, a behavior-preserving alias of
+``MooncakeLayerwiseConnector`` for ordinary Layerwise workloads, together with
+its frozen foundation configuration ``DualPathConfig``. PR-00 adds no DualPath
+decision or data path; it only creates the safe Scheduler and Worker subclass
+seams that later PRs build on.
 
 Modules are imported lazily via the connector name registered in
 ``vllm_ascend.distributed.kv_transfer``; this ``__init__`` deliberately does not
