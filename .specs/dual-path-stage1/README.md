@@ -59,7 +59,7 @@ Every PR in this directory must satisfy all of the following:
 ## Architecture baseline
 
 The detailed architecture remains documented in
-`docs/superpowers/specs/2026-07-23-dual-path-connector-stage1-option-a-detailed-design.md`.
+[2026-07-23-dual-path-connector-stage1-option-a-detailed-design.md](2026-07-23-dual-path-connector-stage1-option-a-detailed-design.md).
 This directory is authoritative for delivery boundaries and PR progress; the
 architecture document is authoritative for Stage 1 semantics. If they diverge,
 pause implementation and resolve both documents in the same documentation
