@@ -15,7 +15,10 @@ Each spec starts with:
 - activation state after merge.
 
 The status in a PR spec describes the approved scope and normally remains
-`PLANNED`; operational status is maintained only in `TRACKING.md`.
+`PLANNED`; operational status is maintained only in `TRACKING.md`. PR-00 is the
+single exception: because it is a pre-existing, revision-pinned prerequisite,
+its spec mirrors `LOCAL_READY` so reviewers do not mistake it for unimplemented
+series work.
 
 ## Required sections
 
@@ -43,6 +46,9 @@ The status in a PR spec describes the approved scope and normally remains
   the same PR.
 - Intermediate PRs may carry dormant behavior only when configuration cannot
   activate incomplete I/O.
+- PR-03 must keep active DualPath configuration fail-closed until PR-04 has a
+  complete Store-full consumer. PR-06 must keep partial `DE_READ` unreachable
+  until PR-07.
 - If PR-03 exceeds a reviewable control-plane change, split it into `PR-03A`
   (schema and Proxy rendezvous) and `PR-03B` (Engine coordinators and Scheduler
   inbox), then update `TRACKING.md` before opening either PR.
@@ -51,7 +57,8 @@ The status in a PR spec describes the approved scope and normally remains
 
 The GitHub PR description should use this order:
 
-1. `Series: [DualPath Stage 1][N/6]`
+1. `Series: [DualPath Stage 1][N/7]` for PR-01 through PR-07; PR-00 is the
+   separately tracked prerequisite;
 2. dependency and stacked-base information;
 3. what the PR does and why;
 4. behavior after merge;

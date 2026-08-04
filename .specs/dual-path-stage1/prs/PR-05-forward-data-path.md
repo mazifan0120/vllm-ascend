@@ -1,14 +1,13 @@
-# PR-04 Explicit Forward Data Path
+# PR-05 Explicit Forward Data Path
 
-- Series position: 4 of 6
+- Series position: 5 of 7
 - Spec status: `PLANNED`
 - Depends on: PR-02
-- Blocks: PR-05
-- Implementation tasks: `DP-14` through `DP-16`, `DP-18` through `DP-21`,
-  and the Forward-only portions of `DP-24` and `DP-25`
+- Blocks: PR-06
+- Implementation tasks: `DP-FWD-01` through `DP-FWD-05`
 - User-visible behavior: no intended semantic change to PE-to-DE transfer
-- Activation after merge: rejected/ordinary PE preparation uses an explicit,
-  tested Forward plan; Reverse remains unavailable
+- Activation after merge: committed `PE_READ` and ordinary PE preparation use
+  an explicit, tested Forward plan; Reverse remains unavailable
 
 ## Goal
 
@@ -20,11 +19,12 @@ Forward consumer before adding bidirectional execution.
 After this PR merges, DualPath can represent and execute PE-to-DE Forward work
 with explicit source/destination block pairs and request-level completion. PE
 Store hit, PE Store miss plus compute, and ordinary PE compute still produce the
-same DE-ready prefix behavior. Reverse and active partial selection remain off.
+same DE-ready prefix behavior. Store-full `DE_READ` from PR-04 remains Store
+only. Reverse and active partial `DE_READ` remain unavailable.
 
 ## In scope
 
-- Frozen `BlockPair`, direction plan, and Worker plan types.
+- Frozen `BlockPair`, Forward direction plan, binding, and Worker plan types.
 - Scheduler ownership of token-to-physical-block conversion.
 - Plan conversion into parent `ReqMeta`/`SendTask` structures.
 - Forward region chunking and monotonic `ForwardFrontier`.
@@ -41,9 +41,10 @@ same DE-ready prefix behavior. Reverse and active partial selection remain off.
 - Reverse send or receive.
 - Starting both parent thread capabilities.
 - DE Store DONE gating Reverse.
-- Positive partial-hit accounting.
-- DE success predicate combining Store and Forward.
+- Positive partial `DE_READ` accounting.
+- DE success predicates combining Store and Forward.
 - Cross-direction terminal reconciliation.
+- Changing the PR-04 Store-full decision or Store-load semantics.
 
 ## Expected code surface
 
@@ -65,6 +66,8 @@ same DE-ready prefix behavior. Reverse and active partial selection remain off.
 - Unknown raw terminal expires after the configured execution/retry window.
 - PE Store hit plus tail and Forward produces correct output on NPU.
 - PE Store miss plus compute and Forward produces correct output on NPU.
+- Store-full `PE_READ` uses the explicit Forward plan; Store-full `DE_READ`
+  creates none.
 - Existing ordinary Mooncake Layerwise behavior still passes regression tests.
 
 Focused commands:
@@ -86,10 +89,12 @@ bash format.sh ci
 ## Rollback contract
 
 Reverting this PR returns DualPath Forward behavior to the inherited parent path
-while preserving PR-02 helper extraction and all control-plane work.
+while preserving PR-02 helper extraction, the PR-03 control plane, and PR-04
+Store-full activation.
 
 ## Review focus
 
 - Is the token-accounting boundary cleanly separated from physical block pairs?
 - Does Forward reuse parent quantization, reshard, event, and completion logic?
 - Can a completion be lost or attributed to the wrong local request?
+- Does this PR avoid changing the already active Store-full path decision?

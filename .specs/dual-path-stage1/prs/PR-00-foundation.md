@@ -1,11 +1,12 @@
 # PR-00 DualPathConnector Foundation
 
 - Series position: prerequisite
-- Spec status: `PLANNED`
+- Spec status: `LOCAL_READY`
 - Depends on: none
 - Blocks: PR-01, PR-02
-- Existing implementation baseline: commit `78451d8f6`
-- Implementation-task mapping: foundation work before `DP-01`
+- Verified implementation revision: `9a12de829ee5`
+- Implementation-task mapping: completed prerequisite; semantic task IDs start
+  with PR-01 in `../TASKS.md`
 - User-visible behavior: a new connector name with no new routing semantics
 - Activation after merge: `DualPathConnector` is a behavior-preserving alias of
   `MooncakeLayerwiseConnector`
@@ -25,10 +26,11 @@ constructs its own Scheduler or Worker subclass. Replacing
 Layerwise workload preserves Scheduler accounting, metadata, Worker transfer,
 completion, invalid-block, cleanup, and failure behavior.
 
-The foundation adds no Store probe, local-full admission, cross-engine decision,
-round-robin path selection, Reverse transfer, new Forward semantics, or new
-completion lifecycle. CPU parity tests and a real NPU Layerwise smoke test are
-both required before merge.
+The foundation adds no Store probe, Store coverage candidate, cross-engine
+decision, round-robin path selection, Reverse transfer, new Forward semantics,
+or new completion lifecycle. CPU parity tests and a real NPU Layerwise smoke
+test are both required before merge. Those local gates are recorded as PASS in
+`../TRACKING.md`; the PR itself has not been opened.
 
 ## In scope
 
@@ -46,10 +48,10 @@ both required before merge.
 
 ## Out of scope
 
-- Store adapters, Store coverage, token accounting, and `DE_LOCAL_FULL_HIT`.
+- Store adapters, Store coverage, token accounting, and `DE_READ`.
 - `PathDecisionRequest`, `PathDecisionCommit`, decision RPC, or Proxy changes.
 - Round-robin, Value Function, LinkMonitor, adaptive, or shadow decisions.
-- Active first-positive accounting or `DE_PARTIAL_HIT`.
+- Active first-positive accounting or any `DE_READ` result.
 - Bidirectional Worker capability, Reverse, or new Forward plans.
 - DualPath metadata, completion reconciliation, tombstones, or timeouts.
 - MultiConnector behavior changes.

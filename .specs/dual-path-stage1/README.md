@@ -11,7 +11,8 @@ raw test logs.
    chain.
 2. Read the corresponding file under [prs/](prs/) before starting or reviewing
    a PR.
-3. Apply [PR-SPEC-CONTRACT.md](PR-SPEC-CONTRACT.md) whenever a PR spec or the
+3. Read [TASKS.md](TASKS.md) for the task definitions owned by that PR.
+4. Apply [PR-SPEC-CONTRACT.md](PR-SPEC-CONTRACT.md) whenever a PR spec or the
    series structure changes.
 
 ## Source-of-truth rules
@@ -21,8 +22,11 @@ raw test logs.
 - `prs/PR-XX-*.md` defines the stable scope and merge contract of one PR.
 - A PR spec changes only when its architectural boundary changes. Routine
   progress updates belong only in `TRACKING.md`.
-- Implementation task IDs such as `DP-01` are navigation aids. When a task note
-  conflicts with a PR spec, stop and resolve the PR spec before coding.
+- `TASKS.md` is the only source for implementation task definitions and PR
+  ownership. Semantic IDs such as `DP-COV-01` remain stable if a later PR is
+  inserted.
+- Task IDs are navigation aids. When a task definition conflicts with a PR
+  spec, stop and resolve the architecture and PR spec before coding.
 - Raw CI output, benchmark logs, and review transcripts stay in their native
   systems. The tracker records concise evidence links or exact commands and
   results.
@@ -49,7 +53,8 @@ Every PR in this directory must satisfy all of the following:
    the PR is merged.
 3. New behavior and its regression tests land together.
 4. Dormant control-plane or data-plane pieces cannot authorize I/O before the
-   PR that activates `DE_PARTIAL_HIT`.
+   PR that activates the corresponding path: PR-04 for Store-full `DE_READ`
+   and PR-07 for partial `DE_READ`.
 5. A revert restores the behavior described by the previous merged PR.
 6. NPU-dependent claims are labelled separately from CPU-only unit-test
    evidence.
@@ -68,6 +73,8 @@ change.
 Current verified checkout baseline:
 
 - Branch: `dev/dualpath`
-- Commit: `c57e6f6e84be`
-- Current implementation: behavior-preserving foundation only; shadow or active
-  cross-engine decision and Forward/Reverse execution are not implemented.
+- Commit: `9a12de829ee5`
+- Current implementation: PR-00 behavior-preserving foundation is
+  `LOCAL_READY`; PR-01 through PR-07 are not implemented. No active
+  cross-engine decision, Store read selection, or Forward/Reverse extension is
+  implemented.

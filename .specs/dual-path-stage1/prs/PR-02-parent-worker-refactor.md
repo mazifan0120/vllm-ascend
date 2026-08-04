@@ -1,10 +1,10 @@
 # PR-02 Parent Layerwise Worker Helper Extraction
 
-- Series position: 2 of 6
+- Series position: 2 of 7
 - Spec status: `PLANNED`
 - Depends on: PR-00
-- Blocks: PR-04
-- Implementation task: `DP-13`
+- Blocks: PR-05
+- Implementation task: `DP-REF-01`
 - User-visible behavior: none
 - Activation after merge: ordinary Layerwise execution remains unchanged
 
@@ -76,7 +76,7 @@ bash format.sh ci
 ## Rollback contract
 
 Reverting this PR restores the original parent method layout without affecting
-the PR-00 foundation or PR-01 local-full path.
+the PR-00 foundation or PR-01 coverage-probe foundation.
 
 ## Review focus
 

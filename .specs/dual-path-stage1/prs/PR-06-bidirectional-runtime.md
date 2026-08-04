@@ -1,14 +1,14 @@
-# PR-05 Bidirectional Runtime and Lifecycle
+# PR-06 Bidirectional Runtime and Lifecycle
 
-- Series position: 5 of 6
+- Series position: 6 of 7
 - Spec status: `PLANNED`
-- Depends on: PR-03, PR-04
-- Blocks: PR-06
-- Implementation tasks: `DP-17`, `DP-22`, `DP-23`, the bidirectional portion
-  of `DP-25`, and `DP-26` through `DP-28`
-- User-visible behavior: incomplete partial path remains non-activatable
-- Activation after merge: injected committed plans can execute both directions;
-  production partial selection remains disabled
+- Depends on: PR-04, PR-05
+- Blocks: PR-07
+- Implementation tasks: `DP-BIDI-01` through `DP-BIDI-05`
+- User-visible behavior: Store-full routing remains active; partial `DE_READ`
+  remains non-activatable
+- Activation after merge: injected committed partial plans can execute both
+  directions; production partial selection remains disabled
 
 ## Goal
 
@@ -17,19 +17,22 @@ start gates, request-local completion, and drain-first resource handling.
 
 ## Merge-state contract
 
-After this PR merges, a DualPath Worker can start one send thread and one receive
-thread from its single inherited runtime. PE can receive Reverse and send
-Forward; DE can send Reverse and receive Forward. Tests and internal integration
-can execute frozen committed plans, but configuration cannot yet turn a partial
-candidate into an active Scheduler winner.
+After this PR merges, a DualPath Worker can start one send thread and one
+receive thread from its single inherited runtime. PE can receive Reverse and
+send Forward; DE can send Reverse and receive Forward. Tests and internal
+integration can execute frozen committed partial plans, but configuration
+cannot yet make partial Store coverage eligible for `DE_READ`.
+
+The active Store-full `PE_READ`/`DE_READ` behavior from PR-04 remains unchanged.
 
 ## In scope
 
 - Direction-aware runtime using one parent Worker initialization and one set of
   registered KV buffers.
 - Role-local endpoint and wire-ID separation for Forward and Reverse.
-- Batch ordering: install all inbound mappings, register receive plans, submit
-  outbound work, then merge pending completion.
+- Reverse plan conversion and dispatch in registered layer order.
+- Batch ordering: install all inbound mappings, reconcile pending raw
+  completion, register receive plans, and only then evaluate outbound gates.
 - DE Store DONE gate before Reverse submission.
 - PE request readiness only after request-level Reverse DONE.
 - DE readiness facts for Forward and Store without activating the final partial
@@ -43,8 +46,8 @@ candidate into an active Scheduler winner.
 
 ## Out of scope
 
-- Positive first-winner accounting for `DE_PARTIAL_HIT`.
-- Production policy activation.
+- Positive first-winner accounting for partial `DE_READ`.
+- Production partial-policy activation.
 - Claiming end-to-end Stage 1 support before the full NPU matrix passes.
 - Post-commit path fallback or force-cancelling submitted DMA.
 - Multiple transport attempts or PP/DP expansion.
@@ -71,7 +74,8 @@ candidate into an active Scheduler winner.
 - Timeout produces invalid blocks before failed terminal publication.
 - Tombstones absorb ACK-loss retries and duplicate late terminal events.
 - Store, Reverse, and Forward failure facts remain source-specific.
-- Configuration still cannot produce active partial first-winner accounting.
+- Configuration still cannot make partial `DE_READ` a first-positive winner.
+- Store-full `PE_READ`/`DE_READ` regression tests remain green.
 
 Focused commands:
 
@@ -88,12 +92,14 @@ bash format.sh ci
 - Mapping-first ordering is enforced in code and tests.
 - Cancel and timeout cannot permit premature block reuse.
 - All operation completions preserve source and direction provenance.
-- Active partial selection remains impossible until PR-06.
+- Active partial selection remains impossible until PR-07.
+- PR-04 Store-full behavior remains a complete supported path.
 
 ## Rollback contract
 
 Reverting this PR removes Reverse and bidirectional lifecycle support while
-retaining the explicit Forward path and decision control-plane closure.
+retaining the explicit Forward path, decision control plane, and Store-full
+activation.
 
 ## Review focus
 
@@ -101,3 +107,4 @@ retaining the explicit Forward path and decision control-plane closure.
 - Are send/receive gates direction-specific despite shared machinery?
 - Can any terminal or cancel race release blocks while DMA can still write?
 - Are raw and Engine-local request identities reconciled exactly once?
+- Is partial selection still unreachable outside injected tests?

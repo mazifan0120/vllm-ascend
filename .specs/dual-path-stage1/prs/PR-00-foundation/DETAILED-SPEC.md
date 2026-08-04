@@ -7,8 +7,8 @@
 - Architecture baseline:
   [../../2026-07-23-dual-path-connector-stage1-option-a-detailed-design.md](../../2026-07-23-dual-path-connector-stage1-option-a-detailed-design.md)
 - Scope: PR-00 only
-- Implementation status: the existing foundation commit is a baseline to clean
-  up and verify, not accepted merge evidence
+- Implementation status: `LOCAL_READY` at revision `9a12de829ee5`; all local
+  merge gates are recorded as PASS in `../../TRACKING.md`, but no PR is open
 
 The parent PR contract owns the stable PR boundary. This document owns the
 implementation-level contract. `TRACKING.md` owns commands, environment details,
@@ -34,8 +34,8 @@ Literal["prefill", "decode"]
 
 `pe` and `de` are not accepted configuration aliases. Protocol formulas and
 later path results may continue to use PE/DE abbreviations, such as `L_PE`,
-`L_DE`, `DE_LOCAL_FULL_HIT`, and `DE_PARTIAL_HIT`; those are protocol terms, not
-foundation role values.
+`L_DE`, `PE_READ`, and `DE_READ`; those are protocol terms, not foundation role
+values.
 
 PR-00 is described as `foundation` or `behavior-preserving alias`. It is not
 described as `shadow mode`: no decision computation, observer, shadow metric, or
@@ -61,13 +61,14 @@ Immediately after merge:
 
 PR-00 does not define or retain placeholders for:
 
-- Store probe, Store load, coverage, token accounting, or local-full admission;
+- Store probe, Store load, coverage, token accounting, or Store-derived path
+  eligibility;
 - `PathDecisionRequest`, `PathDecisionCommit`, decision Future, decision inbox,
   callback endpoint, or Coordinator;
 - round-robin selection, Value Function, LinkMonitor, adaptive policy, or shadow
   observation;
 - `_req_path` or any request-local path side table;
-- `DE_PARTIAL_HIT`, positive first-winner accounting, or MultiConnector changes;
+- positive `DE_READ` first-winner accounting or MultiConnector changes;
 - DualPath transfer plans, metadata subclasses, Reverse, or changed Forward
   semantics;
 - raw-completion reconciliation, terminal tombstones, execution timeout, or
@@ -309,20 +310,21 @@ this gate.
 
 ## 13. Acceptance checklist
 
-- [ ] Registry lookup resolves the connector lazily.
-- [ ] The only DualPath-owned foundation config field is `role`.
-- [ ] User-facing role values are exactly `prefill` and `decode`.
-- [ ] Removed foundation and shadow fields fail fast.
-- [ ] `_is_kv_producer` and all other copied facade state match the parent.
-- [ ] Base, Scheduler/Worker, runtime, Transfer Engine, threads, and buffers are
+- [x] Registry lookup resolves the connector lazily.
+- [x] The only DualPath-owned foundation config field is `role`.
+- [x] User-facing role values are exactly `prefill` and `decode`.
+- [x] Removed foundation and shadow fields fail fast.
+- [x] `_is_kv_producer` and all other copied facade state match the parent.
+- [x] Base, Scheduler/Worker, runtime, Transfer Engine, threads, and buffers are
       initialized exactly once.
-- [ ] No request lifecycle method is overridden.
-- [ ] CPU configuration, construction, behavior, error, and regression tests
+- [x] No request lifecycle method is overridden.
+- [x] CPU configuration, construction, behavior, error, and regression tests
       pass.
-- [ ] The mandatory NPU parity smoke passes.
-- [ ] No Store, decision, round-robin, Reverse, or new Forward behavior is
+- [x] The mandatory NPU parity smoke passes.
+- [x] No Store, decision, round-robin, Reverse, or new Forward behavior is
       reachable.
-- [ ] `bash format.sh ci` passes.
+- [x] `bash format.sh ci` passes for the PR-00 scope; the unrelated pre-existing
+  `csrc/build.sh` shellcheck finding is recorded in `../../TRACKING.md`.
 
 ## 14. Rollback and review stop conditions
 
