@@ -21,9 +21,9 @@ re-admitted into a new Task detailed spec.
 - Task-00 is complete: `DualPathConnector` is a selectable,
   behavior-preserving `MooncakeLayerwiseConnector` subclass with dedicated
   Scheduler and Worker subclass seams.
-- No DualPath Store decision, Proxy rendezvous, PE-owned path commit, Store
-  load, Forward, Reverse, or composite completion path is implemented by
-  Task-00.
+- No DualPath Store decision, direct PE-to-DE decision channel, PE-owned path
+  commit, Store load, Forward, Reverse, or composite completion path is
+  implemented by Task-00.
 - The checked design baseline used to create this catalog is
   `vllm-ascend@7c3983fce22b9c06aac05c57139973e08e53aa2a` with sibling
   `vllm@0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`.
@@ -37,6 +37,11 @@ re-admitted into a new Task detailed spec.
 - [`Task-01 detailed spec`](tasks/TASK-01-decode-admission.md) defines the
   Decode admission path through final slot allocation and
   `WAITING_FOR_REMOTE_KVS`.
+- [`Task-02 detailed spec`](tasks/TASK-02-decision-protocol.md) defines the
+  minimal decision protocol, `Path`, fixed full-hit rule, and replaceable
+  round-robin policy.
+- [`Task-03 detailed spec`](tasks/TASK-03-direct-decision-channel.md) defines
+  the nested bootstrap metadata and minimal direct PE-to-DE ZMQ result channel.
 
 ## Decomposition rules
 
@@ -47,8 +52,9 @@ Every Task must satisfy all of the following:
    mapping, transfer, and terminal cleanup path it introduces.
 3. Keep Store lookup, final Scheduler accounting, path commitment, and Worker
    I/O authorization as distinct operations.
-4. Keep Scheduler hooks non-blocking; HTTP ownership belongs to a
-   `PathDecisionCoordinator` or Proxy coroutine.
+4. Keep Scheduler hooks non-blocking; direct-channel and HTTP operations belong
+   to a `PathDecisionCoordinator` or Proxy coroutine rather than a Scheduler
+   thread.
 5. Do not activate a route until all of its data producers, data consumers,
    completion predicates, failure paths, and cleanup paths exist.
 6. Extract parent Layerwise helpers only when the Task contains their first

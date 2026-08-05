@@ -11,7 +11,8 @@ The target architecture remains:
 - HBM-complete Decode requests stay local and do not enter DualPath decision.
 - Every other Decode request first allocates its final Decode HBM slots and
   enters `WAITING_FOR_REMOTE_KVS`.
-- The Prefill Scheduler owns the unique `PE_READ` or `DE_READ` decision.
+- The Prefill `DualPathConnectorScheduler` owns the unique `PE_READ` or
+  `DE_READ` decision.
 - A committed route is immutable and authorizes exactly one explicit data
   plan.
 - Decode returns to `WAITING` only after the committed route's typed completion
@@ -30,9 +31,8 @@ L_PE = contiguous Prefill HBM prefix
 E_DE = R - L_DE, when L_DE < R
 ```
 
-Store classification is derived from `(L_DE, K_DE, R,
-store_available)` when needed. Stage 1 does not require a public
-`StoreCoverage` object.
+Store classification is derived from `(L_DE, K_DE, R)` when needed. Stage 1
+does not require a public `StoreCoverage` object.
 
 Task-01 does not introduce a `StoreProbeHandle`. Before allocation, the Decode
 Scheduler retains only a minimal detached lookup result. After allocation,
@@ -44,15 +44,17 @@ Scheduler retains only a minimal detached lookup result. After allocation,
 The following requirements apply to every Task:
 
 - `L_DE >= R` returns `(0, False)`, performs no Store lookup, creates no
-  candidate, and does not enter decision.
+  decision request, and does not enter decision.
 - Store lookup never starts an HBM load, Store Worker operation, Forward, or
   Reverse.
 - For `L_DE < R`, Decode Scheduler admission returns `E_DE`, not the number of
   tokens hit in Store.
 - Receiving real block IDs does not authorize a connector to start I/O.
-- The PE Scheduler is the sole producer of `PathDecisionCommit`.
-- Scheduler threads do not perform blocking HTTP operations.
-- Proxy routes and validates decisions but does not choose a path.
+- The PE `DualPathConnectorScheduler` is the sole producer of
+  `PathDecisionCommit`.
+- Scheduler threads do not perform blocking network operations.
+- Proxy dispatches the real Prefill request and forwards the DE control
+  endpoint, but it does not choose or relay a committed path.
 - A committed path never falls back to the other path. Failure may use the
   explicitly defined vLLM recompute/error behavior, but it cannot re-decide.
 - Worker completion retains direction and source provenance until the owning
@@ -70,12 +72,12 @@ flowchart TD
     T00["Task-00 complete<br/>DualPath foundation"]
     T01["Task-01<br/>DE admission to WAITING"]
     T02["Task-02<br/>Decision protocol and policy"]
-    T03["Task-03<br/>Proxy decision rendezvous"]
-    T04["Task-04<br/>DE/PE Scheduler control loop"]
+    T03["Task-03<br/>Direct decision channel"]
+    T04["Task-04<br/>DE/PE Connector Scheduler control loop"]
     T05["Task-05<br/>PE_READ end to end"]
     T06["Task-06<br/>Store-full DE_READ end to end"]
-    T07["Task-07<br/>Bidirectional runtime"]
-    T08["Task-08<br/>Partial DE_READ activation"]
+    T07["Task-07<br/>Bidirectional split runtime"]
+    T08["Task-08<br/>Non-full policy activation"]
 
     T00 --> T01
     T00 --> T02
@@ -91,8 +93,9 @@ flowchart TD
 ```
 
 Task-01 and Task-02 may proceed independently after Task-00. Task-05 and
-Task-06 may be developed independently after the control loop is complete, but
-Store-full round-robin activation waits until both routes are complete.
+Task-06 may be developed independently after the control loop is complete.
+Full requests activate only after Task-06. Non-full policy selection remains
+fail-closed until Task-08 joins the tested `PE_READ` and split `DE_READ` paths.
 
 ## 5. Merge-state summary
 
@@ -100,13 +103,13 @@ Store-full round-robin activation waits until both routes are complete.
 |---|---|---|
 | 00 | Selectable Layerwise-compatible DualPath subclass | Ordinary Layerwise only |
 | 01 | Non-HBM-complete DE request allocates final slots and waits | None; request intentionally remains waiting |
-| 02 | Decision schemas, identity, eligibility, and policy are executable pure logic | None |
-| 03 | Proxy decision Future round trip works with constrained/fake endpoints | None |
-| 04 | Real DE and PE Scheduler hooks exchange one commit; no data I/O is authorized | None; fail-closed |
-| 05 | A committed `PE_READ` request completes through Forward | `PE_READ`-only safe activation |
-| 06 | A Store-full committed `DE_READ` request completes through Decode Store | Full-candidate `PE_READ`/`DE_READ` activation |
-| 07 | Injected partial plans execute on one bidirectional runtime | No partial selection |
-| 08 | Partial `DE_READ` executes and completes with all barriers | Complete Stage 1 route set |
+| 02 | Decision schemas, identity, and replaceable policy are executable pure logic | None |
+| 03 | Direct PE-to-DE decision delivery works with ACK, bounded retry, and observable exhaustion | None |
+| 04 | Real DE and PE `DualPathConnectorScheduler` hooks exchange one commit; no data I/O is authorized | None; fail-closed |
+| 05 | An injected committed `PE_READ` request completes through Forward | None; non-full policy remains fail-closed |
+| 06 | A Store-full committed `DE_READ` request completes through Decode Store | Deterministic full-hit `DE_READ` |
+| 07 | Injected non-full split plans execute on one bidirectional runtime | No non-full policy activation |
+| 08 | Non-full `PE_READ`/`DE_READ` policy results execute with all barriers | Complete Stage 1 route set |
 
 ## 6. Task-00 — DualPath foundation
 
@@ -192,18 +195,21 @@ decision.
 
 **Merge-state contract:**
 
-Request identity, candidate, commit, error, path eligibility, and round-robin
-policy are executable and fully tested as pure logic. They have no Scheduler,
-HTTP, Store, or P2P side effects.
+Request identity, commit, error, the fixed full-hit rule, and a replaceable
+round-robin policy are executable and fully tested as pure logic. They have no
+Scheduler, network, Store, or P2P side effects.
 
 **In scope:**
 
-- Attempt-safe request/candidate identity.
-- `PathKind.PE_READ` and `PathKind.DE_READ`.
-- Candidate, commit, and typed error schemas with strict validation.
-- Capability-aware eligibility calculation.
-- PE-owned round-robin: advance only when both paths are eligible; identical
-  duplicate input must not advance policy state twice.
+- `DualPathRequestKey(decode_engine_instance_id, decode_request_id)`.
+- `Path.PE_READ` and `Path.DE_READ`.
+- Minimal `PathDecisionRequest`, commit, and typed error schemas with strict
+  validation; no public `StoreCoverage` or candidate type.
+- Fixed full-hit `Path.DE_READ` selection outside policy.
+- A lightweight `PathPolicy.choose(request)` protocol.
+- PE-owned `RoundRobinPathPolicy`: choose a random first non-full path, then
+  alternate for subsequent unique non-full requests.
+- Identical and conflicting duplicate semantics without policy-state replay.
 - Serialization round trips and invalid/untrusted input rejection.
 
 **Out of scope:**
@@ -213,70 +219,103 @@ HTTP, Store, or P2P side effects.
 
 **Acceptance endpoint:**
 
-Pure unit tests prove deterministic eligibility, round-robin behavior,
-idempotency, conflict rejection, and schema compatibility.
+Pure unit tests prove strict schemas, the full-hit invariant, seeded-random
+round-robin behavior, duplicate semantics, conflict rejection, and policy
+substitutability.
 
-## 9. Task-03 — Proxy decision rendezvous
+The detailed contract is
+[`tasks/TASK-02-decision-protocol.md`](tasks/TASK-02-decision-protocol.md).
+
+## 9. Task-03 — Direct PE-to-DE decision channel
 
 **Depends on:** Task-02.
 
 **Goal:**
 
-Extend the existing Decode-first Proxy with a DualPath-only decision Future
-rendezvous while preserving the ordinary Layerwise flow.
+Establish a dedicated direct ZMQ control channel from the PE
+`PathDecisionCoordinator` to the DE `PathDecisionCoordinator` without routing
+the Commit back through Proxy.
 
 **Merge-state contract:**
 
-For a valid DualPath candidate, Proxy registers a decision Future before
-dispatching the real Prefill request, accepts one validated PE decision, and
-returns that decision as the Decode `/v1/metaserver` response. Ordinary
-requests continue through the existing metaserver behavior.
+Each DE Scheduler instance exposes one control endpoint derived from
+`dual_path_control_port + data_parallel_rank` and one boot-specific Decode
+Engine instance ID. A nested `kv_transfer_params["dual_path"]` schema carries
+the Task-02 request and DE endpoint through the existing Proxy path. The PE
+Coordinator sends one immutable `PathDecision` directly to that endpoint with
+temporary REQ sockets. The DE Coordinator enqueues it exactly once, then
+returns `b"ACK"`. Delivery exhaustion is observable without a second decision
+attempt.
 
 **In scope:**
 
-- DualPath envelope detection and strict request correlation.
-- Decision Future registration before PE dispatch.
-- `/v1/path-decision` commit-once resolution.
-- Identical duplicate, conflicting duplicate, timeout, PE dispatch failure,
-  client cancellation, and terminal map cleanup.
-- Mixed ordinary/DualPath concurrency and request isolation.
-- Fake or constrained DE/PE endpoint integration tests.
+- `dual_path_control_port` in connector extra configuration, with one endpoint
+  per DE Scheduler/DP rank and no TP Worker port reuse.
+- A boot UUID appended to logical Engine ID and DP rank for restart-safe
+  `decode_engine_instance_id`.
+- Strict nested bootstrap metadata containing `PathDecisionRequest` and the DE
+  endpoint; Proxy forwards it unchanged and retains no decision Future.
+- A DE ZMQ `ROUTER` receiver and PE asynchronous temporary-REQ sender owned by
+  their local `PathDecisionCoordinator` instances.
+- ACK semantics meaning only "validated and enqueued", not Scheduler
+  consumption or data readiness.
+- Three attempts with a fresh REQ socket, one-second send and receive bounds,
+  exact `b"ACK"`, and 0.1-second spacing; no NACK or persistent endpoint pool.
+- Minimal pending/accepted registries: identical duplicates ACK without a
+  second inbox event; conflicting, stale, unknown, and malformed input receive
+  no ACK.
+- Cancellation, delivery exhaustion, Coordinator shutdown, and terminal
+  cleanup.
+- Direct-channel integration tests with constrained sender/receiver endpoints.
 
 **Out of scope:**
 
-- Path selection inside Proxy.
-- Real Scheduler integration and data-plane I/O.
+- Path selection inside the transport.
+- Proxy `/v1/path-decision`, decision Futures, or response-carried Commit.
+- Real per-request Scheduler hooks, DE Decision-wait timeout, and data-plane
+  I/O.
 
 **Acceptance endpoint:**
 
-A Proxy-only integration test exercises one complete candidate-to-commit HTTP
-round trip and proves Future-before-dispatch ordering and terminal cleanup.
+A direct-channel integration test proves request-driven endpoint use,
+Commit/error delivery, literal-ACK retry idempotency, stale/conflict silence,
+observable exhaustion, restart-safe identity, and clean endpoint shutdown
+without real per-request Scheduler hooks or data-plane I/O.
 
-## 10. Task-04 — DE/PE Scheduler decision control loop
+The detailed contract is
+[`tasks/TASK-03-direct-decision-channel.md`](tasks/TASK-03-direct-decision-channel.md).
+
+## 10. Task-04 — DE/PE Connector Scheduler decision control loop
 
 **Depends on:** Task-01, Task-02, and Task-03.
 
 **Goal:**
 
-Connect real DE and PE Scheduler lifecycle hooks to the decision rendezvous
-without authorizing a data path.
+Connect real DE and PE `DualPathConnectorScheduler` lifecycle hooks to the
+direct decision channel without authorizing a data path.
 
 **Merge-state contract:**
 
-After Decode allocation, the DE Scheduler freezes and submits one candidate.
-The PE Scheduler computes and commits one path. The DE Coordinator writes the
-response to a thread-safe inbox, and the DE Scheduler drains that inbox during
+After Decode allocation, the DE `DualPathConnectorScheduler` registers the
+request with its Coordinator, freezes one `PathDecisionRequest`, and submits
+the Task-03 nested `dual_path` metadata through the existing Proxy path. The PE
+`DualPathConnectorScheduler` applies the fixed full-hit rule or invokes its
+policy once and commits one path. The DE Coordinator writes the direct result
+to a thread-safe inbox, and the DE Scheduler drains that inbox during
 `build_connector_meta()` on a later schedule tick. The DE request retains its
 final blocks and remains in `WAITING_FOR_REMOTE_KVS`.
 
 **In scope:**
 
 - Non-blocking PE and DE `PathDecisionCoordinator` ownership.
-- Candidate submission only after final DE block binding.
-- PE Scheduler eligibility and unique policy invocation.
+- Decision-request submission only after final DE block binding.
+- PE full-hit selection and unique non-full policy invocation.
+- PE `_path_decisions` ownership so identical duplicate requests replay the
+  same Commit and conflicting facts fail without advancing policy state.
 - Scheduler-thread decision inbox consumption on every connector metadata
   build tick, including zero-model-token ticks.
-- Commit/error persistence, timeout, cancellation, and duplicate scheduling.
+- Commit/error persistence, fail-closed timeout, cancellation, and duplicate
+  scheduling.
 - Fail-closed configuration and a no-Store/no-P2P closed-loop harness.
 
 **Out of scope:**
@@ -287,9 +326,10 @@ final blocks and remains in `WAITING_FOR_REMOTE_KVS`.
 
 **Acceptance endpoint:**
 
-A control-plane integration test uses real Scheduler hooks and proves one
-candidate reaches PE policy and one immutable commit reaches DE Scheduler
-state while both Workers observe no data operation.
+A control-plane integration test uses real Connector Scheduler hooks and
+proves one request reaches the fixed rule or PE policy and one immutable
+Commit reaches DE Scheduler state while both Workers observe no data
+operation.
 
 ## 11. Task-05 — `PE_READ` end-to-end
 
@@ -297,8 +337,9 @@ state while both Workers observe no data operation.
 
 **Goal:**
 
-Complete the first active DualPath route by reusing PE Store/compute behavior
-and transferring the required prefix to Decode through explicit Forward plans.
+Complete the first DualPath data-plane route implementation by reusing PE
+Store/compute behavior and transferring the required prefix to Decode through
+explicit Forward plans.
 
 **Merge-state contract:**
 
@@ -325,18 +366,19 @@ back to `WAITING`.
 
 **Acceptance endpoint:**
 
-Production-safe `PE_READ`-only activation completes requests for PE Store hit
-and PE compute cases without Decode Store I/O.
+An injected `PE_READ` commit completes PE Store-hit and PE-compute cases
+without Decode Store I/O. Production non-full selection remains fail-closed
+because the approved policy may choose split `DE_READ`, which is not complete
+until Task-08.
 
 ## 12. Task-06 — Store-full `DE_READ` end-to-end
 
-**Depends on:** Task-04 and Task-05 for activation.
+**Depends on:** Task-04.
 
 **Goal:**
 
-Complete Store-full `DE_READ` using the Task-01 detached lookup and final DE
-blocks, then safely activate round-robin only when both full-candidate routes
-are complete.
+Complete deterministic Store-full `DE_READ` using the Task-01 detached lookup
+and final DE blocks.
 
 **Merge-state contract:**
 
@@ -351,10 +393,10 @@ validated no-work lifecycle.
 - `commit_after_alloc(load_spec, final_block_ids)` metadata construction.
 - Decode Store Worker composition, typed DONE/FAILED, invalid-block
   provenance, and request promotion/failure handling.
-- Prevention and cleanup of non-winning PE Store state.
+- Prevention and cleanup of PE Store state on the fixed full-hit route.
 - A proven PE no-work terminal mechanism for full `DE_READ`.
-- Full-candidate round-robin activation only after both `PE_READ` and
-  `DE_READ` NPU paths pass.
+- Production activation of the fixed full-hit rule only after the full
+  `DE_READ` NPU path passes.
 
 **Out of scope:**
 
@@ -363,30 +405,30 @@ validated no-work lifecycle.
 
 **Acceptance endpoint:**
 
-Alternating full candidates complete through `PE_READ` and `DE_READ`; the
-`DE_READ` trace contains one Decode Store load and zero PE Store/model/P2P
-operations.
+Full requests deterministically complete through one Decode Store load and
+zero PE Store/model/P2P operations. Full requests do not call or advance the
+configured `PathPolicy`.
 
-The detailed Task-06 spec must choose and validate the PE no-work mechanism.
-Proxy cancellation after commit is the current preferred design, but it is not
-accepted until an integration test proves that it prevents ModelRunner
-execution and releases PE request resources.
+The detailed Task-06 spec must choose and validate a PE-local no-work terminal
+mechanism. Proxy does not observe the direct Commit and therefore cannot own
+post-commit PE cancellation. Acceptance must prove that the chosen mechanism
+prevents ModelRunner execution and releases PE request resources.
 
-## 13. Task-07 — Bidirectional runtime and injected partial plans
+## 13. Task-07 — Bidirectional runtime and injected non-full split plans
 
 **Depends on:** Task-05 and Task-06.
 
 **Goal:**
 
 Extend one inherited Layerwise Worker runtime to own Forward send/receive and
-Reverse send/receive capabilities, while keeping production partial selection
-disabled.
+Reverse send/receive capabilities, while keeping production non-full policy
+selection disabled.
 
 **Merge-state contract:**
 
-Injected partial plans can execute Store, Reverse, PE compute gates, and
-Forward with explicit direction/source completion provenance. No production
-request can select partial `DE_READ`.
+Injected non-full split plans can execute an optional Store interval, Reverse,
+PE compute gates, and Forward with explicit direction/source completion
+provenance. No production non-full request can yet execute a policy result.
 
 **In scope:**
 
@@ -402,36 +444,39 @@ request can select partial `DE_READ`.
 
 **Out of scope:**
 
-- Partial `DE_READ` eligibility or production activation.
+- Non-full policy integration or production activation.
 
 **Acceptance endpoint:**
 
-An injected partial-plan harness proves the bidirectional runtime and all
-ordering/completion invariants without changing the production selector.
+An injected split-plan harness proves the bidirectional runtime, including an
+empty Store interval, and all ordering/completion invariants without changing
+the production selector.
 
-## 14. Task-08 — Partial `DE_READ` activation
+## 14. Task-08 — Non-full policy activation
 
 **Depends on:** Task-07.
 
 **Goal:**
 
-Connect partial Store candidates to the previously tested bidirectional runtime
-and complete Stage 1 route activation.
+Connect every non-full policy result to the previously tested `PE_READ` and
+bidirectional split runtimes, then complete Stage 1 route activation.
 
 **Merge-state contract:**
 
-For a partial committed `DE_READ`, Decode loads `[L_DE, K_DE)`, Reverse sends
-`[L_PE, K_DE)` when non-empty, PE computes `[K_DE, R)`, and Forward sends
-`[K_DE, R)`. Decode publishes `finished_recving` only after Store DONE and
-Forward DONE. PE does not compute before Reverse DONE when Reverse is required.
+For a non-full committed `DE_READ`, Decode loads `[L_DE, K_DE)` when non-empty,
+Reverse sends `[L_PE, K_DE)` when non-empty, PE computes
+`[max(L_PE, K_DE), R)`, and Forward sends `[K_DE, R)`. Decode publishes
+`finished_recving` only after every non-empty required phase completes. PE does
+not compute before Reverse DONE when Reverse is required. Miss or unavailable
+Store input uses the same plan with an empty Store interval.
 
 **In scope:**
 
-- Partial eligibility and PE round-robin integration.
+- Non-full `PathPolicy` integration for partial, miss, and unavailable Store
+  inputs.
 - Exact logical ranges and frozen physical mappings for Store, Reverse, and
   Forward.
-- Empty-Reverse handling when `L_PE >= K_DE` if admitted by the detailed
-  eligibility contract.
+- Empty-Store and empty-Reverse handling.
 - MultiConnector winner/sibling lifecycle isolation.
 - Failure, invalid-block, timeout, cancellation, observability, and no-
   redecision behavior.
@@ -444,9 +489,9 @@ Forward DONE. PE does not compute before Reverse DONE when Reverse is required.
 
 **Acceptance endpoint:**
 
-The NPU matrix covers full and partial `PE_READ`/`DE_READ`, verifies exact
-transfer ranges and completion predicates, and establishes the complete Stage
-1 activation boundary.
+The NPU matrix covers deterministic full `DE_READ` plus partial/miss
+`PE_READ` and split `DE_READ`, verifies exact ranges and completion predicates,
+and establishes the complete Stage 1 activation boundary.
 
 ## 15. Parent helper extraction ownership
 
@@ -471,11 +516,11 @@ Task and it must not introduce unused protected APIs.
 | PR-00 foundation | Preserved as completed Task-00 |
 | PR-01 Store coverage/probe handle | Replaced by Task-01 admission and Scheduler pending record |
 | PR-02 parent Worker helper extraction | Split into Task-05 send and Task-07 receive ownership |
-| PR-03 unified control plane | Split into Task-02 protocol, Task-03 Proxy, and Task-04 Scheduler loop |
+| PR-03 unified control plane | Split into Task-02 protocol, Task-03 direct channel, and Task-04 Scheduler loop |
 | PR-04 Store-full `DE_READ` | Reworked as Task-06 after `PE_READ` is complete |
 | PR-05 Forward | Reworked and moved earlier as Task-05 |
 | PR-06 bidirectional runtime | Reworked as Task-07 |
-| PR-07 partial activation | Reworked as Task-08 |
+| PR-07 partial activation | Reworked as Task-08 non-full policy activation |
 
 ## 17. Detailed-spec order
 
@@ -483,12 +528,12 @@ Detailed specs are written and approved in dependency order:
 
 1. Task-01 Decode admission to `WAITING_FOR_REMOTE_KVS`.
 2. Task-02 decision protocol and policy.
-3. Task-03 Proxy decision rendezvous.
-4. Task-04 Scheduler decision control loop.
+3. Task-03 direct PE-to-DE decision channel.
+4. Task-04 Connector Scheduler decision control loop.
 5. Task-05 `PE_READ` end-to-end.
 6. Task-06 Store-full `DE_READ` end-to-end.
-7. Task-07 bidirectional runtime.
-8. Task-08 partial activation.
+7. Task-07 bidirectional split runtime.
+8. Task-08 non-full policy activation.
 
 Writing a detailed spec authorizes design elaboration and review only. Code
 implementation begins only after that Task's detailed spec is approved.
