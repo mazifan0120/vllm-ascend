@@ -7,6 +7,13 @@ accepts (``tls_config``, ``prefill``, ``decode``) is inherited Mooncake
 parallel/runtime configuration consumed by the parent implementation and is
 passed through untouched.
 
+Task-01 addition: the existing lookup-only KVPool settings
+(``consumer_is_to_load``, ``backend``, ``lookup_rpc_port``,
+``mooncake_rpc_port``, ``discard_partial_chunks``) are accepted as validated
+pass-through keys. They are read directly from ``kv_connector_extra_config``
+by the owned KVPool components, so they remain absent from the frozen
+dataclass below.
+
 All knobs are read from the connector's own ``kv_connector_extra_config``. No
 environment variables are introduced (see AGENTS.md).
 
@@ -28,7 +35,25 @@ if TYPE_CHECKING:
 
 # Extra-config keys the foundation accepts. ``role`` is the only DualPath-owned
 # key; the rest are inherited Mooncake configuration consumed by the parent.
-ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset({"role", "tls_config", "prefill", "decode"})
+# Task-01 admits the existing lookup-only KVPool settings as pass-through keys:
+# they are validated here but consumed directly from
+# ``kv_connector_extra_config`` by the owned ``KVPoolScheduler``/``KVPoolWorker``,
+# so they are NOT stored as ``DualPathConfig`` fields. ``load_async`` and
+# ``consumer_is_to_put`` stay rejected: DualPath owns the Core-facing async
+# admission result itself, and Decode-side put behavior is not part of Task-01.
+ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "role",
+        "tls_config",
+        "prefill",
+        "decode",
+        "consumer_is_to_load",
+        "backend",
+        "lookup_rpc_port",
+        "mooncake_rpc_port",
+        "discard_partial_chunks",
+    }
+)
 
 # Keys promised by earlier drafts but removed from the foundation scope. They
 # are rejected explicitly so a stale deployment config fails fast with a clear
@@ -97,8 +122,31 @@ class DualPathConfig:
         if role not in FOUNDATION_ROLES:
             raise ValueError(f"DualPathConnector role={role!r} is not supported; choices: 'prefill' | 'decode'.")
 
+        _validate_kvpool_passthrough(extra)
         _validate_role_capability(role, ktc)
         return cls(role=role)
+
+
+def _validate_kvpool_passthrough(extra: dict[str, Any]) -> None:
+    """Validate the Task-01 lookup-only KVPool pass-through keys.
+
+    The values are consumed by the owned KVPool components from
+    ``kv_connector_extra_config``; only type/shape validation happens here.
+    """
+    for key in ("consumer_is_to_load", "discard_partial_chunks"):
+        if key in extra and not isinstance(extra[key], bool):
+            raise ValueError(f"DualPathConnector KVPool setting {key!r} must be a boolean; got {extra[key]!r}.")
+    if "backend" in extra:
+        backend = extra["backend"]
+        if not isinstance(backend, str) or not backend:
+            raise ValueError(f"DualPathConnector KVPool setting 'backend' must be a non-empty string; got {backend!r}.")
+    for key in ("lookup_rpc_port", "mooncake_rpc_port"):
+        if key in extra:
+            port = extra[key]
+            if isinstance(port, bool) or not isinstance(port, int) or port < 0:
+                raise ValueError(
+                    f"DualPathConnector KVPool setting {key!r} must be a non-negative integer; got {port!r}."
+                )
 
 
 def _validate_role_capability(role: str, ktc: KVTransferConfig) -> None:

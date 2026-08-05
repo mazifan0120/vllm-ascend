@@ -364,7 +364,22 @@ class TestDualPathConfig(unittest.TestCase):
             make_kv_transfer_config("kv_producer"),
         )
         self.assertEqual(vars(config), {"role": "prefill"})
-        self.assertEqual(ALLOWED_EXTRA_CONFIG_KEYS, frozenset({"role", "tls_config", "prefill", "decode"}))
+        self.assertEqual(
+            ALLOWED_EXTRA_CONFIG_KEYS,
+            frozenset(
+                {
+                    "role",
+                    "tls_config",
+                    "prefill",
+                    "decode",
+                    "consumer_is_to_load",
+                    "backend",
+                    "lookup_rpc_port",
+                    "mooncake_rpc_port",
+                    "discard_partial_chunks",
+                }
+            ),
+        )
 
     def assert_removed_field_rejected(self, field_name):
         pattern = rf"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*{field_name})(?=.*fail fast)"
@@ -421,6 +436,72 @@ class TestDualPathConfig(unittest.TestCase):
     def test_none_extra_config_behaves_like_empty_config(self):
         with self.assertRaisesRegex(ValueError, r"(?=.*requires 'role')(?=.*prefill)(?=.*decode)"):
             DualPathConfig.from_extra_config(None, make_kv_transfer_config("kv_both"))
+
+    def test_config_accepts_kvpool_passthrough_keys(self):
+        passthrough_extra = {
+            "consumer_is_to_load": True,
+            "backend": "kvpool",
+            "lookup_rpc_port": 18080,
+            "mooncake_rpc_port": 18081,
+            "discard_partial_chunks": False,
+        }
+        for key, value in passthrough_extra.items():
+            config = DualPathConfig.from_extra_config(
+                {"role": "decode", key: value},
+                make_kv_transfer_config("kv_both"),
+            )
+            self.assertEqual(config, DualPathConfig(role="decode"))
+        combined = DualPathConfig.from_extra_config(
+            {"role": "decode", **passthrough_extra},
+            make_kv_transfer_config("kv_both"),
+        )
+        self.assertEqual(combined, DualPathConfig(role="decode"))
+        self.assertEqual(vars(combined), {"role": "decode"})
+
+    def test_config_rejects_invalid_consumer_is_to_load_type(self):
+        with self.assertRaisesRegex(ValueError, r"(?=.*consumer_is_to_load)(?=.*boolean)"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "consumer_is_to_load": "true"},
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_rejects_empty_backend(self):
+        with self.assertRaisesRegex(ValueError, r"(?=.*backend)(?=.*non-empty)"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "backend": ""},
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_rejects_negative_lookup_rpc_port(self):
+        with self.assertRaisesRegex(ValueError, r"(?=.*lookup_rpc_port)(?=.*non-negative)"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "lookup_rpc_port": -1},
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_rejects_non_int_mooncake_rpc_port(self):
+        with self.assertRaisesRegex(ValueError, r"(?=.*mooncake_rpc_port)(?=.*non-negative)"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "mooncake_rpc_port": "18081"},
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_rejects_non_bool_discard_partial_chunks(self):
+        with self.assertRaisesRegex(ValueError, r"(?=.*discard_partial_chunks)(?=.*boolean)"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "discard_partial_chunks": 1},
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_still_rejects_load_async_and_consumer_is_to_put(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*load_async)(?=.*consumer_is_to_put)",
+        ):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "load_async": True, "consumer_is_to_put": False},
+                make_kv_transfer_config("kv_both"),
+            )
 
 
 class TestDualPathConstructionParity(unittest.TestCase):
