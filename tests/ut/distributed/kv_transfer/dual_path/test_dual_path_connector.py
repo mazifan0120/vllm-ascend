@@ -88,6 +88,21 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 for _module_name, _module in _saved_modules.items():
     sys.modules[_module_name] = _module
 
+import pytest  # noqa: E402
+
+
+# Task-01: Decode-role DualPath components compose KVPool lookup adapters.
+# The parity/construction suites in this file target parent-behavior parity,
+# so the adapters are replaced with mocks; the Task-01 admission contract
+# itself is covered by test_decode_scheduler.py with the same seam.
+@pytest.fixture(autouse=True)
+def _patch_task01_adapters():
+    with (
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolWorkerAdapter"),
+    ):
+        yield
+
 
 class MockVllmConfig:
     def __init__(self, dual_role="prefill", kv_role="kv_producer"):
@@ -157,6 +172,7 @@ class MockRequest:
         self.output_token_ids = [101, 102]
         self.num_computed_tokens = 0
         self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.num_tokens = len(self.prompt_token_ids)
         self.max_tokens = 16
         self.all_token_ids = list(self.prompt_token_ids)
         self._all_token_ids = list(self.prompt_token_ids)
@@ -641,8 +657,17 @@ class TestDualPathConstructionParity(unittest.TestCase):
             )
         self.assertIs(scheduler.dual_path_cfg, dual_path_config)
         self.assertIs(worker.dual_path_cfg, dual_path_config)
-        self.assertEqual(set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"})
-        self.assertEqual(set(vars(worker)), set(vars(parent_worker)) | {"dual_path_cfg"})
+        # Task-01 adds exactly these Decode-admission fields beyond the parent.
+        task01_scheduler_fields = {
+            "_kvpool_adapter",
+            "_lookup_results",
+            "_decode_kv_snapshots",
+            "_accepting_task01",
+        }
+        self.assertEqual(
+            set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | task01_scheduler_fields
+        )
+        self.assertEqual(set(vars(worker)), set(vars(parent_worker)) | {"dual_path_cfg", "_kvpool_worker_adapter"})
 
     def test_scheduler_has_no_req_path(self):
         scheduler = DualPathConnectorScheduler(
@@ -758,7 +783,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(parent._reqs_need_send_layerwise, dual._reqs_need_send_layerwise)
         self.assertEqual(parent.executor.submit.call_args_list, dual.executor.submit.call_args_list)
 
-    def test_decode_remote_prefill_matches_parent(self):
+    def test_decode_remote_prefill_routes_to_task01_admission(self):
         parent, dual = self.make_scheduler_pair("decode", "kv_consumer")
         parent_future, dual_future = self.replace_executors_with_mocks(parent, dual)
         params = {"do_remote_prefill": True, "metaserver": "http://meta"}
@@ -766,28 +791,36 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         dual_request = MockRequest("req-load", kv_transfer_params=dict(params))
         parent_blocks = MockBlocks(unhashed=[], block_ids_tuple=([4, 5, 6],))
         dual_blocks = MockBlocks(unhashed=[], block_ids_tuple=([4, 5, 6],))
+        dual._kvpool_adapter.lookup.return_value = None
 
         parent_match = parent.get_num_new_matched_tokens(parent_request, 0)
         dual_match = dual.get_num_new_matched_tokens(dual_request, 0)
         parent.update_state_after_alloc(parent_request, parent_blocks, num_external_tokens=4)
-        dual.update_state_after_alloc(dual_request, dual_blocks, num_external_tokens=4)
+        dual.update_state_after_alloc(dual_request, dual_blocks, num_external_tokens=3)
 
+        # The parent keeps the legacy full-prompt remote-prefill flow.
         self.assertEqual(parent_match, (4, True))
-        self.assertEqual(dual_match, parent_match)
-        self.assertEqual(parent._reqs_need_recv["req-load"][1:], dual._reqs_need_recv["req-load"][1:])
-        self.assertEqual(parent._reqs_need_recv["req-load"][2], ([4, 5, 6],))
-        parent_submit = parent.executor.submit.call_args
-        dual_submit = dual.executor.submit.call_args
-        self.assertIs(parent_submit.args[0].__func__, dual_submit.args[0].__func__)
-        self.assertEqual(parent_submit.kwargs, dual_submit.kwargs)
-        self.assertEqual(parent_submit.kwargs["url"], "http://meta")
-        self.assertEqual(parent_submit.kwargs["message"]["remote_block_ids"], ([4, 5, 6],))
+        self.assertIn("req-load", parent._reqs_need_recv)
+        self.assertFalse(parent_request.kv_transfer_params["do_remote_prefill"])
         self.assertEqual(parent_future.add_done_callback.call_count, 1)
-        self.assertEqual(dual_future.add_done_callback.call_count, 1)
 
+        # Task-01: the Decode-ready admission returns E_DE = R - L_DE (R = P-1 = 3)
+        # and binds a DecodeKVSnapshot without touching parent machinery.
+        self.assertEqual(dual_match, (3, True))
+        self.assertEqual(dual._reqs_need_recv, {})
+        self.assertTrue(dual_request.kv_transfer_params["do_remote_prefill"])
+        self.assertEqual(dual.executor.submit.call_count, 0)
+        self.assertEqual(dual_future.add_done_callback.call_count, 0)
+        self.assertEqual(dual._lookup_results, {})
+        snapshot = dual._decode_kv_snapshots["req-load"]
+        self.assertEqual(snapshot.target_tokens, 3)
+        self.assertEqual(snapshot.external_tokens, 3)
+        self.assertIsNone(snapshot.store_load_spec)
+        self.assertEqual(snapshot.final_block_ids, ((4, 5, 6),))
+        self.assertNotIn("req-load", dual.build_connector_meta(MockSchedulerOutput()).requests)
+
+        # Parent metadata still carries the legacy recv entry; Task-01 metadata does not.
         parent_meta = parent.build_connector_meta(MockSchedulerOutput())
-        dual_meta = dual.build_connector_meta(MockSchedulerOutput())
-        self.assertEqual(metadata_snapshot(parent_meta), metadata_snapshot(dual_meta))
         self.assertEqual(parent_meta.requests["req-load"].local_block_ids, ([4, 5, 6],))
         self.assertEqual(parent._reqs_need_recv, {})
         self.assertEqual(dual._reqs_need_recv, {})
@@ -885,6 +918,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             prompt_token_ids=list(range(17)),
             kv_transfer_params={"do_remote_prefill": True, "metaserver": "http://meta"},
         )
+        dual._kvpool_adapter.lookup.return_value = None
         parent_match = parent.get_num_new_matched_tokens(parent_load, 0)
         dual_match = dual.get_num_new_matched_tokens(dual_load, 0)
         parent.update_state_after_alloc(
@@ -897,15 +931,20 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             MockBlocks(unhashed=[], block_ids_tuple=([4, 5],)),
             num_external_tokens=16,
         )
+        # R = P - 1 = 16 coincides with the parent's hybrid-truncated count, but
+        # the dual side reaches it through the Task-01 admission path.
         self.assertEqual(parent_match, (16, True))
         self.assertEqual(dual_match, parent_match)
-        self.assertEqual(
-            parent.executor.submit.call_args.kwargs["message"],
-            dual.executor.submit.call_args.kwargs["message"],
-        )
+        self.assertEqual(parent.executor.submit.call_count, 1)
+        self.assertEqual(dual.executor.submit.call_count, 0)
         self.assertEqual(parent.executor.submit.call_args.kwargs["message"]["remote_block_ids"], ([4],))
+        self.assertEqual(dual._reqs_need_recv, {})
+        self.assertTrue(dual_load.kv_transfer_params["do_remote_prefill"])
+        snapshot = dual._decode_kv_snapshots["req-hybrid-load"]
+        self.assertEqual(snapshot.target_tokens, 16)
+        self.assertEqual(snapshot.final_block_ids, ((4, 5),))
 
-    def test_allocation_matches_parent(self):
+    def test_allocation_task01_snapshot_replaces_parent_bookkeeping(self):
         parent, dual = self.make_scheduler_pair("decode", "kv_consumer")
         self.replace_executors_with_mocks(parent, dual)
         params = {"do_remote_prefill": True, "do_virtual": True, "metaserver": "http://meta"}
@@ -919,25 +958,35 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             prompt_token_ids=list(range(24)),
             kv_transfer_params=dict(params),
         )
+        dual._kvpool_adapter.lookup.return_value = None
         parent.update_state_after_alloc(
             parent_request,
             MockBlocks(unhashed=[4, 5, 6], block_ids_tuple=([[4, 5, 6]],)),
             num_external_tokens=8,
         )
+        dual_match = dual.get_num_new_matched_tokens(dual_request, 0)
         dual.update_state_after_alloc(
             dual_request,
             MockBlocks(unhashed=[4, 5, 6], block_ids_tuple=([[4, 5, 6]],)),
-            num_external_tokens=8,
+            num_external_tokens=23,
         )
+        # Parent: legacy bookkeeping tracks the request for receive and clears
+        # the remote-prefill flag; DualPath Task-01: no parent bookkeeping at all.
         parent_state = parent._reqs_need_recv["req-alloc"]
-        dual_state = dual._reqs_need_recv["req-alloc"]
         self.assertIs(parent_state[0], parent_request)
-        self.assertIs(dual_state[0], dual_request)
-        self.assertEqual(parent_state[1:], dual_state[1:])
         self.assertEqual(parent_state[2], ([[4, 5, 6]],))
         self.assertFalse(parent_request.kv_transfer_params["do_remote_prefill"])
-        self.assertEqual(parent_request.kv_transfer_params, dual_request.kv_transfer_params)
-        self.assertEqual(parent.executor.submit.call_args_list, dual.executor.submit.call_args_list)
+
+        self.assertEqual(dual_match, (23, True))
+        self.assertEqual(dual._reqs_need_recv, {})
+        self.assertTrue(dual_request.kv_transfer_params["do_remote_prefill"])
+        self.assertEqual(dual.executor.submit.call_count, 0)
+        snapshot = dual._decode_kv_snapshots["req-alloc"]
+        self.assertEqual(snapshot.target_tokens, 23)
+        self.assertEqual(snapshot.external_tokens, 23)
+        self.assertEqual(snapshot.local_tokens, 0)
+        self.assertEqual(snapshot.store_tokens, 0)
+        self.assertEqual(snapshot.final_block_ids, (([4, 5, 6],),))
 
     def test_worker_load_matches_parent(self):
         parent_config = MockVllmConfig("decode", "kv_consumer")
@@ -1297,7 +1346,23 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                     getattr(MooncakeLayerwiseConnector, method_name),
                 )
 
-    def test_dual_path_classes_define_only_init(self):
+    def test_dual_path_classes_define_only_contracted_methods(self):
+        # Task-00 contracted __init__ only; Task-01 adds exactly the Decode
+        # admission surface below. Any further method must update this guard
+        # together with its owning Task spec.
+        expected_methods = {
+            "DualPathConnector": {"__init__", "shutdown"},
+            "DualPathConnectorScheduler": {
+                "__init__",
+                "_is_task01_decode_request",
+                "get_num_new_matched_tokens",
+                "update_state_after_alloc",
+                "request_finished",
+                "request_finished_all_groups",
+                "shutdown",
+            },
+            "DualPathConnectorWorker": {"__init__", "shutdown"},
+        }
         for connector_class in (
             DualPathConnector,
             DualPathConnectorScheduler,
@@ -1305,7 +1370,10 @@ class TestDualPathFoundationGuards(unittest.TestCase):
         ):
             with self.subTest(connector_class=connector_class.__name__):
                 own_methods = {name for name, value in connector_class.__dict__.items() if inspect.isfunction(value)}
-                self.assertEqual(own_methods, {"__init__"})
+                self.assertEqual(own_methods, expected_methods[connector_class.__name__])
+        # The facade and worker still define no parent lifecycle methods.
+        for connector_class in (DualPathConnector, DualPathConnectorWorker):
+            with self.subTest(connector_class=connector_class.__name__):
                 self.assertTrue(self.LIFECYCLE_METHODS.isdisjoint(connector_class.__dict__))
 
     def test_parent_constructor_signatures_are_pinned(self):
