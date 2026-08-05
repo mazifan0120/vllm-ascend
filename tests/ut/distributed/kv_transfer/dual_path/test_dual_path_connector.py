@@ -50,6 +50,12 @@ for _module_name in list(sys.modules):
             _modules_to_remove.append(_module_name)
     elif _module_name.startswith(_VLLM_KV_TRANSFER):
         _modules_to_remove.append(_module_name)
+# Only purge stub modules installed by other suites (MagicMock/fake modules
+# have no real __file__); real package modules are reused so class identity
+# holds across test files within one pytest session.
+_modules_to_remove = [
+    _m for _m in _modules_to_remove if not isinstance(getattr(sys.modules[_m], "__file__", None), str)
+]
 for _module_name in _modules_to_remove:
     _saved_modules[_module_name] = sys.modules.pop(_module_name)
 
