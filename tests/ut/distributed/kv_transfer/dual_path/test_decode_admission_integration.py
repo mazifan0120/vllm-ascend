@@ -73,6 +73,7 @@ def _make_vllm_config() -> VllmConfig:
             "consumer_is_to_load": True,
             "backend": "mooncake",
             "lookup_rpc_port": 18883,
+            "dual_path_control_port": 24001,
         },
     )
     return VllmConfig(
@@ -145,6 +146,11 @@ def _constrain_kvpool_seams():
         patch(
             "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient"
         ) as mock_lookup_client_cls,
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            return_value="127.0.0.1",
+        ),
     ):
         mock_importlib.import_module.return_value = MagicMock()
         yield mock_lookup_client_cls

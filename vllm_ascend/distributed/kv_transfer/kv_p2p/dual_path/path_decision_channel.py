@@ -39,6 +39,24 @@ _JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | d
 _JsonObject: TypeAlias = dict[str, _JsonValue]
 
 
+def derive_decode_control_port(
+    *,
+    dual_path_control_port: int,
+    data_parallel_rank: int,
+    kv_port: int,
+    worker_port_span: int,
+) -> int:
+    derived_port = dual_path_control_port + data_parallel_rank
+    if not 1 <= derived_port <= 65535:
+        raise ValueError(f"derived DualPath control port {derived_port} is outside 1..65535")
+    if kv_port <= derived_port < kv_port + worker_port_span:
+        raise ValueError(
+            f"derived DualPath control port {derived_port} overlaps the worker KV port range "
+            f"[{kv_port}, {kv_port + worker_port_span})"
+        )
+    return derived_port
+
+
 def _require_exact_payload(payload: _JsonValue, expected_keys: frozenset[str]) -> _JsonObject:
     if not isinstance(payload, dict):
         raise PathDecisionValidationError("serialized payload must be a dictionary")

@@ -5,13 +5,21 @@ import time
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import TypeAlias
+from unittest.mock import MagicMock, patch
 
 import msgspec
 import pytest
 import zmq
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
+    DualPathConnector,
+    DualPathConnectorScheduler,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     Path,
@@ -30,6 +38,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     _deliver_decision,
     decode_path_decision,
     encode_path_decision,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    MooncakeLayerwiseConnector,
 )
 
 _JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | dict[str, "_JsonValue"]
@@ -885,3 +896,247 @@ def test_prefill_close_cancels_outstanding_futures_and_stops_executor() -> None:
         coordinator.submit(_free_control_endpoint(), _decision(_request().request_key))
 
 
+def _make_kv_transfer_config(kv_role: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        kv_role=kv_role,
+        is_kv_producer=kv_role in {"kv_producer", "kv_both"},
+        is_kv_consumer=kv_role in {"kv_consumer", "kv_both"},
+    )
+
+
+class TestDualPathControlPortConfig:
+    def test_decode_role_requires_dual_path_control_port(self) -> None:
+        with pytest.raises(ValueError, match=r"dual_path_control_port"):
+            DualPathConfig.from_extra_config({"role": "decode"}, _make_kv_transfer_config("kv_consumer"))
+
+    @pytest.mark.parametrize("port", [True, "7100"])
+    def test_dual_path_control_port_rejects_bool_and_non_int_values(self, port) -> None:
+        with pytest.raises(ValueError, match=r"dual_path_control_port"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "dual_path_control_port": port},
+                _make_kv_transfer_config("kv_consumer"),
+            )
+
+    @pytest.mark.parametrize("port", [0, -1, 65536])
+    def test_dual_path_control_port_rejects_out_of_range_values(self, port) -> None:
+        with pytest.raises(ValueError, match=r"dual_path_control_port"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "dual_path_control_port": port},
+                _make_kv_transfer_config("kv_consumer"),
+            )
+
+    def test_prefill_role_does_not_require_dual_path_control_port(self) -> None:
+        config = DualPathConfig.from_extra_config({"role": "prefill"}, _make_kv_transfer_config("kv_producer"))
+        assert config.dual_path_control_port is None
+
+    def test_decode_role_accepts_valid_dual_path_control_port(self) -> None:
+        config = DualPathConfig.from_extra_config(
+            {"role": "decode", "dual_path_control_port": 7100},
+            _make_kv_transfer_config("kv_consumer"),
+        )
+        assert config.dual_path_control_port == 7100
+
+
+def _make_scheduler_vllm_config(
+    *,
+    dual_role: str,
+    kv_role: str,
+    dual_path_control_port: int | None = None,
+    data_parallel_rank: int = 0,
+    data_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
+    kv_port: int = 5000,
+):
+    config = MagicMock()
+    config.speculative_config = None
+    config.quant_config = None
+    config.model_config.use_mla = True
+    config.model_config.is_deepseek_mla = True
+    config.model_config.hf_config.num_key_value_heads = 1
+    config.model_config.hf_text_config.model_type = "default"
+    config.model_config.hf_text_config.num_key_value_heads = 1
+    config.model_config.get_num_layers.return_value = 1
+    config.model_config.get_total_num_hidden_layers.return_value = 1
+    config.model_config.get_total_num_kv_heads.return_value = 1
+    config.parallel_config.tensor_parallel_size = tensor_parallel_size
+    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.data_parallel_rank_local = data_parallel_rank
+    config.parallel_config.data_parallel_size_local = data_parallel_size
+    config.parallel_config.data_parallel_size = data_parallel_size
+    config.parallel_config.data_parallel_rank = data_parallel_rank
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
+    config.cache_config.block_size = 16
+    config.cache_config.mamba_cache_mode = None
+    config.scheduler_config.disable_hybrid_kv_cache_manager = True
+    config.kv_transfer_config.engine_id = "test_engine"
+    config.kv_transfer_config.kv_port = kv_port
+    config.kv_transfer_config.kv_role = kv_role
+    config.kv_transfer_config.is_kv_producer = kv_role in {"kv_producer", "kv_both"}
+    config.kv_transfer_config.is_kv_consumer = kv_role in {"kv_consumer", "kv_both"}
+    extra_config = {"role": dual_role}
+    if dual_path_control_port is not None:
+        extra_config["dual_path_control_port"] = dual_path_control_port
+    config.kv_transfer_config.kv_connector_extra_config = extra_config
+    config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {
+        "tls_config": {},
+        "prefill": {"tp_size": tensor_parallel_size, "dp_size": data_parallel_size},
+        "decode": {"tp_size": tensor_parallel_size, "dp_size": data_parallel_size},
+    }.get(key, default)
+    return config
+
+
+def _make_scheduler_kv_cache_config():
+    kv_cache_spec = MagicMock()
+    kv_cache_spec.block_size = 16
+    group_spec = MagicMock()
+    group_spec.kv_cache_spec = kv_cache_spec
+    group_spec.layer_names = ["encoder.layer.0"]
+    return SimpleNamespace(kv_cache_groups=[group_spec], kv_cache_tensors=[], num_blocks=10)
+
+
+def test_derive_decode_control_port_adds_data_parallel_rank() -> None:
+    assert (
+        path_decision_channel.derive_decode_control_port(
+            dual_path_control_port=7100,
+            data_parallel_rank=3,
+            kv_port=5000,
+            worker_port_span=8,
+        )
+        == 7103
+    )
+
+
+@pytest.mark.parametrize(
+    ("dual_path_control_port", "data_parallel_rank"),
+    [(0, 0), (65535, 1)],
+)
+def test_derive_decode_control_port_rejects_out_of_range_derivation(
+    dual_path_control_port: int,
+    data_parallel_rank: int,
+) -> None:
+    with pytest.raises(ValueError):
+        path_decision_channel.derive_decode_control_port(
+            dual_path_control_port=dual_path_control_port,
+            data_parallel_rank=data_parallel_rank,
+            kv_port=5000,
+            worker_port_span=8,
+        )
+
+
+def test_derive_decode_control_port_rejects_worker_kv_port_range_overlap() -> None:
+    with pytest.raises(ValueError):
+        path_decision_channel.derive_decode_control_port(
+            dual_path_control_port=5000,
+            data_parallel_rank=2,
+            kv_port=5000,
+            worker_port_span=4,
+        )
+
+
+def test_scheduler_constructs_role_specific_coordinator() -> None:
+    data_parallel_rank = 1
+    derived_port = _free_control_endpoint().port
+    control_port = derived_port - data_parallel_rank
+    decode_config = _make_scheduler_vllm_config(
+        dual_role="decode",
+        kv_role="kv_consumer",
+        dual_path_control_port=control_port,
+        data_parallel_rank=data_parallel_rank,
+        data_parallel_size=2,
+        tensor_parallel_size=2,
+        kv_port=1,
+    )
+    with (
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            return_value="127.0.0.1",
+        ),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
+    ):
+        decode_scheduler = DualPathConnectorScheduler(
+            decode_config,
+            _make_scheduler_kv_cache_config(),
+            "test_engine",
+            DualPathConfig(role="decode", dual_path_control_port=control_port),
+        )
+    try:
+        decode_coordinator = decode_scheduler._path_decision_coordinator
+        assert isinstance(decode_coordinator, PathDecisionCoordinator)
+        assert decode_coordinator.decode_control_endpoint == DecodeControlEndpoint(
+            host="127.0.0.1",
+            port=derived_port,
+        )
+        assert decode_coordinator.decode_engine_instance_id.startswith(f"test_engine:{data_parallel_rank}:")
+    finally:
+        decode_scheduler.shutdown()
+        decode_scheduler.executor.shutdown(wait=False)
+        decode_scheduler.metaserver_client.close()
+
+    prefill_scheduler = DualPathConnectorScheduler(
+        _make_scheduler_vllm_config(dual_role="prefill", kv_role="kv_producer"),
+        _make_scheduler_kv_cache_config(),
+        "test_engine",
+        DualPathConfig(role="prefill"),
+    )
+    try:
+        prefill_coordinator = prefill_scheduler._path_decision_coordinator
+        assert isinstance(prefill_coordinator, PathDecisionCoordinator)
+        assert callable(prefill_coordinator.submit)
+        assert prefill_coordinator._receiver_thread is None
+        with pytest.raises(RuntimeError):
+            _ = prefill_coordinator.decode_control_endpoint
+    finally:
+        prefill_scheduler.shutdown()
+        prefill_scheduler.executor.shutdown(wait=False)
+        prefill_scheduler.metaserver_client.close()
+
+
+def test_scheduler_shutdown_closes_coordinator_idempotently() -> None:
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+    ) as coordinator_cls:
+        scheduler = DualPathConnectorScheduler(
+            _make_scheduler_vllm_config(dual_role="prefill", kv_role="kv_producer"),
+            _make_scheduler_kv_cache_config(),
+            "test_engine",
+            DualPathConfig(role="prefill"),
+        )
+    coordinator = coordinator_cls.for_prefill.return_value
+    try:
+        scheduler.shutdown()
+        scheduler.shutdown()
+        assert coordinator.close.call_count == 2
+    finally:
+        scheduler.executor.shutdown(wait=False)
+        scheduler.metaserver_client.close()
+
+
+def test_facade_shutdown_delegates_coordinator_close() -> None:
+    config = _make_scheduler_vllm_config(
+        dual_role="decode",
+        kv_role="kv_consumer",
+        dual_path_control_port=7100,
+        kv_port=5000,
+    )
+    with (
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            return_value="127.0.0.1",
+        ),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+        ) as coordinator_cls,
+        patch.object(MooncakeLayerwiseConnector, "shutdown", autospec=True) as base_shutdown,
+    ):
+        connector = DualPathConnector(config, KVConnectorRole.SCHEDULER, _make_scheduler_kv_cache_config())
+        try:
+            connector.shutdown()
+            coordinator_cls.for_decode.return_value.close.assert_called_once_with()
+            base_shutdown.assert_called_once_with(connector)
+        finally:
+            scheduler = connector.connector_scheduler
+            assert scheduler is not None
+            scheduler.executor.shutdown(wait=False)
+            scheduler.metaserver_client.close()

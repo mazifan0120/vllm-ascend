@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 # so they are NOT stored as ``DualPathConfig`` fields. ``load_async`` and
 # ``consumer_is_to_put`` stay rejected: DualPath owns the Core-facing async
 # admission result itself, and Decode-side put behavior is not part of Task-01.
+# Task-03 adds ``dual_path_control_port``: required for role="decode", stored
+# on ``DualPathConfig`` and consumed by the Task-03 control endpoint.
 ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "role",
@@ -52,6 +54,7 @@ ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
         "lookup_rpc_port",
         "mooncake_rpc_port",
         "discard_partial_chunks",
+        "dual_path_control_port",
     }
 )
 
@@ -85,6 +88,7 @@ class DualPathConfig:
     """
 
     role: Literal["prefill", "decode"]
+    dual_path_control_port: int | None = None
 
     @classmethod
     def from_extra_config(cls, extra_config: dict[str, Any] | None, ktc: KVTransferConfig) -> DualPathConfig:
@@ -124,7 +128,8 @@ class DualPathConfig:
 
         _validate_kvpool_passthrough(extra)
         _validate_role_capability(role, ktc)
-        return cls(role=role)
+        dual_path_control_port = _validate_dual_path_control_port(extra, role)
+        return cls(role=role, dual_path_control_port=dual_path_control_port)
 
 
 def _validate_kvpool_passthrough(extra: dict[str, Any]) -> None:
@@ -165,3 +170,26 @@ def _validate_role_capability(role: str, ktc: KVTransferConfig) -> None:
             "DualPathConnector role='decode' requires kv_role in "
             f"('kv_consumer', 'kv_both'); got kv_role={ktc.kv_role!r}."
         )
+
+
+def _validate_dual_path_control_port(extra: dict[str, Any], role: str) -> int | None:
+    """Validate and return the Task-03 control port.
+
+    The port is required for role="decode" and must be an integer (not bool)
+    within 1..65535 so the DP-rank-derived endpoint stays in range. For
+    role="prefill" it is optional, type/range-checked when present, and stored
+    but not consumed by the prefill side.
+    """
+    port = extra.get("dual_path_control_port")
+    if role == "decode" and port is None:
+        raise ValueError(
+            "DualPathConnector role='decode' requires 'dual_path_control_port' "
+            "in kv_connector_extra_config (an integer between 1 and 65535)."
+        )
+    if port is None:
+        return None
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(
+            f"DualPathConnector 'dual_path_control_port' must be an integer between 1 and 65535; got {port!r}."
+        )
+    return port

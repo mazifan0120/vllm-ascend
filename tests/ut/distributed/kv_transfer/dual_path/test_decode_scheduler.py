@@ -33,6 +33,7 @@ def _make_vllm_config(kv_role="kv_consumer"):
         key, default
     )
     config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_size = 1
     config.parallel_config.tensor_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
     config.cache_config.block_size = 16
@@ -72,10 +73,19 @@ class TestDecodeAdmission(unittest.TestCase):
     def setUp(self):
         self._adapter_patch = patch(f"{_CONNECTOR_NS}.KVPoolAdapter")
         self._worker_adapter_patch = patch(f"{_CONNECTOR_NS}.KVPoolWorkerAdapter")
+        self._coordinator_patch = patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator")
+        self._get_ip_patch = patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1")
+        self._derive_control_port_patch = patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100)
         self._adapter_patch.start()
         self._worker_adapter_patch.start()
+        self._coordinator_patch.start()
+        self._get_ip_patch.start()
+        self._derive_control_port_patch.start()
         self.addCleanup(self._adapter_patch.stop)
         self.addCleanup(self._worker_adapter_patch.stop)
+        self.addCleanup(self._coordinator_patch.stop)
+        self.addCleanup(self._get_ip_patch.stop)
+        self.addCleanup(self._derive_control_port_patch.stop)
         self.scheduler = DualPathConnectorScheduler(
             _make_vllm_config(),
             _make_kv_cache_config(),

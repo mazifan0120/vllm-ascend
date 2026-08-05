@@ -100,6 +100,11 @@ def _patch_task01_adapters():
     with (
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolWorkerAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            return_value="127.0.0.1",
+        ),
     ):
         yield
 
@@ -142,6 +147,8 @@ class MockVllmConfig:
         self.kv_transfer_config.is_kv_producer = kv_role in {"kv_producer", "kv_both"}
         self.kv_transfer_config.is_kv_consumer = kv_role in {"kv_consumer", "kv_both"}
         self.kv_transfer_config.kv_connector_extra_config = {"role": dual_role}
+        if dual_role == "decode":
+            self.kv_transfer_config.kv_connector_extra_config["dual_path_control_port"] = 7100
         self.kv_transfer_config.get_from_extra_config = MagicMock()
         self.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {
             "tls_config": {},
@@ -328,16 +335,22 @@ class TestDualPathConfig(unittest.TestCase):
         self.assertEqual(config, DualPathConfig(role="prefill"))
 
     def test_valid_decode_with_kv_consumer(self):
-        config = DualPathConfig.from_extra_config({"role": "decode"}, make_kv_transfer_config("kv_consumer"))
-        self.assertEqual(config, DualPathConfig(role="decode"))
+        config = DualPathConfig.from_extra_config(
+            {"role": "decode", "dual_path_control_port": 7100},
+            make_kv_transfer_config("kv_consumer"),
+        )
+        self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
 
     def test_valid_prefill_with_kv_both(self):
         config = DualPathConfig.from_extra_config({"role": "prefill"}, make_kv_transfer_config("kv_both"))
         self.assertEqual(config.role, "prefill")
 
     def test_valid_decode_with_kv_both(self):
-        config = DualPathConfig.from_extra_config({"role": "decode"}, make_kv_transfer_config("kv_both"))
-        self.assertEqual(config.role, "decode")
+        config = DualPathConfig.from_extra_config(
+            {"role": "decode", "dual_path_control_port": 7100},
+            make_kv_transfer_config("kv_both"),
+        )
+        self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
 
     def test_missing_role_rejected(self):
         with self.assertRaisesRegex(ValueError, r"(?=.*requires 'role')(?=.*prefill)(?=.*decode)"):
@@ -385,7 +398,7 @@ class TestDualPathConfig(unittest.TestCase):
             },
             make_kv_transfer_config("kv_producer"),
         )
-        self.assertEqual(vars(config), {"role": "prefill"})
+        self.assertEqual(vars(config), {"role": "prefill", "dual_path_control_port": None})
         self.assertEqual(
             ALLOWED_EXTRA_CONFIG_KEYS,
             frozenset(
@@ -399,6 +412,7 @@ class TestDualPathConfig(unittest.TestCase):
                     "lookup_rpc_port",
                     "mooncake_rpc_port",
                     "discard_partial_chunks",
+                    "dual_path_control_port",
                 }
             ),
         )
@@ -469,16 +483,16 @@ class TestDualPathConfig(unittest.TestCase):
         }
         for key, value in passthrough_extra.items():
             config = DualPathConfig.from_extra_config(
-                {"role": "decode", key: value},
+                {"role": "decode", "dual_path_control_port": 7100, key: value},
                 make_kv_transfer_config("kv_both"),
             )
-            self.assertEqual(config, DualPathConfig(role="decode"))
+            self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
         combined = DualPathConfig.from_extra_config(
-            {"role": "decode", **passthrough_extra},
+            {"role": "decode", "dual_path_control_port": 7100, **passthrough_extra},
             make_kv_transfer_config("kv_both"),
         )
-        self.assertEqual(combined, DualPathConfig(role="decode"))
-        self.assertEqual(vars(combined), {"role": "decode"})
+        self.assertEqual(combined, DualPathConfig(role="decode", dual_path_control_port=7100))
+        self.assertEqual(vars(combined), {"role": "decode", "dual_path_control_port": 7100})
 
     def test_config_rejects_invalid_consumer_is_to_load_type(self):
         with self.assertRaisesRegex(ValueError, r"(?=.*consumer_is_to_load)(?=.*boolean)"):
@@ -657,15 +671,15 @@ class TestDualPathConstructionParity(unittest.TestCase):
             )
         self.assertIs(scheduler.dual_path_cfg, dual_path_config)
         self.assertIs(worker.dual_path_cfg, dual_path_config)
-        # Task-01 adds exactly these Decode-admission fields beyond the parent.
-        task01_scheduler_fields = {
+        dual_path_scheduler_fields = {
             "_kvpool_adapter",
             "_lookup_results",
             "_decode_kv_snapshots",
             "_accepting_task01",
+            "_path_decision_coordinator",
         }
         self.assertEqual(
-            set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | task01_scheduler_fields
+            set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | dual_path_scheduler_fields
         )
         self.assertEqual(set(vars(worker)), set(vars(parent_worker)) | {"dual_path_cfg", "_kvpool_worker_adapter"})
 
@@ -750,7 +764,10 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             MockVllmConfig(dual_role, kv_role),
             MockKVCacheConfig(),
             "test_engine",
-            DualPathConfig(role=dual_role),
+            DualPathConfig(
+                role=dual_role,
+                dual_path_control_port=7100 if dual_role == "decode" else None,
+            ),
         )
         self.schedulers.extend([parent, dual])
         return parent, dual

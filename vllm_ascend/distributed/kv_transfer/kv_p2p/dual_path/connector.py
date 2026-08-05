@@ -37,11 +37,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.logger import logger
+from vllm.utils.network_utils import get_ip
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (
     KVPoolAdapter,
     KVPoolWorkerAdapter,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DecodeControlEndpoint,
+    PathDecisionCoordinator,
+    derive_decode_control_port,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnector,
@@ -111,6 +117,22 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._accepting_task01 = True
         if dual_path_cfg.role == "decode":
             self._kvpool_adapter = KVPoolAdapter(vllm_config, kv_cache_config)
+            data_parallel_rank = vllm_config.parallel_config.data_parallel_rank
+            control_port = derive_decode_control_port(
+                dual_path_control_port=dual_path_cfg.dual_path_control_port,
+                data_parallel_rank=data_parallel_rank,
+                kv_port=vllm_config.kv_transfer_config.kv_port,
+                worker_port_span=(
+                    vllm_config.parallel_config.data_parallel_size * vllm_config.parallel_config.tensor_parallel_size
+                ),
+            )
+            self._path_decision_coordinator = PathDecisionCoordinator.for_decode(
+                engine_id=engine_id,
+                data_parallel_rank=data_parallel_rank,
+                control_endpoint=DecodeControlEndpoint(host=get_ip(), port=control_port),
+            )
+        else:
+            self._path_decision_coordinator = PathDecisionCoordinator.for_prefill()
         logger.info(
             "Initializing DualPath Scheduler %s (role=%s)",
             engine_id,
@@ -238,6 +260,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_kv_snapshots.clear()
         if self._kvpool_adapter is not None:
             self._kvpool_adapter.close()
+        self._path_decision_coordinator.close()
 
 
 class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
