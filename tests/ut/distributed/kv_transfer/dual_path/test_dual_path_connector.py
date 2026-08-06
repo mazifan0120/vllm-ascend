@@ -703,7 +703,16 @@ class TestDualPathConstructionParity(unittest.TestCase):
         )
         self.assertEqual(
             set(vars(worker)),
-            set(vars(parent_worker)) | {"dual_path_cfg", "_kvpool_worker_adapter", "_control_failed_recving"},
+            set(vars(parent_worker))
+            | {
+                "dual_path_cfg",
+                "_kvpool_worker_adapter",
+                "_control_failed_recving",
+                "_forward_receive_bindings",
+                "_pending_forward_done",
+                "_pending_forward_failed",
+                "_consumed_forward_terminals",
+            },
         )
 
     def test_scheduler_has_no_req_path(self):
@@ -1276,9 +1285,9 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             dual_consumer.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
 
             parent_consumer_result = parent_consumer.get_finished()
-            dual_consumer_result = dual_consumer.get_finished()
+            dual_consumer_result = dual_consumer.get_finished(set())
             parent_producer_result = parent_producer.get_finished()
-            dual_producer_result = dual_producer.get_finished()
+            dual_producer_result = dual_producer.get_finished(set())
 
             expected_finished = {normal_request_id, virtual_request_id}
             self.assertEqual(parent_consumer_result, (set(), expected_finished))
@@ -1401,7 +1410,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             parent_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
             dual_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
             self.assertEqual(parent_worker.get_finished(), (set(), set()))
-            self.assertEqual(dual_worker.get_finished(), (set(), set()))
+            self.assertEqual(dual_worker.get_finished(set()), (set(), set()))
             parent_invalid = parent_worker.get_block_ids_with_load_errors()
             dual_invalid = dual_worker.get_block_ids_with_load_errors()
             parent_cleared = parent_worker.get_block_ids_with_load_errors()
@@ -1429,9 +1438,10 @@ class TestDualPathFoundationGuards(unittest.TestCase):
             "wait_for_save",
         }
     )
+    FACADE_METHOD_EXEMPTIONS = frozenset({"get_finished"})
 
     def test_facade_lifecycle_methods_are_identical_to_parent(self):
-        for method_name in self.LIFECYCLE_METHODS:
+        for method_name in self.LIFECYCLE_METHODS - self.FACADE_METHOD_EXEMPTIONS:
             with self.subTest(method=method_name):
                 self.assertIs(
                     getattr(DualPathConnector, method_name),
@@ -1443,7 +1453,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
         # admission surface below. Any further method must update this guard
         # together with its owning Task spec.
         expected_methods = {
-            "DualPathConnector": {"__init__", "shutdown"},
+            "DualPathConnector": {"__init__", "get_finished", "shutdown"},
             "DualPathConnectorScheduler": {
                 "__init__",
                 "_is_task01_decode_request",
@@ -1457,7 +1467,15 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "request_finished_all_groups",
                 "shutdown",
             },
-            "DualPathConnectorWorker": {"__init__", "start_load_kv", "get_finished", "shutdown"},
+            "DualPathConnectorWorker": {
+                "__init__",
+                "_install_forward_receive_binding",
+                "_release_finished_forward_terminals",
+                "_consume_forward_receive_binding",
+                "start_load_kv",
+                "get_finished",
+                "shutdown",
+            },
         }
         for connector_class in (
             DualPathConnector,
@@ -1467,7 +1485,21 @@ class TestDualPathFoundationGuards(unittest.TestCase):
             with self.subTest(connector_class=connector_class.__name__):
                 own_methods = {name for name, value in connector_class.__dict__.items() if inspect.isfunction(value)}
                 self.assertEqual(own_methods, expected_methods[connector_class.__name__])
-        self.assertTrue(self.LIFECYCLE_METHODS.isdisjoint(DualPathConnector.__dict__))
+        self.assertEqual(self.LIFECYCLE_METHODS.intersection(DualPathConnector.__dict__), self.FACADE_METHOD_EXEMPTIONS)
+
+    def test_facade_get_finished_forwards_core_finished_ids(self):
+        # DualPath exempts get_finished from parent identity because the parent
+        # facade drops the Core-finished IDs before calling its worker.
+        connector = object.__new__(DualPathConnector)
+        worker = object.__new__(DualPathConnectorWorker)
+        worker.get_finished = MagicMock(return_value=({"sent"}, {"received"}))
+        connector.connector_worker = worker
+        finished_req_ids = {"decode-request-00000001"}
+
+        result = connector.get_finished(finished_req_ids)
+
+        self.assertEqual(result, ({"sent"}, {"received"}))
+        worker.get_finished.assert_called_once_with(finished_req_ids)
 
     def test_parent_constructor_signatures_are_pinned(self):
         expected = ["self", "vllm_config", "kv_cache_config", "engine_id"]

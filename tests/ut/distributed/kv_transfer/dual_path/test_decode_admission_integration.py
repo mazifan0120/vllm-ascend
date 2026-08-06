@@ -391,14 +391,19 @@ class TestDecisionTimeoutIntegration:
             worker._recving_metadata = {}
             worker._invalid_block_ids = set()
             worker._control_failed_recving = set()
+            worker._forward_receive_bindings = {}
+            worker._pending_forward_done = set()
+            worker._pending_forward_failed = set()
+            worker._consumed_forward_terminals = {}
             worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
             worker.engine = MagicMock(name="transfer_engine")
+            worker.block_size = [16]
 
             worker.start_load_kv(metadata)
             assert worker.kv_recv_layer_thread.method_calls == []
             assert worker._kvpool_worker_adapter.method_calls == []
             assert worker.engine.method_calls == []
-            finished_sending, finished_recving = worker.get_finished()
+            finished_sending, finished_recving = worker.get_finished(set())
             invalid_block_ids = worker.get_block_ids_with_load_errors()
             connector_output = KVConnectorOutput(
                 finished_sending=finished_sending,

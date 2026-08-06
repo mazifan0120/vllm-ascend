@@ -27,6 +27,7 @@ Block forwarding is free:
 
 from __future__ import annotations
 
+import math
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -798,6 +799,10 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self.dual_path_cfg = dual_path_cfg
         self._kvpool_worker_adapter: KVPoolWorkerAdapter | None = None
         self._control_failed_recving: set[str] = set()
+        self._forward_receive_bindings: dict[str, ForwardReceiveBinding] = {}
+        self._pending_forward_done: set[str] = set()
+        self._pending_forward_failed: set[str] = set()
+        self._consumed_forward_terminals: dict[str, str] = {}
         if dual_path_cfg.role == "decode":
             self._kvpool_worker_adapter = KVPoolWorkerAdapter(vllm_config, kv_cache_config)
         logger.info(
@@ -806,19 +811,141 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             dual_path_cfg.role,
         )
 
+    def _install_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
+        consumed_decode_request_id = self._consumed_forward_terminals.get(binding.wire_request_id)
+        if consumed_decode_request_id is not None:
+            if consumed_decode_request_id == binding.decode_request_id:
+                return
+            raise RuntimeError(
+                f"DualPath wire request {binding.wire_request_id} already belongs to a consumed Forward terminal; "
+                "the original binding is preserved"
+            )
+
+        existing_binding = self._forward_receive_bindings.get(binding.decode_request_id)
+        existing_decode_request_id = self.request_map.get(binding.wire_request_id)
+        conflicts_with_retained_binding = any(
+            retained != binding
+            and (retained.request_key == binding.request_key or retained.wire_request_id == binding.wire_request_id)
+            for retained in self._forward_receive_bindings.values()
+        )
+        if (
+            (existing_binding is not None and existing_binding != binding)
+            or (existing_decode_request_id is not None and existing_decode_request_id != binding.decode_request_id)
+            or conflicts_with_retained_binding
+        ):
+            raise RuntimeError(
+                f"DualPath Decode request {binding.decode_request_id} got a conflicting duplicate "
+                "Forward receive binding; the original binding is preserved"
+            )
+
+        self.request_map[binding.wire_request_id] = binding.decode_request_id
+        self._forward_receive_bindings[binding.decode_request_id] = binding
+
+    def _release_finished_forward_terminals(self, finished_req_ids: set[str]) -> set[str]:
+        finished_wire_ids = {get_external_request_id(request_id) for request_id in finished_req_ids}
+        for wire_request_id in finished_wire_ids:
+            decode_request_id = self._consumed_forward_terminals.get(wire_request_id)
+            if decode_request_id in finished_req_ids:
+                self._consumed_forward_terminals.pop(wire_request_id)
+        self._pending_forward_done.difference_update(finished_wire_ids)
+        self._pending_forward_failed.difference_update(finished_wire_ids)
+        return finished_wire_ids
+
+    def _consume_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
+        self._consumed_forward_terminals[binding.wire_request_id] = binding.decode_request_id
+        self.request_map.pop(binding.wire_request_id, None)
+        self._forward_receive_bindings.pop(binding.decode_request_id, None)
+
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
+        for binding in getattr(metadata, "forward_receive_bindings", ()):
+            self._install_forward_receive_binding(binding)
         for timeout in getattr(metadata, "decision_timeouts", ()):
             self._control_failed_recving.add(timeout.request_id)
             self._invalid_block_ids.update(timeout.external_block_ids)
         super().start_load_kv(metadata)
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
-        done_sending, done_recving = super().get_finished()
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
+        if self.vllm_config.kv_transfer_config.is_kv_consumer:
+            assert self.kv_recv_layer_thread is not None
+            raw_done = self.kv_recv_layer_thread.get_and_clear_done_requests()
+            raw_failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
+        else:
+            raw_done = set()
+            raw_failed = set()
+
+        ignored_wire_ids = set(self._consumed_forward_terminals)
+        ignored_wire_ids.update(
+            wire_request_id for wire_request_id in finished_wire_ids if wire_request_id not in self.request_map
+        )
+        raw_done.difference_update(ignored_wire_ids)
+        raw_failed.difference_update(ignored_wire_ids)
+
+        done_wire_ids = raw_done.union(self._pending_forward_done)
+        failed_wire_ids = raw_failed.union(self._pending_forward_failed)
+        done_wire_ids.difference_update(failed_wire_ids)
+        pending_done: set[str] = set()
+        pending_failed: set[str] = set()
+        ordinary_done: set[str] = set()
+        ordinary_failed: set[str] = set()
+        forward_finished: set[str] = set()
+
+        for wire_request_id in failed_wire_ids:
+            decode_request_id = self.request_map.get(wire_request_id)
+            if decode_request_id is None:
+                pending_failed.add(wire_request_id)
+                continue
+            binding = self._forward_receive_bindings.get(decode_request_id)
+            if binding is None or binding.wire_request_id != wire_request_id:
+                ordinary_failed.add(decode_request_id)
+                continue
+            first_forward_block = binding.token_start // self.block_size[0]
+            last_forward_block = math.ceil(binding.token_end / self.block_size[0])
+            self._invalid_block_ids.update(binding.destination_block_ids[0][first_forward_block:last_forward_block])
+            forward_finished.add(decode_request_id)
+            self._consume_forward_receive_binding(binding)
+
+        for wire_request_id in done_wire_ids:
+            decode_request_id = self.request_map.get(wire_request_id)
+            if decode_request_id is None:
+                pending_done.add(wire_request_id)
+                continue
+            binding = self._forward_receive_bindings.get(decode_request_id)
+            if binding is None or binding.wire_request_id != wire_request_id:
+                ordinary_done.add(decode_request_id)
+                continue
+            forward_finished.add(decode_request_id)
+            self._consume_forward_receive_binding(binding)
+
+        for decode_request_id in ordinary_failed:
+            if metadata := self._recving_metadata.get(decode_request_id):
+                self._invalid_block_ids.update(block_id for group in metadata.local_block_ids for block_id in group)
+        for decode_request_id in ordinary_done.union(ordinary_failed):
+            self.request_map.pop(get_external_request_id(decode_request_id), None)
+            self._recving_metadata.pop(decode_request_id, None)
+
+        self._pending_forward_done = pending_done
+        self._pending_forward_failed = pending_failed
+        done_recving = ordinary_done.union(forward_finished, self.virtual_request)
+        self.virtual_request = set()
+        if done_recving:
+            logger.info(
+                "Number of completed KV cache recv requests: %s, receive requests: %s",
+                len(done_recving),
+                done_recving,
+            )
         done_recving.update(self._control_failed_recving)
         self._control_failed_recving.clear()
-        return done_sending, done_recving
+        return set(), done_recving
 
     def shutdown(self) -> None:
+        for binding in self._forward_receive_bindings.values():
+            if self.request_map.get(binding.wire_request_id) == binding.decode_request_id:
+                self.request_map.pop(binding.wire_request_id)
+        self._forward_receive_bindings.clear()
+        self._pending_forward_done.clear()
+        self._pending_forward_failed.clear()
+        self._consumed_forward_terminals.clear()
         self._control_failed_recving.clear()
         if self._kvpool_worker_adapter is not None:
             self._kvpool_worker_adapter.close()
@@ -865,6 +992,10 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
             )
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role!r}")
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        assert isinstance(self.connector_worker, DualPathConnectorWorker)
+        return self.connector_worker.get_finished(finished_req_ids)
 
     def shutdown(self):
         """Release Task-01-owned state and adapters, then defer to the base."""

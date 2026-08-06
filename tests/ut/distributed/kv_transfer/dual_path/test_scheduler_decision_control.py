@@ -194,8 +194,13 @@ def _control_only_worker():
     worker._recving_metadata = {}
     worker._invalid_block_ids = set()
     worker._control_failed_recving = set()
+    worker._forward_receive_bindings = {}
+    worker._pending_forward_done = set()
+    worker._pending_forward_failed = set()
+    worker._consumed_forward_terminals = {}
     worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
     worker.engine = MagicMock(name="transfer_engine")
+    worker.block_size = [16]
     return worker
 
 
@@ -902,14 +907,14 @@ class TestWorkerFailureRelay:
         worker.start_load_kv(metadata)
 
         # When
-        done_sending, done_recving = worker.get_finished()
+        done_sending, done_recving = worker.get_finished(set())
         invalid_block_ids = worker.get_block_ids_with_load_errors()
 
         # Then
         assert done_sending == set()
         assert done_recving == {"request-local-7"}
         assert invalid_block_ids == {42, 43, 44}
-        assert worker.get_finished() == (set(), set())
+        assert worker.get_finished(set()) == (set(), set())
         assert worker.get_block_ids_with_load_errors() == set()
 
 

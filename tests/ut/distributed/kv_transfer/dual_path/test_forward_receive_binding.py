@@ -12,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     ForwardReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
+    DualPathRequestKey,
     Path,
     PathDecisionResult,
 )
@@ -133,6 +134,47 @@ def _destination_from_snapshot(scheduler, snapshot) -> tuple[tuple[int, ...], ..
     )
 
 
+def _make_binding(
+    decode_request_id: str = "decode-request-00000001",
+    destination_block_ids: tuple[tuple[int, ...], ...] = ((101, 102, 103, 104),),
+) -> ForwardReceiveBinding:
+    return ForwardReceiveBinding(
+        request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, decode_request_id),
+        wire_request_id=get_external_request_id(decode_request_id),
+        decode_request_id=decode_request_id,
+        destination_block_ids=destination_block_ids,
+        token_start=16,
+        token_end=49,
+    )
+
+
+def _make_worker():
+    worker = object.__new__(connector_module.DualPathConnectorWorker)
+    worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
+    worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
+    worker.request_map = {}
+    worker.virtual_request = set()
+    worker._recving_metadata = {}
+    worker._invalid_block_ids = set()
+    worker._control_failed_recving = set()
+    worker._forward_receive_bindings = {}
+    worker._pending_forward_done = set()
+    worker._pending_forward_failed = set()
+    worker._consumed_forward_terminals = {}
+    worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
+    worker.engine = MagicMock(name="transfer_engine")
+    worker.block_size = [16]
+    return worker
+
+
+def _binding_metadata(binding: ForwardReceiveBinding) -> DualPathConnectorMetadata:
+    metadata = DualPathConnectorMetadata()
+    metadata.forward_receive_bindings.append(binding)
+    return metadata
+
+
 def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_table(
     scheduler_factory,
 ):
@@ -223,3 +265,231 @@ def test_committed_de_read_result_emits_no_binding(scheduler_factory):
     assert metadata.forward_receive_bindings == []
     assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
     assert state.result is result
+
+
+def test_binding_install_starts_no_receive_or_load_request():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    metadata = _binding_metadata(binding)
+
+    # When
+    worker.start_load_kv(metadata)
+
+    # Then
+    assert worker.request_map == {binding.wire_request_id: binding.decode_request_id}
+    assert worker._forward_receive_bindings == {binding.decode_request_id: binding}
+    assert worker._recving_metadata == {}
+    assert worker.kv_recv_layer_thread.method_calls == []
+    assert worker._kvpool_worker_adapter.method_calls == []
+    assert worker.engine.method_calls == []
+
+
+def test_identical_binding_install_is_idempotent():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    metadata = _binding_metadata(binding)
+    worker.start_load_kv(metadata)
+
+    # When
+    worker.start_load_kv(metadata)
+
+    # Then
+    assert worker.request_map == {binding.wire_request_id: binding.decode_request_id}
+    assert worker._forward_receive_bindings == {binding.decode_request_id: binding}
+
+
+def test_conflicting_binding_install_preserves_first_binding():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    conflicting = _make_binding(destination_block_ids=((201, 202, 203, 204),))
+    worker.start_load_kv(_binding_metadata(binding))
+
+    # When
+    with pytest.raises(RuntimeError):
+        worker.start_load_kv(_binding_metadata(conflicting))
+
+    # Then
+    assert worker.request_map == {binding.wire_request_id: binding.decode_request_id}
+    assert worker._forward_receive_bindings == {binding.decode_request_id: binding}
+
+
+def test_done_after_binding_publishes_finished_recving_only():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    worker.start_load_kv(_binding_metadata(binding))
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
+
+    # When
+    finished = worker.get_finished(set())
+
+    # Then
+    assert finished == (set(), {binding.decode_request_id})
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert worker._forward_receive_bindings == {}
+    assert worker.request_map == {}
+    assert worker._consumed_forward_terminals == {binding.wire_request_id: binding.decode_request_id}
+
+
+def test_failed_after_binding_publishes_exact_forward_suffix_and_finished_recving_prefix_preserved():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    worker.start_load_kv(_binding_metadata(binding))
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {binding.wire_request_id}
+
+    # When
+    finished = worker.get_finished(set())
+    invalid_block_ids = worker.get_block_ids_with_load_errors()
+
+    # Then
+    assert finished == (set(), {binding.decode_request_id})
+    assert invalid_block_ids == {102, 103, 104}
+    assert 101 not in invalid_block_ids
+
+
+def test_done_before_binding_is_retained_and_reconciled_after_install():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
+    assert worker.get_finished(set()) == (set(), set())
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+
+    # When
+    worker.start_load_kv(_binding_metadata(binding))
+    finished = worker.get_finished(set())
+
+    # Then
+    assert finished == (set(), {binding.decode_request_id})
+    assert worker._pending_forward_done == set()
+
+
+def test_failed_before_binding_is_retained_and_reconciled_after_install():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {binding.wire_request_id}
+    assert worker.get_finished(set()) == (set(), set())
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
+
+    # When
+    worker.start_load_kv(_binding_metadata(binding))
+    finished = worker.get_finished(set())
+
+    # Then
+    assert finished == (set(), {binding.decode_request_id})
+    assert worker.get_block_ids_with_load_errors() == {102, 103, 104}
+    assert worker._pending_forward_failed == set()
+
+
+def test_conflicting_done_and_failed_resolves_as_failed():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    worker.start_load_kv(_binding_metadata(binding))
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {binding.wire_request_id}
+
+    # When
+    finished = worker.get_finished(set())
+
+    # Then
+    assert finished == (set(), {binding.decode_request_id})
+    assert worker.get_block_ids_with_load_errors() == {102, 103, 104}
+
+
+def test_unknown_wire_ids_are_retained_without_attribution():
+    # Given
+    worker = _make_worker()
+    worker.request_map["known-wire"] = "known-request-00000001"
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {"unknown-done"}
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {"unknown-failed"}
+
+    # When
+    finished = worker.get_finished(set())
+
+    # Then
+    assert finished == (set(), set())
+    assert worker._pending_forward_done == {"unknown-done"}
+    assert worker._pending_forward_failed == {"unknown-failed"}
+    assert worker.request_map == {"known-wire": "known-request-00000001"}
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_finished_req_ids_do_not_suppress_ordinary_parent_terminals():
+    # Given
+    worker = _make_worker()
+    done_request_id = "ordinary-done-00000001"
+    failed_request_id = "ordinary-failed-00000001"
+    done_wire_request_id = get_external_request_id(done_request_id)
+    failed_wire_request_id = get_external_request_id(failed_request_id)
+    worker.request_map = {
+        done_wire_request_id: done_request_id,
+        failed_wire_request_id: failed_request_id,
+    }
+    worker._recving_metadata = {
+        done_request_id: SimpleNamespace(local_block_ids=((201, 202),)),
+        failed_request_id: SimpleNamespace(local_block_ids=((301, 302),)),
+    }
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {done_wire_request_id}
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {failed_wire_request_id}
+
+    # When
+    finished = worker.get_finished({done_request_id, failed_request_id})
+
+    # Then
+    assert finished == (set(), {done_request_id})
+    assert worker.get_block_ids_with_load_errors() == {301, 302}
+    assert worker.request_map == {}
+    assert worker._recving_metadata == {}
+
+
+def test_duplicate_terminals_are_idempotent_and_consumed_record_releases_on_finished_req_ids():
+    # Given
+    worker = _make_worker()
+    binding = _make_binding()
+    worker.start_load_kv(_binding_metadata(binding))
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
+    assert worker.get_finished(set()) == (set(), {binding.decode_request_id})
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {binding.wire_request_id}
+    assert worker.get_finished(set()) == (set(), set())
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {binding.wire_request_id}
+
+    # When
+    released = worker.get_finished({binding.decode_request_id})
+
+    # Then
+    assert released == (set(), set())
+    assert worker._consumed_forward_terminals == {}
+    assert worker._pending_forward_done == set()
+    assert worker._pending_forward_failed == set()
+
+
+def test_shutdown_clears_task05_worker_state_and_active_wire_mapping():
+    # Given
+    worker = _make_worker()
+    consumed_binding = _make_binding()
+    active_binding = _make_binding("active-request-00000001")
+    worker.start_load_kv(_binding_metadata(consumed_binding))
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {consumed_binding.wire_request_id}
+    assert worker.get_finished(set()) == (set(), {consumed_binding.decode_request_id})
+    worker.start_load_kv(_binding_metadata(active_binding))
+    worker._pending_forward_done.add("unknown-done")
+    worker._pending_forward_failed.add("unknown-failed")
+
+    # When
+    worker.shutdown()
+    worker.shutdown()
+
+    # Then
+    assert active_binding.wire_request_id not in worker.request_map
+    assert worker._forward_receive_bindings == {}
+    assert worker._pending_forward_done == set()
+    assert worker._pending_forward_failed == set()
+    assert worker._consumed_forward_terminals == {}
+    assert worker._kvpool_worker_adapter.close.call_count == 2
