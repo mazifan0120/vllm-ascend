@@ -698,7 +698,10 @@ class TestDualPathConstructionParity(unittest.TestCase):
         self.assertEqual(
             set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | dual_path_scheduler_fields
         )
-        self.assertEqual(set(vars(worker)), set(vars(parent_worker)) | {"dual_path_cfg", "_kvpool_worker_adapter"})
+        self.assertEqual(
+            set(vars(worker)),
+            set(vars(parent_worker)) | {"dual_path_cfg", "_kvpool_worker_adapter", "_control_failed_recving"},
+        )
 
     def test_scheduler_has_no_req_path(self):
         scheduler = DualPathConnectorScheduler(
@@ -1397,11 +1400,12 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "_handle_prefill_decision",
                 "get_num_new_matched_tokens",
                 "update_state_after_alloc",
+                "build_connector_meta",
                 "request_finished",
                 "request_finished_all_groups",
                 "shutdown",
             },
-            "DualPathConnectorWorker": {"__init__", "shutdown"},
+            "DualPathConnectorWorker": {"__init__", "start_load_kv", "get_finished", "shutdown"},
         }
         for connector_class in (
             DualPathConnector,
@@ -1411,10 +1415,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
             with self.subTest(connector_class=connector_class.__name__):
                 own_methods = {name for name, value in connector_class.__dict__.items() if inspect.isfunction(value)}
                 self.assertEqual(own_methods, expected_methods[connector_class.__name__])
-        # The facade and worker still define no parent lifecycle methods.
-        for connector_class in (DualPathConnector, DualPathConnectorWorker):
-            with self.subTest(connector_class=connector_class.__name__):
-                self.assertTrue(self.LIFECYCLE_METHODS.isdisjoint(connector_class.__dict__))
+        self.assertTrue(self.LIFECYCLE_METHODS.isdisjoint(DualPathConnector.__dict__))
 
     def test_parent_constructor_signatures_are_pinned(self):
         expected = ["self", "vllm_config", "kv_cache_config", "engine_id"]

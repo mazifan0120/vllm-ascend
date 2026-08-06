@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
@@ -164,6 +165,29 @@ def _admit(scheduler, params: dict | None = None):
     blocks.get_block_ids.return_value = ([41, 42, 43, 44],)
     scheduler.update_state_after_alloc(request, blocks, 32)
     return request, blocks
+
+
+def _result(request_id: str = "request-local-7") -> PathDecisionResult:
+    return PathDecisionResult(
+        request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, request_id),
+        path=Path.DE_READ,
+    )
+
+
+def _control_only_worker():
+    worker = object.__new__(connector_module.DualPathConnectorWorker)
+    worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
+    worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
+    worker.request_map = {}
+    worker.virtual_request = set()
+    worker._recving_metadata = {}
+    worker._invalid_block_ids = set()
+    worker._control_failed_recving = set()
+    worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
+    worker.engine = MagicMock(name="transfer_engine")
+    return worker
 
 
 def _expected_dual_path_payload() -> dict:
@@ -679,3 +703,147 @@ class TestPrefillDecisionHook:
         finally:
             parent.executor.shutdown(wait=False)
             parent.metaserver_client.close()
+
+
+class TestDecodeResultConsumption:
+    def test_received_result_commits_via_build_connector_meta_without_worker_metadata(
+        self,
+        decode_scheduler,
+        task04_seams,
+    ):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        result = _result()
+        task04_seams.decode_coordinator.take_received_results.return_value = [result]
+
+        # When
+        metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+        # Then
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+        assert state.result is result
+        assert metadata.decision_timeouts == []
+        assert request.request_id not in metadata.requests
+        assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert decode_scheduler._reqs_need_recv == {}
+        task04_seams.decode_coordinator.unregister.assert_not_called()
+
+    def test_result_at_call_start_wins_deadline_boundary(self, decode_scheduler, task04_seams):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        events = []
+        task04_seams.decode_coordinator.take_received_results.side_effect = lambda: (
+            events.append("result") or [_result()]
+        )
+        clock = MagicMock(name="time")
+        clock.monotonic.side_effect = lambda: events.append("clock") or state.deadline + 1
+
+        # When
+        with patch.object(connector_module, "time", clock):
+            metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+        # Then
+        assert events == ["result", "clock"]
+        assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+        assert metadata.decision_timeouts == []
+        task04_seams.decode_coordinator.unregister.assert_not_called()
+
+    def test_timeout_emits_one_aligned_suffix_record_and_unregisters_once(
+        self,
+        decode_scheduler,
+        task04_seams,
+    ):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        task04_seams.decode_coordinator.take_received_results.return_value = []
+
+        # When
+        with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
+            metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+        # Then
+        assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert state.timeout_reported is True
+        assert metadata.requests == {}
+        assert metadata.decision_timeouts == [
+            connector_module.DecisionTimeoutMetadata(
+                request_id=request.request_id,
+                external_block_ids=(42, 43, 44),
+            )
+        ]
+        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+
+    def test_timeout_record_is_never_emitted_twice(self, decode_scheduler, task04_seams):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        task04_seams.decode_coordinator.take_received_results.return_value = []
+
+        # When
+        with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
+            first_metadata = decode_scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
+            second_metadata = decode_scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
+
+        # Then
+        assert len(first_metadata.decision_timeouts) == 1
+        assert second_metadata.decision_timeouts == []
+        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+
+    def test_late_result_after_timeout_is_stale(self, decode_scheduler, task04_seams):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        task04_seams.decode_coordinator.take_received_results.return_value = []
+        with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
+            decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
+        task04_seams.decode_coordinator.take_received_results.return_value = [_result()]
+
+        # When
+        metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_result_scheduler_output"))
+
+        # Then
+        assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert state.result is None
+        assert metadata.decision_timeouts == []
+        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+
+
+class TestWorkerFailureRelay:
+    def test_timeout_only_metadata_starts_no_store_or_p2p_operation(self):
+        # Given
+        worker = _control_only_worker()
+        metadata = connector_module.DualPathConnectorMetadata()
+        metadata.decision_timeouts.append(connector_module.DecisionTimeoutMetadata("request-local-7", (42, 43, 44)))
+        assert metadata.requests == {}
+
+        # When
+        worker.start_load_kv(metadata)
+
+        # Then
+        assert worker._control_failed_recving == {"request-local-7"}
+        assert worker._invalid_block_ids == {42, 43, 44}
+        assert worker.kv_recv_layer_thread.method_calls == []
+        assert worker._kvpool_worker_adapter.method_calls == []
+        assert worker.engine.method_calls == []
+
+    def test_single_kv_connector_output_carries_finished_recving_and_invalid_blocks(self):
+        # Given
+        worker = _control_only_worker()
+        metadata = connector_module.DualPathConnectorMetadata()
+        metadata.decision_timeouts.append(connector_module.DecisionTimeoutMetadata("request-local-7", (42, 43, 44)))
+        worker.start_load_kv(metadata)
+
+        # When
+        done_sending, done_recving = worker.get_finished()
+        invalid_block_ids = worker.get_block_ids_with_load_errors()
+
+        # Then
+        assert done_sending == set()
+        assert done_recving == {"request-local-7"}
+        assert invalid_block_ids == {42, 43, 44}
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_block_ids_with_load_errors() == set()

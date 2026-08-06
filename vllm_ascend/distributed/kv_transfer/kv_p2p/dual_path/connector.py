@@ -31,7 +31,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, assert_never
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -47,6 +47,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPath
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (
     KVPoolAdapter,
     KVPoolWorkerAdapter,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
+    DecisionTimeoutMetadata,
+    DualPathConnectorMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -78,6 +82,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -457,6 +462,63 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         params["do_remote_prefill"] = False
 
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> MooncakeLayerwiseConnectorMetadata:
+        parent_metadata = super().build_connector_meta(scheduler_output)
+        if self.dual_path_cfg.role != "decode":
+            return parent_metadata
+
+        metadata = DualPathConnectorMetadata()
+        metadata.requests = parent_metadata.requests
+        metadata.send_task = parent_metadata.send_task
+        coordinator = self._path_decision_coordinator
+
+        for result in coordinator.take_received_results():
+            request_key = result.request_key
+            if request_key.decode_engine_instance_id != coordinator.decode_engine_instance_id:
+                continue
+            state = self._decode_decision_states.get(request_key.decode_request_id)
+            if state is None or state.request_key != request_key:
+                continue
+            match state.status:
+                case DecodeDecisionStatus.PENDING:
+                    state.result = result
+                    state.status = DecodeDecisionStatus.COMMITTED
+                case DecodeDecisionStatus.COMMITTED | DecodeDecisionStatus.TIMED_OUT:
+                    continue
+                case unreachable:
+                    assert_never(unreachable)
+
+        now = time.monotonic()
+        for request_id, state in self._decode_decision_states.items():
+            match state.status:
+                case DecodeDecisionStatus.PENDING:
+                    if state.deadline > now:
+                        continue
+                case DecodeDecisionStatus.COMMITTED | DecodeDecisionStatus.TIMED_OUT:
+                    continue
+                case unreachable:
+                    assert_never(unreachable)
+            state.status = DecodeDecisionStatus.TIMED_OUT
+            coordinator.unregister(state.request_key)
+            snapshot = self._decode_kv_snapshots[request_id]
+            block_size = self.block_size[0]
+            assert snapshot.local_tokens % block_size == 0
+            first_external_block = snapshot.local_tokens // block_size
+            external_block_ids = snapshot.final_block_ids[0][first_external_block:]
+            assert external_block_ids
+            metadata.decision_timeouts.append(
+                DecisionTimeoutMetadata(
+                    request_id=request_id,
+                    external_block_ids=tuple(external_block_ids),
+                )
+            )
+            state.timeout_reported = True
+
+        return metadata
+
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict | None]:
         self._lookup_results.pop(request.request_id, None)
         self._decode_kv_snapshots.pop(request.request_id, None)
@@ -499,6 +561,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.dual_path_cfg = dual_path_cfg
         self._kvpool_worker_adapter: KVPoolWorkerAdapter | None = None
+        self._control_failed_recving: set[str] = set()
         if dual_path_cfg.role == "decode":
             self._kvpool_worker_adapter = KVPoolWorkerAdapter(vllm_config, kv_cache_config)
         logger.info(
@@ -507,9 +570,22 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             dual_path_cfg.role,
         )
 
+    def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
+        for timeout in getattr(metadata, "decision_timeouts", ()):
+            self._control_failed_recving.add(timeout.request_id)
+            self._invalid_block_ids.update(timeout.external_block_ids)
+        super().start_load_kv(metadata)
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        done_sending, done_recving = super().get_finished()
+        done_recving.update(self._control_failed_recving)
+        self._control_failed_recving.clear()
+        return done_sending, done_recving
+
     def shutdown(self) -> None:
         if self._kvpool_worker_adapter is not None:
             self._kvpool_worker_adapter.close()
+        self._control_failed_recving.clear()
 
 
 class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
