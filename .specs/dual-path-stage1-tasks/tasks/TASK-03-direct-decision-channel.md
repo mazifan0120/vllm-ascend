@@ -6,10 +6,15 @@ This document defines the implementation contract for Task-03 in the
 [`DualPath Stage 1 Task Catalog`](../TASKS.md). It depends on the Task-02
 decision types and replaces the historical Proxy decision-Future return path.
 
-The source baseline is:
+The latest source baseline reviewed for this revision is:
 
-- `vllm-ascend@f0dc79108e4c93a83d35a94ab81d2e8950b90cec`
+- `vllm-ascend@6761bb9c3f179e2c56f636c47051a9c31a98383d`
 - sibling `vllm@0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`
+
+The Task-04 design review replaces the earlier Commit/Error union with one
+concrete `PathDecisionResult` and replaces inbox/drain terminology with an
+explicit received-result queue. This document is authoritative for the
+required reconciliation.
 
 Task-03 owns a small transport closure. It does not select a path, consume a
 decision in a real Scheduler hook, or authorize Store or P2P I/O.
@@ -22,7 +27,7 @@ Task-03 provides a direct result path:
 PE PathDecisionCoordinator
     -> PathDecision over temporary ZMQ REQ
     -> DE PathDecisionCoordinator ROUTER
-    -> validate, suppress duplicate, enqueue once
+    -> validate, suppress duplicate, retain as received once
     -> literal b"ACK"
 ```
 
@@ -37,9 +42,10 @@ control endpoint inside a nested `kv_transfer_params["dual_path"]` envelope.
 Proxy forwards that envelope unchanged and never carries the result back to
 DE.
 
-After Task-03 merges, the channel and inbox are independently executable and
-tested, but no production request is registered, no real PE decision is
-submitted, and no DE Scheduler consumes the inbox. Task-04 owns those hooks.
+After Task-03 merges, the channel and received-result queue are independently
+executable and tested, but no production request is registered, no real PE
+decision is submitted, and no DE Scheduler consumes received results. Task-04
+owns those hooks.
 
 ## 3. Boundary sequence
 
@@ -59,15 +65,15 @@ sequenceDiagram
     Proxy->>PES: forward kv_transfer_params unchanged
     PES->>PEC: submit(endpoint, PathDecision)
     PEC->>DEC: temporary REQ -> ROUTER
-    DEC->>DEC: validate and enqueue once
+    DEC->>DEC: validate and retain as received once
     DEC-->>PEC: b"ACK"
-    Note over DEC,DES: Task-04 later drains the inbox in build_connector_meta()
+    Note over DEC,DES: Task-04 later calls take_received_results()
 ```
 
 The `register_pending()`, envelope injection/extraction, policy invocation,
-`submit()`, and inbox drain arrows are shown for the final control flow. Their
-real Scheduler call sites are Task-04 scope. Task-03 exposes and tests the
-transport surfaces with constrained callers.
+`submit()`, and received-result consumption arrows are shown for the final
+control flow. Their real Scheduler call sites are Task-04 scope. Task-03
+exposes and tests the transport surfaces with constrained callers.
 
 ## 4. Protocol types
 
@@ -76,8 +82,6 @@ Task-03 reuses these Task-02 domain types without modification:
 ```text
 DualPathRequestKey
 PathDecisionRequest
-PathDecisionCommit
-PathDecisionError
 PathDecisionResult
 ```
 
@@ -220,7 +224,7 @@ Every `DualPathConnectorScheduler` owns one role-specific
 `PathDecisionCoordinator` for its full lifetime:
 
 - Decode role: receiver thread, ROUTER socket, pending/accepted registries,
-  and decision inbox.
+  and received-result queue.
 - Prefill role: bounded asynchronous send executor and its outstanding
   Futures.
 
@@ -235,7 +239,7 @@ coordinator.decode_engine_instance_id
 coordinator.decode_control_endpoint
 coordinator.register_pending(request_key)
 coordinator.unregister(request_key)
-coordinator.take_decisions() -> list[PathDecisionResult]
+coordinator.take_received_results() -> list[PathDecisionResult]
 
 # Prefill role
 coordinator.submit(
@@ -247,9 +251,10 @@ coordinator.submit(
 coordinator.close()
 ```
 
-Wrong-role method calls fail immediately. `register_pending()`,
-`unregister()`, and `take_decisions()` are local, thread-safe operations and
-perform no network wait.
+Wrong-role method calls fail immediately. `register_pending()`, `unregister()`,
+and `take_received_results()` are local, thread-safe operations and perform no
+network wait. `take_received_results()` atomically returns and removes every
+Result available at the start of that call.
 
 Task-03 wires Coordinator construction and idempotent close into the real
 DualPath Scheduler facade, but does not call any per-request method from a
@@ -262,7 +267,7 @@ The DE Coordinator owns:
 ```python
 _pending_keys: set[DualPathRequestKey]
 _accepted_results: dict[DualPathRequestKey, PathDecisionResult]
-_decision_inbox: queue.SimpleQueue[PathDecisionResult]
+_received_results: queue.SimpleQueue[PathDecisionResult]
 ```
 
 REQ inserts an empty delimiter between the ROUTER identity and application
@@ -288,11 +293,11 @@ Receiver behavior is:
 ```text
 well-formed + pending key + first result
     -> retain immutable result
-    -> enqueue exactly once
+    -> add to received results exactly once
     -> ACK
 
 same key + structurally identical retained result
-    -> do not enqueue again
+    -> do not add it again
     -> ACK
 
 same key + different retained result
@@ -309,8 +314,9 @@ unsupported version or malformed payload
 ```
 
 There is no NACK message. No-ACK cases become sender timeout/retry and
-eventual delivery failure. `PathDecisionError` is a valid Task-02 semantic
-result and is accepted, enqueued, and ACKed like a Commit.
+eventual delivery failure. Task-03 transports only a valid
+`PathDecisionResult`; PE-local validation or policy failures produce no wire
+message and converge through the Task-04 DE deadline.
 
 `unregister()` is idempotent and removes the key from both registries. No
 Task-03 cancelled/expired/tombstone state machine is introduced. Task-04 owns
@@ -349,12 +355,12 @@ a different path.
 Task-03 does not add backoff, jitter, persistent connection pooling, health
 checks, retransmission logs, or network-partition recovery.
 
-## 10. Inbox and Scheduler boundary
+## 10. Received-result queue and Scheduler boundary
 
-The receiver writes the inbox and returns ACK from its background thread. It
-never invokes a Scheduler method.
+The receiver writes `_received_results` and returns ACK from its background
+thread. It never invokes a Scheduler method.
 
-Task-04 later drains `take_decisions()` from
+Task-04 later calls `take_received_results()` from
 `DualPathConnectorScheduler.build_connector_meta()`. vLLM calls that hook at
 the end of each schedule pass, including zero-model-token passes while a
 request remains in `WAITING_FOR_REMOTE_KVS`.
@@ -363,12 +369,12 @@ An ACK therefore means only:
 
 ```text
 the PathDecision was decoded, accepted for a registered key,
-retained, and enqueued once
+retained, and made available once through take_received_results()
 ```
 
 It does not mean:
 
-- DE Scheduler consumed the result;
+- DE Scheduler consumed the Result;
 - a path was activated;
 - Store, Reverse, or Forward started;
 - KV is ready;
@@ -392,7 +398,7 @@ Task-03 failure ownership is deliberately narrow:
 - close ROUTER/REQ sockets with bounded linger;
 - join the DE receiver thread;
 - stop the PE executor and reconcile outstanding Futures;
-- clear pending, accepted, and inbox state;
+- clear pending, accepted, and received-result state;
 - leave no background thread or open control endpoint.
 
 There is no Store or DMA drain requirement because Task-03 submits no data
@@ -411,18 +417,18 @@ Focused CPU tests must cover:
 5. Nested `kv_transfer_params["dual_path"]` shape and transparent fake Proxy
    pass-through.
 6. No PE socket construction before `submit()` receives a real endpoint.
-7. One successful Commit delivery, one inbox event, and exact `b"ACK"`.
-8. Valid `PathDecisionError` delivery and ACK.
-9. Lost first ACK followed by identical retry, second ACK, and one inbox event.
-10. Conflicting duplicate, unknown key, wrong incarnation, unsupported
-    version, and malformed payload produce no ACK and no extra inbox event.
-11. Exactly three attempts, one fresh REQ socket per attempt, one-second
+7. One successful Result delivery, one received Result, and exact `b"ACK"`.
+8. Lost first ACK followed by identical retry, second ACK, and one received
+   Result.
+9. Conflicting duplicate, unknown key, wrong incarnation, unsupported
+   version, and malformed payload produce no ACK and no extra received Result.
+10. Exactly three attempts, one fresh REQ socket per attempt, one-second
     bounds, and 0.1-second retry spacing using fake time/pollers where needed.
-12. Delivery exhaustion completes the Future exceptionally without a second
+11. Delivery exhaustion completes the Future exceptionally without a second
     policy or request attempt.
-13. Multiple concurrent results remain isolated.
-14. Idempotent register, unregister, request cleanup, and close.
-15. Receiver and executor shutdown leave no live thread, socket, Future, or
+12. Multiple concurrent results remain isolated.
+13. Idempotent register, unregister, request cleanup, and close.
+14. Receiver and executor shutdown leave no live thread, socket, Future, or
     retained request state.
 
 No Task-03 test may instantiate a real vLLM Scheduler, run a model, contact a
@@ -452,7 +458,8 @@ copy Worker transfer code or reuse the Worker handshake endpoint.
 - Real `DecodeKVSnapshot` to `PathDecisionRequest` construction.
 - Real remote-decode metadata injection or PE request extraction.
 - Full-hit rule or `PathPolicy.choose()` invocation.
-- Real per-request Coordinator registration, submission, or inbox drain hooks.
+- Real per-request Coordinator registration, submission, or received-result
+  consumption hooks.
 - DE Decision-wait timeout and Core-facing fail-closed request handling.
 - Proxy `/v1/path-decision`, decision Futures, or result relay.
 - NACK, delivery UUID, fingerprint, persistent socket pool, backoff, jitter,
@@ -466,9 +473,10 @@ Task-03 is accepted when constrained CPU integration tests prove:
 
 - a request-provided endpoint is contacted only after submission;
 - one immutable Task-02 result reaches the correct DE Coordinator;
-- the DE retains and enqueues it exactly once before returning `b"ACK"`;
-- ACK loss causes bounded identical retry without duplicate inbox delivery;
-- malformed, stale, unknown, and conflicting input cannot enter the inbox;
+- the DE retains it and exposes it exactly once before returning `b"ACK"`;
+- ACK loss causes bounded identical retry without duplicate Result delivery;
+- malformed, stale, unknown, and conflicting input cannot enter the received
+  results;
 - retry exhaustion is observable to the PE caller;
 - restart identity, endpoint isolation, cancellation, and shutdown are clean;
 - Proxy, real Scheduler request hooks, Worker, Store, and P2P remain untouched.

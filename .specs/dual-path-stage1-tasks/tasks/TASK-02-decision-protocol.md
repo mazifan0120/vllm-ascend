@@ -7,10 +7,15 @@ This document defines the implementation contract for Task-02 in the
 `StoreCoverage`, `PathKind`, candidate, capability, and Proxy-Future decision
 model for this Task.
 
-The source baseline is:
+The latest source baseline reviewed for this revision is:
 
-- `vllm-ascend@24af3ee65b8ba45afa69a0ec0822b6120c0e9d25`
+- `vllm-ascend@6761bb9c3f179e2c56f636c47051a9c31a98383d`
 - sibling `vllm@0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`
+
+The Task-04 design review removes the earlier wire-level
+`PathDecisionCommit | PathDecisionError` union. This document is authoritative:
+the implementation must converge on the concrete `PathDecisionResult` contract
+below before Task-04 is complete.
 
 Task-02 is transport-independent pure logic. It does not add Scheduler hooks,
 open a network endpoint, contact Proxy, start Store or P2P I/O, or activate a
@@ -25,7 +30,7 @@ path decision owned by the Prefill-side `DualPathConnectorScheduler`:
 PathDecisionRequest
     -> full Decode Store hit: Path.DE_READ
     -> otherwise: PathPolicy.choose(request)
-    -> PathDecisionCommit or PathDecisionError
+    -> PathDecisionResult
 ```
 
 The only paths are:
@@ -134,9 +139,9 @@ This rule is outside the replaceable policy. Therefore:
 - full requests do not consume or change policy state;
 - no later policy may redirect a full request to `Path.PE_READ`;
 - the request still reaches the PE `DualPathConnectorScheduler`, because PE is
-  the sole producer of the decision commit;
+  the sole producer of the decision result;
 - later data-plane Tasks make the PE request a no-work request after the
-  direct `DE_READ` commit is delivered.
+  direct `DE_READ` Result is delivered.
 
 ## 7. Replaceable policy surface
 
@@ -197,40 +202,39 @@ Rules:
 6. Unit tests inject a seeded `random.Random` and never rely on a
    nondeterministic production seed.
 
-## 9. Decision results
+## 9. Decision result
 
 ```python
 @dataclass(frozen=True)
-class PathDecisionCommit:
+class PathDecisionResult:
     request_key: DualPathRequestKey
     path: Path
-
-
-@dataclass(frozen=True)
-class PathDecisionError:
-    request_key: DualPathRequestKey
-    error_code: str
-    message: str
 ```
 
-```python
-PathDecisionResult = PathDecisionCommit | PathDecisionError
-```
-
-Task-02 errors cover invalid protocol input, a conflicting request with the
-same key, or a policy result that cannot be validated as `Path`. Transport
-timeout, stale receiver, ACK, and delivery exhaustion belong to Task-03.
+There is no wire-level Decision error. Invalid protocol input, conflicting
+facts for the same key, or an invalid policy return raises a local
+`PathDecisionValidationError` on PE. Task-04 logs the local failure and sends
+no Result; DE converges through its single Decision deadline. Transport
+timeout, stale receiver, ACK, and delivery exhaustion belong to Task-03/04.
+An exception raised by a custom policy is retained as the same local-failure
+outcome and surfaced as a chained `PathDecisionValidationError`; it is never
+serialized.
 
 ## 10. Duplicate and policy-state contract
 
 `RoundRobinPathPolicy.choose()` is intentionally not a request registry. The
-PE `DualPathConnectorScheduler` integration in Task-04 must retain:
+PE integration in Task-04 must retain one decision record per active key. A
+successful record contains the concrete Result; a locally failed policy
+attempt retains `result=None` so Scheduler replay cannot invoke policy again:
 
 ```python
-_path_decisions: dict[
-    DualPathRequestKey,
-    tuple[PathDecisionRequest, PathDecisionCommit],
-]
+@dataclass(frozen=True)
+class _DecisionRecord:
+    request: PathDecisionRequest
+    result: PathDecisionResult | None
+
+
+_decision_records: dict[DualPathRequestKey, _DecisionRecord]
 ```
 
 The caller contract is:
@@ -238,20 +242,36 @@ The caller contract is:
 ```text
 new key
     -> apply the full-hit rule or invoke choose() once
-    -> retain request and commit
+    -> retain request and result
 
 same key + identical request
-    -> return the retained commit
-    -> do not invoke choose()
+    -> retained Result: return it
+    -> retained local failure: raise a local PathDecisionValidationError
+    -> never invoke choose() again
 
 same key + different request facts
-    -> PathDecisionError(CONFLICTING_REQUEST)
+    -> raise a local PathDecisionValidationError
     -> do not invoke choose()
+
+new key + policy exception or invalid policy result
+    -> retain one local-failure record
+    -> raise a local PathDecisionValidationError
+    -> send no Result
 ```
 
-Task-02 defines and unit-tests this semantic contract with frozen structural
-equality. Task-04 owns the real request map, terminal cleanup, and proof that a
-duplicate PE scheduling event does not call the policy twice.
+Only the first decision attempt for a key may change round-robin state. A
+conflicting duplicate or replay of a locally failed attempt must not call the
+policy. Task-03 owns transport retry/idempotency; retrying identical encoded
+bytes is not a new decision.
+
+Task-04 terminal cleanup calls an idempotent pure-logic release surface:
+
+```python
+decider.discard(request_key: DualPathRequestKey) -> None
+```
+
+`discard()` removes the retained record and does not rewind policy state. It
+performs no network or Scheduler operation.
 
 ## 11. Serialization contract
 
@@ -284,10 +304,14 @@ Focused CPU tests must cover:
 8. alternation across unique non-full requests;
 9. full requests do not advance round-robin state;
 10. identical duplicate semantics do not call `choose()` twice;
-11. conflicting duplicate facts produce a typed error;
-12. request, commit, and error serialization round trips;
-13. invalid path and malformed/untrusted payload rejection;
-14. a second test policy can satisfy `PathPolicy` without changing the caller.
+11. conflicting duplicate facts raise locally without a second policy call;
+12. policy exception and invalid return retain one local failure, and replay
+    raises locally without invoking policy again;
+13. idempotent `discard()` removes either retained outcome without rewinding
+    round-robin state;
+14. request and result serialization round trips;
+15. invalid path and malformed/untrusted payload rejection;
+16. a second test policy can satisfy `PathPolicy` without changing the caller.
 
 No Task-02 test may instantiate a real Scheduler, open a socket, call Proxy,
 construct Store Worker metadata, or observe Store/P2P I/O.
@@ -307,13 +331,13 @@ package structure, but Task-02 must not create transport or Scheduler files.
 
 ## 14. Out of scope
 
-- ZMQ endpoints, direct Commit delivery, ACK, retry, timeout, and shutdown.
+- ZMQ endpoints, direct Result delivery, ACK, retry, timeout, and shutdown.
 - Proxy changes or `/v1/path-decision`.
 - PE or DE Scheduler hooks and request-local runtime maps.
 - Store load, Reverse, Forward, Worker plans, or completion predicates.
 - Metrics collection or a metrics-driven policy implementation.
 - Policy configuration, registry, hot reload, or adaptive feedback.
-- A second decision attempt or post-commit fallback.
+- A second decision attempt or post-Result fallback.
 
 ## 15. Acceptance endpoint
 

@@ -18,14 +18,15 @@ re-admitted into a new Task detailed spec.
 
 ## Current baseline
 
-- Task-00 is complete: `DualPathConnector` is a selectable,
-  behavior-preserving `MooncakeLayerwiseConnector` subclass with dedicated
-  Scheduler and Worker subclass seams.
-- No DualPath Store decision, direct PE-to-DE decision channel, PE-owned path
-  commit, Store load, Forward, Reverse, or composite completion path is
-  implemented by Task-00.
-- The checked design baseline used to create this catalog is
-  `vllm-ascend@7c3983fce22b9c06aac05c57139973e08e53aa2a` with sibling
+- Task-00 through Task-03 source is present: the connector foundation, Decode
+  admission snapshot, PE-owned decision policy, and direct PE-to-DE result
+  channel are independently implemented and tested.
+- Task-04 remains a detailed design. Its protocol-reconciliation section owns
+  the small `PathDecisionResult` and received-result naming changes required
+  before the real Scheduler control loop is complete.
+- No Store load, Forward, Reverse, or composite completion path is active.
+- The latest checked source baseline for Task-04 is
+  `vllm-ascend@6761bb9c3f179e2c56f636c47051a9c31a98383d` with sibling
   `vllm@0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`.
 
 ## Documents
@@ -42,6 +43,9 @@ re-admitted into a new Task detailed spec.
   round-robin policy.
 - [`Task-03 detailed spec`](tasks/TASK-03-direct-decision-channel.md) defines
   the nested bootstrap metadata and minimal direct PE-to-DE ZMQ result channel.
+- [`Task-04 detailed spec`](tasks/TASK-04-scheduler-decision-control-loop.md)
+  connects the real DE/PE Connector Scheduler hooks, without activating a KV
+  data path.
 
 ## Decomposition rules
 

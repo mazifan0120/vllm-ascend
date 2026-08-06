@@ -51,7 +51,7 @@ The following requirements apply to every Task:
   tokens hit in Store.
 - Receiving real block IDs does not authorize a connector to start I/O.
 - The PE `DualPathConnectorScheduler` is the sole producer of
-  `PathDecisionCommit`.
+  `PathDecisionResult`.
 - Scheduler threads do not perform blocking network operations.
 - Proxy dispatches the real Prefill request and forwards the DE control
   endpoint, but it does not choose or relay a committed path.
@@ -105,7 +105,7 @@ fail-closed until Task-08 joins the tested `PE_READ` and split `DE_READ` paths.
 | 01 | Non-HBM-complete DE request allocates final slots and waits | None; request intentionally remains waiting |
 | 02 | Decision schemas, identity, and replaceable policy are executable pure logic | None |
 | 03 | Direct PE-to-DE decision delivery works with ACK, bounded retry, and observable exhaustion | None |
-| 04 | Real DE and PE `DualPathConnectorScheduler` hooks exchange one commit; no data I/O is authorized | None; fail-closed |
+| 04 | Real DE and PE `DualPathConnectorScheduler` hooks exchange one Result; no data I/O is authorized | None; fail-closed |
 | 05 | An injected committed `PE_READ` request completes through Forward | None; non-full policy remains fail-closed |
 | 06 | A Store-full committed `DE_READ` request completes through Decode Store | Deterministic full-hit `DE_READ` |
 | 07 | Injected non-full split plans execute on one bidirectional runtime | No non-full policy activation |
@@ -195,21 +195,23 @@ decision.
 
 **Merge-state contract:**
 
-Request identity, commit, error, the fixed full-hit rule, and a replaceable
-round-robin policy are executable and fully tested as pure logic. They have no
-Scheduler, network, Store, or P2P side effects.
+Request identity, one concrete result type, the fixed full-hit rule, and a
+replaceable round-robin policy are executable and fully tested as pure logic.
+They have no Scheduler, network, Store, or P2P side effects.
 
 **In scope:**
 
 - `DualPathRequestKey(decode_engine_instance_id, decode_request_id)`.
 - `Path.PE_READ` and `Path.DE_READ`.
-- Minimal `PathDecisionRequest`, commit, and typed error schemas with strict
-  validation; no public `StoreCoverage` or candidate type.
+- Minimal `PathDecisionRequest` and concrete `PathDecisionResult` schemas with
+  strict validation; no public `StoreCoverage`, candidate, Commit, or wire
+  Error type.
 - Fixed full-hit `Path.DE_READ` selection outside policy.
 - A lightweight `PathPolicy.choose(request)` protocol.
 - PE-owned `RoundRobinPathPolicy`: choose a random first non-full path, then
   alternate for subsequent unique non-full requests.
-- Identical and conflicting duplicate semantics without policy-state replay.
+- Identical duplicate replay and local conflicting-input rejection without
+  policy-state replay.
 - Serialization round trips and invalid/untrusted input rejection.
 
 **Out of scope:**
@@ -220,7 +222,7 @@ Scheduler, network, Store, or P2P side effects.
 **Acceptance endpoint:**
 
 Pure unit tests prove strict schemas, the full-hit invariant, seeded-random
-round-robin behavior, duplicate semantics, conflict rejection, and policy
+round-robin behavior, duplicate replay, local conflict rejection, and policy
 substitutability.
 
 The detailed contract is
@@ -234,7 +236,7 @@ The detailed contract is
 
 Establish a dedicated direct ZMQ control channel from the PE
 `PathDecisionCoordinator` to the DE `PathDecisionCoordinator` without routing
-the Commit back through Proxy.
+the Result back through Proxy.
 
 **Merge-state contract:**
 
@@ -243,9 +245,9 @@ Each DE Scheduler instance exposes one control endpoint derived from
 Engine instance ID. A nested `kv_transfer_params["dual_path"]` schema carries
 the Task-02 request and DE endpoint through the existing Proxy path. The PE
 Coordinator sends one immutable `PathDecision` directly to that endpoint with
-temporary REQ sockets. The DE Coordinator enqueues it exactly once, then
-returns `b"ACK"`. Delivery exhaustion is observable without a second decision
-attempt.
+temporary REQ sockets. The DE Coordinator makes its Result available exactly
+once, then returns `b"ACK"`. Delivery exhaustion is observable without a
+second decision attempt.
 
 **In scope:**
 
@@ -257,13 +259,13 @@ attempt.
   endpoint; Proxy forwards it unchanged and retains no decision Future.
 - A DE ZMQ `ROUTER` receiver and PE asynchronous temporary-REQ sender owned by
   their local `PathDecisionCoordinator` instances.
-- ACK semantics meaning only "validated and enqueued", not Scheduler
-  consumption or data readiness.
+- ACK semantics meaning only "validated, retained, and made available through
+  `take_received_results()`", not Scheduler consumption or data readiness.
 - Three attempts with a fresh REQ socket, one-second send and receive bounds,
   exact `b"ACK"`, and 0.1-second spacing; no NACK or persistent endpoint pool.
-- Minimal pending/accepted registries: identical duplicates ACK without a
-  second inbox event; conflicting, stale, unknown, and malformed input receive
-  no ACK.
+- Minimal pending/accepted registries and a received-result queue: identical
+  duplicates ACK without a second Result; conflicting, stale, unknown, and
+  malformed input receive no ACK.
 - Cancellation, delivery exhaustion, Coordinator shutdown, and terminal
   cleanup.
 - Direct-channel integration tests with constrained sender/receiver endpoints.
@@ -271,16 +273,16 @@ attempt.
 **Out of scope:**
 
 - Path selection inside the transport.
-- Proxy `/v1/path-decision`, decision Futures, or response-carried Commit.
+- Proxy `/v1/path-decision`, decision Futures, or response-carried Result.
 - Real per-request Scheduler hooks, DE Decision-wait timeout, and data-plane
   I/O.
 
 **Acceptance endpoint:**
 
-A direct-channel integration test proves request-driven endpoint use,
-Commit/error delivery, literal-ACK retry idempotency, stale/conflict silence,
-observable exhaustion, restart-safe identity, and clean endpoint shutdown
-without real per-request Scheduler hooks or data-plane I/O.
+A direct-channel integration test proves request-driven endpoint use, Result
+delivery, literal-ACK retry idempotency, stale/conflict silence, observable
+exhaustion, restart-safe identity, and clean endpoint shutdown without real
+per-request Scheduler hooks or data-plane I/O.
 
 The detailed contract is
 [`tasks/TASK-03-direct-decision-channel.md`](tasks/TASK-03-direct-decision-channel.md).
@@ -300,36 +302,46 @@ After Decode allocation, the DE `DualPathConnectorScheduler` registers the
 request with its Coordinator, freezes one `PathDecisionRequest`, and submits
 the Task-03 nested `dual_path` metadata through the existing Proxy path. The PE
 `DualPathConnectorScheduler` applies the fixed full-hit rule or invokes its
-policy once and commits one path. The DE Coordinator writes the direct result
-to a thread-safe inbox, and the DE Scheduler drains that inbox during
-`build_connector_meta()` on a later schedule tick. The DE request retains its
-final blocks and remains in `WAITING_FOR_REMOTE_KVS`.
+policy once and produces one `PathDecisionResult`. The DE Coordinator exposes
+the received Result once through `take_received_results()`, and the DE
+Scheduler consumes it during `build_connector_meta()` on a later schedule
+tick. The DE request retains its final blocks and remains in
+`WAITING_FOR_REMOTE_KVS`.
 
 **In scope:**
 
 - Non-blocking PE and DE `PathDecisionCoordinator` ownership.
 - Decision-request submission only after final DE block binding.
 - PE full-hit selection and unique non-full policy invocation.
-- PE `_path_decisions` ownership so identical duplicate requests replay the
-  same Commit and conflicting facts fail without advancing policy state.
-- Scheduler-thread decision inbox consumption on every connector metadata
+- PE retained-result ownership so identical duplicate requests replay the same
+  Result and conflicting facts fail locally without advancing policy state.
+- Scheduler-thread received-result consumption on every connector metadata
   build tick, including zero-model-token ticks.
-- Commit/error persistence, fail-closed timeout, cancellation, and duplicate
-  scheduling.
-- Fail-closed configuration and a no-Store/no-P2P closed-loop harness.
+- `VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT`, Result-or-timeout state,
+  cancellation, and duplicate scheduling.
+- Control-only timeout metadata that reuses the existing
+  `invalid_block_ids + finished_recving` failure path.
+- Decode-side single-KV-cache-group and `kv_load_failure_policy="fail"`
+  fail-fast validation.
+- A no-Store/no-P2P closed-loop harness. PE may compute temporarily, but its
+  DualPath request never enters `_reqs_need_send_layerwise`.
 
 **Out of scope:**
 
 - Scheduler-visible positive accounting for an active `DE_READ` route.
-- Store load, Forward, Reverse, or `finished_recving` publication.
+- Store load, Forward, Reverse, or successful `finished_recving` publication.
+- PE no-work/cancellation after a Result.
 - Production route activation.
 
 **Acceptance endpoint:**
 
 A control-plane integration test uses real Connector Scheduler hooks and
-proves one request reaches the fixed rule or PE policy and one immutable
-Commit reaches DE Scheduler state while both Workers observe no data
-operation.
+proves one request reaches the fixed rule or PE policy, one immutable Result
+reaches DE Scheduler state, and timeout becomes `FINISHED_ERROR`, while both
+Workers observe no Store or P2P operation.
+
+The detailed contract is
+[`tasks/TASK-04-scheduler-decision-control-loop.md`](tasks/TASK-04-scheduler-decision-control-loop.md).
 
 ## 11. Task-05 — `PE_READ` end-to-end
 
