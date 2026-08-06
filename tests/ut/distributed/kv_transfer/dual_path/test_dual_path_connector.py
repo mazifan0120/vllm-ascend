@@ -693,6 +693,8 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_path_decision_coordinator",
             "_path_decider",
             "_pe_request_keys",
+            "_pe_path_results",
+            "_pe_forward_plans",
             "_pe_delivery_futures",
             "_pe_invalid_request_ids",
         }
@@ -1446,6 +1448,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "__init__",
                 "_is_task01_decode_request",
                 "_handle_prefill_decision",
+                "_try_install_forward_plan",
                 "_sweep_pe_delivery",
                 "get_num_new_matched_tokens",
                 "update_state_after_alloc",
