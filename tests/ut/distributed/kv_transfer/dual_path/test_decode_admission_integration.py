@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Scheduler integration acceptance for DualPath Decode admission and timeout.
+"""Scheduler integration acceptance for DualPath Decode admission and completion.
 
 Uses the real vLLM v1 Scheduler on CPU with the real ``DualPathConnector``;
 only the KVPool backend module and the ``LookupKeyClient`` transport are
@@ -8,7 +8,10 @@ constrained at their existing seams. Proves that for ``L_DE < R`` one
 final blocks bound in a ``DecodeKVSnapshot``, and that an HBM-complete
 request takes the normal local path with no Task-01 state. It also proves that
 a Task-04 decision timeout reaches ``FINISHED_ERROR`` and releases delayed
-blocks through the Worker/Core relay.
+blocks through the Worker/Core relay. Task-06 coverage drives the complete
+DE-local Store-full success and probe/load-race failure lifecycles through the
+same real Scheduler, including final-token recomputation and delayed-block
+release without Proxy, PE, Decision, Forward, or Reverse activity.
 """
 
 import os
@@ -148,6 +151,29 @@ def _runner_output_for(requests: list[Request]) -> ModelRunnerOutput:
         pooler_output=None,
         kv_connector_output=KVConnectorOutput(finished_sending=set(), finished_recving=set()),
     )
+
+
+def _make_bare_worker() -> DualPathConnectorWorker:
+    worker = object.__new__(DualPathConnectorWorker)
+    worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
+    worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
+    worker.request_map = {}
+    worker.virtual_request = set()
+    worker._recving_metadata = {}
+    worker._invalid_block_ids = set()
+    worker._control_failed_recving = set()
+    worker._forward_receive_bindings = {}
+    worker._pending_forward_done = set()
+    worker._pending_forward_failed = set()
+    worker._consumed_forward_terminals = {}
+    worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), set())
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = set()
+    worker.engine = MagicMock(name="transfer_engine")
+    worker.block_size = [_BLOCK_SIZE]
+    return worker
 
 
 @pytest.fixture(autouse=True)
@@ -353,6 +379,218 @@ def test_hbm_complete_schedules_normally_without_task01_state(_constrain_kvpool_
     assert request.status == RequestStatus.RUNNING
 
 
+def test_store_full_success_completes_locally_and_recomputes_last_token(
+    _constrain_kvpool_seams,
+    scheduler,
+):
+    # Given
+    _constrain_kvpool_seams.return_value.lookup.return_value = 32
+    dual = _dual_scheduler(scheduler)
+    coordinator = dual._path_decision_coordinator
+    pool_scheduler = dual._kvpool_adapter._pool_scheduler
+    committed_specs = []
+    real_build_connector_meta = dual._kvpool_adapter.build_connector_meta
+
+    def capture_committed_spec(scheduler_output):
+        committed_specs.append(pool_scheduler.load_specs["req-de"])
+        return real_build_connector_meta(scheduler_output)
+
+    with (
+        patch.object(
+            dual._kvpool_adapter,
+            "build_connector_meta",
+            side_effect=capture_committed_spec,
+        ),
+        patch.object(dual, "_access_metaserver") as proxy_http,
+    ):
+        request, scheduler_output, matched_returns, lookup_mock, _, alloc_mock = _admit_one_request(scheduler)
+
+    snapshot = dual._decode_kv_snapshots[request.request_id]
+    metadata = scheduler_output.kv_connector_metadata
+    assert isinstance(metadata, DualPathConnectorMetadata)
+    store_metadata = metadata.decode_store_metadata
+    assert store_metadata is not None
+    assert matched_returns == [(32, True)]
+    assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 32
+    assert alloc_mock.call_args.kwargs["delay_cache_blocks"] is True
+    lookup_mock.assert_called_once()
+    assert snapshot.final_block_ids == tuple(
+        tuple(group) for group in scheduler.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+    )
+    assert snapshot.local_tokens == 0
+    assert snapshot.external_tokens == 32
+    assert snapshot.store_load_spec is not None
+    assert snapshot.store_load_spec.can_load is False
+    assert committed_specs[0] is not snapshot.store_load_spec
+    assert committed_specs[0].can_load is True
+    assert pool_scheduler._loading_req_ids == {request.request_id}
+    assert pool_scheduler.load_specs == {}
+    assert metadata.requests == {}
+    assert len(store_metadata.requests) == 1
+    store_request = store_metadata.requests[0]
+    assert store_request.req_id == request.request_id
+    assert store_request.target_token_len == 32
+    assert store_request.load_spec is committed_specs[0]
+    assert store_metadata.loading_req_ids == {request.request_id}
+    assert scheduler_output.num_scheduled_tokens.get(request.request_id, 0) == 0
+    assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert dual._decode_decision_states == {}
+    coordinator.register_pending.assert_not_called()
+    coordinator.submit.assert_not_called()
+    coordinator.unregister.assert_not_called()
+    proxy_http.assert_not_called()
+
+    worker = _make_bare_worker()
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {request.request_id})
+
+    # When
+    worker.start_load_kv(metadata)
+    finished_sending, finished_recving = worker.get_finished(set(), metadata)
+    connector_output = KVConnectorOutput(
+        finished_sending=finished_sending,
+        finished_recving=finished_recving,
+        invalid_block_ids=worker.get_block_ids_with_load_errors(),
+    )
+    runner_output = _runner_output_for([])
+    runner_output.kv_connector_output = connector_output
+    scheduler.update_from_output(scheduler_output, runner_output)
+    allocation_state = []
+    real_allocate_slots = scheduler.kv_cache_manager.allocate_slots
+
+    def capture_resumed_allocation(resumed_request, *args, **kwargs):
+        allocation_state.append((resumed_request.status, resumed_request.num_computed_tokens))
+        return real_allocate_slots(resumed_request, *args, **kwargs)
+
+    with patch.object(
+        scheduler.kv_cache_manager,
+        "allocate_slots",
+        side_effect=capture_resumed_allocation,
+    ):
+        resumed_output = scheduler.schedule()
+
+    # Then
+    assert connector_output.finished_recving == {request.request_id}
+    assert connector_output.invalid_block_ids == set()
+    assert allocation_state == [(RequestStatus.WAITING, 32)]
+    assert resumed_output.num_scheduled_tokens[request.request_id] == 1
+    assert request.status is RequestStatus.RUNNING
+    worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
+    worker._kvpool_worker_adapter.get_finished.assert_called_once_with(set(), store_metadata)
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.assert_called_once_with()
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.assert_called_once_with()
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.assert_called_once_with()
+    assert worker.engine.method_calls == []
+    assert worker._forward_receive_bindings == {}
+    assert dual._pe_request_keys == {}
+    assert dual._pe_path_results == {}
+    assert dual._pe_forward_plans == {}
+    assert dual._pe_forward_send_infos == {}
+    assert dual._pe_delivery_futures == {}
+    assert dual._reqs_need_recv == {}
+
+
+def test_store_full_failure_fails_closed_and_releases_delayed_blocks(
+    _constrain_kvpool_seams,
+    scheduler,
+):
+    # Given
+    prompt = list(range(33))
+    primer = _make_request("req-primer-store-failure", prompt[:17], None)
+    scheduler.add_request(primer)
+    primer_output = scheduler.schedule()
+    scheduler.update_from_output(primer_output, _runner_output_for([primer]))
+    scheduler.finish_requests([primer.request_id], RequestStatus.FINISHED_STOPPED)
+    block_pool = scheduler.kv_cache_manager.block_pool
+    baseline_free_blocks = block_pool.free_block_queue.num_free_blocks
+    _constrain_kvpool_seams.return_value.lookup.return_value = 32
+    dual = _dual_scheduler(scheduler)
+    coordinator = dual._path_decision_coordinator
+
+    request = _make_request(
+        "req-de-store-failure",
+        prompt,
+        {"do_remote_prefill": True, "do_virtual": True},
+    )
+    scheduler.add_request(request)
+    matched_returns = []
+    real_matched = scheduler.connector.get_num_new_matched_tokens
+
+    def capture_matched(admitted_request, num_computed_tokens):
+        result = real_matched(admitted_request, num_computed_tokens)
+        matched_returns.append(result)
+        return result
+
+    with (
+        patch.object(scheduler.connector, "get_num_new_matched_tokens", side_effect=capture_matched),
+        patch.object(
+            scheduler.kv_cache_manager,
+            "allocate_slots",
+            wraps=scheduler.kv_cache_manager.allocate_slots,
+        ) as alloc_mock,
+        patch.object(dual, "_access_metaserver") as proxy_http,
+    ):
+        scheduler_output = scheduler.schedule()
+
+    snapshot = dual._decode_kv_snapshots[request.request_id]
+    destination_blocks = snapshot.final_block_ids[0]
+    hbm_prefix_blocks = set(destination_blocks[:1])
+    failed_suffix_blocks = set(destination_blocks[1:2])
+    metadata = scheduler_output.kv_connector_metadata
+    assert isinstance(metadata, DualPathConnectorMetadata)
+    store_metadata = metadata.decode_store_metadata
+    assert store_metadata is not None
+    assert matched_returns == [(16, True)]
+    assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 16
+    assert alloc_mock.call_args.kwargs["delay_cache_blocks"] is True
+    assert snapshot.local_tokens == 16
+    assert snapshot.external_tokens == 16
+    assert len(destination_blocks) == 2
+    assert failed_suffix_blocks
+    assert block_pool.free_block_queue.num_free_blocks < baseline_free_blocks
+    assert scheduler_output.num_scheduled_tokens.get(request.request_id, 0) == 0
+    assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert dual._decode_decision_states == {}
+    coordinator.register_pending.assert_not_called()
+    coordinator.submit.assert_not_called()
+    coordinator.unregister.assert_not_called()
+    proxy_http.assert_not_called()
+
+    worker = _make_bare_worker()
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {request.request_id})
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = failed_suffix_blocks
+
+    # When
+    worker.start_load_kv(metadata)
+    finished_sending, finished_recving = worker.get_finished(set(), metadata)
+    connector_output = KVConnectorOutput(
+        finished_sending=finished_sending,
+        finished_recving=finished_recving,
+        invalid_block_ids=worker.get_block_ids_with_load_errors(),
+    )
+    runner_output = _runner_output_for([])
+    runner_output.kv_connector_output = connector_output
+    scheduler.update_from_output(scheduler_output, runner_output)
+
+    # Then
+    assert connector_output.finished_recving == {request.request_id}
+    assert connector_output.invalid_block_ids == failed_suffix_blocks
+    assert connector_output.invalid_block_ids.isdisjoint(hbm_prefix_blocks)
+    assert request.status is RequestStatus.FINISHED_ERROR
+    assert request.request_id not in scheduler.requests
+    assert block_pool.free_block_queue.num_free_blocks == baseline_free_blocks
+    worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
+    worker._kvpool_worker_adapter.get_finished.assert_called_once_with(set(), store_metadata)
+    assert worker.engine.method_calls == []
+    assert worker._forward_receive_bindings == {}
+    assert dual._decode_decision_states == {}
+    assert dual._pe_request_keys == {}
+    assert dual._pe_path_results == {}
+    assert dual._pe_forward_plans == {}
+    assert dual._pe_forward_send_infos == {}
+    assert dual._pe_delivery_futures == {}
+    assert dual._reqs_need_recv == {}
+
+
 class TestDecisionTimeoutIntegration:
     def test_timeout_output_finishes_request_and_releases_delayed_blocks(
         self,
@@ -409,25 +647,7 @@ class TestDecisionTimeoutIntegration:
                 )
             ]
 
-            worker = object.__new__(DualPathConnectorWorker)
-            worker.vllm_config = SimpleNamespace(
-                kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
-            )
-            worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
-            worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
-            worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
-            worker.request_map = {}
-            worker.virtual_request = set()
-            worker._recving_metadata = {}
-            worker._invalid_block_ids = set()
-            worker._control_failed_recving = set()
-            worker._forward_receive_bindings = {}
-            worker._pending_forward_done = set()
-            worker._pending_forward_failed = set()
-            worker._consumed_forward_terminals = {}
-            worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
-            worker.engine = MagicMock(name="transfer_engine")
-            worker.block_size = [16]
+            worker = _make_bare_worker()
 
             worker.start_load_kv(metadata)
             assert worker.kv_recv_layer_thread.method_calls == []
