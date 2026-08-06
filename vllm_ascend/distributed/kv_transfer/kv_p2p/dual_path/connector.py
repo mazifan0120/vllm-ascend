@@ -734,6 +734,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             state.proxy_future = None
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
+            self._pe_path_results.pop(request_id, None)
+            forward_plan = self._pe_forward_plans.pop(request_id, None)
+            send_req_info = self._reqs_need_send_layerwise.get(request_id)
+            if forward_plan is not None and send_req_info is not None and send_req_info.request is request:
+                self._reqs_need_send_layerwise.pop(request_id)
             released_key = self._pe_request_keys.pop(request_id, None)
             self._pe_invalid_request_ids.discard(request_id)
             self._sweep_pe_delivery(released_key)
@@ -750,6 +755,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             state.proxy_future = None
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
+            self._pe_path_results.pop(request_id, None)
+            forward_plan = self._pe_forward_plans.pop(request_id, None)
+            send_req_info = self._reqs_need_send_layerwise.get(request_id)
+            if forward_plan is not None and send_req_info is not None and send_req_info.request is request:
+                self._reqs_need_send_layerwise.pop(request_id)
             released_key = self._pe_request_keys.pop(request_id, None)
             self._pe_invalid_request_ids.discard(request_id)
             self._sweep_pe_delivery(released_key)
@@ -773,6 +783,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_kv_snapshots.clear()
         self._decode_decision_states.clear()
         self._pe_request_keys.clear()
+        self._pe_path_results.clear()
+        self._pe_forward_plans.clear()
         self._pe_delivery_futures.clear()
         self._pe_invalid_request_ids.clear()
         if self._kvpool_adapter is not None:

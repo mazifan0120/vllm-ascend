@@ -1,3 +1,4 @@
+import inspect
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -398,6 +399,98 @@ def test_de_read_result_creates_no_plan_no_send_queue_no_error(scheduler_factory
 
 
 @pytest.mark.parametrize(
+    ("method_name", "block_ids"),
+    [
+        ("request_finished", [10, 11, 12]),
+        ("request_finished_all_groups", ([10, 11, 12],)),
+    ],
+)
+def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
+    scheduler_factory,
+    method_name,
+    block_ids,
+):
+    parent_result = (True, {"owner": "parent"})
+    scheduler, _, _ = scheduler_factory()
+    request = _make_request(request_id="prefill-finish-unconsumed")
+    _decide(scheduler, request)
+    scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
+
+    with patch.object(
+        MooncakeLayerwiseConnectorScheduler,
+        method_name,
+        autospec=True,
+        return_value=parent_result,
+    ) as parent_finish:
+        assert getattr(scheduler, method_name)(request, block_ids) == parent_result
+        assert scheduler._pe_path_results == {}
+        assert scheduler._pe_forward_plans == {}
+        assert request.request_id not in scheduler._reqs_need_send_layerwise
+
+        replacement_request = _make_request(request_id=request.request_id)
+        replacement_send_info = SendReqInfo(
+            local_block_ids=[[90, 91, 92]],
+            local_transferred_tokens=16,
+            local_computed_tokens=0,
+            request=replacement_request,
+        )
+        scheduler._reqs_need_send_layerwise[request.request_id] = replacement_send_info
+        assert getattr(scheduler, method_name)(request, block_ids) == parent_result
+        assert scheduler._reqs_need_send_layerwise[request.request_id] is replacement_send_info
+
+        reused_scheduler, _, _ = scheduler_factory()
+        reused_request = _make_request(request_id="prefill-finish-reused-id")
+        _decide(reused_scheduler, reused_request)
+        reused_scheduler.update_state_after_alloc(reused_request, _blocks(([10, 11, 12],)), 0)
+        reused_replacement_request = _make_request(request_id=reused_request.request_id)
+        reused_replacement_send_info = SendReqInfo(
+            local_block_ids=[[80, 81, 82]],
+            local_transferred_tokens=16,
+            local_computed_tokens=0,
+            request=reused_replacement_request,
+        )
+        reused_scheduler._reqs_need_send_layerwise[reused_request.request_id] = reused_replacement_send_info
+        assert getattr(reused_scheduler, method_name)(reused_request, block_ids) == parent_result
+        assert reused_scheduler._pe_path_results == {}
+        assert reused_scheduler._pe_forward_plans == {}
+        assert reused_scheduler._reqs_need_send_layerwise[reused_request.request_id] is reused_replacement_send_info
+
+        consumed_scheduler, _, _ = scheduler_factory()
+        consumed_request = _make_request(request_id="prefill-finish-consumed")
+        _decide(consumed_scheduler, consumed_request)
+        consumed_scheduler.update_state_after_alloc(consumed_request, _blocks(([10, 11, 12],)), 0)
+        consumed_scheduler.build_connector_meta(
+            SimpleNamespace(
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[consumed_request.request_id],
+                    new_block_ids=[None],
+                    num_computed_tokens=[0],
+                ),
+                scheduled_spec_decode_tokens={},
+                scheduled_new_reqs=[],
+                num_scheduled_tokens={consumed_request.request_id: consumed_request.num_prompt_tokens},
+            )
+        )
+        assert consumed_request.request_id not in consumed_scheduler._reqs_need_send_layerwise
+        assert getattr(consumed_scheduler, method_name)(consumed_request, block_ids) == parent_result
+        assert consumed_scheduler._pe_path_results == {}
+        assert consumed_scheduler._pe_forward_plans == {}
+
+    assert parent_finish.call_count == 4
+
+    shutdown_scheduler, _, _ = scheduler_factory()
+    shutdown_request = _make_request(request_id="prefill-shutdown-records")
+    _decide(shutdown_scheduler, shutdown_request)
+    shutdown_scheduler.update_state_after_alloc(shutdown_request, _blocks(([10, 11, 12],)), 0)
+
+    shutdown_scheduler.shutdown()
+    shutdown_scheduler.shutdown()
+
+    assert shutdown_scheduler._pe_path_results == {}
+    assert shutdown_scheduler._pe_forward_plans == {}
+
+
+@pytest.mark.parametrize(
     "invalid_case",
     [
         "misaligned_token_start",
@@ -472,3 +565,19 @@ def test_non_block_aligned_T_selects_containing_final_block(parent_forward_metad
         parent_req_meta.prompt_len,
         dual_req_meta.local_computed_tokens,
     ) == (12, 12, token_end, token_end, token_end)
+
+
+def test_task05_methods_have_no_synchronous_waits():
+    task05_methods = (
+        connector_module.DualPathConnectorScheduler._try_install_forward_plan,
+        connector_module.DualPathConnectorScheduler.build_connector_meta,
+        connector_module.DualPathConnectorWorker._install_forward_receive_binding,
+        connector_module.DualPathConnectorWorker.start_load_kv,
+        connector_module.DualPathConnectorWorker.get_finished,
+    )
+    blocking_calls = (".result(", ".wait(", "time.sleep(", ".recv(")
+
+    for method in task05_methods:
+        source = inspect.getsource(method)
+        for blocking_call in blocking_calls:
+            assert blocking_call not in source, f"{method.__qualname__} contains {blocking_call}"

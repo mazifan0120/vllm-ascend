@@ -267,6 +267,29 @@ def test_committed_de_read_result_emits_no_binding(scheduler_factory):
     assert state.result is result
 
 
+def test_pe_read_never_calls_decode_kvpool_or_store_commit_surfaces(scheduler_factory):
+    # Given
+    scheduler, coordinator = scheduler_factory()
+    request, _, state = _admit_request(scheduler)
+    scheduler._kvpool_adapter.reset_mock()
+    coordinator.take_received_results.return_value = [
+        PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
+    ]
+    worker = _make_worker()
+
+    # When
+    metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+    binding = metadata.forward_receive_bindings[0]
+    worker.start_load_kv(metadata)
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
+    finished = worker.get_finished(set())
+
+    # Then
+    assert finished == (set(), {request.request_id})
+    assert scheduler._kvpool_adapter.method_calls == []
+    assert worker._kvpool_worker_adapter.method_calls == []
+
+
 def test_binding_install_starts_no_receive_or_load_request():
     # Given
     worker = _make_worker()

@@ -10,6 +10,7 @@ It is deterministic and stubs optional Mooncake/NPU extensions before imports.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -1510,6 +1511,15 @@ class TestDualPathFoundationGuards(unittest.TestCase):
         self.assertEqual(
             list(inspect.signature(MooncakeLayerwiseConnectorWorker.__init__).parameters),
             expected,
+        )
+
+    def test_parent_worker_get_finished_source_is_pinned(self):
+        # DualPath reimplements this method to retain early Forward terminals
+        # while mirroring every ordinary completion, failure, and cleanup rule.
+        source = inspect.getsource(MooncakeLayerwiseConnectorWorker.get_finished)
+        self.assertEqual(
+            hashlib.sha256(source.encode()).hexdigest(),
+            "3e430f6cb2b4f6dd23e9da6fc6fed45bfa61c433350f3928b9cba040cdc4f399",
         )
 
     def test_parent_facade_constructor_still_builds_parent_classes(self):
