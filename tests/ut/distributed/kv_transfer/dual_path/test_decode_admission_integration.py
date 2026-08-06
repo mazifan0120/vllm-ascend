@@ -36,6 +36,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # 
     DualPathConnector,
     DualPathConnectorScheduler,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
+    DecodeControlEndpoint,
+)
 
 _BLOCK_SIZE = 16
 _NONE_HASH_INITIALIZED = False
@@ -146,12 +149,18 @@ def _constrain_kvpool_seams():
         patch(
             "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient"
         ) as mock_lookup_client_cls,
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+        ) as coordinator_cls,
         patch(
             "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
             return_value="127.0.0.1",
         ),
     ):
+        decode_coordinator = MagicMock(name="decode_coordinator")
+        decode_coordinator.decode_engine_instance_id = "integration-engine:0:test-boot"
+        decode_coordinator.decode_control_endpoint = DecodeControlEndpoint(host="127.0.0.1", port=24001)
+        coordinator_cls.for_decode.return_value = decode_coordinator
         mock_importlib.import_module.return_value = MagicMock()
         yield mock_lookup_client_cls
 
@@ -184,7 +193,11 @@ def _admit_one_request(scheduler: Scheduler):
         matched_returns.append(result)
         return result
 
-    request = _make_request("req-de", list(range(33)), {"do_remote_prefill": True})
+    request = _make_request(
+        "req-de",
+        list(range(33)),
+        {"do_remote_prefill": True, "do_virtual": True},
+    )
     scheduler.add_request(request)
     with (
         patch.object(dual._kvpool_adapter, "lookup", wraps=dual._kvpool_adapter.lookup) as lookup_mock,
@@ -226,6 +239,7 @@ def _assert_admission_invariants(scheduler, request, scheduler_output, matched_r
     metadata = scheduler_output.kv_connector_metadata
     assert metadata is None or request.request_id not in metadata.requests
     assert dual._reqs_need_recv == {}
+    dual._path_decision_coordinator.register_pending.assert_called_once()
     # 8. no finished_recving completion is published
     scheduler.update_from_output(scheduler_output, _runner_output_for([]))
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -279,7 +293,11 @@ def test_hbm_complete_schedules_normally_without_task01_state(_constrain_kvpool_
     scheduler.finish_requests([primer.request_id], RequestStatus.FINISHED_STOPPED)
 
     lookup_spy = patch.object(dual._kvpool_adapter, "lookup", wraps=dual._kvpool_adapter.lookup)
-    request = _make_request("req-de-hbm", prompt, {"do_remote_prefill": True})
+    request = _make_request(
+        "req-de-hbm",
+        prompt,
+        {"do_remote_prefill": True, "do_virtual": True},
+    )
     scheduler.add_request(request)
     with lookup_spy as lookup_mock:
         scheduler_output = scheduler.schedule()

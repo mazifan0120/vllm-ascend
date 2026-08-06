@@ -16,6 +16,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # 
     DecodeKVSnapshot,
     DualPathConnectorScheduler,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
+    DecodeControlEndpoint,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (  # noqa: E402
     LoadSpec,
 )
@@ -29,6 +32,7 @@ def _make_vllm_config(kv_role="kv_consumer"):
     config.kv_transfer_config.is_kv_consumer = kv_role in {"kv_consumer", "kv_both"}
     config.kv_transfer_config.engine_id = "test_engine"
     config.kv_transfer_config.kv_port = 5000
+    config.kv_transfer_config.kv_load_failure_policy = "fail"
     config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {"tls_config": {}}.get(
         key, default
     )
@@ -36,6 +40,7 @@ def _make_vllm_config(kv_role="kv_consumer"):
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.tensor_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
     config.cache_config.block_size = 16
     config.scheduler_config.disable_hybrid_kv_cache_manager = True
     return config
@@ -78,7 +83,12 @@ class TestDecodeAdmission(unittest.TestCase):
         self._derive_control_port_patch = patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100)
         self._adapter_patch.start()
         self._worker_adapter_patch.start()
-        self._coordinator_patch.start()
+        coordinator_cls = self._coordinator_patch.start()
+        self.coordinator = MagicMock(name="decode_coordinator")
+        self.coordinator.decode_engine_instance_id = "test_engine:0:test-boot"
+        self.coordinator.decode_control_endpoint = DecodeControlEndpoint(host="127.0.0.1", port=7100)
+        coordinator_cls.for_decode.return_value = self.coordinator
+        coordinator_cls.for_prefill.return_value = MagicMock(name="prefill_coordinator")
         self._get_ip_patch.start()
         self._derive_control_port_patch.start()
         self.addCleanup(self._adapter_patch.stop)
@@ -112,6 +122,9 @@ class TestDecodeAdmission(unittest.TestCase):
         self.scheduler._kvpool_adapter.lookup.assert_not_called()
         self.assertEqual(self.scheduler._lookup_results, {})
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
+        self.assertEqual(self.scheduler._decode_decision_states, {})
+        self.coordinator.register_pending.assert_not_called()
+        self.scheduler.executor.submit.assert_not_called()
 
     def test_full_partial_miss_all_return_same_external_delta(self):
         full_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=False)
@@ -142,6 +155,9 @@ class TestDecodeAdmission(unittest.TestCase):
         self.assertIs(snapshot.store_load_spec, spec)
         self.assertEqual(snapshot.final_block_ids, ((7, 8), (9,)))
         self.assertEqual(len(self.scheduler._decode_kv_snapshots), 1)
+        self.coordinator.register_pending.assert_called_once()
+        self.scheduler.executor.submit.assert_called_once()
+        self.assertFalse(request.kv_transfer_params["do_remote_prefill"])
 
     def test_snapshot_derives_local_and_store_tokens(self):
         spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
@@ -241,6 +257,7 @@ class TestDecodeAdmission(unittest.TestCase):
     def test_reprobe_of_admitted_request_raises(self):
         request = _make_request("req-reprobe", 48, _selected_params())
         self._admit(request, 16)
+        request.kv_transfer_params["do_remote_prefill"] = True
         with self.assertRaisesRegex(RuntimeError, "already admitted"):
             self.scheduler.get_num_new_matched_tokens(request, 16)
 
@@ -248,8 +265,9 @@ class TestDecodeAdmission(unittest.TestCase):
         request = _make_request("req-skip", 48, _selected_params())
         self._admit(request, 16)
         self.assertEqual(self.scheduler._reqs_need_recv, {})
-        self.assertTrue(request.kv_transfer_params["do_remote_prefill"])
-        self.scheduler.executor.submit.assert_not_called()
+        self.assertFalse(request.kv_transfer_params["do_remote_prefill"])
+        self.coordinator.register_pending.assert_called_once()
+        self.scheduler.executor.submit.assert_called_once()
 
     def test_prefill_role_and_plain_decode_delegate_to_parent(self):
         prefill_scheduler = DualPathConnectorScheduler(
@@ -289,6 +307,7 @@ class TestDecodeAdmission(unittest.TestCase):
         self.scheduler.shutdown()
         self.assertEqual(self.scheduler._lookup_results, {})
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
+        self.assertEqual(self.scheduler._decode_decision_states, {})
         self.scheduler._kvpool_adapter.close.assert_called_once()
 
     def test_hbm_complete_alloc_callback_creates_no_state_and_skips_parent(self):
@@ -296,9 +315,11 @@ class TestDecodeAdmission(unittest.TestCase):
         self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 47), (0, False))
         self.scheduler.update_state_after_alloc(request, _make_blocks(((1, 2, 3),)), 0)
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
+        self.assertEqual(self.scheduler._decode_decision_states, {})
         self.assertEqual(self.scheduler._lookup_results, {})
         self.assertEqual(self.scheduler._reqs_need_recv, {})
         self.assertTrue(request.kv_transfer_params["do_remote_prefill"])
+        self.coordinator.register_pending.assert_not_called()
         self.scheduler.executor.submit.assert_not_called()
 
 

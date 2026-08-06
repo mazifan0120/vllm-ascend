@@ -110,6 +110,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # DualPath Decode decision timeout in integer seconds. The default is 60,
+    # the valid range is greater than zero, and this value is not sensitive.
+    "VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT": lambda: int(os.getenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", "60")),
 }
 
 # end-env-vars-definition

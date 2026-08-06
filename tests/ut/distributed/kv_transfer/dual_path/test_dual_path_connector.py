@@ -76,6 +76,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # 
     DualPathConnectorScheduler,
     DualPathConnectorWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
+    DecodeControlEndpoint,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (  # noqa: E402
     MooncakeLayerwiseConnector,
     MooncakeLayerwiseConnectorMetadata,
@@ -100,12 +103,19 @@ def _patch_task01_adapters():
     with (
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolWorkerAdapter"),
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+        ) as coordinator_cls,
         patch(
             "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
             return_value="127.0.0.1",
         ),
     ):
+        decode_coordinator = MagicMock(name="decode_coordinator")
+        decode_coordinator.decode_engine_instance_id = "test_engine:0:test-boot"
+        decode_coordinator.decode_control_endpoint = DecodeControlEndpoint(host="127.0.0.1", port=7100)
+        coordinator_cls.for_decode.return_value = decode_coordinator
+        coordinator_cls.for_prefill.return_value = MagicMock(name="prefill_coordinator")
         yield
 
 
@@ -143,6 +153,7 @@ class MockVllmConfig:
 
         self.kv_transfer_config.engine_id = "test_engine"
         self.kv_transfer_config.kv_port = 5000
+        self.kv_transfer_config.kv_load_failure_policy = "fail"
         self.kv_transfer_config.kv_role = kv_role
         self.kv_transfer_config.is_kv_producer = kv_role in {"kv_producer", "kv_both"}
         self.kv_transfer_config.is_kv_consumer = kv_role in {"kv_consumer", "kv_both"}
@@ -675,6 +686,8 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_kvpool_adapter",
             "_lookup_results",
             "_decode_kv_snapshots",
+            "_decode_decision_states",
+            "_decision_timeout_seconds",
             "_accepting_task01",
             "_path_decision_coordinator",
         }
@@ -825,15 +838,17 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         # and binds a DecodeKVSnapshot without touching parent machinery.
         self.assertEqual(dual_match, (3, True))
         self.assertEqual(dual._reqs_need_recv, {})
-        self.assertTrue(dual_request.kv_transfer_params["do_remote_prefill"])
-        self.assertEqual(dual.executor.submit.call_count, 0)
-        self.assertEqual(dual_future.add_done_callback.call_count, 0)
+        self.assertFalse(dual_request.kv_transfer_params["do_remote_prefill"])
+        self.assertEqual(dual.executor.submit.call_count, 1)
+        self.assertEqual(dual_future.add_done_callback.call_count, 1)
+        dual._path_decision_coordinator.register_pending.assert_called_once()
         self.assertEqual(dual._lookup_results, {})
         snapshot = dual._decode_kv_snapshots["req-load"]
         self.assertEqual(snapshot.target_tokens, 3)
         self.assertEqual(snapshot.external_tokens, 3)
         self.assertIsNone(snapshot.store_load_spec)
         self.assertEqual(snapshot.final_block_ids, ((4, 5, 6),))
+        self.assertIn("req-load", dual._decode_decision_states)
         self.assertNotIn("req-load", dual.build_connector_meta(MockSchedulerOutput()).requests)
 
         # Parent metadata still carries the legacy recv entry; Task-01 metadata does not.
@@ -953,10 +968,11 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(parent_match, (16, True))
         self.assertEqual(dual_match, parent_match)
         self.assertEqual(parent.executor.submit.call_count, 1)
-        self.assertEqual(dual.executor.submit.call_count, 0)
+        self.assertEqual(dual.executor.submit.call_count, 1)
         self.assertEqual(parent.executor.submit.call_args.kwargs["message"]["remote_block_ids"], ([4],))
+        self.assertEqual(dual.executor.submit.call_args.kwargs["message"]["remote_block_ids"], ([4],))
         self.assertEqual(dual._reqs_need_recv, {})
-        self.assertTrue(dual_load.kv_transfer_params["do_remote_prefill"])
+        self.assertFalse(dual_load.kv_transfer_params["do_remote_prefill"])
         snapshot = dual._decode_kv_snapshots["req-hybrid-load"]
         self.assertEqual(snapshot.target_tokens, 16)
         self.assertEqual(snapshot.final_block_ids, ((4, 5),))
@@ -996,8 +1012,10 @@ class TestDualPathBehaviorParity(unittest.TestCase):
 
         self.assertEqual(dual_match, (23, True))
         self.assertEqual(dual._reqs_need_recv, {})
-        self.assertTrue(dual_request.kv_transfer_params["do_remote_prefill"])
+        self.assertFalse(dual_request.kv_transfer_params["do_remote_prefill"])
         self.assertEqual(dual.executor.submit.call_count, 0)
+        self.assertIn("req-alloc", dual._decode_decision_states)
+        dual._path_decision_coordinator.register_pending.assert_called_once()
         snapshot = dual._decode_kv_snapshots["req-alloc"]
         self.assertEqual(snapshot.target_tokens, 23)
         self.assertEqual(snapshot.external_tokens, 23)

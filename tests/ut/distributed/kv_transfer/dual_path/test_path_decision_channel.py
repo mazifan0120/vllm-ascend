@@ -917,6 +917,7 @@ def _make_scheduler_vllm_config(
     config.scheduler_config.disable_hybrid_kv_cache_manager = True
     config.kv_transfer_config.engine_id = "test_engine"
     config.kv_transfer_config.kv_port = kv_port
+    config.kv_transfer_config.kv_load_failure_policy = "fail"
     config.kv_transfer_config.kv_role = kv_role
     config.kv_transfer_config.is_kv_producer = kv_role in {"kv_producer", "kv_both"}
     config.kv_transfer_config.is_kv_consumer = kv_role in {"kv_consumer", "kv_both"}
