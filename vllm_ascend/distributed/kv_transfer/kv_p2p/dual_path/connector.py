@@ -260,14 +260,19 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         request: Request,
         parent_result: tuple[int, bool],
     ) -> tuple[int, bool]:
-        if not self._accepting_pe_decisions:
+        params = request.kv_transfer_params
+        if (
+            not self._accepting_pe_decisions
+            or self.dual_path_cfg.role != "prefill"
+            or params is None
+            or params.get("do_remote_decode") is not True
+            or "dual_path" not in params
+        ):
             return parent_result
         self._sweep_pe_delivery()
 
-        params = request.kv_transfer_params
-        assert params is not None
         request_id = request.request_id
-        if "dual_path" not in params or request_id in self._pe_invalid_request_ids:
+        if request_id in self._pe_invalid_request_ids:
             return parent_result
 
         try:
@@ -377,12 +382,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
 
         request_id = request.request_id
-        allocated_block_ids = blocks.get_block_ids()
-        frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
         target_tokens = max(request.num_tokens - 1, 0)
 
         existing = self._decode_kv_snapshots.get(request_id)
         if existing is not None:
+            allocated_block_ids = blocks.get_block_ids()
+            frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
             if (
                 existing.target_tokens == target_tokens
                 and existing.external_tokens == num_external_tokens
@@ -425,6 +430,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     f"{detached_spec.kvpool_cached_tokens} outside ({local_tokens}, {target_tokens}]"
                 )
 
+        allocated_block_ids = blocks.get_block_ids()
+        frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
         snapshot = DecodeKVSnapshot(
             target_tokens=target_tokens,
             external_tokens=num_external_tokens,
@@ -505,6 +512,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     ) -> MooncakeLayerwiseConnectorMetadata:
         parent_metadata = super().build_connector_meta(scheduler_output)
         if self.dual_path_cfg.role != "decode":
+            self._sweep_pe_delivery()
             return parent_metadata
 
         metadata = DualPathConnectorMetadata()
@@ -591,6 +599,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._accepting_task01 = False
         self._accepting_pe_decisions = False
         self._path_decision_coordinator.close()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.metaserver_client.close()
         for state in self._decode_decision_states.values():
             state.proxy_future = None
         if self._path_decider is not None:

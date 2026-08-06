@@ -713,6 +713,26 @@ class TestDualPathConstructionParity(unittest.TestCase):
         )
         self.assertFalse(hasattr(scheduler, "_req_path"))
 
+    def test_scheduler_shutdown_closes_inherited_resources_idempotently(self):
+        scheduler = DualPathConnectorScheduler(
+            MockVllmConfig("prefill", "kv_producer"),
+            MockKVCacheConfig(),
+            "test_engine",
+            DualPathConfig(role="prefill"),
+        )
+        executor = scheduler.executor
+        metaserver_client = scheduler.metaserver_client
+
+        try:
+            scheduler.shutdown()
+            scheduler.shutdown()
+
+            self.assertTrue(executor._shutdown)
+            self.assertTrue(metaserver_client.is_closed)
+        finally:
+            executor.shutdown(wait=False)
+            metaserver_client.close()
+
     def test_worker_construction_adds_no_threads_beyond_parent(self):
         parent_config = MockVllmConfig("prefill", "kv_producer")
         dual_config = MockVllmConfig("prefill", "kv_producer")
@@ -820,6 +840,27 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(parent._reqs_need_recv, dual._reqs_need_recv)
         self.assertEqual(parent._reqs_need_send_layerwise, dual._reqs_need_send_layerwise)
         self.assertEqual(parent.executor.submit.call_args_list, dual.executor.submit.call_args_list)
+
+    def test_no_remote_transfer_allocation_matches_parent_block_access(self):
+        parent, dual = self.make_scheduler_pair("prefill", "kv_producer")
+        parent_request = MockRequest("req-none")
+        dual_request = MockRequest("req-none")
+        parent_blocks = MagicMock(name="parent_blocks")
+        dual_blocks = MagicMock(name="dual_blocks")
+        parent_method = MooncakeLayerwiseConnectorScheduler.update_state_after_alloc
+
+        parent.update_state_after_alloc(parent_request, parent_blocks, 0)
+        with patch.object(
+            MooncakeLayerwiseConnectorScheduler,
+            "update_state_after_alloc",
+            autospec=True,
+            side_effect=parent_method,
+        ) as parent_spy:
+            dual.update_state_after_alloc(dual_request, dual_blocks, 0)
+
+        parent_spy.assert_called_once_with(dual, dual_request, dual_blocks, 0)
+        self.assertEqual(parent_blocks.get_block_ids.call_count, 0)
+        self.assertEqual(dual_blocks.get_block_ids.call_count, parent_blocks.get_block_ids.call_count)
 
     def test_decode_remote_prefill_routes_to_task01_admission(self):
         parent, dual = self.make_scheduler_pair("decode", "kv_consumer")

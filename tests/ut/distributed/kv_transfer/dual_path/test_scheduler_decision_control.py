@@ -505,6 +505,50 @@ class TestPrefillDecisionHook:
 
         task04_seams.prefill_coordinator.submit.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "params",
+        [
+            pytest.param(
+                {"dual_path": _prefill_decision_payload()},
+                id="missing-do-remote-decode",
+            ),
+            pytest.param(
+                {
+                    "do_remote_decode": False,
+                    "dual_path": _prefill_decision_payload(),
+                },
+                id="false-do-remote-decode",
+            ),
+        ],
+    )
+    def test_valid_envelope_without_true_remote_decode_does_not_activate_decision(
+        self,
+        params,
+        scheduler_factory,
+        task04_seams,
+    ):
+        # Given
+        policy = MagicMock(name="path_policy")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-not-remote-decode", params)
+        parent_result = (7, True)
+
+        # When
+        with patch.object(
+            connector_module.MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            return_value=parent_result,
+        ):
+            result = scheduler.get_num_new_matched_tokens(request, 0)
+
+        # Then
+        assert result == parent_result
+        policy.choose.assert_not_called()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+        assert scheduler._pe_request_keys == {}
+        assert scheduler._pe_delivery_futures == {}
+
     def test_full_hit_bypasses_policy_and_submits_de_read(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -972,11 +1016,7 @@ class TestCleanupAndShutdown:
             discard.assert_not_called()
 
             delivery_future.set_result(None)
-            sweep_trigger = _make_prefill_request(
-                "prefill-sweep-trigger",
-                _remote_decode_params(include_dual_path=False),
-            )
-            scheduler.get_num_new_matched_tokens(sweep_trigger, 0)
+            scheduler.build_connector_meta(MagicMock(name="idle_scheduler_output"))
 
         # Then
         discard.assert_called_once_with(request_key)
@@ -1059,8 +1099,21 @@ class TestCleanupAndShutdown:
             )
         ]
 
-    def test_concurrent_requests_stay_isolated_across_outcomes(self, decode_scheduler, task04_seams):
+    def test_concurrent_requests_stay_isolated_across_outcomes(
+        self,
+        decode_scheduler,
+        scheduler_factory,
+        task04_seams,
+    ):
         # Given
+        committed_proxy_future = _completed_future()
+        timed_out_proxy_future = _completed_future()
+        cancelled_proxy_future = _completed_future()
+        decode_scheduler.executor.submit.side_effect = [
+            committed_proxy_future,
+            timed_out_proxy_future,
+            cancelled_proxy_future,
+        ]
         committed_request, _ = _admit_request(
             decode_scheduler,
             _make_request(request_id="request-committed"),
@@ -1079,6 +1132,35 @@ class TestCleanupAndShutdown:
         committed_state = decode_scheduler._decode_decision_states[committed_request.request_id]
         timed_out_state = decode_scheduler._decode_decision_states[timed_out_request.request_id]
         cancelled_state = decode_scheduler._decode_decision_states[cancelled_request.request_id]
+        assert committed_state.proxy_future is committed_proxy_future
+        assert timed_out_state.proxy_future is timed_out_proxy_future
+        assert cancelled_state.proxy_future is cancelled_proxy_future
+
+        completed_delivery_future = _completed_future()
+        inflight_delivery_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.side_effect = [
+            completed_delivery_future,
+            inflight_delivery_future,
+        ]
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.PE_READ
+        prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        committed_prefill_request = _make_prefill_request(
+            "prefill-committed",
+            _remote_decode_params(
+                dual_path=_prefill_decision_payload(decode_request_id=committed_request.request_id),
+            ),
+        )
+        inflight_prefill_request = _make_prefill_request(
+            "prefill-inflight",
+            _remote_decode_params(
+                dual_path=_prefill_decision_payload(decode_request_id=timed_out_request.request_id),
+            ),
+        )
+        prefill_scheduler.get_num_new_matched_tokens(committed_prefill_request, 0)
+        prefill_scheduler.get_num_new_matched_tokens(inflight_prefill_request, 0)
+        prefill_scheduler.request_finished(committed_prefill_request, [4, 5])
+
         task04_seams.decode_coordinator.take_received_results.return_value = [_result(committed_request.request_id)]
         with patch.object(connector_module.time, "monotonic", return_value=0.0):
             decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
@@ -1097,16 +1179,42 @@ class TestCleanupAndShutdown:
             committed_request.request_id,
             timed_out_request.request_id,
         }
+        assert set(decode_scheduler._decode_kv_snapshots) == {
+            committed_request.request_id,
+            timed_out_request.request_id,
+        }
+        assert committed_state.proxy_future is committed_proxy_future
+        assert timed_out_state.proxy_future is timed_out_proxy_future
+        assert cancelled_state.proxy_future is None
         assert timeout_metadata.decision_timeouts == [
             connector_module.DecisionTimeoutMetadata(
                 request_id=timed_out_request.request_id,
                 external_block_ids=(52, 53, 54),
             )
         ]
+        assert task04_seams.decode_coordinator.register_pending.call_args_list == [
+            call(committed_state.request_key),
+            call(timed_out_state.request_key),
+            call(cancelled_state.request_key),
+        ]
         assert task04_seams.decode_coordinator.unregister.call_args_list == [
             call(cancelled_state.request_key),
             call(timed_out_state.request_key),
         ]
+        assert [
+            submitted.args[1].result.request_key for submitted in task04_seams.prefill_coordinator.submit.call_args_list
+        ] == [committed_state.request_key, timed_out_state.request_key]
+        assert completed_delivery_future is not inflight_delivery_future
+        assert prefill_scheduler._pe_request_keys == {
+            inflight_prefill_request.request_id: timed_out_state.request_key,
+        }
+        assert prefill_scheduler._pe_delivery_futures == {
+            timed_out_state.request_key: inflight_delivery_future,
+        }
+        assert not inflight_delivery_future.done()
+        assert prefill_scheduler._path_decider is not None
+        assert set(prefill_scheduler._path_decider._decision_records) == {timed_out_state.request_key}
+        assert policy.choose.call_count == 2
 
         decode_scheduler.request_finished(committed_request, [41, 42, 43, 44])
         decode_scheduler.request_finished(timed_out_request, [51, 52, 53, 54])
@@ -1121,7 +1229,6 @@ class TestCleanupAndShutdown:
             call(committed_state.request_key),
             call(timed_out_state.request_key),
         ]
-        assert task04_seams.decode_coordinator.register_pending.call_count == 3
         assert decode_scheduler.executor.submit.call_count == 3
 
     def test_shutdown_is_idempotent_and_leaves_no_owned_state(self, scheduler_factory, task04_seams):
