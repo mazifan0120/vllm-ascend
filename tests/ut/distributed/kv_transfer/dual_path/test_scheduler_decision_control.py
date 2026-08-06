@@ -23,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     PathDecision,
+    PathDecisionDeliveryError,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     LoadSpec,
@@ -66,9 +67,13 @@ def _make_kv_cache_config(*, group_count: int = 1) -> SimpleNamespace:
     return SimpleNamespace(kv_cache_groups=groups, kv_cache_tensors=[], num_blocks=64)
 
 
-def _make_request(params: dict | None = None) -> SimpleNamespace:
+def _make_request(
+    params: dict | None = None,
+    *,
+    request_id: str = "request-local-7",
+) -> SimpleNamespace:
     return SimpleNamespace(
-        request_id="request-local-7",
+        request_id=request_id,
         num_tokens=49,
         prompt_token_ids=list(range(49)),
         kv_transfer_params=params or {"do_remote_prefill": True, "metaserver": "http://proxy.example/v1/kv"},
@@ -156,15 +161,19 @@ def proxy_echo():
     return echo
 
 
-def _admit(scheduler, params: dict | None = None):
-    request = _make_request(params)
+def _admit_request(scheduler, request: SimpleNamespace, block_ids: tuple[int, ...]):
     load_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
     scheduler._kvpool_adapter.lookup.return_value = load_spec
     assert scheduler.get_num_new_matched_tokens(request, 16) == (32, True)
     blocks = MagicMock()
-    blocks.get_block_ids.return_value = ([41, 42, 43, 44],)
+    blocks.get_block_ids.return_value = (list(block_ids),)
     scheduler.update_state_after_alloc(request, blocks, 32)
     return request, blocks
+
+
+def _admit(scheduler, params: dict | None = None):
+    request = _make_request(params)
+    return _admit_request(scheduler, request, (41, 42, 43, 44))
 
 
 def _result(request_id: str = "request-local-7") -> PathDecisionResult:
@@ -847,3 +856,370 @@ class TestWorkerFailureRelay:
         assert invalid_block_ids == {42, 43, 44}
         assert worker.get_finished() == (set(), set())
         assert worker.get_block_ids_with_load_errors() == set()
+
+
+class TestCleanupAndShutdown:
+    @pytest.mark.parametrize(
+        ("method_name", "block_ids"),
+        [
+            ("request_finished", [41, 42, 43, 44]),
+            ("request_finished_all_groups", ([41, 42, 43, 44],)),
+        ],
+    )
+    def test_cancellation_before_result_cleans_all_state(
+        self,
+        method_name,
+        block_ids,
+        decode_scheduler,
+        task04_seams,
+    ):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        parent_result = (True, {"owner": "parent"})
+
+        # When
+        with patch.object(
+            connector_module.MooncakeLayerwiseConnectorScheduler,
+            method_name,
+            autospec=True,
+            return_value=parent_result,
+        ) as parent_finish:
+            result = getattr(decode_scheduler, method_name)(request, block_ids)
+
+        # Then
+        assert result == parent_result
+        assert decode_scheduler._lookup_results == {}
+        assert decode_scheduler._decode_kv_snapshots == {}
+        assert decode_scheduler._decode_decision_states == {}
+        assert state.proxy_future is None
+        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+        parent_finish.assert_called_once_with(decode_scheduler, request, block_ids)
+
+    def test_cancellation_after_commit_unregisters_first_time(self, decode_scheduler, task04_seams):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        task04_seams.decode_coordinator.take_received_results.return_value = [_result()]
+        decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+        task04_seams.decode_coordinator.unregister.assert_not_called()
+
+        # When
+        result = decode_scheduler.request_finished(request, [41, 42, 43, 44])
+
+        # Then
+        assert result == (False, None)
+        assert request.request_id not in decode_scheduler._decode_decision_states
+        assert state.proxy_future is None
+        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+
+    def test_cancellation_after_timeout_unregisters_idempotently(self, decode_scheduler, task04_seams):
+        # Given
+        request, _ = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        task04_seams.decode_coordinator.take_received_results.return_value = []
+        with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
+            decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+
+        # When
+        result = decode_scheduler.request_finished(request, [41, 42, 43, 44])
+
+        # Then
+        assert result == (False, None)
+        assert request.request_id not in decode_scheduler._decode_decision_states
+        assert state.proxy_future is None
+        assert task04_seams.decode_coordinator.unregister.call_args_list == [
+            call(state.request_key),
+            call(state.request_key),
+        ]
+
+    @pytest.mark.parametrize(
+        ("method_name", "block_ids"),
+        [
+            ("request_finished", [4, 5]),
+            ("request_finished_all_groups", ([4, 5],)),
+        ],
+    )
+    def test_pe_finish_during_inflight_delivery_defers_then_sweeps(
+        self,
+        method_name,
+        block_ids,
+        scheduler_factory,
+        task04_seams,
+    ):
+        # Given
+        delivery_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-inflight", _remote_decode_params())
+        scheduler.get_num_new_matched_tokens(request, 0)
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+        assert scheduler._path_decider is not None
+
+        # When
+        with patch.object(
+            scheduler._path_decider,
+            "discard",
+            wraps=scheduler._path_decider.discard,
+        ) as discard:
+            getattr(scheduler, method_name)(request, block_ids)
+            assert request.request_id not in scheduler._pe_request_keys
+            assert scheduler._pe_delivery_futures == {request_key: delivery_future}
+            discard.assert_not_called()
+
+            delivery_future.set_result(None)
+            sweep_trigger = _make_prefill_request(
+                "prefill-sweep-trigger",
+                _remote_decode_params(include_dual_path=False),
+            )
+            scheduler.get_num_new_matched_tokens(sweep_trigger, 0)
+
+        # Then
+        discard.assert_called_once_with(request_key)
+        assert scheduler._pe_delivery_futures == {}
+        assert request_key not in scheduler._path_decider._decision_records
+
+    @pytest.mark.parametrize(
+        ("method_name", "block_ids"),
+        [
+            ("request_finished", [4, 5]),
+            ("request_finished_all_groups", ([4, 5],)),
+        ],
+    )
+    def test_pe_finish_clears_invalid_request_marker(
+        self,
+        method_name,
+        block_ids,
+        scheduler_factory,
+    ):
+        # Given
+        scheduler = scheduler_factory(role="prefill")
+        request = _make_prefill_request(
+            "prefill-invalid-cleanup",
+            _remote_decode_params(dual_path={"malformed": True}),
+        )
+        scheduler.get_num_new_matched_tokens(request, 0)
+        assert scheduler._pe_invalid_request_ids == {request.request_id}
+
+        # When
+        result = getattr(scheduler, method_name)(request, block_ids)
+
+        # Then
+        assert result == (False, None)
+        assert scheduler._pe_invalid_request_ids == set()
+
+    def test_delivery_exhaustion_converges_to_de_timeout_without_redecision(
+        self,
+        scheduler_factory,
+        task04_seams,
+    ):
+        # Given
+        decode_scheduler = scheduler_factory(role="decode")
+        decode_request, _ = _admit(decode_scheduler)
+        decode_state = decode_scheduler._decode_decision_states[decode_request.request_id]
+        task04_seams.decode_coordinator.take_received_results.return_value = []
+
+        delivery_error = PathDecisionDeliveryError("delivery exhausted")
+        delivery_future: Future[None] = Future()
+        delivery_future.set_exception(delivery_error)
+        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.PE_READ
+        prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        prefill_request = _make_prefill_request(
+            "prefill-delivery-failure",
+            _remote_decode_params(
+                dual_path=_prefill_decision_payload(decode_request_id=decode_request.request_id),
+            ),
+        )
+
+        # When
+        with patch.object(connector_module.logger, "error") as log_error:
+            prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
+            prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
+        with patch.object(connector_module.time, "monotonic", return_value=decode_state.deadline):
+            metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+        # Then
+        log_error.assert_called_once()
+        assert delivery_future.exception() is delivery_error
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_called_once()
+        decode_scheduler.executor.submit.assert_called_once()
+        assert decode_state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert decode_state.result is None
+        assert metadata.decision_timeouts == [
+            connector_module.DecisionTimeoutMetadata(
+                request_id=decode_request.request_id,
+                external_block_ids=(42, 43, 44),
+            )
+        ]
+
+    def test_concurrent_requests_stay_isolated_across_outcomes(self, decode_scheduler, task04_seams):
+        # Given
+        committed_request, _ = _admit_request(
+            decode_scheduler,
+            _make_request(request_id="request-committed"),
+            (41, 42, 43, 44),
+        )
+        timed_out_request, _ = _admit_request(
+            decode_scheduler,
+            _make_request(request_id="request-timed-out"),
+            (51, 52, 53, 54),
+        )
+        cancelled_request, _ = _admit_request(
+            decode_scheduler,
+            _make_request(request_id="request-cancelled"),
+            (61, 62, 63, 64),
+        )
+        committed_state = decode_scheduler._decode_decision_states[committed_request.request_id]
+        timed_out_state = decode_scheduler._decode_decision_states[timed_out_request.request_id]
+        cancelled_state = decode_scheduler._decode_decision_states[cancelled_request.request_id]
+        task04_seams.decode_coordinator.take_received_results.return_value = [_result(committed_request.request_id)]
+        with patch.object(connector_module.time, "monotonic", return_value=0.0):
+            decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
+
+        # When
+        decode_scheduler.request_finished(cancelled_request, [61, 62, 63, 64])
+        task04_seams.decode_coordinator.take_received_results.return_value = []
+        with patch.object(connector_module.time, "monotonic", return_value=timed_out_state.deadline):
+            timeout_metadata = decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
+
+        # Then
+        assert committed_state.status is connector_module.DecodeDecisionStatus.COMMITTED
+        assert timed_out_state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert cancelled_request.request_id not in decode_scheduler._decode_decision_states
+        assert set(decode_scheduler._decode_decision_states) == {
+            committed_request.request_id,
+            timed_out_request.request_id,
+        }
+        assert timeout_metadata.decision_timeouts == [
+            connector_module.DecisionTimeoutMetadata(
+                request_id=timed_out_request.request_id,
+                external_block_ids=(52, 53, 54),
+            )
+        ]
+        assert task04_seams.decode_coordinator.unregister.call_args_list == [
+            call(cancelled_state.request_key),
+            call(timed_out_state.request_key),
+        ]
+
+        decode_scheduler.request_finished(committed_request, [41, 42, 43, 44])
+        decode_scheduler.request_finished(timed_out_request, [51, 52, 53, 54])
+        assert decode_scheduler._decode_decision_states == {}
+        assert decode_scheduler._decode_kv_snapshots == {}
+        assert committed_state.proxy_future is None
+        assert timed_out_state.proxy_future is None
+        assert cancelled_state.proxy_future is None
+        assert task04_seams.decode_coordinator.unregister.call_args_list == [
+            call(cancelled_state.request_key),
+            call(timed_out_state.request_key),
+            call(committed_state.request_key),
+            call(timed_out_state.request_key),
+        ]
+        assert task04_seams.decode_coordinator.register_pending.call_count == 3
+        assert decode_scheduler.executor.submit.call_count == 3
+
+    def test_shutdown_is_idempotent_and_leaves_no_owned_state(self, scheduler_factory, task04_seams):
+        # Given
+        decode_scheduler = scheduler_factory(role="decode")
+        decode_request, _ = _admit(decode_scheduler)
+        decode_state = decode_scheduler._decode_decision_states[decode_request.request_id]
+
+        delivery_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.PE_READ
+        prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        prefill_request = _make_prefill_request("prefill-shutdown", _remote_decode_params())
+        prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
+        invalid_request = _make_prefill_request(
+            "prefill-invalid-shutdown",
+            _remote_decode_params(dual_path={"malformed": True}),
+        )
+        prefill_scheduler.get_num_new_matched_tokens(invalid_request, 0)
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+
+        worker = _control_only_worker()
+        worker._control_failed_recving.add("request-control-failure")
+        events = []
+
+        def record_decode_close():
+            events.append(
+                (
+                    "decode-coordinator",
+                    decode_scheduler._accepting_task01,
+                    getattr(decode_scheduler, "_accepting_pe_decisions", None),
+                    decode_request.request_id in decode_scheduler._decode_decision_states,
+                )
+            )
+
+        def record_prefill_close():
+            events.append(
+                (
+                    "prefill-coordinator",
+                    prefill_scheduler._accepting_task01,
+                    getattr(prefill_scheduler, "_accepting_pe_decisions", None),
+                    prefill_request.request_id in prefill_scheduler._pe_request_keys,
+                    request_key in prefill_scheduler._pe_delivery_futures,
+                )
+            )
+            delivery_future.cancel()
+
+        def record_decode_adapter_close():
+            events.append(
+                (
+                    "decode-adapter",
+                    task04_seams.decode_coordinator.close.call_count,
+                    not decode_scheduler._decode_decision_states,
+                    decode_state.proxy_future is None,
+                )
+            )
+
+        def record_worker_adapter_close():
+            events.append(("worker-adapter", not worker._control_failed_recving))
+
+        task04_seams.decode_coordinator.close.side_effect = record_decode_close
+        task04_seams.prefill_coordinator.close.side_effect = record_prefill_close
+        decode_scheduler._kvpool_adapter.close.side_effect = record_decode_adapter_close
+        worker._kvpool_worker_adapter.close.side_effect = record_worker_adapter_close
+
+        # When
+        decode_scheduler.shutdown()
+        prefill_scheduler.shutdown()
+        worker.shutdown()
+        decode_scheduler.shutdown()
+        prefill_scheduler.shutdown()
+        worker.shutdown()
+
+        post_shutdown_request = _make_prefill_request("prefill-after-shutdown", _remote_decode_params())
+        post_shutdown_result = prefill_scheduler.get_num_new_matched_tokens(post_shutdown_request, 0)
+
+        # Then
+        assert events[:4] == [
+            ("decode-coordinator", False, False, True),
+            ("decode-adapter", 1, True, True),
+            ("prefill-coordinator", False, False, True, True),
+            ("worker-adapter", True),
+        ]
+        assert post_shutdown_result == (0, False)
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_called_once()
+        assert delivery_future.cancelled()
+        assert decode_scheduler._lookup_results == {}
+        assert decode_scheduler._decode_kv_snapshots == {}
+        assert decode_scheduler._decode_decision_states == {}
+        assert prefill_scheduler._pe_request_keys == {}
+        assert prefill_scheduler._pe_delivery_futures == {}
+        assert prefill_scheduler._pe_invalid_request_ids == set()
+        assert prefill_scheduler._path_decider is not None
+        assert prefill_scheduler._path_decider._decision_records == {}
+        assert worker._control_failed_recving == set()
+        assert task04_seams.decode_coordinator.close.call_count == 2
+        assert task04_seams.prefill_coordinator.close.call_count == 2
+        assert decode_scheduler._kvpool_adapter.close.call_count == 2
+        assert worker._kvpool_worker_adapter.close.call_count == 2

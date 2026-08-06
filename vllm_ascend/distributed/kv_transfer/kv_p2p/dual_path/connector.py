@@ -184,6 +184,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decision_timeout_seconds: int | None = None
         self._kvpool_adapter: KVPoolAdapter | None = None
         self._accepting_task01 = True
+        self._accepting_pe_decisions = True
         # PE fields exist on both roles; Decode keeps a None decider and empty
         # maps rather than constructing policy state it never owns.
         self._path_decider: PathDecisionDecider | None = None
@@ -236,11 +237,33 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         params = request.kv_transfer_params
         return params is not None and params.get("do_remote_prefill") is True
 
+    def _sweep_pe_delivery(self, released_key: DualPathRequestKey | None = None) -> None:
+        if self._path_decider is None:
+            return
+
+        active_keys = frozenset(self._pe_request_keys.values())
+        sweep_keys = set(self._pe_delivery_futures)
+        if released_key is not None:
+            sweep_keys.add(released_key)
+
+        for request_key in sweep_keys:
+            if request_key in active_keys:
+                continue
+            delivery_future = self._pe_delivery_futures.get(request_key)
+            if delivery_future is not None and not delivery_future.done():
+                continue
+            self._path_decider.discard(request_key)
+            self._pe_delivery_futures.pop(request_key, None)
+
     def _handle_prefill_decision(
         self,
         request: Request,
         parent_result: tuple[int, bool],
     ) -> tuple[int, bool]:
+        if not self._accepting_pe_decisions:
+            return parent_result
+        self._sweep_pe_delivery()
+
         params = request.kv_transfer_params
         assert params is not None
         request_id = request.request_id
@@ -287,10 +310,24 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 protocol_version=DUAL_PATH_PROTOCOL_VERSION,
                 result=result,
             )
-            self._pe_delivery_futures[request_key] = self._path_decision_coordinator.submit(
+            delivery_future = self._path_decision_coordinator.submit(
                 metadata.decode_control_endpoint,
                 decision,
             )
+            self._pe_delivery_futures[request_key] = delivery_future
+
+            def log_delivery_failure(completed_future: Future[None]) -> None:
+                if completed_future.cancelled():
+                    return
+                error = completed_future.exception()
+                if error is not None:
+                    logger.error(
+                        "DualPath Prefill decision delivery failed for request %s: %s",
+                        request_id,
+                        error,
+                    )
+
+            delivery_future.add_done_callback(log_delivery_failure)
         return parent_result
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
@@ -520,26 +557,55 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         return metadata
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict | None]:
-        self._lookup_results.pop(request.request_id, None)
-        self._decode_kv_snapshots.pop(request.request_id, None)
+        request_id = request.request_id
+        self._lookup_results.pop(request_id, None)
+        self._decode_kv_snapshots.pop(request_id, None)
+        state = self._decode_decision_states.pop(request_id, None)
+        if state is not None:
+            state.proxy_future = None
+            self._path_decision_coordinator.unregister(state.request_key)
+        if self.dual_path_cfg.role == "prefill":
+            released_key = self._pe_request_keys.pop(request_id, None)
+            self._pe_invalid_request_ids.discard(request_id)
+            self._sweep_pe_delivery(released_key)
         return super().request_finished(request, block_ids)
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict | None]:
-        self._lookup_results.pop(request.request_id, None)
-        self._decode_kv_snapshots.pop(request.request_id, None)
+        request_id = request.request_id
+        self._lookup_results.pop(request_id, None)
+        self._decode_kv_snapshots.pop(request_id, None)
+        state = self._decode_decision_states.pop(request_id, None)
+        if state is not None:
+            state.proxy_future = None
+            self._path_decision_coordinator.unregister(state.request_key)
+        if self.dual_path_cfg.role == "prefill":
+            released_key = self._pe_request_keys.pop(request_id, None)
+            self._pe_invalid_request_ids.discard(request_id)
+            self._sweep_pe_delivery(released_key)
         return super().request_finished_all_groups(request, block_ids)
 
     def shutdown(self) -> None:
-        """Stop Task-01 admission and release all owned records and clients."""
+        """Stop Task-04 work and release all owned records and clients."""
         self._accepting_task01 = False
+        self._accepting_pe_decisions = False
+        self._path_decision_coordinator.close()
+        for state in self._decode_decision_states.values():
+            state.proxy_future = None
+        if self._path_decider is not None:
+            retained_keys = set(self._pe_request_keys.values())
+            retained_keys.update(self._pe_delivery_futures)
+            for request_key in retained_keys:
+                self._path_decider.discard(request_key)
         self._lookup_results.clear()
         self._decode_kv_snapshots.clear()
         self._decode_decision_states.clear()
+        self._pe_request_keys.clear()
+        self._pe_delivery_futures.clear()
+        self._pe_invalid_request_ids.clear()
         if self._kvpool_adapter is not None:
             self._kvpool_adapter.close()
-        self._path_decision_coordinator.close()
 
 
 class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
@@ -583,9 +649,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return done_sending, done_recving
 
     def shutdown(self) -> None:
+        self._control_failed_recving.clear()
         if self._kvpool_worker_adapter is not None:
             self._kvpool_worker_adapter.close()
-        self._control_failed_recving.clear()
 
 
 class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
