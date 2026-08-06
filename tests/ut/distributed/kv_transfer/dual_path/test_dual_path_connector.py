@@ -420,6 +420,7 @@ class TestDualPathConfig(unittest.TestCase):
                     "prefill",
                     "decode",
                     "consumer_is_to_load",
+                    "load_async",
                     "backend",
                     "lookup_rpc_port",
                     "mooncake_rpc_port",
@@ -494,13 +495,14 @@ class TestDualPathConfig(unittest.TestCase):
             "discard_partial_chunks": False,
         }
         for key, value in passthrough_extra.items():
-            config = DualPathConfig.from_extra_config(
-                {"role": "decode", "dual_path_control_port": 7100, key: value},
-                make_kv_transfer_config("kv_both"),
-            )
+            extra = {"role": "decode", "dual_path_control_port": 7100, key: value}
+            if key == "consumer_is_to_load":
+                # Decode consumer load requires async Store I/O (Task-06).
+                extra["load_async"] = True
+            config = DualPathConfig.from_extra_config(extra, make_kv_transfer_config("kv_both"))
             self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
         combined = DualPathConfig.from_extra_config(
-            {"role": "decode", "dual_path_control_port": 7100, **passthrough_extra},
+            {"role": "decode", "dual_path_control_port": 7100, **passthrough_extra, "load_async": True},
             make_kv_transfer_config("kv_both"),
         )
         self.assertEqual(combined, DualPathConfig(role="decode", dual_path_control_port=7100))
@@ -541,15 +543,101 @@ class TestDualPathConfig(unittest.TestCase):
                 make_kv_transfer_config("kv_both"),
             )
 
-    def test_config_still_rejects_load_async_and_consumer_is_to_put(self):
+    def test_config_still_rejects_consumer_is_to_put(self):
         with self.assertRaisesRegex(
             ValueError,
-            r"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*load_async)(?=.*consumer_is_to_put)",
+            r"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*consumer_is_to_put)",
         ):
             DualPathConfig.from_extra_config(
-                {"role": "decode", "load_async": True, "consumer_is_to_put": False},
+                {"role": "decode", "dual_path_control_port": 7100, "consumer_is_to_put": False},
                 make_kv_transfer_config("kv_both"),
             )
+
+    def test_config_accepts_load_async(self):
+        config = DualPathConfig.from_extra_config(
+            {"role": "decode", "dual_path_control_port": 7100, "load_async": True},
+            make_kv_transfer_config("kv_both"),
+        )
+        self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
+
+    def test_config_accepts_load_async_for_each_role(self):
+        for role, ktc in (
+            ("prefill", make_kv_transfer_config("kv_producer")),
+            ("decode", make_kv_transfer_config("kv_both")),
+        ):
+            extra = {"role": role, "load_async": True}
+            if role == "decode":
+                extra["dual_path_control_port"] = 7100
+            config = DualPathConfig.from_extra_config(extra, ktc)
+            self.assertEqual(config.role, role)
+
+    def test_config_rejects_non_bool_load_async(self):
+        with self.assertRaisesRegex(ValueError, r"(?=.*load_async)(?=.*boolean)"):
+            DualPathConfig.from_extra_config(
+                {"role": "decode", "dual_path_control_port": 7100, "load_async": "true"},
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_rejects_decode_consumer_load_without_load_async(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"(?=.*consumer_is_to_load)(?=.*load_async)(?=.*synchronous)",
+        ):
+            DualPathConfig.from_extra_config(
+                {
+                    "role": "decode",
+                    "dual_path_control_port": 7100,
+                    "consumer_is_to_load": True,
+                },
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_rejects_decode_consumer_load_with_load_async_false(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"(?=.*consumer_is_to_load)(?=.*load_async)(?=.*synchronous)",
+        ):
+            DualPathConfig.from_extra_config(
+                {
+                    "role": "decode",
+                    "dual_path_control_port": 7100,
+                    "consumer_is_to_load": True,
+                    "load_async": False,
+                },
+                make_kv_transfer_config("kv_both"),
+            )
+
+    def test_config_accepts_decode_consumer_load_with_load_async_true(self):
+        config = DualPathConfig.from_extra_config(
+            {
+                "role": "decode",
+                "dual_path_control_port": 7100,
+                "consumer_is_to_load": True,
+                "load_async": True,
+            },
+            make_kv_transfer_config("kv_both"),
+        )
+        self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
+
+    def test_config_accepts_decode_without_consumer_load_any_load_async(self):
+        for load_async in (True, False):
+            config = DualPathConfig.from_extra_config(
+                {
+                    "role": "decode",
+                    "dual_path_control_port": 7100,
+                    "consumer_is_to_load": False,
+                    "load_async": load_async,
+                },
+                make_kv_transfer_config("kv_both"),
+            )
+            self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
+
+    def test_config_accepts_prefill_consumer_load_without_load_async(self):
+        config = DualPathConfig.from_extra_config(
+            {"role": "prefill", "consumer_is_to_load": True},
+            make_kv_transfer_config("kv_producer"),
+        )
+        self.assertEqual(config, DualPathConfig(role="prefill"))
 
 
 class TestDualPathConstructionParity(unittest.TestCase):

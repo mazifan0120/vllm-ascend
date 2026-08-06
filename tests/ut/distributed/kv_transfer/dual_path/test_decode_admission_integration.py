@@ -84,6 +84,7 @@ def _make_vllm_config() -> VllmConfig:
         kv_connector_extra_config={
             "role": "decode",
             "consumer_is_to_load": True,
+            "load_async": True,
             "backend": "mooncake",
             "lookup_rpc_port": 18883,
             "dual_path_control_port": 24001,

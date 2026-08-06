@@ -38,9 +38,11 @@ if TYPE_CHECKING:
 # Task-01 admits the existing lookup-only KVPool settings as pass-through keys:
 # they are validated here but consumed directly from
 # ``kv_connector_extra_config`` by the owned ``KVPoolScheduler``/``KVPoolWorker``,
-# so they are NOT stored as ``DualPathConfig`` fields. ``load_async`` and
-# ``consumer_is_to_put`` stay rejected: DualPath owns the Core-facing async
-# admission result itself, and Decode-side put behavior is not part of Task-01.
+# so they are NOT stored as ``DualPathConfig`` fields. Task-06 additionally
+# admits ``load_async`` and requires it for a Decode role configured with
+# ``consumer_is_to_load=True`` so synchronous Store I/O never runs in the
+# Scheduler or model thread. ``consumer_is_to_put`` stays rejected: Decode-side
+# put behavior is not part of Stage 1.
 # Task-03 adds ``dual_path_control_port``: required for role="decode", stored
 # on ``DualPathConfig`` and consumed by the Task-03 control endpoint.
 ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -50,6 +52,7 @@ ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
         "prefill",
         "decode",
         "consumer_is_to_load",
+        "load_async",
         "backend",
         "lookup_rpc_port",
         "mooncake_rpc_port",
@@ -127,6 +130,7 @@ class DualPathConfig:
             raise ValueError(f"DualPathConnector role={role!r} is not supported; choices: 'prefill' | 'decode'.")
 
         _validate_kvpool_passthrough(extra)
+        _validate_decode_local_load_async(extra, role)
         _validate_role_capability(role, ktc)
         dual_path_control_port = _validate_dual_path_control_port(extra, role)
         return cls(role=role, dual_path_control_port=dual_path_control_port)
@@ -138,7 +142,7 @@ def _validate_kvpool_passthrough(extra: dict[str, Any]) -> None:
     The values are consumed by the owned KVPool components from
     ``kv_connector_extra_config``; only type/shape validation happens here.
     """
-    for key in ("consumer_is_to_load", "discard_partial_chunks"):
+    for key in ("consumer_is_to_load", "load_async", "discard_partial_chunks"):
         if key in extra and not isinstance(extra[key], bool):
             raise ValueError(f"DualPathConnector KVPool setting {key!r} must be a boolean; got {extra[key]!r}.")
     if "backend" in extra:
@@ -152,6 +156,17 @@ def _validate_kvpool_passthrough(extra: dict[str, Any]) -> None:
                 raise ValueError(
                     f"DualPathConnector KVPool setting {key!r} must be a non-negative integer; got {port!r}."
                 )
+
+
+def _validate_decode_local_load_async(extra: dict[str, Any], role: str) -> None:
+    """Fail fast when a Decode local Store load would run synchronously."""
+    if role == "decode" and extra.get("consumer_is_to_load") is True and extra.get("load_async") is not True:
+        raise ValueError(
+            "DualPathConnector role='decode' with 'consumer_is_to_load' True requires "
+            "'load_async' True in kv_connector_extra_config; got "
+            f"load_async={extra.get('load_async')!r} (synchronous Store I/O must not "
+            "run in the Scheduler or model execution thread)."
+        )
 
 
 def _validate_role_capability(role: str, ktc: KVTransferConfig) -> None:
