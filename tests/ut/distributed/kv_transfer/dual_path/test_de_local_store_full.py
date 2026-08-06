@@ -1,8 +1,10 @@
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import torch
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.ut.distributed.kv_transfer.dual_path.test_decode_scheduler import (
@@ -19,6 +21,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
     DualPathConnectorScheduler,
     DualPathConnectorWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import KVPoolWorkerAdapter
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DecisionTimeoutMetadata,
     DualPathConnectorMetadata,
@@ -39,7 +42,12 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     LoadSpec,
+    ReqMeta,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreRecvingThread
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+_POOL_WORKER_NS = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
 
 
 def _make_store_metadata() -> AscendConnectorMetadata:
@@ -67,6 +75,61 @@ def _make_worker() -> DualPathConnectorWorker:
     worker.engine = MagicMock(name="transfer_engine")
     worker.block_size = [16]
     return worker
+
+
+def _make_real_store_worker_adapter(load_result: list[int] | None) -> tuple[KVPoolWorkerAdapter, MagicMock]:
+    config = _make_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config = {
+        "backend": "mooncake",
+        "consumer_is_to_load": True,
+        "load_async": True,
+    }
+    config.parallel_config.rank = 1
+    config.parallel_config.world_size = 2
+    config.cache_config.hash_block_size = 16
+    config.scheduler_config.disable_hybrid_kv_cache_manager = True
+    config.model_config.model = "org/llama-7b"
+    config.model_config.use_mla = False
+    config.model_config.hf_text_config = SimpleNamespace()
+    config.model_config.hf_config = config.model_config.hf_text_config
+    config.model_config.max_model_len = 1024
+    config.model_config.get_num_layers.return_value = 1
+    config.model_config.get_total_num_kv_heads.return_value = 1
+    config.speculative_config = None
+    config.kv_events_config = None
+    backend = MagicMock(name="fake_store_backend")
+    backend.get.return_value = load_result
+    backend_module = SimpleNamespace(MooncakeBackend=MagicMock(return_value=backend))
+    pcp_group = SimpleNamespace(world_size=1, rank_in_group=0)
+
+    with (
+        patch(f"{_POOL_WORKER_NS}.get_tensor_model_parallel_rank", return_value=0),
+        patch(f"{_POOL_WORKER_NS}.get_tensor_model_parallel_world_size", return_value=1),
+        patch(f"{_POOL_WORKER_NS}.get_pcp_group", return_value=pcp_group),
+        patch(f"{_POOL_WORKER_NS}.get_decode_context_model_parallel_world_size", return_value=1),
+        patch(f"{_POOL_WORKER_NS}.get_decode_context_model_parallel_rank", return_value=0),
+        patch(f"{_POOL_WORKER_NS}.importlib.import_module", return_value=backend_module),
+    ):
+        adapter = KVPoolWorkerAdapter(config, _make_kv_cache_config())
+        adapter.register_kv_caches({"layer.0": torch.zeros((64, 16, 1, 1), dtype=torch.float16)})
+
+    return adapter, backend
+
+
+def _make_real_store_metadata(request_id: str) -> DualPathConnectorMetadata:
+    load_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=True, token_len=48)
+    request_metadata = ReqMeta(
+        req_id=request_id,
+        token_len_chunk=48,
+        block_ids=[101, 102, 103],
+        block_hashes=[b"h0", b"h1", b"h2"],
+        load_spec=load_spec,
+    )
+    store_metadata = AscendConnectorMetadata(set(), set(), loading_req_ids={request_id})
+    store_metadata.add_request(request_metadata)
+    metadata = DualPathConnectorMetadata()
+    metadata.decode_store_metadata = store_metadata
+    return metadata
 
 
 @pytest.fixture()
@@ -205,6 +268,47 @@ def test_store_full_identical_retry_reuses_lookup_and_duplicate_bind_never_commi
         decode_scheduler.update_state_after_alloc(request, _make_blocks(((10, 11, 12),)), 31)
     assert decode_scheduler._decode_kv_snapshots[request.request_id] is first_snapshot
     decode_scheduler._kvpool_adapter.commit_after_alloc.assert_called_once()
+
+
+def test_retry_reprobes_when_cached_non_full_accounting_does_not_match_current_ready_boundary(
+    decode_scheduler,
+) -> None:
+    # Given
+    request = _make_request("retry-non-full-to-full", 48, _selected_params())
+    current_full_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=63, can_load=False)
+    decode_scheduler._kvpool_adapter.lookup.side_effect = [None, current_full_spec]
+    assert decode_scheduler.get_num_new_matched_tokens(request, 16) == (32, True)
+
+    # When
+    request.num_tokens = 64
+    request.prompt_token_ids = list(range(64))
+    retried = decode_scheduler.get_num_new_matched_tokens(request, 16)
+
+    # Then
+    assert retried == (47, True)
+    assert decode_scheduler._kvpool_adapter.lookup.call_args_list == [call(request, 16), call(request, 16)]
+    assert decode_scheduler._lookup_results[request.request_id] == (16, 47, current_full_spec)
+
+
+def test_retry_reprobes_when_cached_full_accounting_becomes_non_full_for_current_ready_boundary(
+    decode_scheduler,
+) -> None:
+    # Given
+    request = _make_request("retry-full-to-non-full", 48, _selected_params())
+    cached_full_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=False)
+    current_partial_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    decode_scheduler._kvpool_adapter.lookup.side_effect = [cached_full_spec, current_partial_spec]
+    assert decode_scheduler.get_num_new_matched_tokens(request, 16) == (31, True)
+
+    # When
+    request.num_tokens = 64
+    request.prompt_token_ids = list(range(64))
+    retried = decode_scheduler.get_num_new_matched_tokens(request, 16)
+
+    # Then
+    assert retried == (48, True)
+    assert decode_scheduler._kvpool_adapter.lookup.call_args_list == [call(request, 16), call(request, 16)]
+    assert decode_scheduler._lookup_results[request.request_id] == (16, 48, current_partial_spec)
 
 
 def test_store_full_alloc_creates_no_decision_side_effects(decode_scheduler) -> None:
@@ -390,6 +494,120 @@ def test_store_failure_never_invalidates_hbm_prefix_blocks() -> None:
 
     assert invalid_block_ids == {102, 103}
     assert 101 not in invalid_block_ids
+
+
+def test_real_store_worker_starts_one_async_non_layerwise_load_without_p2p() -> None:
+    # Given
+    adapter, backend = _make_real_store_worker_adapter([0, 0])
+    worker = _make_worker()
+    worker._kvpool_worker_adapter = adapter
+    metadata = _make_real_store_metadata("real-store-start")
+
+    # When
+    worker.start_load_kv(metadata)
+    recv_thread = adapter._pool_worker.kv_recv_thread
+    assert isinstance(recv_thread, KVCacheStoreRecvingThread)
+    recv_thread.request_queue.join()
+
+    # Then
+    assert isinstance(adapter._pool_worker, KVPoolWorker)
+    assert adapter._pool_worker.use_layerwise is False
+    backend.get.assert_called_once()
+    assert worker.engine.method_calls == []
+    assert worker.kv_recv_layer_thread.method_calls == []
+
+
+def test_store_done_emerges_from_real_pool_worker_as_done_recving() -> None:
+    # Given
+    request_id = "real-store-done"
+    adapter, _ = _make_real_store_worker_adapter([0, 0])
+    worker = _make_worker()
+    worker._kvpool_worker_adapter = adapter
+    metadata = _make_real_store_metadata(request_id)
+    worker.start_load_kv(metadata)
+    recv_thread = adapter._pool_worker.kv_recv_thread
+    assert isinstance(recv_thread, KVCacheStoreRecvingThread)
+    recv_thread.request_queue.join()
+
+    # When
+    first = worker.get_finished(set(), metadata)
+    second = worker.get_finished(set(), metadata)
+
+    # Then
+    assert first == (set(), {request_id})
+    assert second == (set(), set())
+
+
+def test_real_store_worker_miss_reports_only_external_blocks_and_finishes_without_fallback(decode_scheduler) -> None:
+    # Given
+    request = _make_request("real-probe-load-race", 48, _selected_params())
+    spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=False)
+    blocks = _make_blocks(((101, 102, 103),))
+    decode_scheduler._kvpool_adapter.lookup.return_value = spec
+    assert decode_scheduler.get_num_new_matched_tokens(request, 16) == (31, True)
+    decode_scheduler.update_state_after_alloc(request, blocks, 31)
+    adapter, _ = _make_real_store_worker_adapter(None)
+    worker = _make_worker()
+    worker._kvpool_worker_adapter = adapter
+    metadata = _make_real_store_metadata(request.request_id)
+
+    # When
+    worker.start_load_kv(metadata)
+    recv_thread = adapter._pool_worker.kv_recv_thread
+    assert isinstance(recv_thread, KVCacheStoreRecvingThread)
+    recv_thread.request_queue.join()
+    finished_sending, finished_recving = worker.get_finished(set(), metadata)
+    connector_output = KVConnectorOutput(
+        finished_sending=finished_sending,
+        finished_recving=finished_recving,
+        invalid_block_ids=worker.get_block_ids_with_load_errors(),
+    )
+
+    # Then
+    assert connector_output.finished_sending == set()
+    assert connector_output.finished_recving == {request.request_id}
+    assert connector_output.invalid_block_ids == {102, 103}
+    assert 101 not in connector_output.invalid_block_ids
+    assert worker.engine.method_calls == []
+    decode_scheduler._path_decision_coordinator.register_pending.assert_not_called()
+    decode_scheduler.executor.submit.assert_not_called()
+    assert request.kv_transfer_params["do_remote_prefill"] is False
+
+
+def test_real_store_worker_withholds_load_errors_until_done_recving() -> None:
+    # Given
+    request_id = "real-store-publication-race"
+    adapter, _ = _make_real_store_worker_adapter(None)
+    worker = _make_worker()
+    worker._kvpool_worker_adapter = adapter
+    metadata = _make_real_store_metadata(request_id)
+    recv_thread = adapter._pool_worker.kv_recv_thread
+    assert isinstance(recv_thread, KVCacheStoreRecvingThread)
+    reached_completion = threading.Event()
+    release_completion = threading.Event()
+    original_set_finished_request = recv_thread.set_finished_request
+
+    def hold_completion(completed_request_id: str) -> None:
+        reached_completion.set()
+        assert release_completion.wait(timeout=5)
+        original_set_finished_request(completed_request_id)
+
+    # When
+    with patch.object(recv_thread, "set_finished_request", side_effect=hold_completion):
+        worker.start_load_kv(metadata)
+        assert reached_completion.wait(timeout=5)
+        early_finished = worker.get_finished(set(), metadata)
+        early_invalid_blocks = worker.get_block_ids_with_load_errors()
+        release_completion.set()
+        recv_thread.request_queue.join()
+    completed = worker.get_finished(set(), metadata)
+    completed_invalid_blocks = worker.get_block_ids_with_load_errors()
+
+    # Then
+    assert early_finished == (set(), set())
+    assert early_invalid_blocks == set()
+    assert completed == (set(), {request_id})
+    assert completed_invalid_blocks == {102, 103}
 
 
 def test_full_probe_then_worker_miss_fails_closed_without_proxy_fallback(decode_scheduler) -> None:

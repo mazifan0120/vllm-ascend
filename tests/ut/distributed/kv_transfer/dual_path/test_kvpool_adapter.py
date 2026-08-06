@@ -310,6 +310,54 @@ def test_commit_after_alloc_rejects_duplicate_commit(mock_lookup_client_cls):
     update_state_after_alloc.assert_not_called()
 
 
+def test_commit_after_alloc_rejects_duplicate_after_metadata_consumes_load_spec(mock_lookup_client_cls):
+    # Given
+    adapter = _make_commit_adapter()
+    request = _make_request("req-duplicate-after-metadata", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    blocks = _make_blocks([[7, 8, 9]])
+    adapter.commit_after_alloc(request, blocks, detached_spec)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.preempted_req_ids = set()
+    adapter.build_connector_meta(scheduler_output)
+    pool = adapter._pool_scheduler
+    assert request.request_id not in pool.load_specs
+    assert request.request_id in pool._unfinished_requests
+    assert request.request_id in pool._unfinished_request_ids
+    assert request.request_id in pool._loading_req_ids
+
+    # When / Then
+    with pytest.raises(RuntimeError, match="already committed"):
+        adapter.commit_after_alloc(request, blocks, detached_spec)
+
+
+def test_terminal_metadata_cleanup_releases_commit_ownership(mock_lookup_client_cls):
+    # Given
+    adapter = _make_commit_adapter()
+    request = _make_request("req-terminal-release", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    blocks = _make_blocks([[7, 8, 9]])
+    adapter.commit_after_alloc(request, blocks, detached_spec)
+    active_output = SchedulerOutput.make_empty()
+    active_output.preempted_req_ids = set()
+    adapter.build_connector_meta(active_output)
+
+    # When
+    finished_output = SchedulerOutput.make_empty()
+    finished_output.finished_req_ids = {request.request_id}
+    finished_output.preempted_req_ids = set()
+    adapter.build_connector_meta(finished_output)
+
+    # Then
+    pool = adapter._pool_scheduler
+    assert request.request_id not in pool.load_specs
+    assert request.request_id not in pool._unfinished_requests
+    assert request.request_id not in pool._unfinished_request_ids
+    assert request.request_id not in pool._loading_req_ids
+    adapter.commit_after_alloc(request, blocks, detached_spec)
+    assert request.request_id in pool.load_specs
+
+
 @pytest.mark.parametrize(
     ("kv_role", "use_layerwise", "num_tokens", "detached_spec"),
     [
@@ -349,9 +397,6 @@ def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failur
     request = _make_request("req-rollback", 49)
     detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
     original_update = adapter._pool_scheduler.update_state_after_alloc
-    previous_unfinished_request = (MagicMock(), [[99]])
-    adapter._pool_scheduler._unfinished_requests[request.request_id] = previous_unfinished_request
-    adapter._pool_scheduler._unfinished_request_ids.add(request.request_id)
 
     def fail_after_delegated_mutation(request_arg, blocks_arg, ready_delta):
         original_update(request_arg, blocks_arg, ready_delta)
@@ -370,8 +415,8 @@ def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failur
 
     # Then
     assert request.request_id not in adapter._pool_scheduler.load_specs
-    assert adapter._pool_scheduler._unfinished_requests[request.request_id] is previous_unfinished_request
-    assert request.request_id in adapter._pool_scheduler._unfinished_request_ids
+    assert request.request_id not in adapter._pool_scheduler._unfinished_requests
+    assert request.request_id not in adapter._pool_scheduler._unfinished_request_ids
     assert request.request_id not in adapter._pool_scheduler._loading_req_ids
     assert detached_spec.can_load is False
 
