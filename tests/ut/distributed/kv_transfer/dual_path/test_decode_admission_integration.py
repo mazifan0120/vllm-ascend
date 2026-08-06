@@ -222,10 +222,10 @@ def _admit_one_request(scheduler: Scheduler):
 
 def _assert_admission_invariants(scheduler, request, scheduler_output, matched_returns, alloc_mock, expect_store_spec):
     dual = _dual_scheduler(scheduler)
-    # 1. connector returned (R - L_DE, True) = (32, True)
-    assert matched_returns == [(32, True)]
+    # 1. connector returned (T - L_DE, True) = (33, True)
+    assert matched_returns == [(33, True)]
     # 2. allocate_slots received the external delta with delayed caching
-    assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 32
+    assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 33
     assert alloc_mock.call_args.kwargs["delay_cache_blocks"] is True
     # 3. final block IDs exist and equal the snapshot's frozen IDs
     final_block_ids = tuple(
@@ -234,15 +234,17 @@ def _assert_admission_invariants(scheduler, request, scheduler_output, matched_r
     snapshot = dual._decode_kv_snapshots[request.request_id]
     assert snapshot.final_block_ids == final_block_ids
     assert snapshot.target_tokens == 32
-    assert snapshot.external_tokens == 32
+    assert snapshot.transfer_tokens == 33
+    assert snapshot.local_tokens == 0
+    assert snapshot.external_tokens == 33
     if expect_store_spec:
         assert snapshot.store_load_spec is not None
     else:
         assert snapshot.store_load_spec is None
     # 4. the request waits for remote KVs
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-    # 5. vLLM recorded the Decode-ready token count for the pending receive
-    assert request.num_computed_tokens == 32
+    # 5. vLLM recorded the Layerwise transfer target for the pending receive
+    assert request.num_computed_tokens == 33
     # 6. no model tokens were scheduled for the request in this step
     assert scheduler_output.num_scheduled_tokens.get(request.request_id, 0) == 0
     # 7. connector metadata contains no Store or P2P work for the request
@@ -278,7 +280,7 @@ def test_admission_partial_store_hit(_constrain_kvpool_seams, scheduler):
     snapshot = _dual_scheduler(scheduler)._decode_kv_snapshots[request.request_id]
     # Partial hit does not change the Core-facing external delta.
     assert snapshot.store_load_spec.kvpool_cached_tokens == 16
-    assert snapshot.external_tokens == 32
+    assert snapshot.external_tokens == 33
 
 
 def test_admission_store_miss(_constrain_kvpool_seams, scheduler):
@@ -349,8 +351,8 @@ class TestDecisionTimeoutIntegration:
             external_block_ids = snapshot.final_block_ids[0]
 
             assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
-            assert matched_returns == [(32, True)]
-            assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 32
+            assert matched_returns == [(33, True)]
+            assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 33
             assert alloc_mock.call_args.kwargs["delay_cache_blocks"] is True
             lookup_mock.assert_called_once()
             coordinator.register_pending.assert_called_once_with(state.request_key)

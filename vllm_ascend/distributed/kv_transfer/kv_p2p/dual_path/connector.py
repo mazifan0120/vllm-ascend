@@ -91,19 +91,17 @@ if TYPE_CHECKING:
 class DecodeKVSnapshot:
     """Complete Task-01 admission record, created only after real allocation.
 
-    ``local_tokens``/``store_tokens`` are derived rather than duplicated from
-    the detached ``LoadSpec`` fields; ``final_block_ids`` is mandatory because
-    the record cannot exist before vLLM allocates the final Decode blocks.
+    ``local_tokens`` retains the original HBM prefix while ``store_tokens`` is
+    derived from the detached ``LoadSpec``. ``final_block_ids`` is mandatory
+    because the record cannot exist before vLLM allocates the final Decode blocks.
     """
 
     target_tokens: int
+    transfer_tokens: int
+    local_tokens: int
     external_tokens: int
     store_load_spec: LoadSpec | None
     final_block_ids: tuple[tuple[int, ...], ...]
-
-    @property
-    def local_tokens(self) -> int:
-        return self.target_tokens - self.external_tokens
 
     @property
     def store_tokens(self) -> int:
@@ -159,12 +157,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
     Task-01: for a Decode-role request carrying ``do_remote_prefill=True``,
     owns the admission path from initial HBM lookup through final slot
-    allocation: ``get_num_new_matched_tokens`` returns the Decode-ready
-    external delta ``E_DE = R - L_DE`` (never the Store hit), and
-    ``update_state_after_alloc`` binds the frozen final blocks into a
-    ``DecodeKVSnapshot``. Task-04 adds the Prefill decision hook and suppresses
-    inherited Forward queueing for its ``dual_path`` envelope. Requests outside
-    those contracted shapes delegate to the parent unchanged.
+    allocation: ``get_num_new_matched_tokens`` returns the route-dependent
+    external delta ``E_DE = T - L_DE`` for remote-required requests (never the
+    Store hit), and ``update_state_after_alloc`` binds the frozen final blocks
+    into a ``DecodeKVSnapshot``. Task-04 adds the Prefill decision hook and
+    suppresses inherited Forward queueing for its ``dual_path`` envelope.
+    Requests outside those contracted shapes delegate to the parent unchanged.
     """
 
     def __init__(
@@ -178,7 +176,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     ) -> None:
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.dual_path_cfg = dual_path_cfg
-        self._lookup_results: dict[str, tuple[int, LoadSpec | None]] = {}
+        self._lookup_results: dict[str, tuple[int, int, LoadSpec | None]] = {}
         self._decode_kv_snapshots: dict[str, DecodeKVSnapshot] = {}
         self._decode_decision_states: dict[str, DecodePathDecisionState] = {}
         self._decision_timeout_seconds: int | None = None
@@ -348,22 +346,24 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 f"DualPath request {request_id} is already admitted; a new initial lookup is a lifecycle error"
             )
 
-        target_tokens = max(request.num_tokens - 1, 0)
+        transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
+        ready_tokens = max(request.num_tokens - 1, 0)
         local_tokens = num_computed_tokens
-        if not 0 <= local_tokens <= target_tokens:
-            raise RuntimeError(
-                f"DualPath request {request_id} initial admission requires "
-                f"0 <= local_tokens ({local_tokens}) <= target_tokens ({target_tokens})"
-            )
-        if local_tokens >= target_tokens:
+        if local_tokens >= ready_tokens:
             # HBM-complete: no KVPool lookup, no Task-01 state.
             self._lookup_results.pop(request_id, None)
             return 0, False
+        if not 0 <= local_tokens < ready_tokens <= transfer_tokens:
+            raise RuntimeError(
+                f"DualPath request {request_id} initial admission requires "
+                f"0 <= local_tokens ({local_tokens}) < ready_tokens ({ready_tokens}) "
+                f"<= transfer_tokens ({transfer_tokens})"
+            )
 
-        external_tokens = target_tokens - local_tokens
+        external_tokens = transfer_tokens - local_tokens
         cached = self._lookup_results.get(request_id)
         if cached is not None:
-            if cached[0] == external_tokens:
+            if cached[0] == local_tokens and cached[1] == external_tokens:
                 # Identical duplicate lookup (e.g. allocation-failure retry):
                 # reuse the detached result instead of re-probing the KV pool.
                 return external_tokens, True
@@ -373,7 +373,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         assert self._kvpool_adapter is not None
         detached_spec = self._kvpool_adapter.lookup(request, local_tokens)
-        self._lookup_results[request_id] = (external_tokens, detached_spec)
+        self._lookup_results[request_id] = (local_tokens, external_tokens, detached_spec)
         return external_tokens, True
 
     def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:
@@ -383,6 +383,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         request_id = request.request_id
         target_tokens = max(request.num_tokens - 1, 0)
+        transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
 
         existing = self._decode_kv_snapshots.get(request_id)
         if existing is not None:
@@ -390,6 +391,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
             if (
                 existing.target_tokens == target_tokens
+                and existing.transfer_tokens == transfer_tokens
+                and existing.local_tokens == transfer_tokens - num_external_tokens
                 and existing.external_tokens == num_external_tokens
                 and existing.final_block_ids == frozen_block_ids
             ):
@@ -411,12 +414,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         entry = self._lookup_results.pop(request_id, None)
         if entry is None:
             raise RuntimeError(f"DualPath request {request_id} has no Task-01 lookup result to bind after allocation")
-        cached_external_tokens, detached_spec = entry
-        local_tokens = target_tokens - cached_external_tokens
-        if num_external_tokens != cached_external_tokens:
+        local_tokens, cached_external_tokens, detached_spec = entry
+        expected_external_tokens = transfer_tokens - local_tokens
+        if not num_external_tokens == cached_external_tokens == expected_external_tokens:
             raise RuntimeError(
                 f"DualPath request {request_id} external-token mismatch: vLLM allocated "
-                f"{num_external_tokens} but the cached lookup expected {cached_external_tokens}"
+                f"{num_external_tokens}, cached lookup expected {cached_external_tokens}, "
+                f"and transfer accounting expected {expected_external_tokens}"
             )
         if detached_spec is not None:
             if detached_spec.vllm_cached_tokens != local_tokens:
@@ -434,6 +438,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
         snapshot = DecodeKVSnapshot(
             target_tokens=target_tokens,
+            transfer_tokens=transfer_tokens,
+            local_tokens=local_tokens,
             external_tokens=num_external_tokens,
             store_load_spec=detached_spec,
             final_block_ids=frozen_block_ids,

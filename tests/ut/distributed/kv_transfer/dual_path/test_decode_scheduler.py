@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the Task-01 Decode Scheduler admission path (spec §11.2).
 
-Covers token accounting (E_DE = R - L_DE independent of the Store hit), the
+Covers token accounting (E_DE = T - L_DE independent of the Store hit), the
 pre-allocation lookup cache lifecycle, DecodeKVSnapshot creation/binding
 invariants, duplicate scheduling and allocation-failure retry, parent
 delegation for non-selected requests, and terminal cleanup.
@@ -10,6 +10,9 @@ delegation for non-selected requests, and terminal cleanup.
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # noqa: E402
@@ -46,12 +49,32 @@ def _make_vllm_config(kv_role="kv_consumer"):
     return config
 
 
-def _make_kv_cache_config(block_size=16):
-    spec = MagicMock()
-    spec.block_size = block_size
+def _make_kv_cache_config(block_size=16, *, need_truncate=False):
+    if need_truncate:
+        spec = UniformTypeKVCacheSpecs(
+            block_size=block_size,
+            kv_cache_specs={
+                "attention": FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+                "mamba": MambaSpec(
+                    block_size=block_size,
+                    shapes=((1,),),
+                    dtypes=(torch.float16,),
+                ),
+            },
+        )
+        layer_names = ["attention", "mamba"]
+    else:
+        spec = MagicMock()
+        spec.block_size = block_size
+        layer_names = ["layer.0"]
     group = MagicMock()
     group.kv_cache_spec = spec
-    group.layer_names = ["layer.0"]
+    group.layer_names = layer_names
     return SimpleNamespace(kv_cache_groups=[group], kv_cache_tensors=[], num_blocks=64)
 
 
@@ -116,7 +139,7 @@ class TestDecodeAdmission(unittest.TestCase):
 
     def test_hbm_complete_returns_zero_false_no_adapter_call_no_state(self):
         request = _make_request("req-full-hbm", 48, _selected_params())
-        self.scheduler._lookup_results["req-full-hbm"] = (10, None)  # stale entry
+        self.scheduler._lookup_results["req-full-hbm"] = (16, 32, None)  # stale entry
         result = self.scheduler.get_num_new_matched_tokens(request, 47)
         self.assertEqual(result, (0, False))
         self.scheduler._kvpool_adapter.lookup.assert_not_called()
@@ -133,25 +156,51 @@ class TestDecodeAdmission(unittest.TestCase):
             with self.subTest(request_id=request_id):
                 request = _make_request(request_id, 48, _selected_params())
                 self.scheduler._kvpool_adapter.lookup.return_value = spec
-                self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
+                self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
+
+    def test_ordinary_attention_uses_full_prompt_transfer_target(self):
+        request = _make_request("req-ordinary-target", 48, _selected_params())
+        self.scheduler._kvpool_adapter.lookup.return_value = None
+
+        self.assertFalse(self.scheduler.need_truncate)
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
+        self.assertEqual(self.scheduler._lookup_results, {request.request_id: (16, 32, None)})
+
+    def test_attention_mamba_hybrid_uses_decode_ready_transfer_target(self):
+        scheduler = DualPathConnectorScheduler(
+            _make_vllm_config(),
+            _make_kv_cache_config(need_truncate=True),
+            "test_engine",
+            DualPathConfig(role="decode"),
+        )
+        self.addCleanup(scheduler.executor.shutdown, False)
+        self.addCleanup(scheduler.metaserver_client.close)
+        request = _make_request("req-hybrid-target", 48, _selected_params())
+        scheduler._kvpool_adapter.lookup.return_value = None
+
+        self.assertTrue(scheduler.need_truncate)
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 16), (31, True))
+        self.assertEqual(scheduler._lookup_results, {request.request_id: (16, 31, None)})
 
     def test_first_lookup_creates_only_lookup_results(self):
         request = _make_request("req-first", 48, _selected_params())
         spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
         self.scheduler._kvpool_adapter.lookup.return_value = spec
         self.scheduler.get_num_new_matched_tokens(request, 16)
-        self.assertEqual(self.scheduler._lookup_results, {"req-first": (31, spec)})
+        self.assertEqual(self.scheduler._lookup_results, {"req-first": (16, 32, spec)})
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
 
     def test_alloc_consumes_lookup_and_creates_one_snapshot_with_frozen_blocks(self):
         request = _make_request("req-bind", 48, _selected_params())
         spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
         matched, _ = self._admit(request, 16, block_ids_by_group=([7, 8], [9]), lookup_spec=spec)
-        self.assertEqual(matched, (31, True))
+        self.assertEqual(matched, (32, True))
         self.assertEqual(self.scheduler._lookup_results, {})
         snapshot = self.scheduler._decode_kv_snapshots["req-bind"]
         self.assertEqual(snapshot.target_tokens, 47)
-        self.assertEqual(snapshot.external_tokens, 31)
+        self.assertEqual(snapshot.transfer_tokens, 48)
+        self.assertEqual(snapshot.local_tokens, 16)
+        self.assertEqual(snapshot.external_tokens, 32)
         self.assertIs(snapshot.store_load_spec, spec)
         self.assertEqual(snapshot.final_block_ids, ((7, 8), (9,)))
         self.assertEqual(len(self.scheduler._decode_kv_snapshots), 1)
@@ -163,7 +212,9 @@ class TestDecodeAdmission(unittest.TestCase):
         spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
         snapshot = DecodeKVSnapshot(
             target_tokens=47,
-            external_tokens=31,
+            transfer_tokens=48,
+            local_tokens=16,
+            external_tokens=32,
             store_load_spec=spec,
             final_block_ids=((1,),),
         )
@@ -171,7 +222,9 @@ class TestDecodeAdmission(unittest.TestCase):
         self.assertEqual(snapshot.store_tokens, 32)
         miss_snapshot = DecodeKVSnapshot(
             target_tokens=47,
-            external_tokens=31,
+            transfer_tokens=48,
+            local_tokens=16,
+            external_tokens=32,
             store_load_spec=None,
             final_block_ids=((1,),),
         )
@@ -180,24 +233,40 @@ class TestDecodeAdmission(unittest.TestCase):
     def test_identical_duplicate_lookup_performs_one_adapter_call(self):
         request = _make_request("req-dup", 48, _selected_params())
         self.scheduler._kvpool_adapter.lookup.return_value = None
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
         self.scheduler._kvpool_adapter.lookup.assert_called_once()
+
+    def test_retry_reuse_requires_matching_local_and_external_tokens(self):
+        request = _make_request("req-retry-facts", 48, _selected_params())
+        spec_a = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
+        spec_b = LoadSpec(vllm_cached_tokens=32, kvpool_cached_tokens=48, can_load=False)
+        self.scheduler._kvpool_adapter.lookup.side_effect = [spec_a, spec_b]
+
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
+        request.num_tokens = 64
+        request.prompt_token_ids = list(range(64))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 32), (32, True))
+
+        self.assertEqual(self.scheduler._lookup_results, {request.request_id: (32, 32, spec_b)})
+        self.assertEqual(self.scheduler._kvpool_adapter.lookup.call_count, 2)
 
     def test_changed_external_delta_replaces_unbound_result(self):
         request = _make_request("req-change", 48, _selected_params())
         spec_a = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
         spec_b = LoadSpec(vllm_cached_tokens=32, kvpool_cached_tokens=40, can_load=False)
         self.scheduler._kvpool_adapter.lookup.side_effect = [spec_a, spec_b]
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 32), (15, True))
-        self.assertEqual(self.scheduler._lookup_results, {"req-change": (15, spec_b)})
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 32), (16, True))
+        self.assertEqual(self.scheduler._lookup_results, {"req-change": (32, 16, spec_b)})
         self.assertEqual(self.scheduler._kvpool_adapter.lookup.call_count, 2)
 
-    def test_changed_external_delta_discards_before_reprobe_when_lookup_raises(self):
+    def test_changed_local_tokens_discards_before_reprobe_when_lookup_raises(self):
         request = _make_request("req-discard", 48, _selected_params())
         self.scheduler._kvpool_adapter.lookup.return_value = None
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
+        request.num_tokens = 64
+        request.prompt_token_ids = list(range(64))
         self.scheduler._kvpool_adapter.lookup.side_effect = RuntimeError("spec invariant violated")
         with self.assertRaisesRegex(RuntimeError, "spec invariant violated"):
             self.scheduler.get_num_new_matched_tokens(request, 32)
@@ -206,9 +275,9 @@ class TestDecodeAdmission(unittest.TestCase):
     def test_external_token_mismatch_at_bind_raises(self):
         request = _make_request("req-ext-mismatch", 48, _selected_params())
         self.scheduler._kvpool_adapter.lookup.return_value = None
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
         with self.assertRaisesRegex(RuntimeError, "external-token mismatch"):
-            self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 30)
+            self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 31)
         self.assertEqual(self.scheduler._lookup_results, {})
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
 
@@ -216,9 +285,9 @@ class TestDecodeAdmission(unittest.TestCase):
         request = _make_request("req-range", 48, _selected_params())
         out_of_range = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
         self.scheduler._kvpool_adapter.lookup.return_value = out_of_range
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
         with self.assertRaisesRegex(RuntimeError, "outside"):
-            self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 31)
+            self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 32)
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
 
     def test_alloc_failure_retry_reuses_unbound_result(self):
@@ -227,16 +296,16 @@ class TestDecodeAdmission(unittest.TestCase):
         self.scheduler._kvpool_adapter.lookup.return_value = spec
         self.scheduler.get_num_new_matched_tokens(request, 16)
         # allocate_slots returned None: update_state_after_alloc never runs.
-        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (31, True))
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
         self.scheduler._kvpool_adapter.lookup.assert_called_once()
-        self.scheduler.update_state_after_alloc(request, _make_blocks(((5, 6),)), 31)
+        self.scheduler.update_state_after_alloc(request, _make_blocks(((5, 6),)), 32)
         self.assertIn("req-retry", self.scheduler._decode_kv_snapshots)
 
     def test_identical_duplicate_bind_is_idempotent(self):
         request = _make_request("req-idem", 48, _selected_params())
         self._admit(request, 16, block_ids_by_group=((7, 8),))
         first = self.scheduler._decode_kv_snapshots["req-idem"]
-        self.scheduler.update_state_after_alloc(request, _make_blocks(((7, 8),)), 31)
+        self.scheduler.update_state_after_alloc(request, _make_blocks(((7, 8),)), 32)
         self.assertEqual(len(self.scheduler._decode_kv_snapshots), 1)
         self.assertIs(self.scheduler._decode_kv_snapshots["req-idem"], first)
 
@@ -245,13 +314,13 @@ class TestDecodeAdmission(unittest.TestCase):
         self._admit(request, 16, block_ids_by_group=((7, 8),))
         first = self.scheduler._decode_kv_snapshots["req-conflict"]
         with self.assertRaisesRegex(RuntimeError, "conflicting duplicate"):
-            self.scheduler.update_state_after_alloc(request, _make_blocks(((9, 9),)), 31)
+            self.scheduler.update_state_after_alloc(request, _make_blocks(((9, 9),)), 32)
         self.assertIs(self.scheduler._decode_kv_snapshots["req-conflict"], first)
 
     def test_missing_lookup_result_at_bind_raises(self):
         request = _make_request("req-orphan", 48, _selected_params())
         with self.assertRaisesRegex(RuntimeError, "no Task-01 lookup result"):
-            self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 31)
+            self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 32)
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
 
     def test_reprobe_of_admitted_request_raises(self):
@@ -297,7 +366,7 @@ class TestDecodeAdmission(unittest.TestCase):
         result = self.scheduler.request_finished(request, [7, 8])
         self.assertEqual(result, (False, None))
         self.assertNotIn("req-fin", self.scheduler._decode_kv_snapshots)
-        self.assertEqual(self.scheduler._lookup_results, {"req-pending": (31, None)})
+        self.assertEqual(self.scheduler._lookup_results, {"req-pending": (16, 32, None)})
 
         result = self.scheduler.request_finished_all_groups(other, ([5, 6],))
         self.assertEqual(result, (False, None))

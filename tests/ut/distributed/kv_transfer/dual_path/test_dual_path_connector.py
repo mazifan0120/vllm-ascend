@@ -875,7 +875,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         parent_match = parent.get_num_new_matched_tokens(parent_request, 0)
         dual_match = dual.get_num_new_matched_tokens(dual_request, 0)
         parent.update_state_after_alloc(parent_request, parent_blocks, num_external_tokens=4)
-        dual.update_state_after_alloc(dual_request, dual_blocks, num_external_tokens=3)
+        dual.update_state_after_alloc(dual_request, dual_blocks, num_external_tokens=4)
 
         # The parent keeps the legacy full-prompt remote-prefill flow.
         self.assertEqual(parent_match, (4, True))
@@ -883,9 +883,9 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertFalse(parent_request.kv_transfer_params["do_remote_prefill"])
         self.assertEqual(parent_future.add_done_callback.call_count, 1)
 
-        # Task-01: the Decode-ready admission returns E_DE = R - L_DE (R = P-1 = 3)
+        # Task-01: ordinary Attention preserves the Layerwise target T = P = 4
         # and binds a DecodeKVSnapshot without touching parent machinery.
-        self.assertEqual(dual_match, (3, True))
+        self.assertEqual(dual_match, (4, True))
         self.assertEqual(dual._reqs_need_recv, {})
         self.assertFalse(dual_request.kv_transfer_params["do_remote_prefill"])
         self.assertEqual(dual.executor.submit.call_count, 1)
@@ -894,7 +894,9 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(dual._lookup_results, {})
         snapshot = dual._decode_kv_snapshots["req-load"]
         self.assertEqual(snapshot.target_tokens, 3)
-        self.assertEqual(snapshot.external_tokens, 3)
+        self.assertEqual(snapshot.transfer_tokens, 4)
+        self.assertEqual(snapshot.local_tokens, 0)
+        self.assertEqual(snapshot.external_tokens, 4)
         self.assertIsNone(snapshot.store_load_spec)
         self.assertEqual(snapshot.final_block_ids, ((4, 5, 6),))
         self.assertIn("req-load", dual._decode_decision_states)
@@ -1024,6 +1026,9 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertFalse(dual_load.kv_transfer_params["do_remote_prefill"])
         snapshot = dual._decode_kv_snapshots["req-hybrid-load"]
         self.assertEqual(snapshot.target_tokens, 16)
+        self.assertEqual(snapshot.transfer_tokens, 16)
+        self.assertEqual(snapshot.local_tokens, 0)
+        self.assertEqual(snapshot.external_tokens, 16)
         self.assertEqual(snapshot.final_block_ids, ((4, 5),))
 
     def test_allocation_task01_snapshot_replaces_parent_bookkeeping(self):
@@ -1050,7 +1055,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         dual.update_state_after_alloc(
             dual_request,
             MockBlocks(unhashed=[4, 5, 6], block_ids_tuple=([[4, 5, 6]],)),
-            num_external_tokens=23,
+            num_external_tokens=24,
         )
         # Parent: legacy bookkeeping tracks the request for receive and clears
         # the remote-prefill flag; DualPath Task-01: no parent bookkeeping at all.
@@ -1059,7 +1064,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(parent_state[2], ([[4, 5, 6]],))
         self.assertFalse(parent_request.kv_transfer_params["do_remote_prefill"])
 
-        self.assertEqual(dual_match, (23, True))
+        self.assertEqual(dual_match, (24, True))
         self.assertEqual(dual._reqs_need_recv, {})
         self.assertFalse(dual_request.kv_transfer_params["do_remote_prefill"])
         self.assertEqual(dual.executor.submit.call_count, 0)
@@ -1067,7 +1072,8 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         dual._path_decision_coordinator.register_pending.assert_called_once()
         snapshot = dual._decode_kv_snapshots["req-alloc"]
         self.assertEqual(snapshot.target_tokens, 23)
-        self.assertEqual(snapshot.external_tokens, 23)
+        self.assertEqual(snapshot.transfer_tokens, 24)
+        self.assertEqual(snapshot.external_tokens, 24)
         self.assertEqual(snapshot.local_tokens, 0)
         self.assertEqual(snapshot.store_tokens, 0)
         self.assertEqual(snapshot.final_block_ids, (([4, 5, 6],),))

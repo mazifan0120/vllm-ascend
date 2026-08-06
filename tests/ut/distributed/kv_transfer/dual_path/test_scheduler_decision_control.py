@@ -164,10 +164,10 @@ def proxy_echo():
 def _admit_request(scheduler, request: SimpleNamespace, block_ids: tuple[int, ...]):
     load_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
     scheduler._kvpool_adapter.lookup.return_value = load_spec
-    assert scheduler.get_num_new_matched_tokens(request, 16) == (32, True)
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (33, True)
     blocks = MagicMock()
     blocks.get_block_ids.return_value = (list(block_ids),)
-    scheduler.update_state_after_alloc(request, blocks, 32)
+    scheduler.update_state_after_alloc(request, blocks, 33)
     return request, blocks
 
 
@@ -343,7 +343,12 @@ class TestDecodeAdmissionControl:
         with patch.object(connector_module.time, "monotonic", return_value=10.0):
             request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
+        snapshot = decode_scheduler._decode_kv_snapshots[request.request_id]
         expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, request.request_id)
+        assert snapshot.target_tokens == 48
+        assert snapshot.transfer_tokens == 49
+        assert snapshot.local_tokens == 16
+        assert snapshot.external_tokens == 33
         assert state.request_key == expected_key
         assert state.decision_request == PathDecisionRequest(expected_key, 48, 16, 32)
         assert state.status is connector_module.DecodeDecisionStatus.PENDING
@@ -373,7 +378,13 @@ class TestDecodeAdmissionControl:
             "get_external_request_id",
             return_value="external-request-7",
         ) as external_id:
-            _admit(decode_scheduler)
+            request = _make_request()
+            load_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
+            decode_scheduler._kvpool_adapter.lookup.return_value = load_spec
+            assert decode_scheduler.get_num_new_matched_tokens(request, 16) == (32, True)
+            blocks = MagicMock()
+            blocks.get_block_ids.return_value = ([41, 42, 43, 44],)
+            decode_scheduler.update_state_after_alloc(request, blocks, 32)
         external_id.assert_called_once_with("request-local-7")
         message = decode_scheduler.executor.submit.call_args.kwargs["message"]
         assert message == {
@@ -411,7 +422,7 @@ class TestDecodeAdmissionControl:
         first_state = decode_scheduler._decode_decision_states[request.request_id]
         decode_scheduler._path_decision_coordinator.register_pending.reset_mock()
         decode_scheduler.executor.submit.reset_mock()
-        decode_scheduler.update_state_after_alloc(request, blocks, 32)
+        decode_scheduler.update_state_after_alloc(request, blocks, 33)
         assert decode_scheduler._decode_decision_states[request.request_id] is first_state
         assert decode_scheduler._decode_decision_states[request.request_id].deadline == first_state.deadline
         decode_scheduler._path_decision_coordinator.register_pending.assert_not_called()
