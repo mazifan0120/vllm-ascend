@@ -21,6 +21,10 @@ Task-02 is transport-independent pure logic. It does not add Scheduler hooks,
 open a network endpoint, contact Proxy, start Store or P2P I/O, or activate a
 production route.
 
+Task-06 narrows this protocol to Store-non-full requests. Store-full is a
+DE-local admission and never reaches the PE decider. The validation and policy
+contract below reflects that composed post-Task-06 behavior.
+
 ## 2. Outcome
 
 Task-02 defines the minimal language and replaceable policy surface for one
@@ -28,8 +32,8 @@ path decision owned by the Prefill-side `DualPathConnectorScheduler`:
 
 ```text
 PathDecisionRequest
-    -> full Decode Store hit: Path.DE_READ
-    -> otherwise: PathPolicy.choose(request)
+    -> validate Decode Store is non-full
+    -> PathPolicy.choose(request)
     -> PathDecisionResult
 ```
 
@@ -74,24 +78,31 @@ class PathDecisionRequest:
     decode_store_tokens: int
 ```
 
-The fields are derived from the Task-01 `DecodeKVSnapshot`:
+The fields are derived when Task-04 binds the Task-01 snapshot to the original
+Decode request:
 
 ```text
-target_tokens       = snapshot.target_tokens
+target_tokens       = max(request.num_tokens - 1, 0)
 decode_local_tokens = snapshot.local_tokens
 decode_store_tokens = snapshot.store_tokens
 ```
 
+`target_tokens` is the Decode-ready boundary `R`, not the parent Layerwise
+transfer target `T`. The decision needs to know whether HBM or Store can make
+Decode ready to recompute the final prompt token; it does not need to know how
+many tokens a later `PE_READ` Forward will carry. Task-01 retains `T` locally
+as `DecodeKVSnapshot.transfer_tokens`, and Task-05 derives the PE-side Forward
+end from the effective PE request after the parent's Hybrid truncation.
+
 Validation is strict:
 
 ```text
-0 <= decode_local_tokens <= decode_store_tokens <= target_tokens
-decode_local_tokens < target_tokens
+0 <= decode_local_tokens <= decode_store_tokens < target_tokens
 ```
 
-The second invariant ensures an HBM-complete request never enters the decision
-protocol. Task-01 returns `(0, False)` for that request and does not submit a
-decision request.
+The strict upper bound ensures neither HBM-complete nor Decode Store-full
+requests enter the decision protocol. HBM-complete returns `(0, False)`;
+Task-06 completes Store-full locally without constructing this request.
 
 The wire request deliberately excludes:
 
@@ -99,6 +110,7 @@ The wire request deliberately excludes:
 - `LoadSpec`, `LoadSpec.can_load`, or final Decode block IDs;
 - a public `StoreCoverage` object or coverage enum;
 - Prefill-local token counts;
+- the Layerwise transfer target or Forward token range;
 - control endpoint, retry, ACK, or transport configuration.
 
 `LoadSpec.can_load` is a post-allocation Store-I/O authorization bit. It is not
@@ -106,12 +118,9 @@ a Store capability and must not participate in path selection.
 
 ## 5. Store state derived from token facts
 
-Store state is a derived fact, not a serialized type:
+The protocol accepts only Store-non-full derived facts:
 
 ```text
-decode_store_tokens == target_tokens
-    -> full
-
 decode_local_tokens < decode_store_tokens < target_tokens
     -> partial
 
@@ -123,25 +132,25 @@ Miss and unavailable intentionally have the same decision input. Their local
 diagnostic provenance remains owned by Task-01 and is not required by the PE
 policy.
 
-## 6. Fixed full-hit rule
+`decode_store_tokens == target_tokens` is rejected. It belongs to the
+Task-06 DE-local path and must never be normalized into a valid decision
+request.
 
-A full Decode Store hit always selects `Path.DE_READ`:
+## 6. Remote-required admission precondition
+
+Every valid request passed to the decider is already remote-required:
 
 ```python
-if request.decode_store_tokens == request.target_tokens:
-    path = Path.DE_READ
-else:
-    path = policy.choose(request)
+assert request.decode_store_tokens < request.target_tokens
+path = policy.choose(request)
 ```
 
-This rule is outside the replaceable policy. Therefore:
+Therefore:
 
-- full requests do not consume or change policy state;
-- no later policy may redirect a full request to `Path.PE_READ`;
-- the request still reaches the PE `DualPathConnectorScheduler`, because PE is
-  the sole producer of the decision result;
-- later data-plane Tasks make the PE request a no-work request after the
-  direct `DE_READ` Result is delivered.
+- Decode Store-full requests consume no policy state because they never create
+  a request;
+- `Path.DE_READ` remains valid for partial, miss, and unavailable Store input;
+- PE is the sole producer of results only for this remote-required subset.
 
 ## 7. Replaceable policy surface
 
@@ -153,8 +162,8 @@ class PathPolicy(Protocol):
         ...
 ```
 
-The policy is invoked only for non-full requests. Partial, miss, and
-unavailable inputs all use the same policy call. A Store-miss `DE_READ` is a
+The policy is invoked for every valid request. Partial, miss, and unavailable
+inputs all use the same policy call. A Store-miss `DE_READ` is a
 valid non-full selection: its Store interval is empty, while later Tasks may
 use the Decode HBM prefix, Reverse, PE computation, and Forward through the
 same split-plan semantics.
@@ -193,10 +202,11 @@ class RoundRobinPathPolicy:
 
 Rules:
 
-1. The first non-full request chooses a random starting path.
-2. Every subsequent unique non-full request alternates from the previous
+1. The first valid Store-non-full request chooses a random starting path.
+2. Every subsequent unique Store-non-full request alternates from the previous
    policy result.
-3. Full requests bypass `choose()` and do not advance the policy.
+3. Store-full input is rejected before `choose()` and therefore cannot advance
+   policy state.
 4. The policy instance is owned by the PE `DualPathConnectorScheduler`.
 5. The policy is Scheduler-thread-confined; Task-02 adds no lock.
 6. Unit tests inject a seeded `random.Random` and never rely on a
@@ -240,8 +250,8 @@ _decision_records: dict[DualPathRequestKey, _DecisionRecord]
 The caller contract is:
 
 ```text
-new key
-    -> apply the full-hit rule or invoke choose() once
+new valid Store-non-full key
+    -> invoke choose() once
     -> retain request and result
 
 same key + identical request
@@ -295,14 +305,14 @@ retry counters or deadlines
 Focused CPU tests must cover:
 
 1. request-key equality and invalid empty fields;
-2. valid partial, full, and miss request construction;
+2. valid partial and miss request construction, plus Store-full rejection;
 3. every invalid token ordering;
 4. HBM-complete request rejection;
-5. full request always returns `Path.DE_READ` without invoking policy;
-6. partial, miss, and unavailable-equivalent inputs invoke policy;
+5. partial, miss, and unavailable-equivalent inputs invoke policy;
+6. Store-full input is rejected before policy invocation;
 7. seeded random initial `Path.PE_READ` and `Path.DE_READ` cases;
 8. alternation across unique non-full requests;
-9. full requests do not advance round-robin state;
+9. rejected Store-full input does not advance round-robin state;
 10. identical duplicate semantics do not call `choose()` twice;
 11. conflicting duplicate facts raise locally without a second policy call;
 12. policy exception and invalid return retain one local failure, and replay
@@ -344,8 +354,9 @@ package structure, but Task-02 must not create transport or Scheduler files.
 Task-02 is accepted when pure unit tests prove:
 
 - the minimal request and result schemas are strict and round-trip safely;
-- full requests deterministically select `Path.DE_READ` outside policy;
-- every non-full request is delegated to the replaceable `PathPolicy`;
+- Store-full requests are rejected because Task-06 keeps them DE-local;
+- every valid Store-non-full request is delegated to the replaceable
+  `PathPolicy`;
 - `RoundRobinPathPolicy` starts randomly and then alternates;
 - the duplicate contract prevents a logical request from consuming policy
   state twice;

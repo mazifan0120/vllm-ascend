@@ -16,9 +16,14 @@ Task-04 is a control-plane closure, not a production route activation. It
 authorizes no Store load, Forward, or Reverse operation. The approved
 Task-04-only transitional behavior is listed explicitly in Section 12.
 
+Task-06 narrows this loop to Decode Store-non-full admissions. Store-full
+branches locally before request-key construction and therefore creates no
+Task-04 state, Proxy request, PE request, Result, or Decision timeout. The
+remaining Task-04 behavior is unchanged for Store-non-full requests.
+
 ## 2. Outcome and merge-state contract
 
-For every non-HBM-complete DualPath Decode request, Task-04 must provide this
+For every Store-non-full DualPath Decode request, Task-04 must provide this
 real control loop:
 
 ```text
@@ -29,7 +34,7 @@ DE DecodeKVSnapshot
 
 PE real request
     -> validate nested dual_path metadata
-    -> apply the fixed full-hit rule or invoke PathPolicy once
+    -> invoke PathPolicy once
     -> send one PathDecisionResult directly to DE
     -> continue ordinary PE compute without submitting KV transfer work
 
@@ -66,6 +71,7 @@ sequenceDiagram
     participant PECore as "PE vLLM Scheduler"
     participant DEW as "DE DualPathConnectorWorker"
 
+    Note over Core,DES: Store-full already branched to Task-06 local load
     Core->>DES: update_state_after_alloc(request, final_blocks, E_DE)
     DES->>DES: create DecodeKVSnapshot
     DES->>DES: create request key and PathDecisionRequest
@@ -156,6 +162,7 @@ DE control admission:
     dual_path_cfg.role == "decode"
     request entered Task-01 with do_remote_prefill is True
     a DecodeKVSnapshot exists after final allocation
+    snapshot.store_tokens < max(request.num_tokens - 1, 0)
 
 PE decision request:
     dual_path_cfg.role == "prefill"
@@ -205,7 +212,14 @@ the corresponding `DecodeKVSnapshot`.
 
 ### 6.2 Construction order
 
-After Task-01 creates a new `DecodeKVSnapshot`, DE must:
+After Task-01 creates a new `DecodeKVSnapshot`, DE must first prove:
+
+```text
+snapshot.store_tokens < max(request.num_tokens - 1, 0)
+```
+
+Task-06 consumes Store-full before this point. For the remaining
+Store-non-full snapshot, DE must:
 
 1. Obtain `decode_engine_instance_id` and `decode_control_endpoint` from its
    Task-03 Coordinator.
@@ -214,10 +228,14 @@ After Task-01 creates a new `DecodeKVSnapshot`, DE must:
 3. Construct `PathDecisionRequest` from the snapshot:
 
    ```text
-   target_tokens       = snapshot.target_tokens
+   target_tokens       = max(request.num_tokens - 1, 0)
    decode_local_tokens = snapshot.local_tokens
    decode_store_tokens = snapshot.store_tokens
    ```
+
+   `target_tokens` is the decision-only Decode-ready boundary `R`. The
+   snapshot's `transfer_tokens=T` remains DE-local data-plane state and is not
+   added to `PathDecisionRequest` or the Task-03 wire envelope.
 
 4. Construct strict `DualPathDecisionMetadata` and the complete outgoing
    Mooncake remote-decode message.
@@ -577,8 +595,8 @@ not add a busy loop or Scheduler-to-Core callback.
 
 For `COMMITTED`, cleanup is the first normal unregister point. For
 `TIMED_OUT`, unregister is repeated safely after the earlier timeout removal.
-Cancellation before Result, after Result, and after timeout follows the same
-hook.
+Request-terminal cleanup before Result, after Result, and after timeout follows
+the same local hook. It does not notify or stop work on another engine.
 
 ### 10.2 Prefill cleanup
 
@@ -634,6 +652,8 @@ or Future reference. Task-04 owns no active DMA to drain.
 - No successful `finished_recving` is published for a committed Result.
 - HBM-complete Decode requests create no snapshot, key, HTTP notification,
   Result, deadline, or Worker failure record.
+- Store-full Decode requests create a snapshot and local Store commit, but no
+  Task-04 key, HTTP notification, Result, deadline, or timeout record.
 
 ## 12. Boundary-only transitional behavior
 
@@ -642,11 +662,10 @@ route activation. They must not be mistaken for the final architecture:
 
 | Task-04 behavior | Why it is temporary | Owning later Task |
 |---|---|---|
-| PE continues normal computation after producing a Result, but DualPath discards its KV | Task-04 does not add PE no-work/cancellation or a data consumer | Task-05 uses PE work for `PE_READ`; Task-06/08 add path-specific PE lifecycle |
+| PE continues normal computation after producing a Result, but DualPath discards its KV | Task-04 does not add a data consumer | Task-05 uses PE work for `PE_READ`; Task-08 adds split `DE_READ` lifecycle |
 | Every PE DualPath request skips `_reqs_need_send_layerwise` | No committed route has an executable Forward plan yet | Task-05/07/08 replace it with explicit path-specific plans |
 | DE never writes `_reqs_need_recv` | Task-04 receives a Result, not KV | Task-05/07/08 add explicit Forward receive plans |
 | `COMMITTED` remains in `WAITING_FOR_REMOTE_KVS` | No Store/Forward/Reverse completion predicate exists | Task-05 through Task-08 publish readiness only after their real barriers |
-| Full `DE_READ` starts no Store load | Store commit-after-allocation is not Task-04 scope | Task-06 |
 | Non-full `DE_READ` creates no Store/Reverse/compute/Forward ranges | Bidirectional plan/runtime is not Task-04 scope | Task-07/08 |
 | A committed Result emits no Worker metadata | Worker authorization begins only with an executable data plan | Task-05 through Task-08 |
 | Decode rejects multiple KV cache groups | Upstream request termination through invalid block IDs is currently single-group | A later Task may remove this only with a multi-group failure path |
@@ -675,7 +694,9 @@ Focused CPU tests must cover:
 2. Decode role rejects multiple KV cache groups and any KV load failure policy
    other than `fail`; Prefill role does not apply those Decode-only guards.
 3. HBM-complete Decode bypass has no Task-04 side effect.
-4. Snapshot-to-key/request/endpoint construction uses exact Task-01 facts.
+4. Store-full branches before key construction with zero policy, Coordinator,
+   Proxy, PE, or timeout side effect; Store-non-full snapshot-to-key/request/
+   endpoint construction uses exact Task-01 facts.
 5. `register_pending()` occurs before executor submission.
 6. The outgoing message preserves every required Mooncake field, uses
    `snapshot.local_tokens` for `remote_cached_tokens`, applies inherited block
@@ -689,8 +710,9 @@ Focused CPU tests must cover:
    deadline without a second request attempt.
 10. PE parent accounting/truncation executes exactly once for valid, malformed,
     and ordinary metadata.
-11. Full hit bypasses policy and produces `Path.DE_READ`; seeded non-full
-    requests invoke policy once and produce alternating Results.
+11. Store-full creates no Result and does not advance policy; seeded
+    Store-non-full requests invoke policy once and produce alternating
+    Results.
 12. Repeated PE scheduling for identical facts neither advances policy nor
     submits a second delivery Future.
 13. Conflicting facts, invalid nested metadata, version mismatch, policy
@@ -713,13 +735,13 @@ Focused CPU tests must cover:
     `finished_recving`, without Store/P2P calls.
 20. A Scheduler/Core integration test proves the output terminates the request
     as `FINISHED_ERROR` and releases delayed blocks.
-21. Cancellation before Result, after a committed Result, after timeout, and
-    while PE delivery is in flight cleans every owned map and Coordinator
-    registration.
+21. Request-terminal hooks before Result, after a committed Result, after
+    timeout, and while PE delivery is in flight clean every locally owned map
+    and Coordinator registration without defining cross-engine abort.
 22. Delivery exhaustion logs locally and DE times out without re-decision or a
     second Proxy request.
-23. Concurrent requests remain isolated across Result, timeout, cancellation,
-    HTTP Future, and delivery Future state.
+23. Concurrent requests remain isolated across Result, timeout,
+    request-terminal cleanup, HTTP Future, and delivery Future state.
 24. Shutdown is idempotent and leaves no live Task-04 thread, endpoint, Future,
     or retained request state.
 
@@ -761,8 +783,7 @@ metadata pass-through.
 - A second Decision attempt, new Prefill request, or post-Result fallback.
 - Store `commit_after_alloc()` or any Store Worker request.
 - Forward/Reverse block-pair plans, transfer metadata, or data completion.
-- PE no-work, PE cancellation after Result, or prevention of PE ModelRunner
-  compute.
+- PE no-work termination after Result or prevention of PE ModelRunner compute.
 - Successful `finished_recving` for a committed Result.
 - Multiple KV cache groups.
 - Modification of upstream vLLM's invalid-block handling.
@@ -774,8 +795,9 @@ metadata pass-through.
 Task-04 is accepted when a Scheduler/Core-focused CPU integration suite proves
 all of the following:
 
-- a real Decode allocation creates one request, registration, Proxy
-  notification, and deadline without a receive/data queue;
+- a real Store-non-full Decode allocation creates one request, registration,
+  Proxy notification, and deadline without a receive/data queue, while
+  Store-full creates none of them;
 - a real PE Scheduler hook produces and sends one immutable Result without a
   Forward/data queue;
 - DE consumes the Result through `take_received_results()` and retains

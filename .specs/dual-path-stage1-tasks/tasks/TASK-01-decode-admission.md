@@ -16,6 +16,11 @@ the final Decode blocks and leaves the request in
 `WAITING_FOR_REMOTE_KVS`. The request is intentionally not promoted again in
 this Task.
 
+Task-06 later makes Store-full admission locally executable. Its normative
+delta changes Task-01 accounting and snapshot fields as recorded below; the
+Task-06 implementation owns the corresponding changes to already implemented
+Task-01 code and tests.
+
 ## 2. Outcome
 
 For a DualPath Decode request, Task-01 must implement this call chain:
@@ -43,24 +48,32 @@ sequenceDiagram
         KVS-->>KVA: "Store delta and async flag"
         KVA->>KVA: "pop detached LoadSpec"
         KVA-->>DP: "LoadSpec or None"
-        DP->>DP: "cache (E_DE, detached LoadSpec)"
-        DP-->>Core: (E_DE, True)
+        DP->>DP: "classify Store-full after alignment/clamp"
+        alt "Store full: S_DE == R"
+            DP->>DP: "cache (L_DE, R-L_DE, detached LoadSpec)"
+            DP-->>Core: (R-L_DE, True)
+        else "Store non-full: S_DE < R"
+            DP->>DP: "cache (L_DE, T-L_DE, detached LoadSpec)"
+            DP-->>Core: (T-L_DE, True)
+        end
 
-        Core->>HBM: "allocate_slots(..., external=E_DE, delay_cache_blocks=True)"
+        Core->>HBM: "allocate_slots(..., external=route E_DE, delay_cache_blocks=True)"
         alt "allocation fails"
             HBM-->>Core: None
             Note over DP: "Keep minimal lookup result for retry"
         else "allocation succeeds"
             HBM-->>Core: final blocks
-            Core->>DP: "update_state_after_alloc(request, final blocks, E_DE)"
+            Core->>DP: "update_state_after_alloc(request, final blocks, route E_DE)"
             DP->>DP: "consume lookup result; create DecodeKVSnapshot"
             Core->>Core: "status = WAITING_FOR_REMOTE_KVS"
         end
     end
 ```
 
-No branch in this sequence submits to Proxy, starts Store load, builds a P2P
-transfer, publishes `finished_recving`, or returns the request to `WAITING`.
+Task-01 alone submits no branch to Proxy, starts no Store load, builds no P2P
+transfer, publishes no `finished_recving`, and returns no request to
+`WAITING`. Task-06 adds the explicit post-allocation commit only to the
+Store-full branch.
 
 ## 3. Request selection
 
@@ -89,10 +102,14 @@ For an initial request:
 
 ```text
 P    = request.num_tokens at initial scheduling
-R    = max(P - 1, 0)
+R    = max(P - 1, 0), the Decode-ready boundary
+T    = parent Layerwise transfer target:
+       P for an ordinary Attention model
+       R for an Attention-Mamba hybrid model
 L_DE = num_computed_tokens passed by vLLM after local HBM lookup
-E_DE = R - L_DE, when L_DE < R
-K_DE = usable KVPool prefix recorded by a detached LoadSpec
+E_DE = R - L_DE when Store is full through R
+       T - L_DE when Store is non-full
+K_DE = usable KVPool prefix recorded by a detached LoadSpec and clamped to R
 ```
 
 The rules are:
@@ -100,20 +117,30 @@ The rules are:
 | Condition | Return to vLLM Core | KVPool lookup | Task-01 state |
 |---|---:|---|---|
 | `L_DE >= R` | `(0, False)` | No | Clear stale unbound lookup state; create nothing |
-| `L_DE < R` | `(E_DE, True)` | Yes, or reuse identical unbound result | Cache lookup result until allocation |
+| `L_DE < R` and `K_DE == R` | `(R - L_DE, True)` | Yes, or reuse identical unbound result | Cache local Store-full lookup until allocation |
+| `L_DE < R` and `K_DE < R` | `(T - L_DE, True)` | Yes, or reuse identical unbound result | Cache remote-required lookup until allocation |
 
-`E_DE` is the number of final Decode tokens that are not already present in
-HBM. It is deliberately independent of the Store hit:
+`R` and `T` are deliberately different facts. `R` answers whether Decode can
+continue by recomputing the final prompt token. `T` preserves the existing
+Mooncake Layerwise transfer contract used by a later `PE_READ` route. Task-01
+must derive `T` through the inherited hybrid-target helper rather than applying
+a universal `P - 1` rule.
+
+`E_DE` is the number of external tokens for which vLLM must allocate final
+Decode slots. Store-full is now a DE-local route frozen before allocation, so
+its accounting ends at `R`; every Store-non-full request preserves the parent
+Layerwise destination boundary `T`:
 
 ```text
-Store full:    K_DE = R                 but Core still receives R - L_DE
-Store partial: L_DE < K_DE < R          and Core still receives R - L_DE
-Store miss:    no useful detached spec  and Core still receives R - L_DE
+Store full:    K_DE = R                 and Core receives R - L_DE
+Store partial: L_DE < K_DE < R          and Core receives T - L_DE
+Store miss:    no useful detached spec  and Core receives T - L_DE
 ```
 
-This makes vLLM allocate the final Decode destination blocks before any route
-decision. Returning `K_DE - L_DE` would under-allocate partial and miss cases
-and is forbidden.
+Returning the partial Store delta `K_DE - L_DE` remains forbidden because it
+would under-allocate partial and miss remote routes. For ordinary Attention,
+Store-full must not return `T-L_DE`: its local load prepares only
+`R=P-1`, after which Decode recomputes the final prompt token.
 
 The existing KVPool implementation remains authoritative for key generation,
 cache-transfer alignment, `discard_partial_chunks`, multi-group intersection,
@@ -188,13 +215,13 @@ owned by the Scheduler adapter.
 `DualPathConnectorScheduler` owns:
 
 ```python
-_lookup_results: dict[str, tuple[int, LoadSpec | None]]
+_lookup_results: dict[str, tuple[int, int, LoadSpec | None]]
 ```
 
 The tuple is exactly:
 
 ```text
-(external_tokens, detached_store_load_spec)
+(local_tokens, external_tokens, detached_store_load_spec)
 ```
 
 It exists only because vLLM separates lookup and allocation into two
@@ -212,14 +239,11 @@ Create the complete record only after final allocation succeeds:
 ```python
 @dataclass(frozen=True)
 class DecodeKVSnapshot:
-    target_tokens: int
+    transfer_tokens: int
+    local_tokens: int
     external_tokens: int
     store_load_spec: LoadSpec | None
     final_block_ids: tuple[tuple[int, ...], ...]
-
-    @property
-    def local_tokens(self) -> int:
-        return self.target_tokens - self.external_tokens
 
     @property
     def store_tokens(self) -> int:
@@ -236,18 +260,23 @@ _decode_kv_snapshots: dict[str, DecodeKVSnapshot]
 
 The field choices are intentional:
 
-- `local_tokens` is derived rather than duplicated with
-  `LoadSpec.vllm_cached_tokens`.
+- `local_tokens` is explicit. After Task-06, Store-full accounting ends at
+  `R` while remote accounting ends at `T`, so it cannot be derived from
+  `transfer_tokens - external_tokens`.
 - `store_tokens` is derived rather than duplicated with
   `LoadSpec.kvpool_cached_tokens`.
-- `target_tokens` has no equivalent in `LoadSpec` and is retained.
+- `transfer_tokens` has no equivalent in `LoadSpec` and is retained because a
+  later data-plane Task needs the original Layerwise transfer boundary.
+- `ready_tokens` is not stored. It is the temporary admission/decision value
+  `R = max(P - 1, 0)` and is placed in
+  `PathDecisionRequest.target_tokens` by Task-04.
 - `final_block_ids` is mandatory because the record does not exist before
   allocation.
 
 `LoadSpec` is mutable in the existing AscendStore implementation, but the
 detached instance is exclusively owned by this admission after binding.
-Task-01 does not mutate it. A later Task must explicitly move or copy it when
-authorizing a Store load.
+Task-01 does not mutate it. Task-06 explicitly copies it before authorizing a
+Store load so the snapshot fact remains immutable.
 
 ### 5.4 Worker lookup service
 
@@ -274,6 +303,10 @@ Requirements:
 - It does not call `register_kv_caches()`, start receive/send threads, build
   Store load metadata, or expose Store completion.
 - `close()` is idempotent and terminates the lookup server cleanly.
+
+This is the Task-01 merge-state boundary. Task-06 extends the same adapter
+with KV-cache registration, async load, completion, and load-error delegation;
+it does not replace the lookup service.
 
 The existing `LookupKeyServer.close()` must be made lifecycle-safe for this
 first explicit owner: stop accepting requests, unblock its receive loop,
@@ -314,11 +347,10 @@ KVPool policy returns no Store hit; Task-01 still admits the request using
 lookup is always non-layerwise. This does not change the inherited Mooncake
 Layerwise Forward/Reverse runtime.
 
-No new environment variable is introduced. `load_async` is not admitted as a
-Task-01 KVPool setting because DualPath, rather than the owned
-`KVPoolScheduler`, supplies the Core-facing asynchronous admission result.
-Other Store/backend configuration continues to use the current AscendStore
-mechanisms.
+No new environment variable is introduced. Task-01 itself needs no Store
+Worker load. Task-06 admits the existing `load_async` KVPool setting and
+requires `load_async=True` for the DE-local Store-full runtime; DualPath still
+owns the Core-facing asynchronous admission result.
 
 ## 7. Scheduler callback behavior
 
@@ -327,15 +359,21 @@ mechanisms.
 For a selected DualPath Decode request:
 
 1. Calculate `R = max(request.num_tokens - 1, 0)`.
-2. Validate `0 <= L_DE <= R` for the initial admission path.
-3. If `L_DE >= R`, remove any stale `_lookup_results[request_id]` and return
+2. Calculate `T = self._hybrid_prefill_token_count(P)` with the inherited
+   Layerwise target rule: ordinary Attention uses `P`; Attention-Mamba hybrid
+   uses `R`.
+3. Validate `0 <= L_DE <= R <= T` for the initial admission path.
+4. If `L_DE >= R`, remove any stale `_lookup_results[request_id]` and return
    `(0, False)` without calling `KVPoolAdapter`.
-4. Calculate `E_DE = R - L_DE`.
-5. If an unbound entry already exists with the same `E_DE`, reuse it and do
-   not repeat the KVPool lookup.
-6. If an unbound entry exists with a different `E_DE`, discard it, perform a
-   fresh lookup, and replace it.
-7. Store `(E_DE, detached_spec_or_none)` and return `(E_DE, True)`.
+5. Obtain or reuse the detached KVPool lookup result.
+6. Classify Store-full only when the aligned/clamped detached spec reaches
+   `R`.
+7. Calculate `E_DE = R-L_DE` for Store-full, otherwise `T-L_DE`.
+8. If an unbound entry already exists with identical `L_DE`, `R`, `T`, and
+   `E_DE`, reuse it and do not repeat the lookup.
+9. If those admission facts changed, discard the entry, perform a fresh
+   lookup, and replace it.
+10. Store `(L_DE, E_DE, detached_spec_or_none)` and return `(E_DE, True)`.
 
 An existing `DecodeKVSnapshot` for the same request ID makes a new initial
 lookup invalid. Identical duplicate binding is handled in the allocation
@@ -360,19 +398,23 @@ For a selected DualPath Decode request:
 
 1. Freeze `blocks.get_block_ids()` as
    `tuple(tuple(group) for group in block_ids_by_group)`.
-2. If an admission already exists, accept the call only when target,
-   `num_external_tokens`, and frozen blocks are identical; return without
-   changing state. A conflicting duplicate raises `RuntimeError`.
+2. If an admission already exists, accept the call only when transfer target,
+   explicit local tokens, `num_external_tokens`, and frozen blocks are
+   identical; return without changing state. A conflicting duplicate raises
+   `RuntimeError`.
 3. Pop the request's entry from `_lookup_results`; absence is a lifecycle
    error.
-4. Validate `num_external_tokens == cached_external_tokens == R - L_DE`.
+4. Validate `L_DE` from the cached entry and validate
+   `num_external_tokens == cached_external_tokens`.
 5. If a detached spec exists, validate
    `spec.vllm_cached_tokens == L_DE` and
    `L_DE < spec.kvpool_cached_tokens <= R`.
-6. Construct `DecodeKVSnapshot` and insert it into `_decode_kv_snapshots`.
-7. Do not call the parent `update_state_after_alloc()` for this request.
+6. Validate route accounting: `R-L_DE` for Store-full, otherwise `T-L_DE`.
+7. Construct `DecodeKVSnapshot` with explicit `local_tokens` and insert it
+   into `_decode_kv_snapshots`.
+8. Do not call the parent `update_state_after_alloc()` for this request.
 
-Step 7 prevents the parent from populating `_reqs_need_recv`, mutating
+Step 8 prevents the parent from populating `_reqs_need_recv`, mutating
 `do_remote_prefill`, submitting its current metaserver request, or creating
 Worker P2P metadata. Non-selected requests still delegate to the parent.
 
@@ -404,7 +446,7 @@ The Scheduler owns all Task-01 request records and removes both
 
 - `request_finished()`;
 - `request_finished_all_groups()`;
-- cancellation/abort as observed through either finish callback;
+- any request-terminal status observed through either finish callback;
 - connector shutdown.
 
 Cleanup is idempotent. Task-01 never delays block freeing and preserves the
@@ -466,12 +508,15 @@ Tests must cover:
 
 - HBM complete returns `(0, False)`, performs zero adapter calls, and creates
   no state;
-- full, partial, and miss all return the same `E_DE = R - L_DE` for identical
-  `R` and `L_DE`;
+- Store-full returns `R-L_DE`; partial and miss return `T-L_DE` for identical
+  `T` and `L_DE`;
+- ordinary Attention uses `T=P`, while Attention-Mamba hybrid uses `T=R`;
+- neither model enters admission when `L_DE >= R`, even though ordinary
+  Attention would otherwise have `T=R+1`;
 - the first incomplete lookup creates only `_lookup_results`;
 - successful allocation consumes `_lookup_results` and creates exactly one
   `DecodeKVSnapshot` with frozen final block IDs;
-- `local_tokens` and `store_tokens` derivation;
+- explicit `local_tokens` retention and `store_tokens` derivation;
 - identical duplicate lookup performs one underlying Store lookup;
 - changed `E_DE` replaces the unbound lookup result;
 - allocation-failure retry reuses the unbound result;
@@ -499,16 +544,23 @@ A CPU-focused integration test must use the real vLLM Scheduler call order,
 with Store and allocation dependencies constrained or faked at their existing
 seams. For `L_DE < R`, one `schedule()` call must prove:
 
-1. the connector returned `(R - L_DE, True)`;
-2. `allocate_slots()` received `num_external_computed_tokens=R-L_DE` and
-   `delay_cache_blocks=True`;
+1. the connector returned the route-specific value: `R-L_DE` for Store-full
+   or `T-L_DE` for Store-non-full;
+2. `allocate_slots()` received that exact route-specific
+   `num_external_computed_tokens` and `delay_cache_blocks=True`;
 3. final Decode block IDs exist and equal the snapshot's frozen IDs;
 4. request status is `WAITING_FOR_REMOTE_KVS`;
-5. `request.num_computed_tokens == R` as set by vLLM for the pending async
-   receive;
+5. `request.num_computed_tokens == R` for Store-full and `== T` for
+   Store-non-full as set by vLLM for the pending async receive; ordinary
+   Attention Store-full later recomputes the final prompt token, while Hybrid
+   already uses `T=R`;
 6. no model tokens were scheduled for the request in that step;
 7. connector metadata contains no Store or P2P work for the request;
 8. no `finished_recving` completion is published.
+
+Items 7-8 describe the Task-01-only merge state. Task-06 replaces them for
+Store-full with committed local Store metadata and terminal completion; they
+remain unchanged for Store-non-full until its selected remote route runs.
 
 A paired HBM-complete case must prove normal local scheduling and last-token
 recomputation without KVPool lookup or Task-01 state.
@@ -542,7 +594,10 @@ Task-01 is acceptable only if all of the following are true:
 - the adapter reuses current KVPool lookup behavior rather than copying it;
 - no shared `KVPoolScheduler.load_specs` entry survives adapter lookup;
 - no handle, public `StoreCoverage`, or pre-allocation admission object exists;
-- partial and miss cases allocate `R - L_DE`, not `K_DE - L_DE`;
+- Store-full allocates `R-L_DE`; partial and miss allocate `T-L_DE`, never
+  `K_DE-L_DE`;
+- HBM and Store readiness are evaluated against `R`, while allocation and a
+  later Forward route preserve the parent Layerwise target `T`;
 - `DecodeKVSnapshot` exists only after real block allocation;
 - the request reaches and remains in `WAITING_FOR_REMOTE_KVS`;
 - no Proxy, Store load, P2P transfer, or completion path is accidentally

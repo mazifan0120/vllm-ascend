@@ -19,6 +19,10 @@ required reconciliation.
 Task-03 owns a small transport closure. It does not select a path, consume a
 decision in a real Scheduler hook, or authorize Store or P2P I/O.
 
+Post-Task-06, this channel applies only to Store-non-full requests. A Decode
+Store-full request never creates bootstrap metadata or contacts either
+Coordinator; no transport shape or retry rule changes.
+
 ## 2. Outcome
 
 Task-03 provides a direct result path:
@@ -37,8 +41,9 @@ The existing request-dispatch direction remains:
 DE -> Proxy -> PE
 ```
 
-That existing path carries the Task-02 `PathDecisionRequest` and the DE
-control endpoint inside a nested `kv_transfer_params["dual_path"]` envelope.
+That existing path carries a validated Store-non-full Task-02
+`PathDecisionRequest` and the DE control endpoint inside a nested
+`kv_transfer_params["dual_path"]` envelope.
 Proxy forwards that envelope unchanged and never carries the result back to
 DE.
 
@@ -86,6 +91,10 @@ PathDecisionResult
 ```
 
 It adds only transport types.
+
+Task-02 validation requires
+`decode_store_tokens < target_tokens`. A forged Store-full request is rejected
+before the sender can create a `PathDecision`.
 
 ### 4.1 Protocol version
 
@@ -146,6 +155,11 @@ kv_transfer_params = {
     },
 }
 ```
+
+`decision_request.target_tokens` is the Decode-ready boundary
+`R = max(P - 1, 0)`. The envelope does not serialize the parent Layerwise
+transfer target `T`; Task-01 retains that value in DE-local snapshot state and
+Task-05 derives it from the effective PE request when building Forward state.
 
 Task-03 owns strict serialization, deserialization, and a transparent
 pass-through contract. Task-04 owns creation from a real `DecodeKVSnapshot`
@@ -414,8 +428,9 @@ Focused CPU tests must cover:
 3. Deterministic injected boot IDs and explicit DP-rank separation.
 4. Strict `DecodeControlEndpoint`, bootstrap metadata, and `PathDecision`
    serialization round trips.
-5. Nested `kv_transfer_params["dual_path"]` shape and transparent fake Proxy
-   pass-through.
+5. Nested Store-non-full `kv_transfer_params["dual_path"]` shape and
+   transparent fake Proxy pass-through; Store-full request construction is
+   rejected before send.
 6. No PE socket construction before `submit()` receives a real endpoint.
 7. One successful Result delivery, one received Result, and exact `b"ACK"`.
 8. Lost first ACK followed by identical retry, second ACK, and one received
