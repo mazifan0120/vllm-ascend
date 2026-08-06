@@ -12,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionRequest,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    MooncakeLayerwiseConnectorScheduler,
     MooncakeLayerwiseConnectorWorker,
     SendReqInfo,
 )
@@ -148,6 +149,7 @@ def _make_request(
         max_tokens=16,
         prompt_token_ids=prompt_token_ids,
         prompt_embeds=None,
+        all_token_ids=list(prompt_token_ids),
         _all_token_ids=list(prompt_token_ids),
         kv_transfer_params=params,
     )
@@ -162,6 +164,45 @@ def _blocks(block_ids: tuple[list[int], ...]) -> MagicMock:
 
 def _decide(scheduler, request) -> None:
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
+@pytest.fixture()
+def parent_forward_metadata_pair(scheduler_factory):
+    dual_scheduler, _, _ = scheduler_factory()
+    request = _make_request()
+    _decide(dual_scheduler, request)
+    dual_scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
+
+    parent_scheduler = MooncakeLayerwiseConnectorScheduler(
+        _make_vllm_config(),
+        _make_kv_cache_config(),
+        "prefill-engine",
+    )
+    try:
+        installed_send_info = dual_scheduler._reqs_need_send_layerwise[request.request_id]
+        parent_scheduler._reqs_need_send_layerwise[request.request_id] = SendReqInfo(
+            local_block_ids=[list(group) for group in installed_send_info.local_block_ids],
+            local_transferred_tokens=installed_send_info.local_transferred_tokens,
+            local_computed_tokens=installed_send_info.local_computed_tokens,
+            request=request,
+        )
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[request.request_id],
+                new_block_ids=[[[13]]],
+                num_computed_tokens=[16],
+            ),
+            scheduled_spec_decode_tokens={},
+            scheduled_new_reqs=[],
+            num_scheduled_tokens={request.request_id: 17},
+        )
+
+        dual_metadata = dual_scheduler.build_connector_meta(scheduler_output)
+        parent_metadata = parent_scheduler.build_connector_meta(scheduler_output)
+        return dual_metadata.requests[request.request_id], parent_metadata.requests[request.request_id]
+    finally:
+        parent_scheduler.executor.shutdown(wait=False)
+        parent_scheduler.metaserver_client.close()
 
 
 def test_pe_read_result_retained_once_and_single_plan_after_alloc_covers_T(scheduler_factory):
@@ -391,3 +432,43 @@ def test_scheduler_rejects_invalid_forward_plan_without_send_state(scheduler_fac
     assert request.request_id not in scheduler._pe_path_results
     assert request.request_id not in scheduler._pe_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
+
+
+def test_build_connector_meta_frontier_matches_parent(parent_forward_metadata_pair):
+    dual_req_meta, parent_req_meta = parent_forward_metadata_pair
+
+    assert (
+        (
+            dual_req_meta.local_transed_tokens,
+            dual_req_meta.local_computed_tokens,
+            dual_req_meta.chunk_finish,
+        )
+        == (
+            parent_req_meta.local_transed_tokens,
+            parent_req_meta.local_computed_tokens,
+            parent_req_meta.chunk_finish,
+        )
+        == (0, 33, True)
+    )
+
+
+def test_remote_cache_tokens_skips_decode_ready_prefix_exactly_once(parent_forward_metadata_pair):
+    dual_req_meta, parent_req_meta = parent_forward_metadata_pair
+
+    assert dual_req_meta.remote_cache_tokens == parent_req_meta.remote_cache_tokens == 16
+    assert max(dual_req_meta.remote_cache_tokens, dual_req_meta.local_transed_tokens) == 16
+
+
+def test_non_block_aligned_T_selects_containing_final_block(parent_forward_metadata_pair):
+    dual_req_meta, parent_req_meta = parent_forward_metadata_pair
+    token_end = 33
+    containing_block_index = token_end // _BLOCK_SIZE
+
+    assert token_end % _BLOCK_SIZE != 0
+    assert (
+        dual_req_meta.local_block_ids[0][containing_block_index],
+        parent_req_meta.local_block_ids[0][containing_block_index],
+        dual_req_meta.prompt_len,
+        parent_req_meta.prompt_len,
+        dual_req_meta.local_computed_tokens,
+    ) == (12, 12, token_end, token_end, token_end)
