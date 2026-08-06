@@ -5,11 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final, Protocol, TypeAlias
-
-ERROR_INVALID_REQUEST: Final[str] = "INVALID_REQUEST"
-ERROR_CONFLICTING_REQUEST: Final[str] = "CONFLICTING_REQUEST"
-ERROR_INVALID_POLICY_RESULT: Final[str] = "INVALID_POLICY_RESULT"
+from typing import Protocol, TypeAlias
 
 _JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | dict[str, "_JsonValue"]
 _JsonObject: TypeAlias = dict[str, _JsonValue]
@@ -116,7 +112,7 @@ class PathDecisionRequest:
 
 
 @dataclass(frozen=True)
-class PathDecisionCommit:
+class PathDecisionResult:
     request_key: DualPathRequestKey
     path: Path
 
@@ -133,7 +129,7 @@ class PathDecisionCommit:
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> PathDecisionCommit:
+    def from_dict(cls, payload: _JsonValue) -> PathDecisionResult:
         data = _require_exact_payload(
             payload,
             frozenset({"request_key", "path"}),
@@ -146,43 +142,6 @@ class PathDecisionCommit:
             request_key=DualPathRequestKey.from_dict(data["request_key"]),
             path=path,
         )
-
-
-@dataclass(frozen=True)
-class PathDecisionError:
-    request_key: DualPathRequestKey
-    error_code: str
-    message: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request_key, DualPathRequestKey):
-            raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
-        if not isinstance(self.error_code, str):
-            raise PathDecisionValidationError("error_code must be a string")
-        if not isinstance(self.message, str):
-            raise PathDecisionValidationError("message must be a string")
-
-    def to_dict(self) -> _JsonObject:
-        return {
-            "request_key": self.request_key.to_dict(),
-            "error_code": self.error_code,
-            "message": self.message,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: _JsonValue) -> PathDecisionError:
-        data = _require_exact_payload(
-            payload,
-            frozenset({"request_key", "error_code", "message"}),
-        )
-        return cls(
-            request_key=DualPathRequestKey.from_dict(data["request_key"]),
-            error_code=data["error_code"],
-            message=data["message"],
-        )
-
-
-PathDecisionResult = PathDecisionCommit | PathDecisionError
 
 
 class PathPolicy(Protocol):
@@ -199,47 +158,44 @@ class RoundRobinPathPolicy:
         return selected
 
 
+@dataclass(frozen=True)
+class _DecisionRecord:
+    request: PathDecisionRequest
+    result: PathDecisionResult | None
+
+
 class PathDecisionDecider:
     def __init__(self, policy: PathPolicy) -> None:
         self._policy = policy
-        self._path_decisions: dict[
-            DualPathRequestKey,
-            tuple[PathDecisionRequest, PathDecisionCommit],
-        ] = {}
+        self._decision_records: dict[DualPathRequestKey, _DecisionRecord] = {}
 
     def decide(self, request: PathDecisionRequest) -> PathDecisionResult:
         if not isinstance(request, PathDecisionRequest):
-            request_key = getattr(request, "request_key", None)
-            if isinstance(request_key, DualPathRequestKey):
-                return PathDecisionError(
-                    request_key=request_key,
-                    error_code=ERROR_INVALID_REQUEST,
-                    message="decision input must be a PathDecisionRequest",
-                )
-            raise PathDecisionValidationError("decision input must include a valid DualPathRequestKey")
+            raise PathDecisionValidationError("decision input must be a PathDecisionRequest")
 
-        existing = self._path_decisions.get(request.request_key)
+        existing = self._decision_records.get(request.request_key)
         if existing is not None:
-            retained_request, retained_commit = existing
-            if request == retained_request:
-                return retained_commit
-            return PathDecisionError(
-                request_key=request.request_key,
-                error_code=ERROR_CONFLICTING_REQUEST,
-                message="request key is already associated with different token facts",
-            )
+            if request != existing.request:
+                raise PathDecisionValidationError("request key is already associated with different token facts")
+            if existing.result is None:
+                raise PathDecisionValidationError("decision previously failed locally")
+            return existing.result
 
         if request.decode_store_tokens == request.target_tokens:
             path = Path.DE_READ
         else:
-            path = self._policy.choose(request)
+            try:
+                path = self._policy.choose(request)
+            except Exception as error:  # noqa: BLE001
+                self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
+                raise PathDecisionValidationError("path policy raised an exception") from error
             if not isinstance(path, Path):
-                return PathDecisionError(
-                    request_key=request.request_key,
-                    error_code=ERROR_INVALID_POLICY_RESULT,
-                    message=f"policy returned an invalid path: {path!r}",
-                )
+                self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
+                raise PathDecisionValidationError(f"policy returned an invalid path: {path!r}")
 
-        commit = PathDecisionCommit(request_key=request.request_key, path=path)
-        self._path_decisions[request.request_key] = (request, commit)
-        return commit
+        result = PathDecisionResult(request_key=request.request_key, path=path)
+        self._decision_records[request.request_key] = _DecisionRecord(request=request, result=result)
+        return result
+
+    def discard(self, request_key: DualPathRequestKey) -> None:
+        self._decision_records.pop(request_key, None)

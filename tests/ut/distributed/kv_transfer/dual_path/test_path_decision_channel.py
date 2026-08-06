@@ -23,9 +23,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     Path,
-    PathDecisionCommit,
-    PathDecisionError,
     PathDecisionRequest,
+    PathDecisionResult,
     PathDecisionValidationError,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
@@ -91,7 +90,7 @@ def _metadata_payload() -> _JsonObject:
     }
 
 
-def _commit_payload() -> _JsonObject:
+def _result_payload() -> _JsonObject:
     return {"request_key": _key_payload(), "path": "PE_READ"}
 
 
@@ -163,41 +162,15 @@ def test_dual_path_decision_metadata_rejects_non_exact_keys(payload: _JsonValue)
         DualPathDecisionMetadata.from_dict(payload)
 
 
-def test_path_decision_msgpack_round_trip_commit() -> None:
+def test_path_decision_msgpack_round_trip_result() -> None:
     decision = PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionCommit(request_key=_request().request_key, path=Path.PE_READ),
+        result=PathDecisionResult(request_key=_request().request_key, path=Path.PE_READ),
     )
     expected_bytes = msgspec.msgpack.encode(
         {
             "protocol_version": 1,
-            "result_type": "commit",
-            "result": _commit_payload(),
-        }
-    )
-
-    assert encode_path_decision(decision) == expected_bytes
-    assert decode_path_decision(expected_bytes) == decision
-
-
-def test_path_decision_msgpack_round_trip_error() -> None:
-    decision = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionError(
-            request_key=_request().request_key,
-            error_code="INVALID_REQUEST",
-            message="invalid decision input",
-        ),
-    )
-    expected_bytes = msgspec.msgpack.encode(
-        {
-            "protocol_version": 1,
-            "result_type": "error",
-            "result": {
-                "request_key": _key_payload(),
-                "error_code": "INVALID_REQUEST",
-                "message": "invalid decision input",
-            },
+            "result": _result_payload(),
         }
     )
 
@@ -210,31 +183,21 @@ def test_path_decision_msgpack_round_trip_error() -> None:
     [
         pytest.param(
             {
-                "protocol_version": 1,
-                "result_type": "unknown",
-                "result": {},
-            },
-            id="unknown-result-type",
-        ),
-        pytest.param(
-            {
                 "protocol_version": True,
-                "result_type": "commit",
-                "result": _commit_payload(),
+                "result": _result_payload(),
             },
             id="boolean-version",
         ),
         pytest.param(
             {
                 "protocol_version": "1",
-                "result_type": "commit",
-                "result": _commit_payload(),
+                "result": _result_payload(),
             },
             id="non-integer-version",
         ),
     ],
 )
-def test_path_decision_from_dict_rejects_unknown_result_type_and_bad_version(payload: _JsonValue) -> None:
+def test_path_decision_from_dict_rejects_bad_version(payload: _JsonValue) -> None:
     with pytest.raises(PathDecisionValidationError):
         PathDecision.from_dict(payload)
 
@@ -243,17 +206,24 @@ def test_path_decision_from_dict_rejects_unknown_result_type_and_bad_version(pay
     "payload",
     [
         pytest.param(
-            {"protocol_version": 1, "result_type": "commit"},
+            {"protocol_version": 1},
             id="missing-field",
         ),
         pytest.param(
             {
                 "protocol_version": 1,
-                "result_type": "commit",
-                "result": _commit_payload(),
+                "result": _result_payload(),
                 "unexpected": None,
             },
             id="extra-field",
+        ),
+        pytest.param(
+            {
+                "protocol_version": 1,
+                "result": _result_payload(),
+                "result" + "_type": "commit",
+            },
+            id="legacy-discriminator-extra-field",
         ),
     ],
 )
@@ -337,18 +307,7 @@ def _coordinator(endpoint: DecodeControlEndpoint, *, boot_id: str | None = "boot
 def _decision(key: DualPathRequestKey, *, path: Path = Path.PE_READ) -> PathDecision:
     return PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionCommit(request_key=key, path=path),
-    )
-
-
-def _error_decision(key: DualPathRequestKey) -> PathDecision:
-    return PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionError(
-            request_key=key,
-            error_code="INVALID_REQUEST",
-            message="invalid decision input",
-        ),
+        result=PathDecisionResult(request_key=key, path=path),
     )
 
 
@@ -490,7 +449,7 @@ def test_prefill_submit_does_no_socket_io_on_caller_thread() -> None:
         coordinator.close()
 
 
-def test_commit_delivery_round_trip_enqueues_once_and_returns_ack() -> None:
+def test_result_delivery_round_trip_enqueues_once_and_returns_ack() -> None:
     endpoint = _free_control_endpoint()
     receiver = _coordinator(endpoint)
     sender = PathDecisionCoordinator.for_prefill()
@@ -498,8 +457,8 @@ def test_commit_delivery_round_trip_enqueues_once_and_returns_ack() -> None:
     try:
         receiver.register_pending(key)
         assert sender.submit(endpoint, _decision(key)).result(timeout=5) is None
-        assert receiver.take_decisions() == [_decision(key).result]
-        assert receiver.take_decisions() == []
+        assert receiver.take_received_results() == [_decision(key).result]
+        assert receiver.take_received_results() == []
     finally:
         sender.close()
         receiver.close()
@@ -516,22 +475,7 @@ def test_receiver_ack_frame_is_exactly_ack() -> None:
         receiver.close()
 
 
-def test_error_decision_delivery_is_accepted_enqueued_and_acked() -> None:
-    endpoint = _free_control_endpoint()
-    receiver = _coordinator(endpoint)
-    sender = PathDecisionCoordinator.for_prefill()
-    key = _request().request_key
-    try:
-        receiver.register_pending(key)
-        decision = _error_decision(key)
-        assert sender.submit(endpoint, decision).result(timeout=5) is None
-        assert receiver.take_decisions() == [decision.result]
-    finally:
-        sender.close()
-        receiver.close()
-
-
-def test_identical_redelivery_is_acked_without_duplicate_inbox() -> None:
+def test_identical_redelivery_is_acked_without_duplicate_received_result() -> None:
     endpoint = _free_control_endpoint()
     receiver = _coordinator(endpoint)
     key = _request().request_key
@@ -546,8 +490,8 @@ def test_identical_redelivery_is_acked_without_duplicate_inbox() -> None:
         assert first.poll(1000) != 0
         first.close(linger=0)
         assert _raw_request(endpoint, encoded) == b"ACK"
-        assert receiver.take_decisions() == [_decision(key).result]
-        assert receiver.take_decisions() == []
+        assert receiver.take_received_results() == [_decision(key).result]
+        assert receiver.take_received_results() == []
     finally:
         first.close(linger=0)
         context.term()
@@ -594,7 +538,7 @@ def test_submit_retries_identical_bytes_until_ack() -> None:
     assert not thread.is_alive()
 
 
-def test_conflicting_duplicate_gets_no_ack_and_no_inbox_growth() -> None:
+def test_conflicting_duplicate_gets_no_ack_and_no_received_result_growth() -> None:
     endpoint = _free_control_endpoint()
     receiver = _coordinator(endpoint)
     key = _request().request_key
@@ -602,8 +546,8 @@ def test_conflicting_duplicate_gets_no_ack_and_no_inbox_growth() -> None:
         receiver.register_pending(key)
         assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
         assert _raw_request(endpoint, encode_path_decision(_decision(key, path=Path.DE_READ))) is None
-        assert receiver.take_decisions() == [_decision(key).result]
-        assert receiver.take_decisions() == []
+        assert receiver.take_received_results() == [_decision(key).result]
+        assert receiver.take_received_results() == []
     finally:
         receiver.close()
 
@@ -613,7 +557,7 @@ def test_unknown_key_gets_no_ack() -> None:
     receiver = _coordinator(endpoint)
     try:
         assert _raw_request(endpoint, encode_path_decision(_decision(_request().request_key))) is None
-        assert receiver.take_decisions() == []
+        assert receiver.take_received_results() == []
     finally:
         receiver.close()
 
@@ -629,7 +573,7 @@ def test_wrong_incarnation_key_gets_no_ack() -> None:
     try:
         receiver.register_pending(pending)
         assert _raw_request(endpoint, encode_path_decision(_decision(wrong))) is None
-        assert receiver.take_decisions() == []
+        assert receiver.take_received_results() == []
     finally:
         receiver.close()
 
@@ -644,7 +588,7 @@ def test_registered_wrong_incarnation_key_gets_no_ack() -> None:
     try:
         receiver.register_pending(wrong)
         assert _raw_request(endpoint, encode_path_decision(_decision(wrong))) is None
-        assert receiver.take_decisions() == []
+        assert receiver.take_received_results() == []
         assert wrong not in receiver._accepted_results
     finally:
         receiver.close()
@@ -659,7 +603,7 @@ def test_unsupported_protocol_version_gets_no_ack() -> None:
     try:
         receiver.register_pending(key)
         assert _raw_request(endpoint, msgspec.msgpack.encode(payload)) is None
-        assert receiver.take_decisions() == []
+        assert receiver.take_received_results() == []
     finally:
         receiver.close()
 
@@ -672,7 +616,7 @@ def test_malformed_payload_gets_no_ack_and_receiver_survives() -> None:
         receiver.register_pending(key)
         assert _raw_request(endpoint, b"\x81") is None
         assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
-        assert receiver.take_decisions() == [_decision(key).result]
+        assert receiver.take_received_results() == [_decision(key).result]
     finally:
         receiver.close()
 
@@ -760,14 +704,16 @@ def test_concurrent_submissions_stay_isolated() -> None:
     receiver = _coordinator(endpoint)
     sender = PathDecisionCoordinator.for_prefill()
     keys = [DualPathRequestKey(receiver.decode_engine_instance_id, f"request-{index}") for index in range(8)]
-    decisions = [_decision(key) if index % 2 == 0 else _error_decision(key) for index, key in enumerate(keys)]
+    decisions = [
+        _decision(key, path=Path.PE_READ if index % 2 == 0 else Path.DE_READ) for index, key in enumerate(keys)
+    ]
     try:
         for key in keys:
             receiver.register_pending(key)
         futures = [sender.submit(endpoint, decision) for decision in decisions]
         assert [future.result(timeout=5) for future in futures] == [None] * 8
-        assert set(receiver.take_decisions()) == {decision.result for decision in decisions}
-        assert receiver.take_decisions() == []
+        assert set(receiver.take_received_results()) == {decision.result for decision in decisions}
+        assert receiver.take_received_results() == []
     finally:
         sender.close()
         receiver.close()
@@ -804,7 +750,7 @@ def test_unregister_is_idempotent_for_unknown_keys() -> None:
     try:
         coordinator.unregister(key)
         coordinator.unregister(key)
-        assert coordinator.take_decisions() == []
+        assert coordinator.take_received_results() == []
     finally:
         coordinator.close()
 
@@ -820,7 +766,7 @@ def test_register_and_submit_after_close_are_rejected() -> None:
     with pytest.raises(RuntimeError):
         sender.submit(_free_control_endpoint(), _decision(_request().request_key))
     receiver.unregister(_request().request_key)
-    assert receiver.take_decisions() == []
+    assert receiver.take_received_results() == []
 
 
 def test_close_is_idempotent() -> None:
@@ -845,7 +791,7 @@ def test_close_leaves_no_threads_sockets_futures_or_retained_state() -> None:
     assert not coordinator._receiver_thread.is_alive()
     assert coordinator._pending_keys == set()
     assert coordinator._accepted_results == {}
-    assert coordinator.take_decisions() == []
+    assert coordinator.take_received_results() == []
     assert {thread.ident for thread in threading.enumerate()} == baseline_threads
     context = zmq.Context()
     socket = context.socket(zmq.ROUTER)

@@ -18,8 +18,6 @@ from vllm.logger import logger
 
 from .path_decision import (
     DualPathRequestKey,
-    PathDecisionCommit,
-    PathDecisionError,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
@@ -131,29 +129,22 @@ class PathDecision:
 
     def __post_init__(self) -> None:
         _require_protocol_version(self.protocol_version)
-        if not isinstance(self.result, (PathDecisionCommit, PathDecisionError)):
-            raise PathDecisionValidationError("result must be a PathDecisionCommit or PathDecisionError")
+        if not isinstance(self.result, PathDecisionResult):
+            raise PathDecisionValidationError("result must be a PathDecisionResult")
 
     def to_dict(self) -> _JsonObject:
-        result_type = "commit" if isinstance(self.result, PathDecisionCommit) else "error"
         return {
             "protocol_version": self.protocol_version,
-            "result_type": result_type,
             "result": self.result.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: _JsonValue) -> PathDecision:
-        data = _require_exact_payload(payload, frozenset({"protocol_version", "result_type", "result"}))
-        protocol_version = _require_protocol_version(data["protocol_version"])
-        match data["result_type"]:
-            case "commit":
-                result = PathDecisionCommit.from_dict(data["result"])
-            case "error":
-                result = PathDecisionError.from_dict(data["result"])
-            case _:
-                raise PathDecisionValidationError("serialized result_type must be 'commit' or 'error'")
-        return cls(protocol_version=protocol_version, result=result)
+        data = _require_exact_payload(payload, frozenset({"protocol_version", "result"}))
+        return cls(
+            protocol_version=_require_protocol_version(data["protocol_version"]),
+            result=PathDecisionResult.from_dict(data["result"]),
+        )
 
 
 def encode_path_decision(decision: PathDecision) -> bytes:
@@ -267,7 +258,7 @@ class PathDecisionCoordinator:
         self._decode_control_endpoint: DecodeControlEndpoint | None = None
         self._pending_keys: set[DualPathRequestKey] = set()
         self._accepted_results: dict[DualPathRequestKey, PathDecisionResult] = {}
-        self._decision_inbox: queue.SimpleQueue[PathDecisionResult] = queue.SimpleQueue()
+        self._received_results: queue.SimpleQueue[PathDecisionResult] = queue.SimpleQueue()
         self._registry_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._context: zmq.Context | None = None
@@ -298,15 +289,15 @@ class PathDecisionCoordinator:
         coordinator._context = zmq.Context()
         ready_event = threading.Event()
         coordinator._receiver_thread = threading.Thread(
-            target=coordinator._receive_decisions,
+            target=coordinator._receive_results,
             args=(ready_event,),
-            name=f"path-decision-receiver-{data_parallel_rank}",
+            name=f"path-decision-result-receiver-{data_parallel_rank}",
             daemon=True,
         )
         coordinator._receiver_thread.start()
         if not ready_event.wait(timeout=_RECEIVER_READY_TIMEOUT_S):
             coordinator.close()
-            raise RuntimeError("path decision receiver did not become ready")
+            raise RuntimeError("path decision result receiver did not become ready")
         if coordinator._receiver_error is not None:
             error = coordinator._receiver_error
             coordinator.close()
@@ -362,16 +353,16 @@ class PathDecisionCoordinator:
             self._pending_keys.discard(key)
             self._accepted_results.pop(key, None)
 
-    def take_decisions(self) -> list[PathDecisionResult]:
+    def take_received_results(self) -> list[PathDecisionResult]:
         self._require_role("decode")
         if self._closed:
             return []
-        decisions: list[PathDecisionResult] = []
+        results: list[PathDecisionResult] = []
         while True:
             try:
-                decisions.append(self._decision_inbox.get_nowait())
+                results.append(self._received_results.get_nowait())
             except queue.Empty:
-                return decisions
+                return results
 
     def submit(
         self,
@@ -412,7 +403,7 @@ class PathDecisionCoordinator:
             with self._registry_lock:
                 self._pending_keys.clear()
                 self._accepted_results.clear()
-            self._drain_inbox()
+            self._drain_received_results()
         elif self._role == "prefill":
             assert self._executor is not None
             self._executor.shutdown(wait=True, cancel_futures=True)
@@ -421,7 +412,7 @@ class PathDecisionCoordinator:
         if self._role != role:
             raise RuntimeError(f"path decision coordinator does not support {role} operations")
 
-    def _receive_decisions(self, ready_event: threading.Event) -> None:
+    def _receive_results(self, ready_event: threading.Event) -> None:
         assert self._context is not None
         assert self._decode_control_endpoint is not None
         socket: zmq.Socket | None = None
@@ -439,12 +430,12 @@ class PathDecisionCoordinator:
                 except zmq.ZMQError:
                     if not self._running:
                         break
-                    logger.exception("path decision receiver socket failure")
+                    logger.exception("path decision result receiver socket failure")
                     continue
                 try:
                     self._handle_frames(socket, frames)
                 except Exception:  # noqa: BLE001
-                    logger.exception("path decision receiver rejected an unexpected message failure")
+                    logger.exception("path decision result receiver rejected an unexpected message failure")
         except BaseException as error:  # noqa: BLE001
             self._receiver_error = error
             ready_event.set()
@@ -454,41 +445,41 @@ class PathDecisionCoordinator:
 
     def _handle_frames(self, socket: zmq.Socket, frames: list[bytes]) -> None:
         if len(frames) != 3 or frames[1] != b"":
-            logger.warning("path decision receiver rejected invalid frame shape")
+            logger.warning("path decision result receiver rejected invalid frame shape")
             return
         identity, _, payload = frames
         try:
             decision = decode_path_decision(payload)
         except PathDecisionValidationError:
-            logger.warning("path decision receiver rejected malformed payload")
+            logger.warning("path decision result receiver rejected malformed payload")
             return
         if decision.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-            logger.warning("path decision receiver rejected unsupported protocol version")
+            logger.warning("path decision result receiver rejected unsupported protocol version")
             return
 
         result = decision.result
         key = result.request_key
         if key.decode_engine_instance_id != self.decode_engine_instance_id:
-            logger.warning("path decision receiver rejected wrong-incarnation key")
+            logger.warning("path decision result receiver rejected wrong-incarnation key")
             return
         with self._registry_lock:
             if key not in self._pending_keys:
-                logger.warning("path decision receiver rejected unknown or stale key")
+                logger.warning("path decision result receiver rejected unknown or stale key")
                 return
             retained = self._accepted_results.get(key)
             if retained is not None:
                 if retained != result:
-                    logger.warning("path decision receiver rejected conflicting duplicate")
+                    logger.warning("path decision result receiver rejected conflicting duplicate")
                     return
             else:
                 self._accepted_results[key] = result
-                self._decision_inbox.put(result)
+                self._received_results.put(result)
 
         socket.send_multipart([identity, b"", _ACK])
 
-    def _drain_inbox(self) -> None:
+    def _drain_received_results(self) -> None:
         while True:
             try:
-                self._decision_inbox.get_nowait()
+                self._received_results.get_nowait()
             except queue.Empty:
                 return

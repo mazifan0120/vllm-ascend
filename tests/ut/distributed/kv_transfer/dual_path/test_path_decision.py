@@ -6,14 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
-    ERROR_CONFLICTING_REQUEST,
-    ERROR_INVALID_POLICY_RESULT,
-    ERROR_INVALID_REQUEST,
     DualPathRequestKey,
     Path,
-    PathDecisionCommit,
     PathDecisionDecider,
-    PathDecisionError,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
@@ -184,7 +179,7 @@ def test_full_store_hit_returns_de_read_without_invoking_policy() -> None:
 
     result = PathDecisionDecider(policy).decide(request)
 
-    assert result == PathDecisionCommit(request_key=request.request_key, path=Path.DE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=Path.DE_READ)
     assert policy.choose_count == 0
     assert policy.requests == []
 
@@ -209,7 +204,7 @@ def test_non_full_requests_invoke_policy(
 
     result = PathDecisionDecider(policy).decide(request)
 
-    assert result == PathDecisionCommit(request_key=request.request_key, path=Path.PE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=Path.PE_READ)
     assert policy.choose_count == 1
     assert policy.requests == [request]
 
@@ -220,7 +215,7 @@ def test_round_robin_initial_choice_seeded_pe_read() -> None:
 
     result = decider.decide(request)
 
-    assert result == PathDecisionCommit(request_key=request.request_key, path=Path.PE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=Path.PE_READ)
 
 
 def test_round_robin_initial_choice_seeded_de_read() -> None:
@@ -229,7 +224,7 @@ def test_round_robin_initial_choice_seeded_de_read() -> None:
 
     result = decider.decide(request)
 
-    assert result == PathDecisionCommit(request_key=request.request_key, path=Path.DE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=Path.DE_READ)
 
 
 def test_round_robin_alternates_across_unique_requests() -> None:
@@ -239,10 +234,10 @@ def test_round_robin_alternates_across_unique_requests() -> None:
     results = [decider.decide(request) for request in requests]
 
     assert results == [
-        PathDecisionCommit(request_key=requests[0].request_key, path=Path.PE_READ),
-        PathDecisionCommit(request_key=requests[1].request_key, path=Path.DE_READ),
-        PathDecisionCommit(request_key=requests[2].request_key, path=Path.PE_READ),
-        PathDecisionCommit(request_key=requests[3].request_key, path=Path.DE_READ),
+        PathDecisionResult(request_key=requests[0].request_key, path=Path.PE_READ),
+        PathDecisionResult(request_key=requests[1].request_key, path=Path.DE_READ),
+        PathDecisionResult(request_key=requests[2].request_key, path=Path.PE_READ),
+        PathDecisionResult(request_key=requests[3].request_key, path=Path.DE_READ),
     ]
 
 
@@ -263,13 +258,13 @@ def test_full_requests_do_not_advance_round_robin_state() -> None:
     ]
 
     assert results == [
-        PathDecisionCommit(request_key=full_request.request_key, path=Path.DE_READ),
-        PathDecisionCommit(request_key=first_non_full.request_key, path=Path.PE_READ),
-        PathDecisionCommit(request_key=second_non_full.request_key, path=Path.DE_READ),
+        PathDecisionResult(request_key=full_request.request_key, path=Path.DE_READ),
+        PathDecisionResult(request_key=first_non_full.request_key, path=Path.PE_READ),
+        PathDecisionResult(request_key=second_non_full.request_key, path=Path.DE_READ),
     ]
 
 
-def test_identical_duplicate_returns_retained_commit_without_choose() -> None:
+def test_identical_duplicate_returns_retained_result_without_choose() -> None:
     request = _make_request()
     equal_but_distinct = _make_request()
     policy = SpyPolicy(Path.PE_READ)
@@ -285,7 +280,7 @@ def test_identical_duplicate_returns_retained_commit_without_choose() -> None:
     assert policy.requests == [request]
 
 
-def test_identical_full_hit_duplicate_returns_retained_commit_without_choose() -> None:
+def test_identical_full_hit_duplicate_returns_retained_result_without_choose() -> None:
     full_request = _make_request(decode_store_tokens=32)
     equal_but_distinct = _make_request(decode_store_tokens=32)
     policy = SpyPolicy(Path.PE_READ)
@@ -299,74 +294,127 @@ def test_identical_full_hit_duplicate_returns_retained_commit_without_choose() -
     assert policy.choose_count == 0
 
 
-def test_conflicting_duplicate_returns_typed_error_without_choose() -> None:
+def test_conflicting_duplicate_raises_and_preserves_original_result_without_choose() -> None:
     original = _make_request()
     conflicting = _make_request(decode_store_tokens=8)
     policy = SpyPolicy(Path.PE_READ)
     decider = PathDecisionDecider(policy)
 
-    retained_commit = decider.decide(original)
-    conflict = decider.decide(conflicting)
-    retried_commit = decider.decide(_make_request())
+    retained_result = decider.decide(original)
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(conflicting)
+    retried_result = decider.decide(_make_request())
 
-    assert isinstance(conflict, PathDecisionError)
-    assert conflict.request_key == original.request_key
-    assert conflict.error_code == ERROR_CONFLICTING_REQUEST
-    assert conflict.message
-    assert retried_commit is retained_commit
+    assert retried_result is retained_result
     assert policy.choose_count == 1
     assert policy.requests == [original]
 
 
-def test_decide_with_invalid_protocol_input_returns_typed_error() -> None:
+def test_decide_with_invalid_protocol_input_raises_without_retaining_record() -> None:
     invalid_request = SimpleNamespace(request_key=_key())
     policy = SpyPolicy(Path.PE_READ)
+    decider = PathDecisionDecider(policy)
 
-    result = PathDecisionDecider(policy).decide(invalid_request)
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(invalid_request)
 
-    assert isinstance(result, PathDecisionError)
-    assert result.request_key == _key()
-    assert result.error_code == ERROR_INVALID_REQUEST
-    assert result.message
+    assert decider._decision_records == {}
     assert policy.choose_count == 0
 
 
 def test_decide_with_invalid_protocol_input_without_key_raises_validation_error() -> None:
     policy = SpyPolicy(Path.PE_READ)
+    decider = PathDecisionDecider(policy)
 
     with pytest.raises(PathDecisionValidationError):
-        PathDecisionDecider(policy).decide(SimpleNamespace())
+        decider.decide(SimpleNamespace())
 
+    assert decider._decision_records == {}
     assert policy.choose_count == 0
 
 
 @pytest.mark.parametrize("invalid_result", ["PE_READ", None])
-def test_policy_result_not_a_path_returns_typed_error(invalid_result: str | None) -> None:
+def test_policy_result_not_a_path_raises_and_retains_failure(invalid_result: str | None) -> None:
     request = _make_request()
     policy = InvalidResultPolicy(invalid_result)
     decider = PathDecisionDecider(policy)
 
-    first_result = decider.decide(request)
-    retry_result = decider.decide(_make_request())
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(request)
+    retained = decider._decision_records[request.request_key]
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(_make_request())
 
-    assert isinstance(first_result, PathDecisionError)
-    assert first_result.request_key == request.request_key
-    assert first_result.error_code == ERROR_INVALID_POLICY_RESULT
-    assert first_result.message
-    assert retry_result == first_result
-    assert policy.choose_count == 2
+    assert retained.request == request
+    assert retained.result is None
+    assert policy.choose_count == 1
 
 
-def test_policy_exception_propagates_and_is_not_retained() -> None:
+def test_policy_exception_is_chained_retained_and_invoked_once() -> None:
+    request = _make_request()
     policy = ExplodingPolicy()
     decider = PathDecisionDecider(policy)
 
-    with pytest.raises(RuntimeError, match="policy failed"):
-        decider.decide(_make_request())
-    with pytest.raises(RuntimeError, match="policy failed"):
+    with pytest.raises(PathDecisionValidationError) as raised:
+        decider.decide(request)
+    with pytest.raises(PathDecisionValidationError):
         decider.decide(_make_request())
 
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "policy failed"
+    assert decider._decision_records[request.request_key].result is None
+    assert policy.choose_count == 1
+
+
+def test_discard_removes_retained_result_record() -> None:
+    request = _make_request()
+    policy = SpyPolicy(Path.PE_READ)
+    decider = PathDecisionDecider(policy)
+    decider.decide(request)
+
+    decider.discard(request.request_key)
+    decider.decide(request)
+
     assert policy.choose_count == 2
+
+
+def test_discard_removes_failure_record() -> None:
+    request = _make_request()
+    policy = InvalidResultPolicy("PE_READ")
+    decider = PathDecisionDecider(policy)
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(request)
+
+    decider.discard(request.request_key)
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(request)
+
+    assert policy.choose_count == 2
+
+
+def test_discard_is_idempotent_and_does_not_rewind_policy() -> None:
+    decider = PathDecisionDecider(RoundRobinPathPolicy(random.Random(1)))
+    first = _make_request(request_id="request-1")
+    second = _make_request(request_id="request-2")
+    assert decider.decide(first).path is Path.PE_READ
+
+    decider.discard(first.request_key)
+    decider.discard(first.request_key)
+
+    assert decider.decide(second).path is Path.DE_READ
+
+
+def test_retained_failure_replay_raises_without_policy() -> None:
+    request = _make_request()
+    policy = InvalidResultPolicy(None)
+    decider = PathDecisionDecider(policy)
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(request)
+
+    with pytest.raises(PathDecisionValidationError):
+        decider.decide(_make_request())
+
+    assert policy.choose_count == 1
 
 
 def test_second_policy_satisfies_path_policy_without_caller_change() -> None:
@@ -383,7 +431,7 @@ def test_second_policy_satisfies_path_policy_without_caller_change() -> None:
     ]
 
     assert results == [
-        PathDecisionCommit(request_key=_key(f"request-{index}"), path=expected_path)
+        PathDecisionResult(request_key=_key(f"request-{index}"), path=expected_path)
         for index, (_, expected_path) in enumerate(policies)
     ]
 
@@ -430,8 +478,8 @@ def test_request_serialization_round_trips_both_directions(
 
 
 @pytest.mark.parametrize("path", [Path.PE_READ, Path.DE_READ])
-def test_commit_serialization_round_trips_both_directions(path: Path) -> None:
-    commit = PathDecisionCommit(request_key=_key(), path=path)
+def test_result_serialization_round_trips_both_directions(path: Path) -> None:
+    result = PathDecisionResult(request_key=_key(), path=path)
     payload = {
         "request_key": {
             "decode_engine_instance_id": "decode-engine-1",
@@ -440,27 +488,8 @@ def test_commit_serialization_round_trips_both_directions(path: Path) -> None:
         "path": path.value,
     }
 
-    assert PathDecisionCommit.from_dict(commit.to_dict()) == commit
-    assert PathDecisionCommit.from_dict(payload).to_dict() == payload
-
-
-def test_error_serialization_round_trips_both_directions() -> None:
-    error = PathDecisionError(
-        request_key=_key(),
-        error_code=ERROR_INVALID_REQUEST,
-        message="invalid decision input",
-    )
-    payload = {
-        "request_key": {
-            "decode_engine_instance_id": "decode-engine-1",
-            "decode_request_id": "request-1",
-        },
-        "error_code": "INVALID_REQUEST",
-        "message": "invalid decision input",
-    }
-
-    assert PathDecisionError.from_dict(error.to_dict()) == error
-    assert PathDecisionError.from_dict(payload).to_dict() == payload
+    assert PathDecisionResult.from_dict(result.to_dict()) == result
+    assert PathDecisionResult.from_dict(payload).to_dict() == payload
 
 
 def test_from_dict_rejects_unknown_path_value() -> None:
@@ -473,7 +502,7 @@ def test_from_dict_rejects_unknown_path_value() -> None:
     }
 
     with pytest.raises(PathDecisionValidationError):
-        PathDecisionCommit.from_dict(payload)
+        PathDecisionResult.from_dict(payload)
 
 
 @pytest.mark.parametrize(
@@ -495,22 +524,12 @@ def test_from_dict_rejects_unknown_path_value() -> None:
             },
         ),
         (
-            PathDecisionCommit,
+            PathDecisionResult,
             {
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
                 }
-            },
-        ),
-        (
-            PathDecisionError,
-            {
-                "request_key": {
-                    "decode_engine_instance_id": "decode-engine-1",
-                    "decode_request_id": "request-1",
-                },
-                "error_code": "INVALID_REQUEST",
             },
         ),
     ],
@@ -545,25 +564,13 @@ def test_from_dict_rejects_missing_fields(protocol_type, payload) -> None:
             },
         ),
         (
-            PathDecisionCommit,
+            PathDecisionResult,
             {
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
                 },
                 "path": "PE_READ",
-                "extra": "value",
-            },
-        ),
-        (
-            PathDecisionError,
-            {
-                "request_key": {
-                    "decode_engine_instance_id": "decode-engine-1",
-                    "decode_request_id": "request-1",
-                },
-                "error_code": "INVALID_REQUEST",
-                "message": "invalid decision input",
                 "extra": "value",
             },
         ),
@@ -653,8 +660,7 @@ def test_from_dict_rejects_invalid_token_ordering(
     [
         (DualPathRequestKey, None),
         (PathDecisionRequest, []),
-        (PathDecisionCommit, "payload"),
-        (PathDecisionError, _key()),
+        (PathDecisionResult, "payload"),
     ],
 )
 def test_from_dict_rejects_non_dict_payload(protocol_type, payload) -> None:
@@ -713,50 +719,20 @@ def test_from_dict_rejects_non_dict_payload(protocol_type, payload) -> None:
             },
         ),
         (
-            PathDecisionCommit,
+            PathDecisionResult,
             {
                 "request_key": _key(),
                 "path": "PE_READ",
             },
         ),
         (
-            PathDecisionCommit,
+            PathDecisionResult,
             {
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
                 },
                 "path": 1,
-            },
-        ),
-        (
-            PathDecisionError,
-            {
-                "request_key": [],
-                "error_code": "INVALID_REQUEST",
-                "message": "invalid decision input",
-            },
-        ),
-        (
-            PathDecisionError,
-            {
-                "request_key": {
-                    "decode_engine_instance_id": "decode-engine-1",
-                    "decode_request_id": "request-1",
-                },
-                "error_code": 1,
-                "message": "invalid decision input",
-            },
-        ),
-        (
-            PathDecisionError,
-            {
-                "request_key": {
-                    "decode_engine_instance_id": "decode-engine-1",
-                    "decode_request_id": "request-1",
-                },
-                "error_code": "INVALID_REQUEST",
-                "message": None,
             },
         ),
     ],
