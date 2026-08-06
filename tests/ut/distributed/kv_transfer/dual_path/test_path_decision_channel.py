@@ -127,6 +127,14 @@ def test_dual_path_decision_metadata_round_trip() -> None:
     assert DualPathDecisionMetadata.from_dict(payload) == metadata
 
 
+def test_decision_metadata_rejects_forged_store_full_before_send() -> None:
+    payload = _metadata_payload()
+    payload["decision_request"]["decode_store_tokens"] = payload["decision_request"]["target_tokens"]
+
+    with pytest.raises(PathDecisionValidationError):
+        DualPathDecisionMetadata.from_dict(payload)
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -22,7 +22,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
-    PathDecision,
     PathDecisionDeliveryError,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -350,7 +349,6 @@ class TestDecodeAdmissionControl:
         state = decode_scheduler._decode_decision_states[request.request_id]
         snapshot = decode_scheduler._decode_kv_snapshots[request.request_id]
         expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, request.request_id)
-        assert snapshot.target_tokens == 48
         assert snapshot.transfer_tokens == 49
         assert snapshot.local_tokens == 16
         assert snapshot.external_tokens == 33
@@ -565,7 +563,7 @@ class TestPrefillDecisionHook:
         assert scheduler._pe_request_keys == {}
         assert scheduler._pe_delivery_futures == {}
 
-    def test_full_hit_bypasses_policy_and_submits_de_read(self, scheduler_factory, task04_seams):
+    def test_forged_full_payload_is_invalidated_without_decide_or_submit(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         payload = _prefill_decision_payload(decode_store_tokens=48)
@@ -573,18 +571,12 @@ class TestPrefillDecisionHook:
 
         result = scheduler.get_num_new_matched_tokens(request, 0)
 
-        expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
         assert result == (0, False)
         policy.choose.assert_not_called()
-        task04_seams.prefill_coordinator.submit.assert_called_once_with(
-            _CONTROL_ENDPOINT,
-            PathDecision(
-                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-                result=PathDecisionResult(request_key=expected_key, path=Path.DE_READ),
-            ),
-        )
-        assert scheduler._pe_request_keys == {request.request_id: expected_key}
-        assert scheduler._pe_delivery_futures == {expected_key: task04_seams.prefill_delivery_future}
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        assert scheduler._pe_request_keys == {}
+        assert scheduler._pe_delivery_futures == {}
 
     def test_seeded_non_full_requests_invoke_policy_once_and_alternate(self, scheduler_factory, task04_seams):
         policy = MagicMock(spec=RoundRobinPathPolicy, wraps=RoundRobinPathPolicy(random.Random(1)))
@@ -907,14 +899,14 @@ class TestWorkerFailureRelay:
         worker.start_load_kv(metadata)
 
         # When
-        done_sending, done_recving = worker.get_finished(set())
+        done_sending, done_recving = worker.get_finished(set(), metadata)
         invalid_block_ids = worker.get_block_ids_with_load_errors()
 
         # Then
         assert done_sending == set()
         assert done_recving == {"request-local-7"}
         assert invalid_block_ids == {42, 43, 44}
-        assert worker.get_finished(set()) == (set(), set())
+        assert worker.get_finished(set(), metadata) == (set(), set())
         assert worker.get_block_ids_with_load_errors() == set()
 
 

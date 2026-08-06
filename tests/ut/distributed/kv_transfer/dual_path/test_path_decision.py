@@ -114,11 +114,10 @@ def test_request_key_rejects_empty_identity_fields(engine_id, request_id) -> Non
     ("target_tokens", "decode_local_tokens", "decode_store_tokens"),
     [
         (32, 8, 16),
-        (32, 8, 32),
         (32, 8, 8),
     ],
 )
-def test_request_construction_accepts_partial_full_and_miss(
+def test_request_construction_accepts_partial_and_miss(
     target_tokens: int,
     decode_local_tokens: int,
     decode_store_tokens: int,
@@ -142,6 +141,8 @@ def test_request_construction_accepts_partial_full_and_miss(
         (32, 0, -1),
         (32, 8, 7),
         (32, 0, 33),
+        (32, 8, 32),
+        (32, 0, 32),
         (-1, 0, 0),
         (True, 0, 0),
         (32, False, 0),
@@ -171,17 +172,6 @@ def test_request_rejects_hbm_complete_local_equals_target() -> None:
             decode_local_tokens=32,
             decode_store_tokens=32,
         )
-
-
-def test_full_store_hit_returns_de_read_without_invoking_policy() -> None:
-    request = _make_request(decode_local_tokens=8, decode_store_tokens=32)
-    policy = SpyPolicy(Path.PE_READ)
-
-    result = PathDecisionDecider(policy).decide(request)
-
-    assert result == PathDecisionResult(request_key=request.request_key, path=Path.DE_READ)
-    assert policy.choose_count == 0
-    assert policy.requests == []
 
 
 @pytest.mark.parametrize(
@@ -241,29 +231,6 @@ def test_round_robin_alternates_across_unique_requests() -> None:
     ]
 
 
-def test_full_requests_do_not_advance_round_robin_state() -> None:
-    decider = PathDecisionDecider(RoundRobinPathPolicy(random.Random(1)))
-    full_request = _make_request(
-        request_id="full-request",
-        decode_local_tokens=8,
-        decode_store_tokens=32,
-    )
-    first_non_full = _make_request(request_id="first-non-full")
-    second_non_full = _make_request(request_id="second-non-full")
-
-    results = [
-        decider.decide(full_request),
-        decider.decide(first_non_full),
-        decider.decide(second_non_full),
-    ]
-
-    assert results == [
-        PathDecisionResult(request_key=full_request.request_key, path=Path.DE_READ),
-        PathDecisionResult(request_key=first_non_full.request_key, path=Path.PE_READ),
-        PathDecisionResult(request_key=second_non_full.request_key, path=Path.DE_READ),
-    ]
-
-
 def test_identical_duplicate_returns_retained_result_without_choose() -> None:
     request = _make_request()
     equal_but_distinct = _make_request()
@@ -278,20 +245,6 @@ def test_identical_duplicate_returns_retained_result_without_choose() -> None:
     assert duplicate_result is first_result
     assert policy.choose_count == 1
     assert policy.requests == [request]
-
-
-def test_identical_full_hit_duplicate_returns_retained_result_without_choose() -> None:
-    full_request = _make_request(decode_store_tokens=32)
-    equal_but_distinct = _make_request(decode_store_tokens=32)
-    policy = SpyPolicy(Path.PE_READ)
-    decider = PathDecisionDecider(policy)
-
-    first_result = decider.decide(full_request)
-    duplicate_result = decider.decide(equal_but_distinct)
-
-    assert first_result.path is Path.DE_READ
-    assert duplicate_result is first_result
-    assert policy.choose_count == 0
 
 
 def test_conflicting_duplicate_raises_and_preserves_original_result_without_choose() -> None:
@@ -451,7 +404,6 @@ def test_request_key_serialization_round_trips_both_directions() -> None:
     ("decode_local_tokens", "decode_store_tokens"),
     [
         pytest.param(8, 16, id="partial"),
-        pytest.param(8, 32, id="full"),
         pytest.param(8, 8, id="miss"),
     ],
 )
@@ -632,6 +584,8 @@ def test_from_dict_rejects_bool_for_int(
         (32, 0, -1),
         (32, 8, 7),
         (32, 0, 33),
+        (32, 8, 32),
+        (32, 0, 32),
         (-1, 0, 0),
         (32, 32, 32),
     ],

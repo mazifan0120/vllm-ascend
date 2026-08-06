@@ -75,12 +75,10 @@ class PathDecisionRequest:
         )
         if any(isinstance(token_count, bool) or not isinstance(token_count, int) for token_count in token_counts):
             raise PathDecisionValidationError("token counts must be integers and must not be booleans")
-        if not 0 <= self.decode_local_tokens <= self.decode_store_tokens <= self.target_tokens:
+        if not 0 <= self.decode_local_tokens <= self.decode_store_tokens < self.target_tokens:
             raise PathDecisionValidationError(
-                "token counts must satisfy 0 <= decode_local_tokens <= decode_store_tokens <= target_tokens"
+                "token counts must satisfy 0 <= decode_local_tokens <= decode_store_tokens < target_tokens"
             )
-        if self.decode_local_tokens >= self.target_tokens:
-            raise PathDecisionValidationError("decode_local_tokens must be less than target_tokens")
 
     def to_dict(self) -> _JsonObject:
         return {
@@ -181,17 +179,14 @@ class PathDecisionDecider:
                 raise PathDecisionValidationError("decision previously failed locally")
             return existing.result
 
-        if request.decode_store_tokens == request.target_tokens:
-            path = Path.DE_READ
-        else:
-            try:
-                path = self._policy.choose(request)
-            except Exception as error:  # noqa: BLE001
-                self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
-                raise PathDecisionValidationError("path policy raised an exception") from error
-            if not isinstance(path, Path):
-                self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
-                raise PathDecisionValidationError(f"policy returned an invalid path: {path!r}")
+        try:
+            path = self._policy.choose(request)
+        except Exception as error:  # noqa: BLE001
+            self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
+            raise PathDecisionValidationError("path policy raised an exception") from error
+        if not isinstance(path, Path):
+            self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
+            raise PathDecisionValidationError(f"policy returned an invalid path: {path!r}")
 
         result = PathDecisionResult(request_key=request.request_key, path=path)
         self._decision_records[request.request_key] = _DecisionRecord(request=request, result=result)

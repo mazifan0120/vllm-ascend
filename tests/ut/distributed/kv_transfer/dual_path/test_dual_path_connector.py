@@ -994,7 +994,6 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         dual._path_decision_coordinator.register_pending.assert_called_once()
         self.assertEqual(dual._lookup_results, {})
         snapshot = dual._decode_kv_snapshots["req-load"]
-        self.assertEqual(snapshot.target_tokens, 3)
         self.assertEqual(snapshot.transfer_tokens, 4)
         self.assertEqual(snapshot.local_tokens, 0)
         self.assertEqual(snapshot.external_tokens, 4)
@@ -1126,7 +1125,6 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(dual._reqs_need_recv, {})
         self.assertFalse(dual_load.kv_transfer_params["do_remote_prefill"])
         snapshot = dual._decode_kv_snapshots["req-hybrid-load"]
-        self.assertEqual(snapshot.target_tokens, 16)
         self.assertEqual(snapshot.transfer_tokens, 16)
         self.assertEqual(snapshot.local_tokens, 0)
         self.assertEqual(snapshot.external_tokens, 16)
@@ -1172,7 +1170,6 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertIn("req-alloc", dual._decode_decision_states)
         dual._path_decision_coordinator.register_pending.assert_called_once()
         snapshot = dual._decode_kv_snapshots["req-alloc"]
-        self.assertEqual(snapshot.target_tokens, 23)
         self.assertEqual(snapshot.transfer_tokens, 24)
         self.assertEqual(snapshot.external_tokens, 24)
         self.assertEqual(snapshot.local_tokens, 0)
@@ -1375,9 +1372,9 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             dual_consumer.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
 
             parent_consumer_result = parent_consumer.get_finished()
-            dual_consumer_result = dual_consumer.get_finished(set())
+            dual_consumer_result = dual_consumer.get_finished(set(), dual_meta)
             parent_producer_result = parent_producer.get_finished()
-            dual_producer_result = dual_producer.get_finished(set())
+            dual_producer_result = dual_producer.get_finished(set(), dual_meta)
 
             expected_finished = {normal_request_id, virtual_request_id}
             self.assertEqual(parent_consumer_result, (set(), expected_finished))
@@ -1429,7 +1426,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             dual.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
 
             parent_result = parent.get_finished()
-            dual_result = dual.get_finished(set())
+            dual_result = dual.get_finished(set(), dual_meta)
             parent_invalid = parent.get_block_ids_with_load_errors()
             dual_invalid = dual.get_block_ids_with_load_errors()
 
@@ -1548,7 +1545,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             parent_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
             dual_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
             self.assertEqual(parent_worker.get_finished(), (set(), set()))
-            self.assertEqual(dual_worker.get_finished(set()), (set(), set()))
+            self.assertEqual(dual_worker.get_finished(set(), dual_meta), (set(), set()))
             parent_invalid = parent_worker.get_block_ids_with_load_errors()
             dual_invalid = dual_worker.get_block_ids_with_load_errors()
             parent_cleared = parent_worker.get_block_ids_with_load_errors()
@@ -1610,8 +1607,10 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "_install_forward_receive_binding",
                 "_release_finished_forward_terminals",
                 "_consume_forward_receive_binding",
+                "register_kv_caches",
                 "start_load_kv",
                 "get_finished",
+                "get_block_ids_with_load_errors",
                 "shutdown",
             },
         }
@@ -1632,12 +1631,13 @@ class TestDualPathFoundationGuards(unittest.TestCase):
         worker = object.__new__(DualPathConnectorWorker)
         worker.get_finished = MagicMock(return_value=({"sent"}, {"received"}))
         connector.connector_worker = worker
+        connector._connector_metadata = MooncakeLayerwiseConnectorMetadata()
         finished_req_ids = {"decode-request-00000001"}
 
         result = connector.get_finished(finished_req_ids)
 
         self.assertEqual(result, ({"sent"}, {"received"}))
-        worker.get_finished.assert_called_once_with(finished_req_ids)
+        worker.get_finished.assert_called_once_with(finished_req_ids, connector._connector_metadata)
 
     def test_parent_constructor_signatures_are_pinned(self):
         expected = ["self", "vllm_config", "kv_cache_config", "engine_id"]

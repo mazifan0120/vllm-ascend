@@ -414,6 +414,24 @@ def test_build_connector_meta_emits_one_async_load_reqmeta_with_ready_boundary(m
     assert metadata.loading_req_ids == {request.request_id}
 
 
+def test_build_connector_meta_filters_unowned_preemption_but_cleans_owned_tracker(mock_lookup_client_cls):
+    adapter = _make_commit_adapter()
+    request = _make_request("req-preempted", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.preempted_req_ids = {request.request_id, "ordinary-request"}
+
+    metadata = adapter.build_connector_meta(scheduler_output)
+
+    pool = adapter._pool_scheduler
+    assert metadata.preempted_req_ids == {request.request_id}
+    assert pool._preempted_req_ids == {request.request_id}
+    assert pool._unfinished_requests == {}
+    assert pool._request_trackers == {}
+    assert pool._loading_req_ids == set()
+
+
 def test_lookup_clamp_preserves_can_load_and_token_len_via_replace(mock_lookup_client_cls):
     adapter = _make_adapter()
     raw_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=60, can_load=False, token_len=7)
@@ -437,3 +455,24 @@ def test_close_idempotent_before_and_after_lazy_client_creation(mock_lookup_clie
     adapter.close()
     mock_lookup_client_cls.return_value.close.assert_called_once()
     assert adapter._pool_scheduler.client is None
+
+
+def test_close_releases_all_private_scheduler_request_records(mock_lookup_client_cls):
+    adapter = _make_commit_adapter()
+    request = _make_request("req-shutdown", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.preempted_req_ids = set()
+    adapter.build_connector_meta(scheduler_output)
+
+    adapter.close()
+
+    pool = adapter._pool_scheduler
+    assert pool.load_specs == {}
+    assert pool._request_trackers == {}
+    assert pool._preempted_req_ids == set()
+    assert pool._unfinished_requests == {}
+    assert pool._unfinished_request_ids == set()
+    assert pool._loading_req_ids == set()
+    assert pool._delayed_free_req_ids == set()

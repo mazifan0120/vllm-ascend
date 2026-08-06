@@ -86,6 +86,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 if TYPE_CHECKING:
+    import torch
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -101,7 +102,6 @@ class DecodeKVSnapshot:
     because the record cannot exist before vLLM allocates the final Decode blocks.
     """
 
-    target_tokens: int
     transfer_tokens: int
     local_tokens: int
     external_tokens: int
@@ -493,10 +493,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
         ready_tokens = max(request.num_tokens - 1, 0)
         local_tokens = num_computed_tokens
-        if not 0 <= local_tokens <= ready_tokens <= transfer_tokens:
+        if local_tokens < 0 or ready_tokens > transfer_tokens:
             raise RuntimeError(
                 f"DualPath request {request_id} initial admission requires "
-                f"0 <= local_tokens ({local_tokens}) <= ready_tokens ({ready_tokens}) "
+                f"0 <= local_tokens ({local_tokens}) and ready_tokens ({ready_tokens}) "
                 f"<= transfer_tokens ({transfer_tokens})"
             )
         if local_tokens >= ready_tokens:
@@ -504,19 +504,31 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._lookup_results.pop(request_id, None)
             return 0, False
 
-        external_tokens = transfer_tokens - local_tokens
+        if not 0 <= local_tokens < ready_tokens <= transfer_tokens:
+            raise RuntimeError(
+                f"DualPath request {request_id} Store lookup requires "
+                f"0 <= local_tokens ({local_tokens}) < ready_tokens ({ready_tokens}) "
+                f"<= transfer_tokens ({transfer_tokens})"
+            )
+
         cached = self._lookup_results.get(request_id)
         if cached is not None:
-            if cached[0] == local_tokens and cached[1] == external_tokens:
+            if cached[0] == local_tokens:
                 # Identical duplicate lookup (e.g. allocation-failure retry):
                 # reuse the detached result instead of re-probing the KV pool.
-                return external_tokens, True
+                return cached[1], True
             # A changed E_DE invalidates the unbound result; discard it before
             # the fresh lookup so a failing re-probe cannot leave it behind.
             del self._lookup_results[request_id]
 
         assert self._kvpool_adapter is not None
         detached_spec = self._kvpool_adapter.lookup(request, local_tokens)
+        store_full = (
+            detached_spec is not None
+            and detached_spec.vllm_cached_tokens == local_tokens
+            and detached_spec.kvpool_cached_tokens == ready_tokens
+        )
+        external_tokens = (ready_tokens if store_full else transfer_tokens) - local_tokens
         self._lookup_results[request_id] = (local_tokens, external_tokens, detached_spec)
         return external_tokens, True
 
@@ -534,17 +546,22 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return super().update_state_after_alloc(request, blocks, num_external_tokens)
 
         request_id = request.request_id
-        target_tokens = max(request.num_tokens - 1, 0)
-        transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
+        allocated_block_ids = blocks.get_block_ids()
+        frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
 
         existing = self._decode_kv_snapshots.get(request_id)
         if existing is not None:
-            allocated_block_ids = blocks.get_block_ids()
-            frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
+            ready_tokens = max(request.num_tokens - 1, 0)
+            transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
+            existing_store_full = (
+                existing.store_load_spec is not None
+                and existing.store_load_spec.vllm_cached_tokens == existing.local_tokens
+                and existing.store_load_spec.kvpool_cached_tokens == ready_tokens
+            )
+            duplicate_local_tokens = (ready_tokens if existing_store_full else transfer_tokens) - num_external_tokens
             if (
-                existing.target_tokens == target_tokens
-                and existing.transfer_tokens == transfer_tokens
-                and existing.local_tokens == transfer_tokens - num_external_tokens
+                existing.transfer_tokens == transfer_tokens
+                and existing.local_tokens == duplicate_local_tokens
                 and existing.external_tokens == num_external_tokens
                 and existing.final_block_ids == frozen_block_ids
             ):
@@ -564,7 +581,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if entry is None:
             raise RuntimeError(f"DualPath request {request_id} has no Task-01 lookup result to bind after allocation")
         local_tokens, cached_external_tokens, detached_spec = entry
-        expected_external_tokens = transfer_tokens - local_tokens
+        ready_tokens = max(request.num_tokens - 1, 0)
+        transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
+        store_full = (
+            detached_spec is not None
+            and detached_spec.vllm_cached_tokens == local_tokens
+            and detached_spec.kvpool_cached_tokens == ready_tokens
+        )
+        expected_external_tokens = (ready_tokens if store_full else transfer_tokens) - local_tokens
         if not num_external_tokens == cached_external_tokens == expected_external_tokens:
             raise RuntimeError(
                 f"DualPath request {request_id} external-token mismatch: vLLM allocated "
@@ -577,16 +601,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     f"DualPath request {request_id} detached LoadSpec local tokens "
                     f"{detached_spec.vllm_cached_tokens} != {local_tokens}"
                 )
-            if not local_tokens < detached_spec.kvpool_cached_tokens <= target_tokens:
+            if not local_tokens < detached_spec.kvpool_cached_tokens <= ready_tokens:
                 raise RuntimeError(
                     f"DualPath request {request_id} detached LoadSpec store tokens "
-                    f"{detached_spec.kvpool_cached_tokens} outside ({local_tokens}, {target_tokens}]"
+                    f"{detached_spec.kvpool_cached_tokens} outside ({local_tokens}, {ready_tokens}]"
                 )
 
-        allocated_block_ids = blocks.get_block_ids()
-        frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
         snapshot = DecodeKVSnapshot(
-            target_tokens=target_tokens,
             transfer_tokens=transfer_tokens,
             local_tokens=local_tokens,
             external_tokens=num_external_tokens,
@@ -595,11 +616,20 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
         self._decode_kv_snapshots[request_id] = snapshot
 
+        params = request.kv_transfer_params
+        assert params is not None
+        if store_full:
+            assert detached_spec is not None
+            assert self._kvpool_adapter is not None
+            self._kvpool_adapter.commit_after_alloc(request, blocks, detached_spec)
+            params["do_remote_prefill"] = False
+            return
+
         coordinator = self._path_decision_coordinator
         request_key = DualPathRequestKey(coordinator.decode_engine_instance_id, request_id)
         decision_request = PathDecisionRequest(
             request_key=request_key,
-            target_tokens=snapshot.target_tokens,
+            target_tokens=ready_tokens,
             decode_local_tokens=snapshot.local_tokens,
             decode_store_tokens=snapshot.store_tokens,
         )
@@ -630,8 +660,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
         self._decode_decision_states[request_id] = state
 
-        params = request.kv_transfer_params
-        assert params is not None
         if params.get("do_virtual") is not True:
             try:
                 future = self.executor.submit(
@@ -693,7 +721,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                 tuple(group)
                                 for group in self._trim_hybrid_remote_block_ids(
                                     snapshot.final_block_ids,
-                                    snapshot.target_tokens + 1,
+                                    state.decision_request.target_tokens + 1,
                                 )
                             )
                             metadata.forward_receive_bindings.append(
@@ -731,7 +759,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             block_size = self.block_size[0]
             assert snapshot.local_tokens % block_size == 0
             first_external_block = snapshot.local_tokens // block_size
-            external_block_ids = snapshot.final_block_ids[0][first_external_block:]
+            ready_block_ids = self._trim_hybrid_remote_block_ids(
+                tuple(list(group) for group in snapshot.final_block_ids),
+                state.decision_request.target_tokens + 1,
+            )
+            external_block_ids = ready_block_ids[0][first_external_block:]
             assert external_block_ids
             metadata.decision_timeouts.append(
                 DecisionTimeoutMetadata(
@@ -740,6 +772,18 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 )
             )
             state.timeout_reported = True
+
+        assert self._kvpool_adapter is not None
+        store_metadata = self._kvpool_adapter.build_connector_meta(scheduler_output)
+        attach_store_metadata = bool(
+            store_metadata.requests
+            or store_metadata.unfinished_request_ids
+            or store_metadata.preempted_req_ids
+            or store_metadata.loading_req_ids
+            or store_metadata.delayed_free_req_ids
+        )
+        if attach_store_metadata:
+            metadata.decode_store_metadata = store_metadata
 
         return metadata
 
@@ -818,10 +862,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     """Worker side of DualPathConnector.
 
-    Task-01: a Decode-role worker additionally owns a lookup-only
-    ``KVPoolWorkerAdapter`` (non-layerwise ``KVPoolWorker`` + the existing
-    ``LookupKeyServer`` on the owning rank). No transfer threads, KV cache
-    registration, or Store load metadata are started by this adapter.
+    A Decode-role worker owns a non-layerwise ``KVPoolWorkerAdapter`` for the
+    local Store load lifecycle and its existing ``LookupKeyServer``.
     """
 
     def __init__(
@@ -846,6 +888,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             engine_id,
             dual_path_cfg.role,
         )
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        super().register_kv_caches(kv_caches)
+        if self._kvpool_worker_adapter is not None:
+            self._kvpool_worker_adapter.register_kv_caches(kv_caches)
 
     def _install_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
         consumed_decode_request_id = self._consumed_forward_terminals.get(binding.wire_request_id)
@@ -898,9 +945,17 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         for timeout in getattr(metadata, "decision_timeouts", ()):
             self._control_failed_recving.add(timeout.request_id)
             self._invalid_block_ids.update(timeout.external_block_ids)
+        store_metadata = getattr(metadata, "decode_store_metadata", None)
+        if store_metadata is not None:
+            assert self._kvpool_worker_adapter is not None
+            self._kvpool_worker_adapter.start_load_kv(store_metadata)
         super().start_load_kv(metadata)
 
-    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+        metadata: MooncakeLayerwiseConnectorMetadata,
+    ) -> tuple[set[str], set[str]]:
         finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             assert self.kv_recv_layer_thread is not None
@@ -981,7 +1036,23 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             )
         done_recving.update(self._control_failed_recving)
         self._control_failed_recving.clear()
-        return set(), done_recving
+        done_sending: set[str] = set()
+        store_metadata = getattr(metadata, "decode_store_metadata", None)
+        if store_metadata is not None:
+            assert self._kvpool_worker_adapter is not None
+            store_done_sending, store_done_recving = self._kvpool_worker_adapter.get_finished(
+                finished_req_ids,
+                store_metadata,
+            )
+            done_sending.update(store_done_sending)
+            done_recving.update(store_done_recving)
+        return done_sending, done_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        invalid_block_ids = super().get_block_ids_with_load_errors()
+        if self._kvpool_worker_adapter is not None:
+            invalid_block_ids.update(self._kvpool_worker_adapter.get_block_ids_with_load_errors())
+        return invalid_block_ids
 
     def shutdown(self) -> None:
         for binding in self._forward_receive_bindings.values():
@@ -1040,7 +1111,7 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert isinstance(self.connector_worker, DualPathConnectorWorker)
-        return self.connector_worker.get_finished(finished_req_ids)
+        return self.connector_worker.get_finished(finished_req_ids, self._connector_metadata)
 
     def shutdown(self):
         """Release Task-01-owned state and adapters, then defer to the base."""

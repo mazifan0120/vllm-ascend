@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
@@ -275,7 +276,9 @@ def _build_lifecycle(
     assert len(metadata.forward_receive_bindings) == 1
     binding = metadata.forward_receive_bindings[0]
     decode_scheduler._path_decision_coordinator.take_received_results.return_value = [pe_result]
-    duplicate_metadata = decode_scheduler.build_connector_meta(MagicMock(name="duplicate_output"))
+    duplicate_output = SchedulerOutput.make_empty()
+    duplicate_output.preempted_req_ids = set()
+    duplicate_metadata = decode_scheduler.build_connector_meta(duplicate_output)
     assert duplicate_metadata.forward_receive_bindings == []
 
     pe_metadata = _build_parent_metadata(pe_scheduler, pe_request)
@@ -308,7 +311,9 @@ def _worker_connector_output(harness: LifecycleHarness, *, failed: bool) -> KVCo
     harness.worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = (
         {wire_request_id} if failed else set()
     )
-    finished_sending, finished_recving = harness.worker.get_finished(set())
+    metadata = harness.binding_output.kv_connector_metadata
+    assert isinstance(metadata, DualPathConnectorMetadata)
+    finished_sending, finished_recving = harness.worker.get_finished(set(), metadata)
     return KVConnectorOutput(
         finished_sending=finished_sending,
         finished_recving=finished_recving,

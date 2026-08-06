@@ -221,12 +221,21 @@ def _admit_one_request(scheduler: Scheduler):
     return request, scheduler_output, matched_returns, lookup_mock, matched_mock, alloc_mock
 
 
-def _assert_admission_invariants(scheduler, request, scheduler_output, matched_returns, alloc_mock, expect_store_spec):
+def _assert_admission_invariants(
+    scheduler,
+    request,
+    scheduler_output,
+    matched_returns,
+    alloc_mock,
+    *,
+    expect_store_spec,
+    store_full,
+):
     dual = _dual_scheduler(scheduler)
-    # 1. connector returned (T - L_DE, True) = (33, True)
-    assert matched_returns == [(33, True)]
+    expected_external_tokens = 32 if store_full else 33
+    assert matched_returns == [(expected_external_tokens, True)]
     # 2. allocate_slots received the external delta with delayed caching
-    assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 33
+    assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == expected_external_tokens
     assert alloc_mock.call_args.kwargs["delay_cache_blocks"] is True
     # 3. final block IDs exist and equal the snapshot's frozen IDs
     final_block_ids = tuple(
@@ -234,10 +243,9 @@ def _assert_admission_invariants(scheduler, request, scheduler_output, matched_r
     )
     snapshot = dual._decode_kv_snapshots[request.request_id]
     assert snapshot.final_block_ids == final_block_ids
-    assert snapshot.target_tokens == 32
     assert snapshot.transfer_tokens == 33
     assert snapshot.local_tokens == 0
-    assert snapshot.external_tokens == 33
+    assert snapshot.external_tokens == expected_external_tokens
     if expect_store_spec:
         assert snapshot.store_load_spec is not None
     else:
@@ -245,14 +253,17 @@ def _assert_admission_invariants(scheduler, request, scheduler_output, matched_r
     # 4. the request waits for remote KVs
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     # 5. vLLM recorded the Layerwise transfer target for the pending receive
-    assert request.num_computed_tokens == 33
+    assert request.num_computed_tokens == expected_external_tokens
     # 6. no model tokens were scheduled for the request in this step
     assert scheduler_output.num_scheduled_tokens.get(request.request_id, 0) == 0
     # 7. connector metadata contains no Store or P2P work for the request
     metadata = scheduler_output.kv_connector_metadata
     assert metadata is None or request.request_id not in metadata.requests
     assert dual._reqs_need_recv == {}
-    dual._path_decision_coordinator.register_pending.assert_called_once()
+    if store_full:
+        dual._path_decision_coordinator.register_pending.assert_not_called()
+    else:
+        dual._path_decision_coordinator.register_pending.assert_called_once()
     # 8. no finished_recving completion is published
     scheduler.update_from_output(scheduler_output, _runner_output_for([]))
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -264,7 +275,13 @@ def test_admission_full_store_hit(_constrain_kvpool_seams, scheduler):
     request, scheduler_output, matched_returns, lookup_mock, _, alloc_mock = _admit_one_request(scheduler)
     lookup_mock.assert_called_once()
     _assert_admission_invariants(
-        scheduler, request, scheduler_output, matched_returns, alloc_mock, expect_store_spec=True
+        scheduler,
+        request,
+        scheduler_output,
+        matched_returns,
+        alloc_mock,
+        expect_store_spec=True,
+        store_full=True,
     )
     snapshot = _dual_scheduler(scheduler)._decode_kv_snapshots[request.request_id]
     assert snapshot.store_load_spec.kvpool_cached_tokens == 32
@@ -276,7 +293,13 @@ def test_admission_partial_store_hit(_constrain_kvpool_seams, scheduler):
     request, scheduler_output, matched_returns, lookup_mock, _, alloc_mock = _admit_one_request(scheduler)
     lookup_mock.assert_called_once()
     _assert_admission_invariants(
-        scheduler, request, scheduler_output, matched_returns, alloc_mock, expect_store_spec=True
+        scheduler,
+        request,
+        scheduler_output,
+        matched_returns,
+        alloc_mock,
+        expect_store_spec=True,
+        store_full=False,
     )
     snapshot = _dual_scheduler(scheduler)._decode_kv_snapshots[request.request_id]
     # Partial hit does not change the Core-facing external delta.
@@ -289,7 +312,13 @@ def test_admission_store_miss(_constrain_kvpool_seams, scheduler):
     request, scheduler_output, matched_returns, lookup_mock, _, alloc_mock = _admit_one_request(scheduler)
     lookup_mock.assert_called_once()
     _assert_admission_invariants(
-        scheduler, request, scheduler_output, matched_returns, alloc_mock, expect_store_spec=False
+        scheduler,
+        request,
+        scheduler_output,
+        matched_returns,
+        alloc_mock,
+        expect_store_spec=False,
+        store_full=False,
     )
 
 
@@ -404,7 +433,7 @@ class TestDecisionTimeoutIntegration:
             assert worker.kv_recv_layer_thread.method_calls == []
             assert worker._kvpool_worker_adapter.method_calls == []
             assert worker.engine.method_calls == []
-            finished_sending, finished_recving = worker.get_finished(set())
+            finished_sending, finished_recving = worker.get_finished(set(), metadata)
             invalid_block_ids = worker.get_block_ids_with_load_errors()
             connector_output = KVConnectorOutput(
                 finished_sending=finished_sending,
@@ -422,7 +451,7 @@ class TestDecisionTimeoutIntegration:
             assert request.status is RequestStatus.FINISHED_ERROR
             assert request.request_id not in scheduler.requests
             assert block_pool.free_block_queue.num_free_blocks == baseline_free_blocks
-            assert worker._kvpool_worker_adapter.method_calls == []
+            worker._kvpool_worker_adapter.get_block_ids_with_load_errors.assert_called_once_with()
             assert worker.engine.method_calls == []
             assert dual._reqs_need_recv == {}
         finally:

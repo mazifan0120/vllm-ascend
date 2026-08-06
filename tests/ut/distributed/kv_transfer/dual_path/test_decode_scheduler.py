@@ -149,11 +149,10 @@ class TestDecodeAdmission(unittest.TestCase):
         self.coordinator.register_pending.assert_not_called()
         self.scheduler.executor.submit.assert_not_called()
 
-    def test_local_tokens_greater_than_ready_tokens_raise(self):
+    def test_local_tokens_greater_than_ready_tokens_is_hbm_complete(self):
         request = _make_request("req-local-past-ready", 48, _selected_params())
 
-        with self.assertRaisesRegex(RuntimeError, "0 <= local_tokens"):
-            self.scheduler.get_num_new_matched_tokens(request, 48)
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 48), (0, False))
 
         self.scheduler._kvpool_adapter.lookup.assert_not_called()
         self.assertEqual(self.scheduler._lookup_results, {})
@@ -166,15 +165,6 @@ class TestDecodeAdmission(unittest.TestCase):
 
         self.scheduler._kvpool_adapter.lookup.assert_not_called()
         self.assertEqual(self.scheduler._lookup_results, {})
-
-    def test_full_partial_miss_all_return_same_external_delta(self):
-        full_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=False)
-        partial_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
-        for request_id, spec in (("req-f", full_spec), ("req-p", partial_spec), ("req-m", None)):
-            with self.subTest(request_id=request_id):
-                request = _make_request(request_id, 48, _selected_params())
-                self.scheduler._kvpool_adapter.lookup.return_value = spec
-                self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 16), (32, True))
 
     def test_ordinary_attention_uses_full_prompt_transfer_target(self):
         request = _make_request("req-ordinary-target", 48, _selected_params())
@@ -215,7 +205,6 @@ class TestDecodeAdmission(unittest.TestCase):
         self.assertEqual(matched, (32, True))
         self.assertEqual(self.scheduler._lookup_results, {})
         snapshot = self.scheduler._decode_kv_snapshots["req-bind"]
-        self.assertEqual(snapshot.target_tokens, 47)
         self.assertEqual(snapshot.transfer_tokens, 48)
         self.assertEqual(snapshot.local_tokens, 16)
         self.assertEqual(snapshot.external_tokens, 32)
@@ -229,7 +218,6 @@ class TestDecodeAdmission(unittest.TestCase):
     def test_snapshot_derives_local_and_store_tokens(self):
         spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
         snapshot = DecodeKVSnapshot(
-            target_tokens=47,
             transfer_tokens=48,
             local_tokens=16,
             external_tokens=32,
@@ -239,7 +227,6 @@ class TestDecodeAdmission(unittest.TestCase):
         self.assertEqual(snapshot.local_tokens, 16)
         self.assertEqual(snapshot.store_tokens, 32)
         miss_snapshot = DecodeKVSnapshot(
-            target_tokens=47,
             transfer_tokens=48,
             local_tokens=16,
             external_tokens=32,
