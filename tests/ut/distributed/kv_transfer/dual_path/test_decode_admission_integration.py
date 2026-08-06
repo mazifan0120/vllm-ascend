@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Scheduler integration acceptance for Task-01 Decode admission (spec §11.4).
+"""Scheduler integration acceptance for DualPath Decode admission and timeout.
 
 Uses the real vLLM v1 Scheduler on CPU with the real ``DualPathConnector``;
 only the KVPool backend module and the ``LookupKeyClient`` transport are
 constrained at their existing seams. Proves that for ``L_DE < R`` one
 ``schedule()`` call admits the request into ``WAITING_FOR_REMOTE_KVS`` with
 final blocks bound in a ``DecodeKVSnapshot``, and that an HBM-complete
-request takes the normal local path with no Task-01 state.
+request takes the normal local path with no Task-01 state. It also proves that
+a Task-04 decision timeout reaches ``FINISHED_ERROR`` and releases delayed
+blocks through the Worker/Core relay.
 """
 
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,15 +35,22 @@ from vllm.v1.request import Request, RequestStatus  # noqa: E402
 from vllm.v1.structured_output import StructuredOutputManager  # noqa: E402
 
 from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # noqa: E402
     DualPathConnector,
     DualPathConnectorScheduler,
+    DualPathConnectorWorker,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (  # noqa: E402
+    DecisionTimeoutMetadata,
+    DualPathConnectorMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
     DecodeControlEndpoint,
 )
 
 _BLOCK_SIZE = 16
+_DECISION_TIMEOUT_ENV = "VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT"
 _NONE_HASH_INITIALIZED = False
 _CONNECTOR_REGISTERED = False
 
@@ -309,3 +319,103 @@ def test_hbm_complete_schedules_normally_without_task01_state(_constrain_kvpool_
     assert dual._decode_kv_snapshots == {}
     assert scheduler_output.num_scheduled_tokens[request.request_id] == 1
     assert request.status == RequestStatus.RUNNING
+
+
+class TestDecisionTimeoutIntegration:
+    def test_timeout_output_finishes_request_and_releases_delayed_blocks(
+        self,
+        monkeypatch,
+        _constrain_kvpool_seams,
+    ):
+        # Given
+        monkeypatch.setenv(_DECISION_TIMEOUT_ENV, "1")
+        _constrain_kvpool_seams.return_value.lookup.return_value = 0
+        scheduler = _make_scheduler(_make_vllm_config())
+        dual = _dual_scheduler(scheduler)
+        coordinator = dual._path_decision_coordinator
+        coordinator.take_received_results.return_value = []
+        block_pool = scheduler.kv_cache_manager.block_pool
+        baseline_free_blocks = block_pool.free_block_queue.num_free_blocks
+
+        try:
+            with (
+                patch.object(connector_module.time, "monotonic", return_value=100.0),
+                patch.object(dual, "_access_metaserver") as proxy_http,
+            ):
+                request, scheduler_output, matched_returns, lookup_mock, _, alloc_mock = _admit_one_request(scheduler)
+
+            state = dual._decode_decision_states[request.request_id]
+            snapshot = dual._decode_kv_snapshots[request.request_id]
+            external_block_ids = snapshot.final_block_ids[0]
+
+            assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert matched_returns == [(32, True)]
+            assert alloc_mock.call_args.kwargs["num_external_computed_tokens"] == 32
+            assert alloc_mock.call_args.kwargs["delay_cache_blocks"] is True
+            lookup_mock.assert_called_once()
+            coordinator.register_pending.assert_called_once_with(state.request_key)
+            proxy_http.assert_not_called()
+            coordinator.submit.assert_not_called()
+            assert state.status is connector_module.DecodeDecisionStatus.PENDING
+            assert state.deadline == 101.0
+            assert dual._reqs_need_recv == {}
+            assert block_pool.free_block_queue.num_free_blocks < baseline_free_blocks
+
+            scheduler.update_from_output(scheduler_output, _runner_output_for([]))
+
+            # When
+            with patch.object(connector_module.time, "monotonic", return_value=state.deadline + 1):
+                timeout_scheduler_output = scheduler.schedule()
+
+            metadata = timeout_scheduler_output.kv_connector_metadata
+            assert isinstance(metadata, DualPathConnectorMetadata)
+            assert metadata.requests == {}
+            assert metadata.decision_timeouts == [
+                DecisionTimeoutMetadata(
+                    request_id=request.request_id,
+                    external_block_ids=external_block_ids,
+                )
+            ]
+
+            worker = object.__new__(DualPathConnectorWorker)
+            worker.vllm_config = SimpleNamespace(
+                kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
+            )
+            worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
+            worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+            worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
+            worker.request_map = {}
+            worker.virtual_request = set()
+            worker._recving_metadata = {}
+            worker._invalid_block_ids = set()
+            worker._control_failed_recving = set()
+            worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
+            worker.engine = MagicMock(name="transfer_engine")
+
+            worker.start_load_kv(metadata)
+            assert worker.kv_recv_layer_thread.method_calls == []
+            assert worker._kvpool_worker_adapter.method_calls == []
+            assert worker.engine.method_calls == []
+            finished_sending, finished_recving = worker.get_finished()
+            invalid_block_ids = worker.get_block_ids_with_load_errors()
+            connector_output = KVConnectorOutput(
+                finished_sending=finished_sending,
+                finished_recving=finished_recving,
+                invalid_block_ids=invalid_block_ids,
+            )
+            model_runner_output = _runner_output_for([])
+            model_runner_output.kv_connector_output = connector_output
+            scheduler.update_from_output(timeout_scheduler_output, model_runner_output)
+
+            # Then
+            assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+            assert connector_output.finished_recving == {request.request_id}
+            assert connector_output.invalid_block_ids == set(external_block_ids)
+            assert request.status is RequestStatus.FINISHED_ERROR
+            assert request.request_id not in scheduler.requests
+            assert block_pool.free_block_queue.num_free_blocks == baseline_free_blocks
+            assert worker._kvpool_worker_adapter.method_calls == []
+            assert worker.engine.method_calls == []
+            assert dual._reqs_need_recv == {}
+        finally:
+            scheduler.shutdown()
