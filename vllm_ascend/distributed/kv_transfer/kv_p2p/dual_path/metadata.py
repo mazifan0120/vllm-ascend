@@ -9,6 +9,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    AscendConnectorMetadata,
+)
 
 BlockTable = tuple[tuple[int, ...], ...]
 
@@ -97,3 +100,4 @@ class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):
         super().__init__()
         self.decision_timeouts = []
         self.forward_receive_bindings = []
+        self.decode_store_metadata: AscendConnectorMetadata | None = None

@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decode-side KVPool lookup adapters for ``DualPathConnector`` (Task-01).
+"""Decode-side KVPool adapters for ``DualPathConnector``.
 
 ``KVPoolAdapter`` gives the Decode Scheduler a private, non-layerwise
-``KVPoolScheduler`` whose only job is to answer "how much of this request is
-already in the KV pool". Each lookup immediately detaches the resulting
-``LoadSpec`` from the owned scheduler's ``load_specs`` so no shared mutable
-record survives: the detached spec is a candidate fact owned by the DualPath
-admission path, and ``can_load`` never authorizes I/O in Task-01.
+``KVPoolScheduler``. Lookup detaches candidate ``LoadSpec`` records; an
+explicit post-allocation commit authorizes the existing async load lifecycle
+using a copy so the detached admission fact remains unchanged.
 
-``KVPoolWorkerAdapter`` gives the Decode Worker the lookup-only half of the
-AscendStore runtime: a ``KVPoolWorker`` plus the existing ``LookupKeyServer``,
-bound only on the owning rank. It starts no transfer threads and registers no
-KV caches.
+``KVPoolWorkerAdapter`` delegates that load lifecycle to one private
+``KVPoolWorker`` and retains ownership of the existing ``LookupKeyServer``.
 """
 
 from __future__ import annotations
@@ -26,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_conne
     LookupKeyServer,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    AscendConnectorMetadata,
     LoadSpec,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
@@ -36,6 +33,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import
 )
 
 if TYPE_CHECKING:
+    import torch
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -96,6 +96,60 @@ class KVPoolAdapter:
             return None
         return spec
 
+    def commit_after_alloc(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        load_spec: LoadSpec,
+    ) -> None:
+        pool = self._pool_scheduler
+        request_id = request.request_id
+        ready_tokens = max(request.num_tokens - 1, 0)
+        ready_delta = ready_tokens - load_spec.vllm_cached_tokens
+
+        if pool.kv_role != "kv_consumer" or pool.use_layerwise:
+            raise RuntimeError("DualPath KVPool commit requires a non-layerwise Decode-owned scheduler")
+        if load_spec.kvpool_cached_tokens != ready_tokens:
+            raise RuntimeError(
+                f"DualPath KVPool commit ready-token mismatch for request {request_id}: "
+                f"expected {ready_tokens}, detached LoadSpec has {load_spec.kvpool_cached_tokens}"
+            )
+        if ready_delta <= 0:
+            raise RuntimeError(
+                f"DualPath KVPool commit requires a positive ready-token delta for request {request_id}: "
+                f"ready={ready_tokens}, local={load_spec.vllm_cached_tokens}"
+            )
+        if request_id in pool.load_specs:
+            raise RuntimeError(f"DualPath KVPool request {request_id} is already committed")
+
+        had_unfinished_request = request_id in pool._unfinished_requests
+        previous_unfinished_request = pool._unfinished_requests.get(request_id)
+        had_unfinished_request_id = request_id in pool._unfinished_request_ids
+        had_loading_request_id = request_id in pool._loading_req_ids
+
+        pool.load_specs[request_id] = dataclasses.replace(load_spec)
+        try:
+            pool.update_state_after_alloc(request, blocks, ready_delta)
+        except Exception:
+            pool.load_specs.pop(request_id, None)
+            if had_unfinished_request:
+                assert previous_unfinished_request is not None
+                pool._unfinished_requests[request_id] = previous_unfinished_request
+            else:
+                pool._unfinished_requests.pop(request_id, None)
+            if had_unfinished_request_id:
+                pool._unfinished_request_ids.add(request_id)
+            else:
+                pool._unfinished_request_ids.discard(request_id)
+            if had_loading_request_id:
+                pool._loading_req_ids.add(request_id)
+            else:
+                pool._loading_req_ids.discard(request_id)
+            raise
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> AscendConnectorMetadata:
+        return self._pool_scheduler.build_connector_meta(scheduler_output)
+
     def close(self) -> None:
         """Close the lazily created LookupKeyClient, if any. Idempotent."""
         client = self._pool_scheduler.client
@@ -105,7 +159,7 @@ class KVPoolAdapter:
 
 
 class KVPoolWorkerAdapter:
-    """Lookup-only Decode Worker adapter: KVPoolWorker + LookupKeyServer."""
+    """Decode Worker adapter over a KVPoolWorker and LookupKeyServer."""
 
     def __init__(
         self,
@@ -122,6 +176,22 @@ class KVPoolWorkerAdapter:
         # endpoint is bound by rank 0 only.
         if vllm_config.parallel_config.rank == 0:
             self._lookup_server = LookupKeyServer(self._pool_worker, vllm_config)
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        self._pool_worker.register_kv_caches(kv_caches)
+
+    def start_load_kv(self, metadata: AscendConnectorMetadata) -> None:
+        self._pool_worker.start_load_kv(metadata)
+
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+        metadata: AscendConnectorMetadata,
+    ) -> tuple[set[str], set[str]]:
+        return self._pool_worker.get_finished(finished_req_ids, metadata)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        return self._pool_worker.get_block_ids_with_load_errors()
 
     def close(self) -> None:
         """Terminate the lookup server if bound. Idempotent."""

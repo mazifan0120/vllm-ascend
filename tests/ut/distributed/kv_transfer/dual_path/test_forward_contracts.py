@@ -175,3 +175,9 @@ def test_dual_path_connector_metadata_initializes_forward_receive_bindings():
 
     assert metadata.forward_receive_bindings == []
     assert metadata.decision_timeouts == []
+
+
+def test_dual_path_connector_metadata_decode_store_metadata_defaults_none():
+    metadata = DualPathConnectorMetadata()
+
+    assert metadata.decode_store_metadata is None

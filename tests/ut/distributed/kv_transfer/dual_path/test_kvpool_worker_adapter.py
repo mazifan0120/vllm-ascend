@@ -60,6 +60,69 @@ def test_worker_adapter_constructs_non_layerwise_pool_worker_only(collaborators)
     worker.start_load_kv.assert_not_called()
 
 
+def test_register_kv_caches_delegates_exact_argument(collaborators):
+    # Given
+    mock_worker_cls, _ = collaborators
+    adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=1), MagicMock())
+    kv_caches = {"layer.0": MagicMock()}
+
+    # When
+    adapter.register_kv_caches(kv_caches)
+
+    # Then
+    delegated_kv_caches = mock_worker_cls.return_value.register_kv_caches.call_args.args[0]
+    assert delegated_kv_caches is kv_caches
+
+
+def test_start_load_kv_delegates_exact_metadata(collaborators):
+    # Given
+    mock_worker_cls, _ = collaborators
+    adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=1), MagicMock())
+    metadata = MagicMock()
+
+    # When
+    adapter.start_load_kv(metadata)
+
+    # Then
+    delegated_metadata = mock_worker_cls.return_value.start_load_kv.call_args.args[0]
+    assert delegated_metadata is metadata
+
+
+def test_get_finished_delegates_arguments_and_returns_exact_result(collaborators):
+    # Given
+    mock_worker_cls, _ = collaborators
+    adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=1), MagicMock())
+    finished_req_ids = {"req-finished"}
+    metadata = MagicMock()
+    expected = ({"req-sent"}, {"req-received"})
+    mock_worker_cls.return_value.get_finished.return_value = expected
+
+    # When
+    result = adapter.get_finished(finished_req_ids, metadata)
+
+    # Then
+    assert result is expected
+    mock_worker_cls.return_value.get_finished.assert_called_once_with(finished_req_ids, metadata)
+
+
+def test_get_block_ids_with_load_errors_preserves_drain_once_semantics(collaborators):
+    # Given
+    mock_worker_cls, _ = collaborators
+    adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=1), MagicMock())
+    first_errors = {7, 8}
+    drained_errors: set[int] = set()
+    mock_worker_cls.return_value.get_block_ids_with_load_errors.side_effect = [first_errors, drained_errors]
+
+    # When
+    first_result = adapter.get_block_ids_with_load_errors()
+    second_result = adapter.get_block_ids_with_load_errors()
+
+    # Then
+    assert first_result is first_errors
+    assert second_result is drained_errors
+    assert mock_worker_cls.return_value.get_block_ids_with_load_errors.call_count == 2
+
+
 def test_worker_close_idempotent_and_delegates_to_server_close(collaborators):
     _, mock_server_cls = collaborators
     adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=0), MagicMock())
