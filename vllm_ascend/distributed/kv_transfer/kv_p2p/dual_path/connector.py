@@ -194,6 +194,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._pe_request_keys: dict[str, DualPathRequestKey] = {}
         self._pe_path_results: dict[str, PathDecisionResult] = {}
         self._pe_forward_plans: dict[str, ForwardPlan] = {}
+        self._pe_forward_send_infos: dict[str, SendReqInfo] = {}
         self._pe_delivery_futures: dict[DualPathRequestKey, Future[None]] = {}
         self._pe_invalid_request_ids: set[str] = set()
         if dual_path_cfg.role == "decode":
@@ -387,10 +388,21 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if not 0 <= token_start < token_end:
                 raise PathDecisionValidationError("Forward token range must satisfy 0 <= token_start < token_end")
 
-            required_fields = ("remote_block_size", "remote_engine_id", "remote_host", "remote_port")
+            topology_fields = ("remote_tp_size", "remote_pcp_size", "remote_dcp_size")
+            required_fields = (
+                "remote_block_size",
+                "remote_engine_id",
+                "remote_host",
+                "remote_port",
+                *topology_fields,
+            )
             missing_fields = [field for field in required_fields if field not in params]
             if missing_fields:
                 raise PathDecisionValidationError(f"missing inherited remote fields: {missing_fields}")
+            for field in topology_fields:
+                topology_size = params[field]
+                if isinstance(topology_size, bool) or not isinstance(topology_size, int) or topology_size <= 0:
+                    raise PathDecisionValidationError(f"{field} must be a positive integer")
             if params.get("remote_cached_tokens") != token_start:
                 raise PathDecisionValidationError(
                     "remote_cached_tokens does not match the Decision Request local prefix"
@@ -455,13 +467,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 "the original plan is preserved"
             )
 
-        self._pe_forward_plans[request_id] = plan
-        self._reqs_need_send_layerwise[request_id] = SendReqInfo(
+        send_req_info = SendReqInfo(
             local_block_ids=[list(group) for group in plan.source_block_ids],
             local_transferred_tokens=plan.token_start,
             local_computed_tokens=0,
             request=request,
         )
+        self._pe_forward_plans[request_id] = plan
+        self._pe_forward_send_infos[request_id] = send_req_info
+        self._reqs_need_send_layerwise[request_id] = send_req_info
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         if not self._is_task01_decode_request(request):
@@ -479,16 +493,16 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
         ready_tokens = max(request.num_tokens - 1, 0)
         local_tokens = num_computed_tokens
+        if not 0 <= local_tokens <= ready_tokens <= transfer_tokens:
+            raise RuntimeError(
+                f"DualPath request {request_id} initial admission requires "
+                f"0 <= local_tokens ({local_tokens}) <= ready_tokens ({ready_tokens}) "
+                f"<= transfer_tokens ({transfer_tokens})"
+            )
         if local_tokens >= ready_tokens:
             # HBM-complete: no KVPool lookup, no Task-01 state.
             self._lookup_results.pop(request_id, None)
             return 0, False
-        if not 0 <= local_tokens < ready_tokens <= transfer_tokens:
-            raise RuntimeError(
-                f"DualPath request {request_id} initial admission requires "
-                f"0 <= local_tokens ({local_tokens}) < ready_tokens ({ready_tokens}) "
-                f"<= transfer_tokens ({transfer_tokens})"
-            )
 
         external_tokens = transfer_tokens - local_tokens
         cached = self._lookup_results.get(request_id)
@@ -739,9 +753,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
             self._pe_path_results.pop(request_id, None)
-            forward_plan = self._pe_forward_plans.pop(request_id, None)
+            self._pe_forward_plans.pop(request_id, None)
+            owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
             send_req_info = self._reqs_need_send_layerwise.get(request_id)
-            if forward_plan is not None and send_req_info is not None and send_req_info.request is request:
+            if owned_send_req_info is send_req_info and send_req_info is not None and send_req_info.request is request:
                 self._reqs_need_send_layerwise.pop(request_id)
             released_key = self._pe_request_keys.pop(request_id, None)
             self._pe_invalid_request_ids.discard(request_id)
@@ -760,9 +775,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
             self._pe_path_results.pop(request_id, None)
-            forward_plan = self._pe_forward_plans.pop(request_id, None)
+            self._pe_forward_plans.pop(request_id, None)
+            owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
             send_req_info = self._reqs_need_send_layerwise.get(request_id)
-            if forward_plan is not None and send_req_info is not None and send_req_info.request is request:
+            if owned_send_req_info is send_req_info and send_req_info is not None and send_req_info.request is request:
                 self._reqs_need_send_layerwise.pop(request_id)
             released_key = self._pe_request_keys.pop(request_id, None)
             self._pe_invalid_request_ids.discard(request_id)
@@ -788,6 +804,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_decision_states.clear()
         self._pe_request_keys.clear()
         self._pe_path_results.clear()
+        for request_id, owned_send_req_info in self._pe_forward_send_infos.items():
+            if self._reqs_need_send_layerwise.get(request_id) is owned_send_req_info:
+                self._reqs_need_send_layerwise.pop(request_id)
+        self._pe_forward_send_infos.clear()
         self._pe_forward_plans.clear()
         self._pe_delivery_futures.clear()
         self._pe_invalid_request_ids.clear()
@@ -899,7 +919,16 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
         done_wire_ids = raw_done.union(self._pending_forward_done)
         failed_wire_ids = raw_failed.union(self._pending_forward_failed)
-        done_wire_ids.difference_update(failed_wire_ids)
+        failed_wins_wire_ids: set[str] = set()
+        for wire_request_id in failed_wire_ids:
+            decode_request_id = self.request_map.get(wire_request_id)
+            if decode_request_id is None:
+                failed_wins_wire_ids.add(wire_request_id)
+                continue
+            binding = self._forward_receive_bindings.get(decode_request_id)
+            if binding is not None and binding.wire_request_id == wire_request_id:
+                failed_wins_wire_ids.add(wire_request_id)
+        done_wire_ids.difference_update(failed_wins_wire_ids)
         pending_done: set[str] = set()
         pending_failed: set[str] = set()
         ordinary_done: set[str] = set()

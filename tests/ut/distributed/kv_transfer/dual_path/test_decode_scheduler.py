@@ -149,6 +149,24 @@ class TestDecodeAdmission(unittest.TestCase):
         self.coordinator.register_pending.assert_not_called()
         self.scheduler.executor.submit.assert_not_called()
 
+    def test_local_tokens_greater_than_ready_tokens_raise(self):
+        request = _make_request("req-local-past-ready", 48, _selected_params())
+
+        with self.assertRaisesRegex(RuntimeError, "0 <= local_tokens"):
+            self.scheduler.get_num_new_matched_tokens(request, 48)
+
+        self.scheduler._kvpool_adapter.lookup.assert_not_called()
+        self.assertEqual(self.scheduler._lookup_results, {})
+
+    def test_negative_local_tokens_raise(self):
+        request = _make_request("req-negative-local", 48, _selected_params())
+
+        with self.assertRaisesRegex(RuntimeError, "0 <= local_tokens"):
+            self.scheduler.get_num_new_matched_tokens(request, -1)
+
+        self.scheduler._kvpool_adapter.lookup.assert_not_called()
+        self.assertEqual(self.scheduler._lookup_results, {})
+
     def test_full_partial_miss_all_return_same_external_delta(self):
         full_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=False)
         partial_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)

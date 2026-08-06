@@ -696,6 +696,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_pe_request_keys",
             "_pe_path_results",
             "_pe_forward_plans",
+            "_pe_forward_send_infos",
             "_pe_delivery_futures",
             "_pe_invalid_request_ids",
         }
@@ -1301,6 +1302,54 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             self.assertEqual(dual_consumer._recving_metadata, parent_consumer._recving_metadata)
             self.assertNotIn(external_request_id, parent_consumer.request_map)
             self.assertEqual(dual_consumer.request_map, parent_consumer.request_map)
+
+    def test_ordinary_done_and_failed_completion_matches_parent(self):
+        parent_config = MockVllmConfig("decode", "kv_consumer")
+        dual_config = MockVllmConfig("decode", "kv_consumer")
+        parent_config.parallel_config.tensor_parallel_size = 1
+        dual_config.parallel_config.tensor_parallel_size = 1
+        request_id = "reqC-load-00000001"
+        params = {
+            "remote_block_ids": [[1, 2]],
+            "remote_block_size": [[16]],
+            "remote_engine_id": "prefill-engine",
+            "remote_host": "127.0.0.2",
+            "remote_port": 6000,
+            "remote_te_rpc_port": 9090,
+        }
+        parent_meta = MooncakeLayerwiseConnectorMetadata()
+        dual_meta = MooncakeLayerwiseConnectorMetadata()
+        parent_meta.add_new_req(request_id, [[7, 8]], dict(params))
+        dual_meta.add_new_req(request_id, [[7, 8]], dict(params))
+
+        with worker_environment():
+            parent = MooncakeLayerwiseConnectorWorker(parent_config, MockKVCacheConfig(), "test_engine")
+            dual = DualPathConnectorWorker(
+                dual_config,
+                MockKVCacheConfig(),
+                "test_engine",
+                DualPathConfig(role="decode"),
+            )
+            parent.register_kv_caches(make_kv_caches())
+            dual.register_kv_caches(make_kv_caches())
+            parent.start_load_kv(parent_meta)
+            dual.start_load_kv(dual_meta)
+            external_request_id = get_external_request_id(request_id)
+            parent.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {external_request_id}
+            dual.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {external_request_id}
+            parent.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
+            dual.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {external_request_id}
+
+            parent_result = parent.get_finished()
+            dual_result = dual.get_finished(set())
+            parent_invalid = parent.get_block_ids_with_load_errors()
+            dual_invalid = dual.get_block_ids_with_load_errors()
+
+        self.assertEqual(parent_result, (set(), {request_id}))
+        self.assertEqual(dual_result, parent_result)
+        self.assertEqual(dual_invalid, parent_invalid)
+        self.assertEqual(dual.request_map, parent.request_map)
+        self.assertEqual(dual._recving_metadata, parent._recving_metadata)
 
     def test_cleanup_matches_parent(self):
         parent, dual = self.make_scheduler_pair("prefill", "kv_producer")

@@ -136,6 +136,9 @@ def _make_request(
         "remote_engine_id": "decode-engine",
         "remote_host": "198.51.100.20",
         "remote_port": 6000,
+        "remote_tp_size": 1,
+        "remote_pcp_size": 1,
+        "remote_dcp_size": 1,
         "dual_path": _decision_payload(
             target_tokens=target_tokens,
             local_tokens=local_tokens,
@@ -425,6 +428,7 @@ def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
         assert getattr(scheduler, method_name)(request, block_ids) == parent_result
         assert scheduler._pe_path_results == {}
         assert scheduler._pe_forward_plans == {}
+        assert scheduler._pe_forward_send_infos == {}
         assert request.request_id not in scheduler._reqs_need_send_layerwise
 
         replacement_request = _make_request(request_id=request.request_id)
@@ -482,12 +486,26 @@ def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
     shutdown_request = _make_request(request_id="prefill-shutdown-records")
     _decide(shutdown_scheduler, shutdown_request)
     shutdown_scheduler.update_state_after_alloc(shutdown_request, _blocks(([10, 11, 12],)), 0)
+    owned_send_info = shutdown_scheduler._reqs_need_send_layerwise[shutdown_request.request_id]
+    owned_send_info.local_transferred_tokens = 0
+    owned_send_info.local_block_ids[0].append(13)
+    ordinary_request = _make_request(request_id="ordinary-parent-send-state")
+    ordinary_send_info = SendReqInfo(
+        local_block_ids=[[70, 71, 72]],
+        local_transferred_tokens=0,
+        local_computed_tokens=0,
+        request=ordinary_request,
+    )
+    shutdown_scheduler._reqs_need_send_layerwise[ordinary_request.request_id] = ordinary_send_info
 
     shutdown_scheduler.shutdown()
     shutdown_scheduler.shutdown()
 
     assert shutdown_scheduler._pe_path_results == {}
     assert shutdown_scheduler._pe_forward_plans == {}
+    assert shutdown_scheduler._pe_forward_send_infos == {}
+    assert shutdown_request.request_id not in shutdown_scheduler._reqs_need_send_layerwise
+    assert shutdown_scheduler._reqs_need_send_layerwise[ordinary_request.request_id] is ordinary_send_info
 
 
 @pytest.mark.parametrize(
@@ -520,6 +538,41 @@ def test_scheduler_rejects_invalid_forward_plan_without_send_state(scheduler_fac
     _decide(scheduler, request)
 
     scheduler.update_state_after_alloc(request, blocks, 0)
+
+    assert request.request_id in scheduler._pe_invalid_request_ids
+    assert request.request_id not in scheduler._pe_path_results
+    assert request.request_id not in scheduler._pe_forward_plans
+    assert request.request_id not in scheduler._reqs_need_send_layerwise
+
+
+@pytest.mark.parametrize("topology_field", ["remote_tp_size", "remote_pcp_size", "remote_dcp_size"])
+def test_scheduler_rejects_missing_forward_topology_without_send_state(scheduler_factory, topology_field):
+    scheduler, _, _ = scheduler_factory()
+    request = _make_request()
+    request.kv_transfer_params.pop(topology_field)
+    _decide(scheduler, request)
+
+    scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
+
+    assert request.request_id in scheduler._pe_invalid_request_ids
+    assert request.request_id not in scheduler._pe_path_results
+    assert request.request_id not in scheduler._pe_forward_plans
+    assert request.request_id not in scheduler._reqs_need_send_layerwise
+
+
+@pytest.mark.parametrize("topology_field", ["remote_tp_size", "remote_pcp_size", "remote_dcp_size"])
+@pytest.mark.parametrize("invalid_value", [None, 0, -1, True, "1"])
+def test_scheduler_rejects_invalid_forward_topology_without_send_state(
+    scheduler_factory,
+    topology_field,
+    invalid_value,
+):
+    scheduler, _, _ = scheduler_factory()
+    request = _make_request()
+    request.kv_transfer_params[topology_field] = invalid_value
+    _decide(scheduler, request)
+
+    scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
     assert request.request_id in scheduler._pe_invalid_request_ids
     assert request.request_id not in scheduler._pe_path_results

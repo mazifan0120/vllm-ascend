@@ -19,6 +19,7 @@ from tests.ut.distributed.kv_transfer.dual_path import test_pe_read_forward as f
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
+    DualPathConnector,
     DualPathConnectorScheduler,
     DualPathConnectorWorker,
 )
@@ -35,7 +36,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     DecodeControlEndpoint,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    MooncakeLayerwiseConnectorWorker,
+    LayerMetadata,
+    MooncakeLayerwiseConnectorMetadata,
     get_external_request_id,
 )
 
@@ -152,10 +154,48 @@ def _build_parent_metadata(
         num_scheduled_tokens={request.request_id: request.num_prompt_tokens},
     )
     metadata = scheduler.build_connector_meta(scheduler_output)
+    return _send_parent_metadata_through_connector(scheduler, request, metadata)
+
+
+def _send_parent_metadata_through_connector(
+    scheduler: DualPathConnectorScheduler,
+    request: SimpleNamespace,
+    metadata: MooncakeLayerwiseConnectorMetadata,
+) -> SimpleNamespace:
     request_metadata = metadata.requests[request.request_id]
-    with patch.object(MooncakeLayerwiseConnectorWorker, "save_kv_layer", autospec=True) as layer_send:
-        layer_send(MagicMock(), "layer.0", [], MagicMock(), metadata)
-        layer_send.assert_called_once()
+    worker = object.__new__(DualPathConnectorWorker)
+    worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=False, is_kv_producer=True))
+    worker.current_layer = 0
+    worker.total_layers = 1
+    worker.block_size = [_BLOCK_SIZE]
+    worker.pd_head_ratio = 1
+    worker.enable_kv_quant = False
+    worker.enable_c8_quant = False
+    worker.layer_metadata = {"layer.0": LayerMetadata([0], [0], [_BLOCK_SIZE], [1])}
+    worker.engine = MagicMock(name="transfer_engine")
+    worker.kv_send_layer_thread = MagicMock(name="kv_send_layer_thread")
+    facade = object.__new__(DualPathConnector)
+    facade._connector_metadata = metadata
+    facade.connector_worker = worker
+    attn_metadata = SimpleNamespace(reshape_cache_event=MagicMock(name="reshape_cache_event"))
+
+    with patch.object(worker, "update_decoder_info", side_effect=lambda _request_id, req_meta: req_meta):
+        facade.save_kv_layer("layer.0", [], attn_metadata)
+
+    worker.kv_send_layer_thread.send_queue.put.assert_called_once()
+    sent_task = worker.kv_send_layer_thread.send_queue.put.call_args.args[0]
+    sent_request_metadata = sent_task.send_request[request.request_id]
+    plan = scheduler._pe_forward_plans[request.request_id]
+    assert sent_task.layer_name == "layer.0"
+    assert sent_task.layer_idx == 0
+    assert sent_task.wait_event is attn_metadata.reshape_cache_event
+    assert sent_request_metadata is request_metadata
+    assert sent_request_metadata.local_block_ids == [list(group) for group in plan.source_block_ids]
+    assert tuple(tuple(group) for group in sent_request_metadata.remote_block_ids) == plan.destination_block_ids
+    assert sent_request_metadata.remote_cache_tokens == plan.token_start
+    assert sent_request_metadata.chunk_finish is True
+    assert worker.current_layer == 1
+    assert worker.engine.method_calls == []
     return request_metadata
 
 
