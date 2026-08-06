@@ -37,12 +37,18 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput  # noqa: E402
 from vllm.v1.request import Request, RequestStatus  # noqa: E402
 from vllm.v1.structured_output import StructuredOutputManager  # noqa: E402
 
+from tests.ut.distributed.kv_transfer.dual_path.test_de_local_store_full import (  # noqa: E402
+    _make_real_store_worker_adapter,
+)
 from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # noqa: E402
     DualPathConnector,
     DualPathConnectorScheduler,
     DualPathConnectorWorker,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (  # noqa: E402
+    KVPoolWorkerAdapter,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (  # noqa: E402
     DecisionTimeoutMetadata,
@@ -153,7 +159,9 @@ def _runner_output_for(requests: list[Request]) -> ModelRunnerOutput:
     )
 
 
-def _make_bare_worker() -> DualPathConnectorWorker:
+def _make_bare_worker(
+    load_result: list[int] | None,
+) -> tuple[DualPathConnectorWorker, KVPoolWorkerAdapter, MagicMock]:
     worker = object.__new__(DualPathConnectorWorker)
     worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
     worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
@@ -168,12 +176,18 @@ def _make_bare_worker() -> DualPathConnectorWorker:
     worker._pending_forward_done = set()
     worker._pending_forward_failed = set()
     worker._consumed_forward_terminals = {}
-    worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
-    worker._kvpool_worker_adapter.get_finished.return_value = (set(), set())
-    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = set()
+    adapter, backend = _make_real_store_worker_adapter(load_result)
+    worker._kvpool_worker_adapter = adapter
     worker.engine = MagicMock(name="transfer_engine")
     worker.block_size = [_BLOCK_SIZE]
-    return worker
+    return worker, adapter, backend
+
+
+def test_integration_worker_completion_source_is_real_kvpool_adapter() -> None:
+    worker, adapter, _ = _make_bare_worker([0, 0])
+
+    assert worker._kvpool_worker_adapter is adapter
+    assert isinstance(adapter, KVPoolWorkerAdapter)
 
 
 @pytest.fixture(autouse=True)
@@ -440,11 +454,13 @@ def test_store_full_success_completes_locally_and_recomputes_last_token(
     coordinator.unregister.assert_not_called()
     proxy_http.assert_not_called()
 
-    worker = _make_bare_worker()
-    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {request.request_id})
+    worker, adapter, backend = _make_bare_worker([0, 0])
 
     # When
     worker.start_load_kv(metadata)
+    recv_thread = adapter._pool_worker.kv_recv_thread
+    assert recv_thread is not None
+    recv_thread.request_queue.join()
     finished_sending, finished_recving = worker.get_finished(set(), metadata)
     connector_output = KVConnectorOutput(
         finished_sending=finished_sending,
@@ -474,9 +490,7 @@ def test_store_full_success_completes_locally_and_recomputes_last_token(
     assert allocation_state == [(RequestStatus.WAITING, 32)]
     assert resumed_output.num_scheduled_tokens[request.request_id] == 1
     assert request.status is RequestStatus.RUNNING
-    worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
-    worker._kvpool_worker_adapter.get_finished.assert_called_once_with(set(), store_metadata)
-    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.assert_called_once_with()
+    backend.get.assert_called_once()
     worker.kv_recv_layer_thread.get_and_clear_done_requests.assert_called_once_with()
     worker.kv_recv_layer_thread.get_and_clear_failed_requests.assert_called_once_with()
     assert worker.engine.method_calls == []
@@ -555,12 +569,13 @@ def test_store_full_failure_fails_closed_and_releases_delayed_blocks(
     coordinator.unregister.assert_not_called()
     proxy_http.assert_not_called()
 
-    worker = _make_bare_worker()
-    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {request.request_id})
-    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = failed_suffix_blocks
+    worker, adapter, backend = _make_bare_worker(None)
 
     # When
     worker.start_load_kv(metadata)
+    recv_thread = adapter._pool_worker.kv_recv_thread
+    assert recv_thread is not None
+    recv_thread.request_queue.join()
     finished_sending, finished_recving = worker.get_finished(set(), metadata)
     connector_output = KVConnectorOutput(
         finished_sending=finished_sending,
@@ -578,8 +593,7 @@ def test_store_full_failure_fails_closed_and_releases_delayed_blocks(
     assert request.status is RequestStatus.FINISHED_ERROR
     assert request.request_id not in scheduler.requests
     assert block_pool.free_block_queue.num_free_blocks == baseline_free_blocks
-    worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
-    worker._kvpool_worker_adapter.get_finished.assert_called_once_with(set(), store_metadata)
+    backend.get.assert_called_once()
     assert worker.engine.method_calls == []
     assert worker._forward_receive_bindings == {}
     assert dual._decode_decision_states == {}
@@ -647,11 +661,11 @@ class TestDecisionTimeoutIntegration:
                 )
             ]
 
-            worker = _make_bare_worker()
+            worker, _, backend = _make_bare_worker([0, 0])
 
             worker.start_load_kv(metadata)
             assert worker.kv_recv_layer_thread.method_calls == []
-            assert worker._kvpool_worker_adapter.method_calls == []
+            backend.get.assert_not_called()
             assert worker.engine.method_calls == []
             finished_sending, finished_recving = worker.get_finished(set(), metadata)
             invalid_block_ids = worker.get_block_ids_with_load_errors()
@@ -671,7 +685,7 @@ class TestDecisionTimeoutIntegration:
             assert request.status is RequestStatus.FINISHED_ERROR
             assert request.request_id not in scheduler.requests
             assert block_pool.free_block_queue.num_free_blocks == baseline_free_blocks
-            worker._kvpool_worker_adapter.get_block_ids_with_load_errors.assert_called_once_with()
+            backend.get.assert_not_called()
             assert worker.engine.method_calls == []
             assert dual._reqs_need_recv == {}
         finally:

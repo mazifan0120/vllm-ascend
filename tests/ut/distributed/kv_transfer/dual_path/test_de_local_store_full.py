@@ -311,6 +311,25 @@ def test_retry_reprobes_when_cached_full_accounting_becomes_non_full_for_current
     assert decode_scheduler._lookup_results[request.request_id] == (16, 48, current_partial_spec)
 
 
+def test_retry_reprobes_when_cached_spec_exceeds_shrinking_ready_boundary(decode_scheduler) -> None:
+    # Given
+    request = _make_request("retry-shrinking-prompt", 48, _selected_params())
+    cached_full_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=False)
+    current_full_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=46, can_load=False)
+    decode_scheduler._kvpool_adapter.lookup.side_effect = [cached_full_spec, current_full_spec]
+    assert decode_scheduler.get_num_new_matched_tokens(request, 16) == (31, True)
+
+    # When
+    request.num_tokens = 47
+    request.prompt_token_ids = list(range(47))
+    retried = decode_scheduler.get_num_new_matched_tokens(request, 16)
+
+    # Then
+    assert retried == (30, True)
+    assert decode_scheduler._kvpool_adapter.lookup.call_args_list == [call(request, 16), call(request, 16)]
+    assert decode_scheduler._lookup_results[request.request_id] == (16, 30, current_full_spec)
+
+
 def test_store_full_alloc_creates_no_decision_side_effects(decode_scheduler) -> None:
     request = _make_request("side-effects", 48, _selected_params())
     spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=47, can_load=False)
@@ -581,6 +600,9 @@ def test_real_store_worker_withholds_load_errors_until_done_recving() -> None:
     worker = _make_worker()
     worker._kvpool_worker_adapter = adapter
     metadata = _make_real_store_metadata(request_id)
+    store_metadata = metadata.decode_store_metadata
+    assert store_metadata is not None
+    pool_worker = adapter._pool_worker
     recv_thread = adapter._pool_worker.kv_recv_thread
     assert isinstance(recv_thread, KVCacheStoreRecvingThread)
     reached_completion = threading.Event()
@@ -596,12 +618,12 @@ def test_real_store_worker_withholds_load_errors_until_done_recving() -> None:
     with patch.object(recv_thread, "set_finished_request", side_effect=hold_completion):
         worker.start_load_kv(metadata)
         assert reached_completion.wait(timeout=5)
-        early_finished = worker.get_finished(set(), metadata)
-        early_invalid_blocks = worker.get_block_ids_with_load_errors()
+        early_finished = pool_worker.get_finished(set(), store_metadata)
+        early_invalid_blocks = pool_worker.get_block_ids_with_load_errors()
         release_completion.set()
         recv_thread.request_queue.join()
-    completed = worker.get_finished(set(), metadata)
-    completed_invalid_blocks = worker.get_block_ids_with_load_errors()
+    completed = pool_worker.get_finished(set(), store_metadata)
+    completed_invalid_blocks = pool_worker.get_block_ids_with_load_errors()
 
     # Then
     assert early_finished == (set(), set())

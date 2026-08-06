@@ -13,7 +13,6 @@ using a copy so the detached admission fact remains unchanged.
 from __future__ import annotations
 
 import dataclasses
-import math
 from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
@@ -25,9 +24,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_conne
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     LoadSpec,
-)
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
-    KVCacheStoreRecvingThread,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
@@ -226,9 +222,6 @@ class KVPoolWorkerAdapter:
             use_layerwise=False,
             kv_cache_config=kv_cache_config,
         )
-        self._load_block_ids: dict[str, set[int]] = {}
-        self._pending_load_error_blocks: set[int] = set()
-        self._completed_load_error_blocks: set[int] = set()
         self._lookup_server: LookupKeyServer | None = None
         # Same ownership rule as AscendStoreConnector: the non-layerwise lookup
         # endpoint is bound by rank 0 only.
@@ -237,56 +230,22 @@ class KVPoolWorkerAdapter:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._pool_worker.register_kv_caches(kv_caches)
-        recv_thread = self._pool_worker.kv_recv_thread
-        if isinstance(recv_thread, KVCacheStoreRecvingThread):
-            recv_thread._invalid_block_ids = self._pool_worker._invalid_block_ids
-            recv_thread._invalid_block_ids_lock = self._pool_worker._invalid_block_ids_lock
 
     def start_load_kv(self, metadata: AscendConnectorMetadata) -> None:
-        block_size = self._pool_worker.block_size
-        for request in metadata.requests:
-            load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:
-                continue
-            first_load_block = load_spec.vllm_cached_tokens // block_size
-            last_load_block = math.ceil(load_spec.kvpool_cached_tokens / block_size)
-            self._load_block_ids[request.req_id] = set(request.block_ids[first_load_block:last_load_block])
         self._pool_worker.start_load_kv(metadata)
-
-    def _collect_load_errors(self) -> None:
-        known_blocks = {block_id for block_ids in self._load_block_ids.values() for block_id in block_ids}
-        worker_errors = self._pool_worker.get_block_ids_with_load_errors()
-        self._pending_load_error_blocks.update(worker_errors.intersection(known_blocks))
 
     def get_finished(
         self,
         finished_req_ids: set[str],
         metadata: AscendConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
-        result = self._pool_worker.get_finished(finished_req_ids, metadata)
-        done_sending, done_recving = result
-        self._collect_load_errors()
-        for request_id in done_recving:
-            request_blocks = self._load_block_ids.pop(request_id, set())
-            self._completed_load_error_blocks.update(self._pending_load_error_blocks.intersection(request_blocks))
-            self._pending_load_error_blocks.difference_update(request_blocks)
-        for request_id in finished_req_ids.union(metadata.preempted_req_ids):
-            request_blocks = self._load_block_ids.pop(request_id, set())
-            self._pending_load_error_blocks.difference_update(request_blocks)
-            self._completed_load_error_blocks.difference_update(request_blocks)
-        return result
+        return self._pool_worker.get_finished(finished_req_ids, metadata)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        self._collect_load_errors()
-        completed_errors = self._completed_load_error_blocks.copy()
-        self._completed_load_error_blocks.clear()
-        return completed_errors
+        return self._pool_worker.get_block_ids_with_load_errors()
 
     def close(self) -> None:
         """Terminate the lookup server if bound. Idempotent."""
         if self._lookup_server is not None:
             self._lookup_server.close()
             self._lookup_server = None
-        self._load_block_ids.clear()
-        self._pending_load_error_blocks.clear()
-        self._completed_load_error_blocks.clear()

@@ -842,6 +842,32 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         )
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
+        self._failed_block_ids_by_request: dict[str, set[int]] = {}
+
+    def get_and_clear_finished_requests(
+        self,
+        req_ids: set[str] | None = None,
+    ) -> set[str]:
+        with self.done_task_lock:
+            if req_ids is None:
+                finished_requests = self.finished_requests.copy()
+                self.finished_requests.clear()
+            else:
+                finished_requests = self.finished_requests & req_ids
+                self.finished_requests -= finished_requests
+            failed_block_ids = set().union(
+                *(self._failed_block_ids_by_request.pop(req_id, set()) for req_id in finished_requests)
+            )
+        if failed_block_ids:
+            with self._invalid_block_ids_lock:
+                self._invalid_block_ids.update(failed_block_ids)
+        return finished_requests
+
+    def discard_finished_requests(self, req_ids: set[str]) -> None:
+        with self.done_task_lock:
+            self.finished_requests -= req_ids
+            for req_id in req_ids:
+                self._failed_block_ids_by_request.pop(req_id, None)
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
@@ -900,15 +926,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             key_list_c[:3],
         )
         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        missing_block_ids: set[int] = set()
         if ret is not None and any(r != 0 for r in ret):
             missing_block_ids = record_failed_blocks(
                 block_id_list_c,
                 ret,
             )
-            if len(req_meta.block_ids_by_group) == 1:
-                with self._invalid_block_ids_lock:
-                    self._invalid_block_ids.update(missing_block_ids)
-            elif missing_block_ids:
+            if len(req_meta.block_ids_by_group) != 1 and missing_block_ids:
                 logger.error(
                     "KV load failed for hybrid request %s. "
                     "Skip invalid-block fallback to avoid scheduler crash. "
@@ -921,10 +945,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 block_id_list_c,
                 [1] * len(block_id_list_c),
             )
-            if len(req_meta.block_ids_by_group) == 1:
-                with self._invalid_block_ids_lock:
-                    self._invalid_block_ids.update(missing_block_ids)
-            elif missing_block_ids:
+            if len(req_meta.block_ids_by_group) != 1 and missing_block_ids:
                 logger.error(
                     "KV load failed for hybrid request %s. "
                     "Skip invalid-block fallback to avoid scheduler crash. "
@@ -939,6 +960,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             req_meta.kv_cache_group_ids or [0],
             len(key_list_c),
         )
+        if len(req_meta.block_ids_by_group) == 1 and missing_block_ids:
+            with self.done_task_lock:
+                self._failed_block_ids_by_request[req_id] = missing_block_ids
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 

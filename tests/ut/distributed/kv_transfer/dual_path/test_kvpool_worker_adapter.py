@@ -105,31 +105,19 @@ def test_get_finished_delegates_arguments_and_returns_exact_result(collaborators
     mock_worker_cls.return_value.get_finished.assert_called_once_with(finished_req_ids, metadata)
 
 
-def test_get_block_ids_with_load_errors_preserves_drain_once_semantics(collaborators):
+def test_get_block_ids_with_load_errors_delegates_and_returns_exact_result(collaborators):
     # Given
     mock_worker_cls, _ = collaborators
     adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=1), MagicMock())
-    first_errors = {7, 8}
-    drained_errors: set[int] = set()
-    adapter._load_block_ids["req-received"] = first_errors.copy()
-    mock_worker_cls.return_value.get_finished.return_value = (set(), {"req-received"})
-    mock_worker_cls.return_value.get_block_ids_with_load_errors.side_effect = [
-        first_errors,
-        drained_errors,
-        drained_errors,
-    ]
-    metadata = MagicMock()
-    metadata.preempted_req_ids = set()
+    expected = {7, 8}
+    mock_worker_cls.return_value.get_block_ids_with_load_errors.return_value = expected
 
     # When
-    adapter.get_finished(set(), metadata)
-    first_result = adapter.get_block_ids_with_load_errors()
-    second_result = adapter.get_block_ids_with_load_errors()
+    result = adapter.get_block_ids_with_load_errors()
 
     # Then
-    assert first_result == first_errors
-    assert second_result == drained_errors
-    assert mock_worker_cls.return_value.get_block_ids_with_load_errors.call_count == 3
+    assert result is expected
+    mock_worker_cls.return_value.get_block_ids_with_load_errors.assert_called_once_with()
 
 
 def test_worker_close_idempotent_and_delegates_to_server_close(collaborators):

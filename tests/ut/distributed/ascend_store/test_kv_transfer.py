@@ -428,6 +428,33 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         keys, _, _ = store.get_calls[0]
         self.assertEqual(len(keys), 1)
 
+    def test_failed_blocks_publish_when_finished_request_is_drained(self):
+        invalid_block_ids: set[int] = set()
+        thread = KVCacheStoreRecvingThread(
+            m_store=FakeStore(),
+            token_database=FakeTokenDatabase(),
+            block_size=16,
+            tp_rank=0,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_ids_lock=threading.Lock(),
+        )
+        request = ReqMeta(
+            req_id="failed-request",
+            token_len_chunk=32,
+            block_ids=[10, 11],
+            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=True, token_len=32),
+        )
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(invalid_block_ids, set())
+        self.assertEqual(thread.get_and_clear_finished_requests(), {"failed-request"})
+        self.assertEqual(invalid_block_ids, {10, 11})
+
 
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
 class TestKVCacheStoreLayerSendingThread(unittest.TestCase):

@@ -514,13 +514,16 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         cached = self._lookup_results.get(request_id)
         if cached is not None:
             cached_spec = cached[2]
+            cached_spec_is_current = cached_spec is None or (
+                cached_spec.vllm_cached_tokens == local_tokens and cached_spec.kvpool_cached_tokens <= ready_tokens
+            )
             cached_store_full = (
                 cached_spec is not None
                 and cached_spec.vllm_cached_tokens == local_tokens
                 and cached_spec.kvpool_cached_tokens == ready_tokens
             )
             expected_external_tokens = (ready_tokens if cached_store_full else transfer_tokens) - local_tokens
-            if cached[0] == local_tokens and cached[1] == expected_external_tokens:
+            if cached_spec_is_current and cached[0] == local_tokens and cached[1] == expected_external_tokens:
                 # Identical duplicate lookup (e.g. allocation-failure retry):
                 # reuse the detached result instead of re-probing the KV pool.
                 return cached[1], True
