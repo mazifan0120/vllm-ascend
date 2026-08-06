@@ -512,6 +512,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._try_install_forward_plan(request, blocks)
             return
 
+        if not self._is_task01_decode_request(request):
+            # Non-selected requests delegate untouched; in particular a request
+            # resumed after a completed async load (its admission flag is already
+            # consumed and num_external_tokens == 0) must not re-enter the
+            # duplicate-bind check against its own earlier snapshot.
+            return super().update_state_after_alloc(request, blocks, num_external_tokens)
+
         request_id = request.request_id
         target_tokens = max(request.num_tokens - 1, 0)
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
@@ -532,9 +539,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 f"DualPath request {request_id} got a conflicting duplicate admission bind; "
                 "the original admission is preserved"
             )
-
-        if not self._is_task01_decode_request(request):
-            return super().update_state_after_alloc(request, blocks, num_external_tokens)
 
         if num_external_tokens == 0:
             # HBM-complete admission returned (0, False): no Task-01 state, and

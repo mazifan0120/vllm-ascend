@@ -313,9 +313,23 @@ class TestDecodeAdmission(unittest.TestCase):
         request = _make_request("req-conflict", 48, _selected_params())
         self._admit(request, 16, block_ids_by_group=((7, 8),))
         first = self.scheduler._decode_kv_snapshots["req-conflict"]
+        # The duplicate-bind guard applies while the request is still in its
+        # admission window; the first bind consumes do_remote_prefill, so a
+        # replayed bind attempt re-presents the flag.
+        request.kv_transfer_params["do_remote_prefill"] = True
         with self.assertRaisesRegex(RuntimeError, "conflicting duplicate"):
             self.scheduler.update_state_after_alloc(request, _make_blocks(((9, 9),)), 32)
         self.assertIs(self.scheduler._decode_kv_snapshots["req-conflict"], first)
+
+    def test_resumed_after_async_load_delegates_without_conflicting_bind(self):
+        # After DONE promotes the request back to WAITING, vLLM allocates the
+        # final recompute token with num_external_tokens=0 while the admission
+        # flag is already consumed; the resume must delegate, not raise.
+        request = _make_request("req-resume", 48, _selected_params())
+        self._admit(request, 16, block_ids_by_group=((7, 8),))
+        request.kv_transfer_params["do_remote_prefill"] = False
+        self.scheduler.update_state_after_alloc(request, _make_blocks(((7, 8),)), 0)
+        self.assertIn("req-resume", self.scheduler._decode_kv_snapshots)
 
     def test_missing_lookup_result_at_bind_raises(self):
         request = _make_request("req-orphan", 48, _selected_params())
