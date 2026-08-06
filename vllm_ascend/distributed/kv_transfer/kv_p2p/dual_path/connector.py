@@ -52,6 +52,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DecisionTimeoutMetadata,
     DualPathConnectorMetadata,
     ForwardPlan,
+    ForwardReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -664,6 +665,30 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 continue
             match state.status:
                 case DecodeDecisionStatus.PENDING:
+                    match result.path:
+                        case Path.DE_READ:
+                            pass
+                        case Path.PE_READ:
+                            snapshot = self._decode_kv_snapshots[request_key.decode_request_id]
+                            destination_block_ids = tuple(
+                                tuple(group)
+                                for group in self._trim_hybrid_remote_block_ids(
+                                    snapshot.final_block_ids,
+                                    snapshot.target_tokens + 1,
+                                )
+                            )
+                            metadata.forward_receive_bindings.append(
+                                ForwardReceiveBinding(
+                                    request_key=state.request_key,
+                                    wire_request_id=get_external_request_id(request_key.decode_request_id),
+                                    decode_request_id=request_key.decode_request_id,
+                                    destination_block_ids=destination_block_ids,
+                                    token_start=snapshot.local_tokens,
+                                    token_end=snapshot.transfer_tokens,
+                                )
+                            )
+                        case unreachable:
+                            assert_never(unreachable)
                     state.result = result
                     state.status = DecodeDecisionStatus.COMMITTED
                 case DecodeDecisionStatus.COMMITTED | DecodeDecisionStatus.TIMED_OUT:
