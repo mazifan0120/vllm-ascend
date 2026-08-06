@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -12,11 +13,15 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as co
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    Path,
     PathDecisionRequest,
+    PathDecisionResult,
+    RoundRobinPathPolicy,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
+    PathDecision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     LoadSpec,
@@ -89,6 +94,8 @@ def task04_seams():
         decode_coordinator.decode_engine_instance_id = _DECODE_INSTANCE_ID
         decode_coordinator.decode_control_endpoint = _CONTROL_ENDPOINT
         prefill_coordinator = MagicMock(name="prefill_coordinator")
+        prefill_delivery_future = MagicMock(spec=Future, name="prefill_delivery_future")
+        prefill_coordinator.submit.return_value = prefill_delivery_future
         coordinator_cls.for_decode.return_value = decode_coordinator
         coordinator_cls.for_prefill.return_value = prefill_coordinator
         yield SimpleNamespace(
@@ -96,6 +103,7 @@ def task04_seams():
             coordinator_cls=coordinator_cls,
             decode_coordinator=decode_coordinator,
             prefill_coordinator=prefill_coordinator,
+            prefill_delivery_future=prefill_delivery_future,
         )
 
 
@@ -108,12 +116,17 @@ def scheduler_factory(task04_seams):
         role: str = "decode",
         config: MagicMock | None = None,
         kv_cache_config: SimpleNamespace | None = None,
+        path_policy=None,
     ):
+        scheduler_kwargs = {}
+        if path_policy is not None:
+            scheduler_kwargs["path_policy"] = path_policy
         scheduler = connector_module.DualPathConnectorScheduler(
             config or _make_vllm_config(kv_role="kv_consumer" if role == "decode" else "kv_producer"),
             kv_cache_config or _make_kv_cache_config(),
             "decode-engine",
             DualPathConfig(role=role, dual_path_control_port=7100 if role == "decode" else None),
+            **scheduler_kwargs,
         )
         scheduler.executor.shutdown(wait=False)
         scheduler.metaserver_client.close()
@@ -167,6 +180,62 @@ def _expected_dual_path_payload() -> dict:
         },
         "decode_control_endpoint": {"host": "192.0.2.44", "port": 24001},
     }
+
+
+def _prefill_decision_payload(
+    *,
+    decode_request_id: str = "decode-request-7",
+    target_tokens: int = 48,
+    decode_local_tokens: int = 16,
+    decode_store_tokens: int = 32,
+    protocol_version: int = DUAL_PATH_PROTOCOL_VERSION,
+) -> dict:
+    return {
+        "protocol_version": protocol_version,
+        "decision_request": {
+            "request_key": {
+                "decode_engine_instance_id": _DECODE_INSTANCE_ID,
+                "decode_request_id": decode_request_id,
+            },
+            "target_tokens": target_tokens,
+            "decode_local_tokens": decode_local_tokens,
+            "decode_store_tokens": decode_store_tokens,
+        },
+        "decode_control_endpoint": {
+            "host": _CONTROL_ENDPOINT.host,
+            "port": _CONTROL_ENDPOINT.port,
+        },
+    }
+
+
+def _remote_decode_params(*, dual_path: dict | None = None, include_dual_path: bool = True) -> dict:
+    params = {
+        "do_remote_decode": True,
+        "remote_block_ids": [[4, 5]],
+        "remote_block_size": [16],
+        "remote_cached_tokens": 0,
+        "remote_engine_id": "decode-engine",
+        "remote_host": "198.51.100.20",
+        "remote_port": 6000,
+    }
+    if include_dual_path:
+        params["dual_path"] = dual_path if dual_path is not None else _prefill_decision_payload()
+    return params
+
+
+def _make_prefill_request(request_id: str, params: dict) -> SimpleNamespace:
+    prompt_token_ids = list(range(49))
+    return SimpleNamespace(
+        request_id=request_id,
+        num_tokens=len(prompt_token_ids),
+        num_prompt_tokens=len(prompt_token_ids),
+        num_computed_tokens=0,
+        max_tokens=16,
+        prompt_token_ids=prompt_token_ids,
+        prompt_embeds=None,
+        _all_token_ids=list(prompt_token_ids),
+        kv_transfer_params=params,
+    )
 
 
 class TestDecisionTimeoutEnv:
@@ -357,3 +426,256 @@ class TestDecodeAdmissionControl:
         assert state.deadline == 90.0
         assert state.proxy_future is None
         decode_scheduler.executor.submit.assert_not_called()
+
+
+class TestPrefillDecisionHook:
+    @staticmethod
+    def _assert_parent_accounting_once(scheduler, request) -> None:
+        scheduler.need_truncate = True
+        parent_method = connector_module.MooncakeLayerwiseConnectorScheduler.get_num_new_matched_tokens
+        with patch.object(
+            connector_module.MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            side_effect=parent_method,
+        ) as parent_spy:
+            result = scheduler.get_num_new_matched_tokens(request, 0)
+
+        assert result == (0, False)
+        parent_spy.assert_called_once_with(scheduler, request, 0)
+        assert request.kv_transfer_params["_p_side_truncated"] is True
+        assert len(request.prompt_token_ids) == 48
+
+    def test_parent_accounting_runs_exactly_once_for_valid_dual_path(self, scheduler_factory):
+        scheduler = scheduler_factory(role="prefill")
+        request = _make_prefill_request("prefill-valid", _remote_decode_params())
+
+        self._assert_parent_accounting_once(scheduler, request)
+
+    def test_parent_accounting_runs_exactly_once_for_malformed_dual_path(self, scheduler_factory):
+        scheduler = scheduler_factory(role="prefill")
+        request = _make_prefill_request(
+            "prefill-malformed",
+            _remote_decode_params(dual_path={"malformed": True}),
+        )
+
+        self._assert_parent_accounting_once(scheduler, request)
+
+    def test_parent_accounting_runs_exactly_once_for_ordinary_request(self, scheduler_factory, task04_seams):
+        scheduler = scheduler_factory(role="prefill")
+        request = _make_prefill_request(
+            "prefill-ordinary",
+            _remote_decode_params(include_dual_path=False),
+        )
+
+        self._assert_parent_accounting_once(scheduler, request)
+
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+
+    def test_full_hit_bypasses_policy_and_submits_de_read(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        payload = _prefill_decision_payload(decode_store_tokens=48)
+        request = _make_prefill_request("prefill-full", _remote_decode_params(dual_path=payload))
+
+        result = scheduler.get_num_new_matched_tokens(request, 0)
+
+        expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+        assert result == (0, False)
+        policy.choose.assert_not_called()
+        task04_seams.prefill_coordinator.submit.assert_called_once_with(
+            _CONTROL_ENDPOINT,
+            PathDecision(
+                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+                result=PathDecisionResult(request_key=expected_key, path=Path.DE_READ),
+            ),
+        )
+        assert scheduler._pe_request_keys == {request.request_id: expected_key}
+        assert scheduler._pe_delivery_futures == {expected_key: task04_seams.prefill_delivery_future}
+
+    def test_seeded_non_full_requests_invoke_policy_once_and_alternate(self, scheduler_factory, task04_seams):
+        policy = MagicMock(spec=RoundRobinPathPolicy, wraps=RoundRobinPathPolicy(random.Random(1)))
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        requests = [
+            _make_prefill_request(
+                f"prefill-{index}",
+                _remote_decode_params(dual_path=_prefill_decision_payload(decode_request_id=f"decode-request-{index}")),
+            )
+            for index in range(2)
+        ]
+
+        results = [scheduler.get_num_new_matched_tokens(request, 0) for request in requests]
+
+        assert results == [(0, False), (0, False)]
+        assert policy.choose.call_count == 2
+        assert [
+            submitted.args[1].result.path for submitted in task04_seams.prefill_coordinator.submit.call_args_list
+        ] == [
+            Path.PE_READ,
+            Path.DE_READ,
+        ]
+
+    def test_identical_replay_neither_advances_policy_nor_submits_second_future(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-replay", _remote_decode_params())
+
+        first = scheduler.get_num_new_matched_tokens(request, 0)
+        second = scheduler.get_num_new_matched_tokens(request, 0)
+
+        assert first == second == (0, False)
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_called_once()
+        expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+        assert scheduler._pe_delivery_futures[expected_key] is task04_seams.prefill_delivery_future
+
+    def test_conflicting_facts_fail_locally_without_second_policy_invocation(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        original = _make_prefill_request(
+            "prefill-conflict",
+            _remote_decode_params(dual_path=_prefill_decision_payload(decode_store_tokens=24)),
+        )
+        conflicting = _make_prefill_request(
+            "prefill-conflict",
+            _remote_decode_params(dual_path=_prefill_decision_payload(decode_store_tokens=32)),
+        )
+
+        with patch.object(connector_module.logger, "error") as log_error:
+            scheduler.get_num_new_matched_tokens(original, 0)
+            result = scheduler.get_num_new_matched_tokens(conflicting, 0)
+
+        assert result == (0, False)
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_called_once()
+        log_error.assert_called_once()
+
+    def test_malformed_nested_metadata_marks_invalid_and_sends_nothing(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request(
+            "prefill-malformed",
+            _remote_decode_params(dual_path={"malformed": True}),
+        )
+
+        scheduler.get_num_new_matched_tokens(request, 0)
+        scheduler.get_num_new_matched_tokens(request, 0)
+
+        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        policy.choose.assert_not_called()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+
+    def test_version_mismatch_fails_locally_and_sends_nothing(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        payload = _prefill_decision_payload(protocol_version=DUAL_PATH_PROTOCOL_VERSION + 1)
+        request = _make_prefill_request("prefill-version", _remote_decode_params(dual_path=payload))
+
+        scheduler.get_num_new_matched_tokens(request, 0)
+
+        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        policy.choose.assert_not_called()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+
+    def test_policy_exception_is_retained_and_never_reinvoked(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        policy.choose.side_effect = RuntimeError("policy failed")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-policy-error", _remote_decode_params())
+
+        scheduler.get_num_new_matched_tokens(request, 0)
+        scheduler.get_num_new_matched_tokens(request, 0)
+
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+
+    def test_invalid_policy_result_is_retained_and_never_reinvoked(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = "PE_READ"
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-invalid-result", _remote_decode_params())
+
+        scheduler.get_num_new_matched_tokens(request, 0)
+        scheduler.get_num_new_matched_tokens(request, 0)
+
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+
+    def test_local_failures_never_enter_parent_forward_queue(self, scheduler_factory):
+        policy = MagicMock(name="path_policy")
+        policy.choose.side_effect = RuntimeError("policy failed")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-local-failure", _remote_decode_params())
+        blocks = MagicMock(name="blocks")
+        blocks.get_block_ids.return_value = ([7, 8, 9],)
+
+        scheduler.get_num_new_matched_tokens(request, 0)
+        scheduler.update_state_after_alloc(request, blocks, 0)
+
+        assert scheduler._reqs_need_send_layerwise == {}
+
+    def test_update_state_after_alloc_suppresses_send_queue_for_dual_path(self, scheduler_factory):
+        scheduler = scheduler_factory(role="prefill")
+        request = _make_prefill_request("prefill-valid", _remote_decode_params())
+        blocks = MagicMock(name="blocks")
+
+        scheduler.update_state_after_alloc(request, blocks, 0)
+
+        assert scheduler._reqs_need_send_layerwise == {}
+        blocks.get_block_ids.assert_not_called()
+
+    def test_update_state_after_alloc_suppresses_send_queue_for_malformed_dual_path(self, scheduler_factory):
+        scheduler = scheduler_factory(role="prefill")
+        request = _make_prefill_request(
+            "prefill-malformed",
+            _remote_decode_params(dual_path={"malformed": True}),
+        )
+        blocks = MagicMock(name="blocks")
+
+        scheduler.update_state_after_alloc(request, blocks, 0)
+
+        assert scheduler._reqs_need_send_layerwise == {}
+        blocks.get_block_ids.assert_not_called()
+
+    def test_ordinary_remote_decode_alloc_matches_parent(self, scheduler_factory):
+        parent = connector_module.MooncakeLayerwiseConnectorScheduler(
+            _make_vllm_config(kv_role="kv_producer"),
+            _make_kv_cache_config(),
+            "prefill-engine",
+        )
+        scheduler = scheduler_factory(role="prefill")
+        parent_request = _make_prefill_request(
+            "prefill-ordinary",
+            _remote_decode_params(include_dual_path=False),
+        )
+        dual_request = _make_prefill_request(
+            "prefill-ordinary",
+            _remote_decode_params(include_dual_path=False),
+        )
+        parent_blocks = MagicMock(name="parent_blocks")
+        parent_blocks.get_block_ids.return_value = ([7, 8, 9],)
+        dual_blocks = MagicMock(name="dual_blocks")
+        dual_blocks.get_block_ids.return_value = ([7, 8, 9],)
+        parent_method = connector_module.MooncakeLayerwiseConnectorScheduler.update_state_after_alloc
+
+        try:
+            parent.update_state_after_alloc(parent_request, parent_blocks, 0)
+            with patch.object(
+                connector_module.MooncakeLayerwiseConnectorScheduler,
+                "update_state_after_alloc",
+                autospec=True,
+                side_effect=parent_method,
+            ) as parent_spy:
+                scheduler.update_state_after_alloc(dual_request, dual_blocks, 0)
+
+            parent_spy.assert_called_once_with(scheduler, dual_request, dual_blocks, 0)
+            parent_info = parent._reqs_need_send_layerwise[parent_request.request_id]
+            dual_info = scheduler._reqs_need_send_layerwise[dual_request.request_id]
+            assert dual_info.local_block_ids == parent_info.local_block_ids
+            assert dual_info.local_transferred_tokens == parent_info.local_transferred_tokens
+            assert dual_info.local_computed_tokens == parent_info.local_computed_tokens
+        finally:
+            parent.executor.shutdown(wait=False)
+            parent.metaserver_client.close()

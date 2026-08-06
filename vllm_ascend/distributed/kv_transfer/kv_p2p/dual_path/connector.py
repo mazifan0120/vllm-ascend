@@ -50,13 +50,18 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import 
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    PathDecisionDecider,
     PathDecisionRequest,
     PathDecisionResult,
+    PathDecisionValidationError,
+    PathPolicy,
+    RoundRobinPathPolicy,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     DualPathDecisionMetadata,
+    PathDecision,
     PathDecisionCoordinator,
     derive_decode_control_port,
 )
@@ -152,8 +157,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     allocation: ``get_num_new_matched_tokens`` returns the Decode-ready
     external delta ``E_DE = R - L_DE`` (never the Store hit), and
     ``update_state_after_alloc`` binds the frozen final blocks into a
-    ``DecodeKVSnapshot``. Every other request delegates to the parent
-    Mooncake Layerwise implementation unchanged.
+    ``DecodeKVSnapshot``. Task-04 adds the Prefill decision hook and suppresses
+    inherited Forward queueing for its ``dual_path`` envelope. Requests outside
+    those contracted shapes delegate to the parent unchanged.
     """
 
     def __init__(
@@ -162,6 +168,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         kv_cache_config: KVCacheConfig,
         engine_id: str,
         dual_path_cfg: DualPathConfig,
+        *,
+        path_policy: PathPolicy | None = None,
     ) -> None:
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.dual_path_cfg = dual_path_cfg
@@ -171,6 +179,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decision_timeout_seconds: int | None = None
         self._kvpool_adapter: KVPoolAdapter | None = None
         self._accepting_task01 = True
+        # PE fields exist on both roles; Decode keeps a None decider and empty
+        # maps rather than constructing policy state it never owns.
+        self._path_decider: PathDecisionDecider | None = None
+        self._pe_request_keys: dict[str, DualPathRequestKey] = {}
+        self._pe_delivery_futures: dict[DualPathRequestKey, Future[None]] = {}
+        self._pe_invalid_request_ids: set[str] = set()
         if dual_path_cfg.role == "decode":
             if len(kv_cache_config.kv_cache_groups) != 1:
                 raise ValueError("DualPath Decode requires exactly one KV cache group")
@@ -200,6 +214,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 control_endpoint=DecodeControlEndpoint(host=get_ip(), port=control_port),
             )
         else:
+            policy = path_policy if path_policy is not None else RoundRobinPathPolicy()
+            self._path_decider = PathDecisionDecider(policy)
             self._path_decision_coordinator = PathDecisionCoordinator.for_prefill()
         logger.info(
             "Initializing DualPath Scheduler %s (role=%s)",
@@ -215,9 +231,69 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         params = request.kv_transfer_params
         return params is not None and params.get("do_remote_prefill") is True
 
+    def _handle_prefill_decision(
+        self,
+        request: Request,
+        parent_result: tuple[int, bool],
+    ) -> tuple[int, bool]:
+        params = request.kv_transfer_params
+        assert params is not None
+        request_id = request.request_id
+        if "dual_path" not in params or request_id in self._pe_invalid_request_ids:
+            return parent_result
+
+        try:
+            metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
+        except PathDecisionValidationError as error:
+            logger.error(
+                "DualPath Prefill decision metadata is invalid for request %s: %s",
+                request_id,
+                error,
+            )
+            self._pe_invalid_request_ids.add(request_id)
+            return parent_result
+
+        if metadata.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
+            logger.error(
+                "DualPath Prefill decision protocol version mismatch for request %s: expected %s, got %s",
+                request_id,
+                DUAL_PATH_PROTOCOL_VERSION,
+                metadata.protocol_version,
+            )
+            self._pe_invalid_request_ids.add(request_id)
+            return parent_result
+
+        decision_request = metadata.decision_request
+        request_key = decision_request.request_key
+        self._pe_request_keys[request_id] = request_key
+        assert self._path_decider is not None
+        try:
+            result = self._path_decider.decide(decision_request)
+        except Exception as error:  # noqa: BLE001
+            logger.error(
+                "DualPath Prefill decision failed locally for request %s: %s",
+                request_id,
+                error,
+            )
+            return parent_result
+
+        if request_key not in self._pe_delivery_futures:
+            decision = PathDecision(
+                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+                result=result,
+            )
+            self._pe_delivery_futures[request_key] = self._path_decision_coordinator.submit(
+                metadata.decode_control_endpoint,
+                decision,
+            )
+        return parent_result
+
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         if not self._is_task01_decode_request(request):
-            return super().get_num_new_matched_tokens(request, num_computed_tokens)
+            parent_result = super().get_num_new_matched_tokens(request, num_computed_tokens)
+            if self.dual_path_cfg.role == "prefill" and request.kv_transfer_params is not None:
+                return self._handle_prefill_decision(request, parent_result)
+            return parent_result
 
         request_id = request.request_id
         if request_id in self._decode_kv_snapshots:
@@ -254,6 +330,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         return external_tokens, True
 
     def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:
+        params = request.kv_transfer_params
+        if self.dual_path_cfg.role == "prefill" and params is not None and "dual_path" in params:
+            return
+
         request_id = request.request_id
         allocated_block_ids = blocks.get_block_ids()
         frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)

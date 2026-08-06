@@ -690,6 +690,10 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_decision_timeout_seconds",
             "_accepting_task01",
             "_path_decision_coordinator",
+            "_path_decider",
+            "_pe_request_keys",
+            "_pe_delivery_futures",
+            "_pe_invalid_request_ids",
         }
         self.assertEqual(
             set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | dual_path_scheduler_fields
@@ -1390,6 +1394,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
             "DualPathConnectorScheduler": {
                 "__init__",
                 "_is_task01_decode_request",
+                "_handle_prefill_decision",
                 "get_num_new_matched_tokens",
                 "update_state_after_alloc",
                 "request_finished",
