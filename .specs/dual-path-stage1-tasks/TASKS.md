@@ -465,6 +465,9 @@ The detailed contract is
 
 **Depends on:** Task-05 and Task-06.
 
+**Detailed spec:**
+[`tasks/TASK-07-bidirectional-split-runtime.md`](tasks/TASK-07-bidirectional-split-runtime.md).
+
 **Goal:**
 
 Extend one inherited Layerwise Worker runtime to own Forward send/receive and
@@ -483,6 +486,8 @@ provenance. No production non-full request can yet execute a policy result.
   unavoidable; no helper API is pre-authorized by the catalog.
 - One-time KV buffer registration with send and receive capabilities.
 - Immutable Reverse block-pair plans and registered layer ordering.
+- Request-level Reverse completion before PE model execution; the inherited
+  PE Forward path remains compute-one-layer/send-one-layer.
 - Mapping-first metadata binding and preservation of early raw DONE/FAILED.
 - Store DONE, Reverse DONE, compute, and Forward gates.
 - Cross-direction completion provenance, explicit failure, and terminal
@@ -503,6 +508,9 @@ the production selector.
 
 **Depends on:** Task-07.
 
+**Detailed spec:**
+[`tasks/TASK-08-non-full-production-activation.md`](tasks/TASK-08-non-full-production-activation.md).
+
 **Goal:**
 
 Connect every non-full policy result to the previously tested `PE_READ` and
@@ -510,21 +518,30 @@ bidirectional split runtimes, then complete Stage 1 route activation.
 
 **Merge-state contract:**
 
-For a non-full committed `DE_READ`, Decode loads `[L_DE, K_DE)` when non-empty,
-Reverse sends `[L_PE, K_DE)` when non-empty, PE computes
-`[max(L_PE, K_DE), T)`, and Forward sends `[K_DE, T)`. Decode publishes
-`finished_recving` only after every non-empty required phase completes. PE does
-not compute before Reverse DONE when Reverse is required. Miss or unavailable
-Store input uses the same plan with an empty Store interval.
+For every Store-non-full request, PE first applies the production eligibility
+gate: `L_PE >= K_DE` deterministically selects `PE_READ`; only `L_PE < K_DE`
+allows `PathPolicy` to choose between `PE_READ` and `DE_READ`. A production
+`DE_READ` therefore always has a non-empty Reverse. Decode loads
+`[L_DE, K_DE)` when non-empty, Reverse sends `[L_PE, K_DE)`, PE computes
+`[K_DE, T)`, and Forward sends `[K_DE, T)`. Decode publishes
+`finished_recving` only after every required phase completes. Miss or
+unavailable Store input uses the same route with an empty Store interval and
+a Reverse sourced from Decode HBM.
 
 **In scope:**
 
-- Non-full `PathPolicy` integration for partial, miss, and unavailable Store
-  inputs.
+- Eligibility-before-policy integration for partial, miss, and unavailable
+  Store inputs; a singleton `PE_READ` result does not advance policy state.
+- Protocol-v2, post-PE-allocation `PathDecision` delivery with an optional
+  `ReversePlan` that is mandatory for `DE_READ` and absent for `PE_READ`.
 - Exact logical ranges and frozen physical mappings for Store, Reverse, and
   Forward.
-- Empty-Store and empty-Reverse handling.
-- MultiConnector winner/sibling lifecycle isolation.
+- Empty-Store production handling and defensive-only empty-Reverse runtime
+  compatibility inherited from Task-07.
+- MultiConnector first-positive accounting without a new sibling-stop seam:
+  `PE_READ` may use PE AscendStore, while positive Reverse accounting makes
+  `DE_READ` the winner before the Store sibling is queried.
+- Partial Decode Store commit from the retained post-allocation snapshot.
 - Failure, invalid-block, observability, and no-redecision behavior.
 - Complete CPU, NPU, HBM, topology, and supported-configuration acceptance.
 
@@ -535,9 +552,10 @@ Store input uses the same plan with an empty Store interval.
 
 **Acceptance endpoint:**
 
-The NPU matrix covers deterministic DE-local Store-full plus partial/miss
-`PE_READ` and split `DE_READ`, verifies exact ranges and completion predicates,
-and establishes the complete Stage 1 activation boundary.
+The NPU matrix covers HBM-complete, deterministic DE-local Store-full,
+eligibility-forced `PE_READ`, and partial/miss policy-selected `PE_READ` and
+split `DE_READ`. It verifies exact ranges, completion predicates, coordinated
+protocol-v2 activation, and the complete Stage 1 boundary.
 
 ## 15. Parent reuse boundary
 
