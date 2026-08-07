@@ -142,6 +142,7 @@ def _make_binding(
 ) -> ForwardReceiveBinding:
     return ForwardReceiveBinding(
         request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, decode_request_id),
+        path=Path.PE_READ,
         wire_request_id=get_external_request_id(decode_request_id),
         decode_request_id=decode_request_id,
         destination_block_ids=destination_block_ids,
@@ -201,6 +202,7 @@ def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_t
     assert metadata.forward_receive_bindings == [
         ForwardReceiveBinding(
             request_key=state.request_key,
+            path=Path.PE_READ,
             wire_request_id=get_external_request_id(request.request_id),
             decode_request_id=request.request_id,
             destination_block_ids=derived_destination,

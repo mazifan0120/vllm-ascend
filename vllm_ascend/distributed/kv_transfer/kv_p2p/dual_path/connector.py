@@ -737,6 +737,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             metadata.forward_receive_bindings.append(
                                 ForwardReceiveBinding(
                                     request_key=state.request_key,
+                                    path=Path.PE_READ,
                                     wire_request_id=get_external_request_id(request_key.decode_request_id),
                                     decode_request_id=request_key.decode_request_id,
                                     destination_block_ids=destination_block_ids,

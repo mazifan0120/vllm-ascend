@@ -683,6 +683,7 @@ def test_parent_timeout_forward_and_store_completions_stay_isolated() -> None:
     ordinary_wire_id = get_external_request_id(ordinary_request_id)
     binding = ForwardReceiveBinding(
         request_key=DualPathRequestKey("decode-instance", forward_request_id),
+        path=Path.PE_READ,
         wire_request_id=get_external_request_id(forward_request_id),
         decode_request_id=forward_request_id,
         destination_block_ids=((201, 202),),
