@@ -107,7 +107,7 @@ class KVPoolAdapter:
         ready_tokens = max(request.num_tokens - 1, 0)
         ready_delta = ready_tokens - load_spec.vllm_cached_tokens
 
-        if pool.kv_role != "kv_consumer" or pool.use_layerwise:
+        if pool.kv_role not in {"kv_consumer", "kv_both"} or pool.use_layerwise:
             raise RuntimeError("DualPath KVPool commit requires a non-layerwise Decode-owned scheduler")
         if load_spec.kvpool_cached_tokens != ready_tokens:
             raise RuntimeError(

@@ -358,11 +358,12 @@ class PathDecisionCoordinator:
         if self._closed:
             return []
         results: list[PathDecisionResult] = []
-        while True:
-            try:
-                results.append(self._received_results.get_nowait())
-            except queue.Empty:
-                return results
+        with self._registry_lock:
+            while True:
+                try:
+                    results.append(self._received_results.get_nowait())
+                except queue.Empty:
+                    return results
 
     def submit(
         self,
@@ -397,9 +398,7 @@ class PathDecisionCoordinator:
             assert self._context is not None
             assert self._receiver_thread is not None
             self._context.term()
-            self._receiver_thread.join(timeout=5)
-            if self._receiver_thread.is_alive():
-                logger.warning("path decision receiver thread did not exit within 5s of close()")
+            self._receiver_thread.join()
             with self._registry_lock:
                 self._pending_keys.clear()
                 self._accepted_results.clear()

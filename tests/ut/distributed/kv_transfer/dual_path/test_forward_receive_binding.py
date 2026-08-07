@@ -235,6 +235,27 @@ def test_binding_destination_table_includes_hybrid_trimming(scheduler_factory):
     assert metadata.forward_receive_bindings[0].destination_block_ids == derived_destination
 
 
+def test_hybrid_timeout_uses_literal_frozen_table_suffix_without_changing_message_trim(scheduler_factory):
+    # Given
+    scheduler, coordinator = scheduler_factory(need_truncate=True)
+    request, snapshot, state = _admit_request(scheduler)
+    assert snapshot.final_block_ids == ((41, 42, 43, 44),)
+    assert scheduler.executor.submit.call_args.kwargs["message"]["remote_block_ids"] == ([41, 42, 43],)
+    coordinator.take_received_results.return_value = []
+
+    # When
+    with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
+        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+    # Then
+    assert metadata.decision_timeouts == [
+        connector_module.DecisionTimeoutMetadata(
+            request_id=request.request_id,
+            external_block_ids=(42, 43, 44),
+        )
+    ]
+
+
 def test_duplicate_pe_read_result_does_not_emit_second_binding(scheduler_factory):
     # Given
     scheduler, coordinator = scheduler_factory()

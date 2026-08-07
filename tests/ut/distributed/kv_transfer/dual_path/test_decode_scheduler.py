@@ -149,6 +149,35 @@ class TestDecodeAdmission(unittest.TestCase):
         self.coordinator.register_pending.assert_not_called()
         self.scheduler.executor.submit.assert_not_called()
 
+    def test_hybrid_hbm_complete_returns_zero_false_without_adapter_or_admission_state(self):
+        # Given
+        scheduler = DualPathConnectorScheduler(
+            _make_vllm_config(),
+            _make_kv_cache_config(need_truncate=True),
+            "test_engine",
+            DualPathConfig(role="decode"),
+        )
+        scheduler.executor.shutdown(wait=False)
+        scheduler.metaserver_client.close()
+        scheduler.executor = MagicMock(name="hybrid_executor")
+        request = _make_request("req-hybrid-full-hbm", 48, _selected_params())
+
+        try:
+            # When
+            result = scheduler.get_num_new_matched_tokens(request, 47)
+
+            # Then
+            self.assertTrue(scheduler.need_truncate)
+            self.assertEqual(result, (0, False))
+            self.assertEqual(scheduler._kvpool_adapter.method_calls, [])
+            self.assertEqual(scheduler._lookup_results, {})
+            self.assertEqual(scheduler._decode_kv_snapshots, {})
+            self.assertEqual(scheduler._decode_decision_states, {})
+            self.coordinator.register_pending.assert_not_called()
+            scheduler.executor.submit.assert_not_called()
+        finally:
+            scheduler.shutdown()
+
     def test_local_tokens_greater_than_ready_tokens_is_hbm_complete(self):
         request = _make_request("req-local-past-ready", 48, _selected_params())
 

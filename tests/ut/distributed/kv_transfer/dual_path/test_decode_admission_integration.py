@@ -71,7 +71,7 @@ def _ensure_connector_registered() -> None:
         _CONNECTOR_REGISTERED = True
 
 
-def _make_vllm_config() -> VllmConfig:
+def _make_vllm_config(kv_role: str = "kv_consumer") -> VllmConfig:
     fake_weight_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "_fake_weight")
     model_config = ModelConfig(model=fake_weight_path, skip_tokenizer_init=True)
     scheduler_config = SchedulerConfig(
@@ -89,7 +89,7 @@ def _make_vllm_config() -> VllmConfig:
     )
     kv_transfer_config = KVTransferConfig(
         kv_connector="DualPathConnector",
-        kv_role="kv_consumer",
+        kv_role=kv_role,
         kv_connector_extra_config={
             "role": "decode",
             "consumer_is_to_load": True,
@@ -326,6 +326,40 @@ def test_admission_full_store_hit(_constrain_kvpool_seams, scheduler):
     snapshot = _dual_scheduler(scheduler)._decode_kv_snapshots[request.request_id]
     assert snapshot.store_load_spec.kvpool_cached_tokens == 32
     assert snapshot.store_tokens == 32
+
+
+def test_kv_both_store_full_admission_commits_through_adapter_metadata_without_partial_state(
+    _constrain_kvpool_seams,
+):
+    # Given
+    scheduler = _make_scheduler(_make_vllm_config(kv_role="kv_both"))
+    _constrain_kvpool_seams.return_value.lookup.return_value = 32
+    dual = _dual_scheduler(scheduler)
+    adapter = dual._kvpool_adapter
+    assert adapter is not None
+
+    try:
+        # When
+        with patch.object(adapter, "commit_after_alloc", wraps=adapter.commit_after_alloc) as commit_after_alloc:
+            request, scheduler_output, _, _, _, _ = _admit_one_request(scheduler)
+
+        # Then
+        commit_after_alloc.assert_called_once()
+        metadata = scheduler_output.kv_connector_metadata
+        assert isinstance(metadata, DualPathConnectorMetadata)
+        store_metadata = metadata.decode_store_metadata
+        assert store_metadata is not None
+        assert [store_request.req_id for store_request in store_metadata.requests] == [request.request_id]
+        assert dual._lookup_results == {}
+        assert set(dual._decode_kv_snapshots) == {request.request_id}
+        assert dual._decode_decision_states == {}
+        pool = adapter._pool_scheduler
+        assert pool.load_specs == {}
+        assert set(pool._unfinished_requests) == {request.request_id}
+        assert pool._unfinished_request_ids == {request.request_id}
+        assert pool._loading_req_ids == {request.request_id}
+    finally:
+        scheduler.shutdown()
 
 
 def test_admission_partial_store_hit(_constrain_kvpool_seams, scheduler):

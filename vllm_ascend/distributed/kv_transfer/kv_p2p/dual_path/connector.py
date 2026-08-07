@@ -769,16 +769,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             block_size = self.block_size[0]
             assert snapshot.local_tokens % block_size == 0
             first_external_block = snapshot.local_tokens // block_size
-            ready_block_ids = self._trim_hybrid_remote_block_ids(
-                tuple(list(group) for group in snapshot.final_block_ids),
-                state.decision_request.target_tokens + 1,
-            )
-            external_block_ids = ready_block_ids[0][first_external_block:]
+            external_block_ids = snapshot.final_block_ids[0][first_external_block:]
             assert external_block_ids
             metadata.decision_timeouts.append(
                 DecisionTimeoutMetadata(
                     request_id=request_id,
-                    external_block_ids=tuple(external_block_ids),
+                    external_block_ids=external_block_ids,
                 )
             )
             state.timeout_reported = True
