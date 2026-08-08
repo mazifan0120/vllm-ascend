@@ -12,6 +12,7 @@ from vllm.v1.request import RequestStatus
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     Path,
@@ -184,10 +185,25 @@ def _result(request_id: str = "request-local-7") -> PathDecisionResult:
 
 
 def _decision(result: PathDecisionResult | None = None) -> PathDecision:
+    retained_result = result or _result()
     return PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=result or _result(),
-        reverse_plan=None,
+        result=retained_result,
+        reverse_plan=ReversePlan(
+            request_key=retained_result.request_key,
+            wire_request_id=connector_module.get_external_request_id(retained_result.request_key.decode_request_id),
+            token_start=16,
+            token_end=32,
+            source_block_ids=((41, 42, 43, 44),),
+            destination_block_ids=((71, 72, 73, 74),),
+            remote_engine_id="prefill-engine",
+            remote_host="198.51.100.10",
+            remote_port=6000,
+            remote_block_sizes=(16,),
+            remote_tp_size=1,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+        ),
     )
 
 
@@ -966,6 +982,26 @@ class TestDecodeResultConsumption:
         assert state.result is None
         assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+
+    def test_late_decision_after_activation_failure_is_stale(self, decode_scheduler, task04_seams):
+        request, snapshot = _admit(decode_scheduler)
+        state = decode_scheduler._decode_decision_states[request.request_id]
+        invalid_decision = PathDecision(
+            protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+            result=_result(),
+            reverse_plan=None,
+        )
+        task04_seams.decode_coordinator.take_received_decisions.return_value = [invalid_decision]
+        first_metadata = decode_scheduler.build_connector_meta(MagicMock(name="failure_scheduler_output"))
+        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
+
+        late_metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_scheduler_output"))
+
+        assert snapshot.get_block_ids.return_value == ([41, 42, 43, 44],)
+        assert state.status is connector_module.DecodeDecisionStatus.ACTIVATION_FAILED
+        assert len(first_metadata.control_failures) == 1
+        assert late_metadata.control_failures == []
+        assert late_metadata.reverse_plans == []
 
 
 class TestWorkerFailureRelay:

@@ -1534,6 +1534,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "_prepare_forward_plan",
                 "_try_install_forward_plan",
                 "_activate_de_read_path",
+                "_activate_committed_decision",
                 "_emit_prefill_control_failure",
                 "_sweep_pe_delivery",
                 "get_num_new_matched_tokens",

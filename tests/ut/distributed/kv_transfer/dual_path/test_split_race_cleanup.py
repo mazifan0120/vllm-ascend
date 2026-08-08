@@ -9,6 +9,7 @@ import pytest
 
 from tests.ut.distributed.kv_transfer.dual_path.test_forward_receive_binding import (
     _admit_request,
+    _de_read_decision,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_forward_receive_binding import (
     scheduler_factory as _scheduler_factory_fixture,
@@ -20,17 +21,14 @@ from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     _make_reverse_plan,
     _make_reverse_receive_binding,
     _make_split_metadata,
+    _make_store_metadata,
     _make_worker,
     _set_forward_terminal,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorScheduler
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import DualPathConnectorMetadata
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import Path, PathDecisionResult
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
-    PathDecision,
-)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import Path
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorWorker,
     get_external_request_id,
@@ -517,35 +515,25 @@ def test_shutdown_makes_public_split_start_load_inert_but_preserves_pre_shutdown
     worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
 
 
-def test_production_de_read_result_creates_no_plan_tracker_or_worker_operation(monkeypatch) -> None:
+def test_production_de_read_result_creates_plan_binding_store_without_scheduler_worker_io(monkeypatch) -> None:
     fixture = _scheduler_factory_fixture.__wrapped__(monkeypatch)
     scheduler_factory = next(fixture)
     try:
         scheduler, coordinator = scheduler_factory()
-        _, _, state = _admit_request(scheduler)
-        coordinator.take_received_decisions.return_value = [
-            PathDecision(
-                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-                result=PathDecisionResult(request_key=state.request_key, path=Path.DE_READ),
-                reverse_plan=None,
-            )
-        ]
+        request, snapshot, state = _admit_request(scheduler)
+        decision = _de_read_decision(state, snapshot)
+        store_metadata = _make_store_metadata(request.request_id)
+        scheduler._kvpool_adapter.build_connector_meta.return_value = store_metadata
+        coordinator.take_received_decisions.return_value = [decision]
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        worker = _make_worker()
-        engine_calls_before = list(worker.engine.method_calls)
 
-        with patch.object(worker, "_enqueue_kv_layer_send") as enqueue:
-            worker.start_load_kv(metadata)
-
-        assert metadata.forward_receive_bindings == []
-        assert metadata.reverse_plans == []
+        assert len(metadata.forward_receive_bindings) == 1
+        assert metadata.forward_receive_bindings[0].path is Path.DE_READ
+        assert metadata.reverse_plans == [decision.reverse_plan]
         assert metadata.reverse_receive_bindings == []
-        assert worker._split_trackers == {}
-        assert worker._reverse_plans == {}
-        assert worker._forward_receive_bindings == {}
-        assert worker._reverse_receive_bindings == {}
-        assert worker.engine.method_calls == engine_calls_before
-        enqueue.assert_not_called()
+        assert metadata.decode_store_metadata is store_metadata
+        assert scheduler._reqs_need_recv == {}
+        assert scheduler._reqs_need_send_layerwise == {}
     finally:
         with pytest.raises(StopIteration):
             next(fixture)
@@ -559,6 +547,7 @@ def test_task07_adds_no_scheduler_split_state_or_blocking_hooks() -> None:
         "_prepare_forward_plan",
         "_try_install_forward_plan",
         "_activate_de_read_path",
+        "_activate_committed_decision",
         "_emit_prefill_control_failure",
         "_sweep_pe_delivery",
         "get_num_new_matched_tokens",
