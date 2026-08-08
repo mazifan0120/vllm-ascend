@@ -719,6 +719,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_kvpool_worker_adapter",
                 "_registered_kv_caches",
                 "_registered_layer_order",
+                "_split_trackers",
                 "_control_failed_recving",
                 "_forward_receive_bindings",
                 "_pending_forward_done",
@@ -1529,8 +1530,10 @@ class TestDualPathFoundationGuards(unittest.TestCase):
             "DualPathConnectorWorker": {
                 "__init__",
                 "_install_forward_receive_binding",
+                "_install_split_tracker",
                 "_release_finished_forward_terminals",
                 "_consume_forward_receive_binding",
+                "_consume_store_completions",
                 "register_kv_caches",
                 "start_load_kv",
                 "get_finished",

@@ -54,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
     ForwardPlan,
     ForwardReceiveBinding,
+    ReversePlan,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -92,6 +93,10 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+        AscendConnectorMetadata,
+    )
+
 
 @dataclass(frozen=True)
 class DecodeKVSnapshot:
@@ -119,6 +124,27 @@ class DecodeDecisionStatus(str, Enum):
     PENDING = "PENDING"
     COMMITTED = "COMMITTED"
     TIMED_OUT = "TIMED_OUT"
+
+
+class _SplitPhase(str, Enum):
+    SKIPPED = "SKIPPED"
+    PENDING = "PENDING"
+    DONE = "DONE"
+    FAILED = "FAILED"
+
+
+@dataclass(slots=True)
+class _SplitTracker:
+    """Mutable DE-local execution state for one injected split request."""
+
+    store_phase: _SplitPhase
+    reverse_phase: _SplitPhase
+    forward_phase: _SplitPhase
+    store_destination_slice: tuple[int, ...]
+    forward_destination_slice: tuple[int, ...]
+    plan: ReversePlan | None
+    reverse_submitted: bool
+    terminal_published: bool
 
 
 @dataclass
@@ -885,6 +911,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._kvpool_worker_adapter: KVPoolWorkerAdapter | None = None
         self._registered_kv_caches: dict[str, list[torch.Tensor]] | None = None
         self._registered_layer_order: tuple[tuple[int, str], ...] = ()
+        self._split_trackers: dict[str, _SplitTracker] = {}
         self._control_failed_recving: set[str] = set()
         self._forward_receive_bindings: dict[str, ForwardReceiveBinding] = {}
         self._pending_forward_done: set[str] = set()
@@ -957,13 +984,84 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self.request_map.pop(binding.wire_request_id, None)
         self._forward_receive_bindings.pop(binding.decode_request_id, None)
 
+    def _install_split_tracker(
+        self,
+        binding: ForwardReceiveBinding,
+        store_metadata: AscendConnectorMetadata | None,
+    ) -> None:
+        if binding.decode_request_id in self._split_trackers:
+            return
+
+        store_request = None
+        if store_metadata is not None:
+            store_request = next(
+                (
+                    request
+                    for request in store_metadata.requests
+                    if request.req_id == binding.decode_request_id and request.load_spec is not None
+                ),
+                None,
+            )
+
+        block_size = self.block_size[0]
+        first_forward_block = binding.token_start // block_size
+        last_forward_block = math.ceil(binding.token_end / block_size)
+        forward_destination_slice = tuple(binding.destination_block_ids[0][first_forward_block:last_forward_block])
+        if store_request is None:
+            store_phase = _SplitPhase.SKIPPED
+            store_destination_slice = ()
+        else:
+            load_spec = store_request.load_spec
+            assert load_spec is not None
+            first_store_block = load_spec.vllm_cached_tokens // block_size
+            last_store_block = math.ceil(load_spec.kvpool_cached_tokens / block_size)
+            store_phase = _SplitPhase.PENDING
+            store_destination_slice = tuple(binding.destination_block_ids[0][first_store_block:last_store_block])
+
+        self._split_trackers[binding.decode_request_id] = _SplitTracker(
+            store_phase=store_phase,
+            reverse_phase=_SplitPhase.SKIPPED,
+            forward_phase=_SplitPhase.PENDING,
+            store_destination_slice=store_destination_slice,
+            forward_destination_slice=forward_destination_slice,
+            plan=None,
+            reverse_submitted=False,
+            terminal_published=False,
+        )
+
+    def _consume_store_completions(
+        self,
+        store_done_recving: set[str],
+        store_invalid_block_ids: set[int],
+    ) -> set[str]:
+        published_store_terminals: set[str] = set()
+        split_trackers = getattr(self, "_split_trackers", {})
+        for request_id in store_done_recving:
+            tracker = split_trackers.get(request_id)
+            if tracker is None:
+                published_store_terminals.add(request_id)
+                continue
+            if tracker.store_phase is not _SplitPhase.PENDING:
+                continue
+            if store_invalid_block_ids.intersection(tracker.store_destination_slice):
+                tracker.store_phase = _SplitPhase.FAILED
+                self._invalid_block_ids.update(tracker.store_destination_slice)
+                if not tracker.terminal_published:
+                    tracker.terminal_published = True
+                    published_store_terminals.add(request_id)
+            else:
+                tracker.store_phase = _SplitPhase.DONE
+        return published_store_terminals
+
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
+        store_metadata = getattr(metadata, "decode_store_metadata", None)
         for binding in getattr(metadata, "forward_receive_bindings", ()):
             self._install_forward_receive_binding(binding)
+            if binding.path is Path.DE_READ and self.dual_path_cfg.role == "decode":
+                self._install_split_tracker(binding, store_metadata)
         for timeout in getattr(metadata, "decision_timeouts", ()):
             self._control_failed_recving.add(timeout.request_id)
             self._invalid_block_ids.update(timeout.external_block_ids)
-        store_metadata = getattr(metadata, "decode_store_metadata", None)
         if store_metadata is not None:
             assert self._kvpool_worker_adapter is not None
             self._kvpool_worker_adapter.start_load_kv(store_metadata)
@@ -975,6 +1073,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         metadata: MooncakeLayerwiseConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
         finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
+        split_trackers = getattr(self, "_split_trackers", {})
+        for request_id in finished_req_ids:
+            tracker = split_trackers.get(request_id)
+            if tracker is not None and tracker.terminal_published:
+                split_trackers.pop(request_id)
         if self.kv_recv_layer_thread is not None:
             raw_done = self.kv_recv_layer_thread.get_and_clear_done_requests()
             raw_failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
@@ -1061,8 +1164,10 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 finished_req_ids,
                 store_metadata,
             )
+            store_invalid_block_ids = self._kvpool_worker_adapter.get_block_ids_with_load_errors()
+            self._invalid_block_ids.update(store_invalid_block_ids)
             done_sending.update(store_done_sending)
-            done_recving.update(store_done_recving)
+            done_recving.update(self._consume_store_completions(store_done_recving, store_invalid_block_ids))
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
