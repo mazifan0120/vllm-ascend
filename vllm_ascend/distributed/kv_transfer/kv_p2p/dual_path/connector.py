@@ -915,6 +915,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._kvpool_worker_adapter: KVPoolWorkerAdapter | None = None
         self._registered_kv_caches: dict[str, list[torch.Tensor]] | None = None
         self._registered_layer_order: tuple[tuple[int, str], ...] = ()
+        self._accepting_task07 = True
         self._split_trackers: dict[str, _SplitTracker] = {}
         self._reverse_plans: dict[str, ReversePlan] = {}
         self._reverse_terminal_lock = threading.Lock()
@@ -952,6 +953,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._kvpool_worker_adapter.register_kv_caches(kv_caches)
 
     def _install_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
+        if binding.path is Path.DE_READ and not getattr(self, "_accepting_task07", True):
+            return
         consumed_decode_request_id = self._consumed_forward_terminals.get(binding.wire_request_id)
         if consumed_decode_request_id is not None:
             if consumed_decode_request_id == binding.decode_request_id:
@@ -992,6 +995,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return finished_wire_ids
 
     def _install_reverse_receive_binding(self, binding: ReverseReceiveBinding) -> None:
+        if not getattr(self, "_accepting_task07", True):
+            return
         existing_binding = self._reverse_receive_bindings.get(binding.prefill_request_id)
         retained_wire_binding = next(
             (
@@ -1037,6 +1042,29 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._pending_forward_failed.remove(binding.wire_request_id)
             self._pending_reverse_failed.add(binding.wire_request_id)
 
+    def _release_task07_request_state(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
+        finished_reverse_wire_ids = self._release_finished_reverse_terminals(finished_req_ids)
+        split_trackers = getattr(self, "_split_trackers", {})
+        reverse_plans = getattr(self, "_reverse_plans", {})
+        for request_id in finished_req_ids:
+            binding = self._forward_receive_bindings.get(request_id)
+            if binding is not None and binding.path is Path.DE_READ:
+                if self.request_map.get(binding.wire_request_id) == request_id:
+                    self.request_map.pop(binding.wire_request_id)
+                self._forward_receive_bindings.pop(request_id)
+            split_trackers.pop(request_id, None)
+            reverse_plans.pop(request_id, None)
+        reverse_terminal_lock = getattr(self, "_reverse_terminal_lock", None)
+        if reverse_terminal_lock is not None:
+            with reverse_terminal_lock:
+                for request_id in finished_req_ids:
+                    self._pending_local_reverse_terminals.pop(request_id, None)
+        else:
+            for request_id in finished_req_ids:
+                getattr(self, "_pending_local_reverse_terminals", {}).pop(request_id, None)
+        return finished_wire_ids, finished_reverse_wire_ids
+
     def _release_finished_reverse_terminals(self, finished_req_ids: set[str]) -> set[str]:
         finished_wire_ids: set[str] = set()
         reverse_receive_bindings = getattr(self, "_reverse_receive_bindings", {})
@@ -1067,6 +1095,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         binding: ForwardReceiveBinding,
         store_metadata: AscendConnectorMetadata | None,
     ) -> None:
+        if not getattr(self, "_accepting_task07", True):
+            return
         if binding.decode_request_id in self._split_trackers:
             return
 
@@ -1108,6 +1138,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         )
 
     def _install_reverse_plan(self, plan: ReversePlan) -> None:
+        if not getattr(self, "_accepting_task07", True):
+            return
         decode_request_id = plan.request_key.decode_request_id
         if get_external_request_id(decode_request_id) != plan.wire_request_id:
             raise RuntimeError(
@@ -1206,6 +1238,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return metadata
 
     def _submit_reverse(self, decode_request_id: str) -> None:
+        if not getattr(self, "_accepting_task07", True):
+            return
         tracker = self._split_trackers.get(decode_request_id)
         if (
             tracker is None
@@ -1299,13 +1333,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         finished_req_ids: set[str],
         metadata: MooncakeLayerwiseConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
-        finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
-        finished_reverse_wire_ids = self._release_finished_reverse_terminals(finished_req_ids)
+        finished_wire_ids, finished_reverse_wire_ids = self._release_task07_request_state(finished_req_ids)
         split_trackers = getattr(self, "_split_trackers", {})
-        for request_id in finished_req_ids:
-            tracker = split_trackers.get(request_id)
-            if tracker is not None and tracker.terminal_published:
-                split_trackers.pop(request_id)
 
         done_sending: set[str] = set()
         done_recving: set[str] = set()
@@ -1496,6 +1525,10 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return invalid_block_ids
 
     def shutdown(self) -> None:
+        """Release local state without promising cancellation of remote DMA."""
+        if not getattr(self, "_accepting_task07", True):
+            return
+        self._accepting_task07 = False
         for binding in self._forward_receive_bindings.values():
             if self.request_map.get(binding.wire_request_id) == binding.decode_request_id:
                 self.request_map.pop(binding.wire_request_id)
@@ -1503,9 +1536,23 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._pending_forward_done.clear()
         self._pending_forward_failed.clear()
         self._consumed_forward_terminals.clear()
+        getattr(self, "_split_trackers", {}).clear()
+        getattr(self, "_reverse_plans", {}).clear()
+        reverse_terminal_lock = getattr(self, "_reverse_terminal_lock", None)
+        if reverse_terminal_lock is not None:
+            with reverse_terminal_lock:
+                self._pending_local_reverse_terminals.clear()
+        getattr(self, "_reverse_receive_bindings", {}).clear()
+        getattr(self, "_reverse_request_map", {}).clear()
+        getattr(self, "_pending_reverse_done", set()).clear()
+        getattr(self, "_pending_reverse_failed", set()).clear()
+        getattr(self, "_consumed_reverse_terminals", {}).clear()
         self._control_failed_recving.clear()
         if self._kvpool_worker_adapter is not None:
             self._kvpool_worker_adapter.close()
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if parent_shutdown is not None:
+            parent_shutdown()
 
 
 class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):

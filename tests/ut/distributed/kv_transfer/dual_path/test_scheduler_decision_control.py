@@ -1337,4 +1337,4 @@ class TestCleanupAndShutdown:
         assert task04_seams.decode_coordinator.close.call_count == 2
         assert task04_seams.prefill_coordinator.close.call_count == 2
         assert decode_scheduler._kvpool_adapter.close.call_count == 2
-        assert worker._kvpool_worker_adapter.close.call_count == 2
+        assert worker._kvpool_worker_adapter.close.call_count == 1

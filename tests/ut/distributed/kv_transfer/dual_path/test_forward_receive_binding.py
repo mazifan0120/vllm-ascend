@@ -554,4 +554,4 @@ def test_shutdown_clears_task05_worker_state_and_active_wire_mapping():
     assert worker._pending_forward_done == set()
     assert worker._pending_forward_failed == set()
     assert worker._consumed_forward_terminals == {}
-    assert worker._kvpool_worker_adapter.close.call_count == 2
+    assert worker._kvpool_worker_adapter.close.call_count == 1
