@@ -290,9 +290,56 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             sweep_keys.add(released_key)
 
         for request_key in sweep_keys:
+            delivery_future = self._pe_delivery_futures.get(request_key)
+            if delivery_future is not None and delivery_future.done():
+                delivery_failed = delivery_future.cancelled() or delivery_future.exception() is not None
+                if delivery_failed:
+                    request_id = next(
+                        (
+                            request_id
+                            for request_id, retained_key in self._pe_request_keys.items()
+                            if retained_key == request_key
+                        ),
+                        None,
+                    )
+                    result = self._pe_path_results.get(request_id) if request_id is not None else None
+                    if result is not None and request_id not in self._pe_invalid_request_ids:
+                        match result.path:
+                            case Path.DE_READ:
+                                binding = self._pe_pending_reverse_receive_bindings.get(request_id)
+                                if binding is not None:
+                                    destination_block_ids = binding.destination_block_ids[0]
+                                    token_start = binding.token_start
+                                    token_end = binding.token_end
+                                else:
+                                    forward_plan = self._pe_forward_plans.get(request_id)
+                                    token_start = self._pe_prefill_local_tokens.get(request_id)
+                                    if forward_plan is None or token_start is None:
+                                        continue
+                                    destination_block_ids = forward_plan.source_block_ids[0]
+                                    token_end = forward_plan.token_start
+                                block_size = self.block_size[0]
+                                first_block = token_start // block_size
+                                last_block = math.ceil(token_end / block_size)
+                                failure = DualPathControlFailureMetadata(
+                                    request_id=request_id,
+                                    invalid_block_ids=tuple(destination_block_ids[first_block:last_block]),
+                                    reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+                                )
+                                existing = self._pe_control_failures.get(request_id)
+                                if existing is not None and existing != failure:
+                                    raise RuntimeError(
+                                        f"DualPath Prefill request {request_id} got a conflicting local "
+                                        "control failure; the original failure is preserved"
+                                    )
+                                self._pe_control_failures[request_id] = failure
+                                self._pe_invalid_request_ids.add(request_id)
+                            case Path.PE_READ:
+                                pass
+                            case unreachable:
+                                assert_never(unreachable)
             if request_key in active_keys:
                 continue
-            delivery_future = self._pe_delivery_futures.get(request_key)
             if delivery_future is not None and not delivery_future.done():
                 continue
             self._path_decider.discard(request_key)
@@ -1468,6 +1515,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     def _release_task07_request_state(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
         finished_reverse_wire_ids = self._release_finished_reverse_terminals(finished_req_ids)
+        self._control_failed_recving.difference_update(finished_req_ids)
         split_trackers = getattr(self, "_split_trackers", {})
         reverse_plans = getattr(self, "_reverse_plans", {})
         for request_id in finished_req_ids:

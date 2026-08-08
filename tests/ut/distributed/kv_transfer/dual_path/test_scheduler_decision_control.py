@@ -9,6 +9,9 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from vllm.v1.request import RequestStatus
 
+from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
+    _make_prefill_worker,
+)
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
@@ -102,6 +105,9 @@ def task04_seams():
         decode_coordinator.decode_control_endpoint = _CONTROL_ENDPOINT
         prefill_coordinator = MagicMock(name="prefill_coordinator")
         prefill_delivery_future = MagicMock(spec=Future, name="prefill_delivery_future")
+        prefill_delivery_future.done.return_value = False
+        prefill_delivery_future.cancelled.return_value = False
+        prefill_delivery_future.exception.return_value = None
         prefill_coordinator.submit.return_value = prefill_delivery_future
         coordinator_cls.for_decode.return_value = decode_coordinator
         coordinator_cls.for_prefill.return_value = prefill_coordinator
@@ -1098,6 +1104,26 @@ class TestWorkerFailureRelay:
         assert worker.get_finished(set(), metadata) == (set(), set())
         assert worker.get_block_ids_with_load_errors() == set()
 
+    def test_finished_request_removes_pending_control_failure_without_publication(self):
+        # Given
+        worker = _control_only_worker()
+        metadata = connector_module.DualPathConnectorMetadata()
+        metadata.control_failures.append(
+            connector_module.DualPathControlFailureMetadata(
+                "request-local-7",
+                (42, 43, 44),
+                connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
+            )
+        )
+        worker.start_load_kv(metadata)
+
+        # When
+        result = worker.get_finished({"request-local-7"}, metadata)
+
+        # Then
+        assert result == (set(), set())
+        assert worker._control_failed_recving == set()
+
 
 class TestCleanupAndShutdown:
     @pytest.mark.parametrize(
@@ -1299,6 +1325,64 @@ class TestCleanupAndShutdown:
                 reason=connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
             )
         ]
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_de_read_delivery_exhaustion_fails_pe_reverse_destination_once(
+        self,
+        cancelled,
+        scheduler_factory,
+        task04_seams,
+    ):
+        # Given
+        delivery_error = PathDecisionDeliveryError("delivery exhausted")
+        delivery_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        policy = MagicMock(name="de_read_path_policy")
+        policy.choose.return_value = Path.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request(
+            "prefill-de-read-delivery-failure",
+            _remote_decode_params(),
+        )
+        scheduler.get_num_new_matched_tokens(request, 0)
+        _bind_prefill(scheduler, request)
+        binding_metadata = scheduler.build_connector_meta(MagicMock(name="binding_scheduler_output"))
+        assert len(binding_metadata.reverse_receive_bindings) == 1
+        assert binding_metadata.control_failures == []
+
+        # When
+        if cancelled:
+            delivery_future.cancel()
+        else:
+            delivery_future.set_exception(delivery_error)
+        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+        # Then
+        expected_failure = connector_module.DualPathControlFailureMetadata(
+            request_id=request.request_id,
+            invalid_block_ids=(10, 11),
+            reason=connector_module.DualPathControlFailureReason.ACTIVATION_FAILED,
+        )
+        assert metadata.reverse_receive_bindings == []
+        assert metadata.control_failures == [expected_failure]
+        assert scheduler._pe_control_failures == {}
+
+        worker = _make_prefill_worker()
+        worker.start_load_kv(binding_metadata)
+        worker.start_load_kv(metadata)
+        assert worker.get_finished(set(), metadata) == (set(), {request.request_id})
+        assert worker.get_block_ids_with_load_errors() == {10, 11}
+        assert worker.get_finished(set(), metadata) == (set(), set())
+
+        repeated_metadata = scheduler.build_connector_meta(MagicMock(name="repeated_scheduler_output"))
+        assert getattr(repeated_metadata, "control_failures", []) == []
+        scheduler.request_finished(request, [10, 11, 12, 13])
+        assert worker.get_finished({request.request_id}, metadata) == (set(), set())
+        assert worker._control_failed_recving == set()
+        assert worker._reverse_receive_bindings == {}
+        assert scheduler._pe_delivery_futures == {}
+        assert scheduler._pe_pending_reverse_receive_bindings == {}
+        assert scheduler._pe_control_failures == {}
 
     def test_concurrent_requests_stay_isolated_across_outcomes(
         self,
