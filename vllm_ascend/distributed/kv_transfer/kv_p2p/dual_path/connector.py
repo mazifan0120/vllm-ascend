@@ -228,6 +228,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._pe_path_results: dict[str, PathDecisionResult] = {}
         self._pe_forward_plans: dict[str, ForwardPlan] = {}
         self._pe_forward_send_infos: dict[str, SendReqInfo] = {}
+        self._pe_pending_reverse_receive_bindings: dict[str, ReverseReceiveBinding] = {}
+        self._pe_control_failures: dict[str, DualPathControlFailureMetadata] = {}
         self._pe_delivery_futures: dict[DualPathRequestKey, Future[None]] = {}
         self._pe_invalid_request_ids: set[str] = set()
         if dual_path_cfg.role == "decode":
@@ -382,6 +384,106 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             case unreachable:
                 assert_never(unreachable)
 
+    def _prepare_forward_plan(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        token_start: int,
+    ) -> tuple[ForwardPlan, SendReqInfo] | None:
+        params = request.kv_transfer_params
+        assert params is not None
+        metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
+        if metadata.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
+            raise PathDecisionValidationError(
+                f"protocol version must be {DUAL_PATH_PROTOCOL_VERSION}, got {metadata.protocol_version}"
+            )
+        decision_request = metadata.decision_request
+        result = self._pe_path_results[request.request_id]
+        if result.request_key != decision_request.request_key:
+            raise PathDecisionValidationError("retained result key does not match the Decision Request key")
+
+        token_end = request.num_prompt_tokens
+        expected_token_end = (
+            decision_request.target_tokens if self.need_truncate else decision_request.target_tokens + 1
+        )
+        if token_end != expected_token_end:
+            raise PathDecisionValidationError(
+                f"effective Prefill token count {token_end} does not match the expected transfer target "
+                f"{expected_token_end}"
+            )
+        if not 0 <= token_start < token_end:
+            raise PathDecisionValidationError("Forward token range must satisfy 0 <= token_start < token_end")
+
+        topology_fields = ("remote_tp_size", "remote_pcp_size", "remote_dcp_size")
+        required_fields = (
+            "remote_block_size",
+            "remote_engine_id",
+            "remote_host",
+            "remote_port",
+            *topology_fields,
+        )
+        missing_fields = [field for field in required_fields if field not in params]
+        if missing_fields:
+            raise PathDecisionValidationError(f"missing inherited remote fields: {missing_fields}")
+        for field_name in ("remote_engine_id", "remote_host"):
+            if not isinstance(params[field_name], str) or not params[field_name]:
+                raise PathDecisionValidationError(f"{field_name} must be a non-empty string")
+        for field_name in ("remote_port", *topology_fields):
+            value = params[field_name]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise PathDecisionValidationError(f"{field_name} must be a positive integer")
+        if params.get("remote_cached_tokens") != decision_request.decode_local_tokens:
+            raise PathDecisionValidationError("remote_cached_tokens does not match the Decision Request local prefix")
+
+        local_block_sizes = tuple(self.block_size)
+        remote_block_sizes = tuple(params["remote_block_size"])
+        if not local_block_sizes or len(local_block_sizes) != len(remote_block_sizes):
+            raise PathDecisionValidationError("local and remote block-size group counts must match")
+        for block_size in (*local_block_sizes, *remote_block_sizes):
+            if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size <= 0:
+                raise PathDecisionValidationError("block sizes must be positive integers")
+        if any(token_start % block_size != 0 for block_size in remote_block_sizes):
+            raise PathDecisionValidationError("token_start must align to the Decode block size")
+
+        destination_block_ids = tuple(tuple(group) for group in params["remote_block_ids"])
+        if len(destination_block_ids) != len(remote_block_sizes):
+            raise PathDecisionValidationError("destination block-table group count does not match block sizes")
+        for group, block_size in zip(destination_block_ids, remote_block_sizes, strict=True):
+            if not group or any(isinstance(block_id, bool) or not isinstance(block_id, int) for block_id in group):
+                raise PathDecisionValidationError("destination block groups must contain integer block ids")
+            if len(group) * block_size < token_end:
+                raise PathDecisionValidationError("destination block table does not cover token_end")
+
+        source_block_ids = tuple(tuple(group) for group in blocks.get_block_ids())
+        if len(source_block_ids) != len(local_block_sizes):
+            raise PathDecisionValidationError("source block-table group count does not match block sizes")
+        for group in source_block_ids:
+            if any(isinstance(block_id, bool) or not isinstance(block_id, int) for block_id in group):
+                raise PathDecisionValidationError("source block groups must contain integer block ids")
+        advertised_destination = tuple(tuple(group) for group in params["remote_block_ids"])
+        if advertised_destination != destination_block_ids:
+            raise PathDecisionValidationError("destination block table changed during Forward plan installation")
+        if any(
+            len(group) * block_size < token_end
+            for group, block_size in zip(source_block_ids, local_block_sizes, strict=True)
+        ):
+            return None
+
+        plan = ForwardPlan(
+            request_key=decision_request.request_key,
+            token_start=token_start,
+            token_end=token_end,
+            source_block_ids=source_block_ids,
+            destination_block_ids=destination_block_ids,
+        )
+        send_req_info = SendReqInfo(
+            local_block_ids=[list(group) for group in plan.source_block_ids],
+            local_transferred_tokens=plan.token_start,
+            local_computed_tokens=0,
+            request=request,
+        )
+        return plan, send_req_info
+
     def _try_install_forward_plan(self, request: Request, blocks: KVCacheBlocks) -> None:
         request_id = request.request_id
         result = self._pe_path_results.get(request_id)
@@ -391,95 +493,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             case Path.DE_READ:
                 return
             case Path.PE_READ:
-                pass
+                token_start = DualPathDecisionMetadata.from_dict(
+                    request.kv_transfer_params["dual_path"]
+                ).decision_request.decode_local_tokens
             case unreachable:
                 assert_never(unreachable)
 
-        params = request.kv_transfer_params
-        assert params is not None
         try:
-            metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
-            if metadata.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-                raise PathDecisionValidationError(
-                    f"protocol version must be {DUAL_PATH_PROTOCOL_VERSION}, got {metadata.protocol_version}"
-                )
-            decision_request = metadata.decision_request
-            if result.request_key != decision_request.request_key:
-                raise PathDecisionValidationError("retained result key does not match the Decision Request key")
-
-            token_start = decision_request.decode_local_tokens
-            token_end = request.num_prompt_tokens
-            expected_token_end = (
-                decision_request.target_tokens if self.need_truncate else decision_request.target_tokens + 1
-            )
-            if token_end != expected_token_end:
-                raise PathDecisionValidationError(
-                    f"effective Prefill token count {token_end} does not match the expected transfer target "
-                    f"{expected_token_end}"
-                )
-            if not 0 <= token_start < token_end:
-                raise PathDecisionValidationError("Forward token range must satisfy 0 <= token_start < token_end")
-
-            topology_fields = ("remote_tp_size", "remote_pcp_size", "remote_dcp_size")
-            required_fields = (
-                "remote_block_size",
-                "remote_engine_id",
-                "remote_host",
-                "remote_port",
-                *topology_fields,
-            )
-            missing_fields = [field for field in required_fields if field not in params]
-            if missing_fields:
-                raise PathDecisionValidationError(f"missing inherited remote fields: {missing_fields}")
-            for field in topology_fields:
-                topology_size = params[field]
-                if isinstance(topology_size, bool) or not isinstance(topology_size, int) or topology_size <= 0:
-                    raise PathDecisionValidationError(f"{field} must be a positive integer")
-            if params.get("remote_cached_tokens") != token_start:
-                raise PathDecisionValidationError(
-                    "remote_cached_tokens does not match the Decision Request local prefix"
-                )
-
-            local_block_sizes = tuple(self.block_size)
-            remote_block_sizes = tuple(params["remote_block_size"])
-            if not local_block_sizes or len(local_block_sizes) != len(remote_block_sizes):
-                raise PathDecisionValidationError("local and remote block-size group counts must match")
-            for block_size in (*local_block_sizes, *remote_block_sizes):
-                if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size <= 0:
-                    raise PathDecisionValidationError("block sizes must be positive integers")
-            if any(token_start % block_size != 0 for block_size in remote_block_sizes):
-                raise PathDecisionValidationError("token_start must align to the Decode block size")
-
-            destination_block_ids = tuple(tuple(group) for group in params["remote_block_ids"])
-            if len(destination_block_ids) != len(remote_block_sizes):
-                raise PathDecisionValidationError("destination block-table group count does not match block sizes")
-            for group, block_size in zip(destination_block_ids, remote_block_sizes):
-                if not group or any(isinstance(block_id, bool) or not isinstance(block_id, int) for block_id in group):
-                    raise PathDecisionValidationError("destination block groups must contain integer block ids")
-                if len(group) * block_size < token_end:
-                    raise PathDecisionValidationError("destination block table does not cover token_end")
-
-            source_block_ids = tuple(tuple(group) for group in blocks.get_block_ids())
-            if len(source_block_ids) != len(local_block_sizes):
-                raise PathDecisionValidationError("source block-table group count does not match block sizes")
-            for group in source_block_ids:
-                if any(isinstance(block_id, bool) or not isinstance(block_id, int) for block_id in group):
-                    raise PathDecisionValidationError("source block groups must contain integer block ids")
-            advertised_destination = tuple(tuple(group) for group in params["remote_block_ids"])
-            if advertised_destination != destination_block_ids:
-                raise PathDecisionValidationError("destination block table changed during Forward plan installation")
-            if any(
-                len(group) * block_size < token_end for group, block_size in zip(source_block_ids, local_block_sizes)
-            ):
-                return
-
-            plan = ForwardPlan(
-                request_key=decision_request.request_key,
-                token_start=token_start,
-                token_end=token_end,
-                source_block_ids=source_block_ids,
-                destination_block_ids=destination_block_ids,
-            )
+            prepared = self._prepare_forward_plan(request, blocks, token_start)
         except (KeyError, PathDecisionValidationError, TypeError) as error:
             logger.error(
                 "DualPath Prefill Forward plan is invalid for request %s: %s",
@@ -489,6 +510,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._pe_invalid_request_ids.add(request_id)
             self._pe_path_results.pop(request_id, None)
             return
+        if prepared is None:
+            return
+        plan, send_req_info = prepared
 
         existing_plan = self._pe_forward_plans.get(request_id)
         if existing_plan is not None:
@@ -499,15 +523,117 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 "the original plan is preserved"
             )
 
-        send_req_info = SendReqInfo(
-            local_block_ids=[list(group) for group in plan.source_block_ids],
-            local_transferred_tokens=plan.token_start,
-            local_computed_tokens=0,
-            request=request,
-        )
         self._pe_forward_plans[request_id] = plan
         self._pe_forward_send_infos[request_id] = send_req_info
         self._reqs_need_send_layerwise[request_id] = send_req_info
+
+    def _activate_de_read_path(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        result: PathDecisionResult,
+    ) -> ReversePlan | None:
+        request_id = request.request_id
+        params = request.kv_transfer_params
+        assert params is not None
+        metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
+        if metadata.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
+            raise PathDecisionValidationError(
+                f"protocol version must be {DUAL_PATH_PROTOCOL_VERSION}, got {metadata.protocol_version}"
+            )
+        decision_request = metadata.decision_request
+        if result.request_key != decision_request.request_key:
+            raise PathDecisionValidationError("retained result key does not match the Decision Request key")
+
+        token_start = self._pe_prefill_local_tokens[request_id]
+        token_split = decision_request.decode_store_tokens
+        ready_tokens = decision_request.target_tokens
+        token_end = request.num_prompt_tokens
+        if not token_start < token_split < ready_tokens <= token_end:
+            raise PathDecisionValidationError("DE_READ token ranges must satisfy L_PE < K_DE < R <= T")
+        if not 0 <= decision_request.decode_local_tokens <= token_split:
+            raise PathDecisionValidationError("Decode local tokens must not exceed the DE_READ split")
+
+        prepared = self._prepare_forward_plan(request, blocks, token_split)
+        if prepared is None:
+            return None
+        forward_plan, send_req_info = prepared
+        wire_request_id = get_external_request_id(request_id)
+        binding = ReverseReceiveBinding(
+            request_key=result.request_key,
+            wire_request_id=wire_request_id,
+            prefill_request_id=request_id,
+            destination_block_ids=forward_plan.source_block_ids,
+            token_start=token_start,
+            token_end=token_split,
+        )
+        parallel_config = self.vllm_config.parallel_config
+        reverse_plan = ReversePlan(
+            request_key=result.request_key,
+            wire_request_id=wire_request_id,
+            token_start=token_start,
+            token_end=token_split,
+            source_block_ids=forward_plan.destination_block_ids,
+            destination_block_ids=forward_plan.source_block_ids,
+            remote_engine_id=self.engine_id,
+            remote_host=self.side_channel_host,
+            remote_port=self.side_channel_port,
+            remote_block_sizes=tuple(self.block_size),
+            remote_tp_size=parallel_config.tensor_parallel_size,
+            remote_pcp_size=parallel_config.prefill_context_parallel_size,
+            remote_dcp_size=parallel_config.decode_context_parallel_size,
+        )
+
+        existing_plan = self._pe_forward_plans.get(request_id)
+        if existing_plan is not None and existing_plan != forward_plan:
+            raise RuntimeError(
+                f"DualPath Prefill request {request_id} got a conflicting duplicate Forward plan; "
+                "the original plan is preserved"
+            )
+        existing_binding = self._pe_pending_reverse_receive_bindings.get(request_id)
+        conflicting_binding = any(
+            retained != binding
+            and (retained.request_key == binding.request_key or retained.wire_request_id == binding.wire_request_id)
+            for retained in self._pe_pending_reverse_receive_bindings.values()
+        )
+        if (existing_binding is not None and existing_binding != binding) or conflicting_binding:
+            raise RuntimeError(
+                f"DualPath Prefill request {request_id} got a conflicting duplicate Reverse receive binding; "
+                "the original binding is preserved"
+            )
+        if existing_plan is not None and result.request_key in self._pe_delivery_futures:
+            return reverse_plan
+
+        self._pe_pending_reverse_receive_bindings[request_id] = binding
+        self._pe_forward_plans[request_id] = forward_plan
+        self._pe_forward_send_infos[request_id] = send_req_info
+        self._reqs_need_send_layerwise[request_id] = send_req_info
+        return reverse_plan
+
+    def _emit_prefill_control_failure(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        token_start: int,
+        token_end: int,
+    ) -> None:
+        block_size = self.block_size[0]
+        first_block = token_start // block_size
+        last_block = math.ceil(token_end / block_size)
+        destination_block_ids = blocks.get_block_ids()[0]
+        invalid_block_ids = tuple(destination_block_ids[first_block:last_block])
+        failure = DualPathControlFailureMetadata(
+            request_id=request.request_id,
+            invalid_block_ids=invalid_block_ids,
+            reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+        )
+        existing = self._pe_control_failures.get(request.request_id)
+        if existing is not None and existing != failure:
+            raise RuntimeError(
+                f"DualPath Prefill request {request.request_id} got a conflicting local control failure; "
+                "the original failure is preserved"
+            )
+        self._pe_control_failures[request.request_id] = failure
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         if not self._is_task01_decode_request(request):
@@ -577,18 +703,41 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:
         params = request.kv_transfer_params
         if self.dual_path_cfg.role == "prefill" and params is not None and "dual_path" in params:
-            self._try_install_forward_plan(request, blocks)
             request_id = request.request_id
+            result = self._pe_path_results.get(request_id)
+            if result is None:
+                return
+
+            reverse_plan: ReversePlan | None = None
+            try:
+                match result.path:
+                    case Path.DE_READ:
+                        reverse_plan = self._activate_de_read_path(request, blocks, result)
+                    case Path.PE_READ:
+                        self._try_install_forward_plan(request, blocks)
+                    case unreachable:
+                        assert_never(unreachable)
+            except (KeyError, PathDecisionValidationError, RuntimeError, TypeError) as error:
+                logger.error(
+                    "DualPath Prefill activation failed locally for request %s: %s",
+                    request_id,
+                    error,
+                )
+                if result.path is Path.DE_READ:
+                    decision_request = DualPathDecisionMetadata.from_dict(params["dual_path"]).decision_request
+                    self._emit_prefill_control_failure(
+                        request,
+                        blocks,
+                        self._pe_prefill_local_tokens[request_id],
+                        decision_request.decode_store_tokens,
+                    )
+                self._pe_invalid_request_ids.add(request_id)
+                self._pe_path_results.pop(request_id, None)
+                return
+
             result = self._pe_path_results.get(request_id)
             if result is None or request_id not in self._pe_forward_plans:
                 return
-            match result.path:
-                case Path.DE_READ:
-                    return
-                case Path.PE_READ:
-                    pass
-                case unreachable:
-                    assert_never(unreachable)
 
             request_key = result.request_key
             if request_key in self._pe_delivery_futures:
@@ -597,12 +746,38 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             decision = PathDecision(
                 protocol_version=DUAL_PATH_PROTOCOL_VERSION,
                 result=result,
-                reverse_plan=None,
+                reverse_plan=reverse_plan,
             )
-            delivery_future = self._path_decision_coordinator.submit(
-                metadata.decode_control_endpoint,
-                decision,
-            )
+            try:
+                delivery_future = self._path_decision_coordinator.submit(
+                    metadata.decode_control_endpoint,
+                    decision,
+                )
+            except RuntimeError as error:
+                logger.error(
+                    "DualPath Prefill decision submission failed locally for request %s: %s",
+                    request_id,
+                    error,
+                )
+                if result.path is Path.DE_READ:
+                    decision_request = metadata.decision_request
+                    self._emit_prefill_control_failure(
+                        request,
+                        blocks,
+                        self._pe_prefill_local_tokens[request_id],
+                        decision_request.decode_store_tokens,
+                    )
+                self._pe_invalid_request_ids.add(request_id)
+                self._pe_path_results.pop(request_id, None)
+                self._pe_pending_reverse_receive_bindings.pop(request_id, None)
+                self._pe_forward_plans.pop(request_id, None)
+                owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
+                if (
+                    owned_send_req_info is not None
+                    and self._reqs_need_send_layerwise.get(request_id) is owned_send_req_info
+                ):
+                    self._reqs_need_send_layerwise.pop(request_id)
+                return
             self._pe_delivery_futures[request_key] = delivery_future
 
             def log_delivery_failure(completed_future: Future[None]) -> None:
@@ -778,7 +953,16 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         parent_metadata = super().build_connector_meta(scheduler_output)
         if self.dual_path_cfg.role != "decode":
             self._sweep_pe_delivery()
-            return parent_metadata
+            if not self._pe_pending_reverse_receive_bindings and not self._pe_control_failures:
+                return parent_metadata
+            metadata = DualPathConnectorMetadata()
+            metadata.requests = parent_metadata.requests
+            metadata.send_task = parent_metadata.send_task
+            metadata.reverse_receive_bindings.extend(self._pe_pending_reverse_receive_bindings.values())
+            metadata.control_failures.extend(self._pe_control_failures.values())
+            self._pe_pending_reverse_receive_bindings.clear()
+            self._pe_control_failures.clear()
+            return metadata
 
         metadata = DualPathConnectorMetadata()
         metadata.requests = parent_metadata.requests
@@ -880,6 +1064,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._pe_prefill_local_tokens.pop(request_id, None)
             self._pe_path_results.pop(request_id, None)
             self._pe_forward_plans.pop(request_id, None)
+            self._pe_pending_reverse_receive_bindings.pop(request_id, None)
+            self._pe_control_failures.pop(request_id, None)
             owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
             send_req_info = self._reqs_need_send_layerwise.get(request_id)
             if owned_send_req_info is send_req_info and send_req_info is not None and send_req_info.request is request:
@@ -903,6 +1089,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._pe_prefill_local_tokens.pop(request_id, None)
             self._pe_path_results.pop(request_id, None)
             self._pe_forward_plans.pop(request_id, None)
+            self._pe_pending_reverse_receive_bindings.pop(request_id, None)
+            self._pe_control_failures.pop(request_id, None)
             owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
             send_req_info = self._reqs_need_send_layerwise.get(request_id)
             if owned_send_req_info is send_req_info and send_req_info is not None and send_req_info.request is request:
@@ -937,6 +1125,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._reqs_need_send_layerwise.pop(request_id)
         self._pe_forward_send_infos.clear()
         self._pe_forward_plans.clear()
+        self._pe_pending_reverse_receive_bindings.clear()
+        self._pe_control_failures.clear()
         self._pe_delivery_futures.clear()
         self._pe_invalid_request_ids.clear()
         if self._kvpool_adapter is not None:

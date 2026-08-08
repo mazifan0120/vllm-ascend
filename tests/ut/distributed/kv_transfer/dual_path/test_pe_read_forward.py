@@ -1,5 +1,6 @@
 import inspect
 from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,14 +9,23 @@ import pytest
 from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import AscendMultiConnector
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
+    DualPathConnectorMetadata,
+    DualPathControlFailureMetadata,
+    DualPathControlFailureReason,
+    ReverseReceiveBinding,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
+    DualPathRequestKey,
     Path,
     PathDecisionRequest,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
+    PathDecision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    MooncakeLayerwiseConnectorMetadata,
     MooncakeLayerwiseConnectorScheduler,
     MooncakeLayerwiseConnectorWorker,
     SendReqInfo,
@@ -356,17 +366,18 @@ def test_identical_duplicate_alloc_is_idempotent(scheduler_factory):
     assert scheduler._reqs_need_send_layerwise[request.request_id] is first_send
 
 
-def test_conflicting_duplicate_alloc_raises_preserving_first_plan(scheduler_factory):
+def test_conflicting_duplicate_alloc_fails_locally_preserving_first_plan(scheduler_factory):
     scheduler, _, _ = scheduler_factory()
     request = _make_request()
     _decide(scheduler, request)
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
     first_plan = scheduler._pe_forward_plans[request.request_id]
 
-    with pytest.raises(RuntimeError, match="conflicting duplicate Forward plan"):
-        scheduler.update_state_after_alloc(request, _blocks(([13, 14, 15],)), 0)
+    scheduler.update_state_after_alloc(request, _blocks(([13, 14, 15],)), 0)
 
     assert scheduler._pe_forward_plans[request.request_id] is first_plan
+    assert request.request_id in scheduler._pe_invalid_request_ids
+    assert request.request_id not in scheduler._pe_path_results
 
 
 def test_post_install_validation_failure_preserves_first_plan_and_send_state(scheduler_factory):
@@ -496,19 +507,211 @@ def test_lookup_or_install_alone_invokes_no_worker_p2p(scheduler_factory):
     p2p_spy.assert_not_called()
 
 
-def test_de_read_result_creates_no_plan_no_send_queue_no_error(scheduler_factory):
+def test_partial_de_read_freezes_exact_ranges_with_distinct_tables(scheduler_factory):
     scheduler, _, _ = scheduler_factory(Path.DE_READ)
-    request = _make_request()
-    blocks = _blocks(([10, 11, 12],))
+    request = _make_request(
+        target_tokens=48,
+        prompt_tokens=49,
+        local_tokens=16,
+        store_tokens=32,
+        destination_block_ids=[[20, 21, 22, 23]],
+    )
+    blocks = _blocks(([70, 71, 72, 73],))
 
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
     scheduler.update_state_after_alloc(request, blocks, 0)
 
-    assert scheduler._pe_path_results[request.request_id].path is Path.DE_READ
+    binding = scheduler._pe_pending_reverse_receive_bindings[request.request_id]
+    forward = scheduler._pe_forward_plans[request.request_id]
+    decision = scheduler._path_decision_coordinator.submit.call_args.args[1]
+    reverse = decision.reverse_plan
+    assert reverse is not None
+    assert (binding.token_start, binding.token_end) == (16, 32)
+    assert (reverse.token_start, reverse.token_end) == (16, 32)
+    assert (forward.token_start, forward.token_end) == (32, 49)
+    assert binding.destination_block_ids == reverse.destination_block_ids == ((70, 71, 72, 73),)
+    assert reverse.source_block_ids == forward.destination_block_ids == ((20, 21, 22, 23),)
+    assert forward.source_block_ids == ((70, 71, 72, 73),)
+    assert (reverse.remote_engine_id, reverse.remote_host, reverse.remote_port) == (
+        scheduler.engine_id,
+        scheduler.side_channel_host,
+        scheduler.side_channel_port,
+    )
+    assert (reverse.remote_tp_size, reverse.remote_pcp_size, reverse.remote_dcp_size) == (1, 1, 1)
+
+
+def test_de_read_installs_binding_plan_and_forward_before_submit(scheduler_factory):
+    scheduler, policy, coordinator = scheduler_factory(Path.DE_READ)
+    request = _make_request(
+        target_tokens=48,
+        prompt_tokens=49,
+        local_tokens=16,
+        store_tokens=32,
+        destination_block_ids=[[20, 21, 22, 23]],
+    )
+    blocks = _blocks(([70, 71, 72, 73],))
+    events = []
+
+    class RecordingDict(dict):
+        def __init__(self, event_name):
+            super().__init__()
+            self.event_name = event_name
+
+        def __setitem__(self, key, value):
+            events.append(self.event_name)
+            return super().__setitem__(key, value)
+
+    scheduler._pe_pending_reverse_receive_bindings = RecordingDict("binding")
+    scheduler._pe_forward_plans = RecordingDict("forward")
+
+    def submit_after_install(_endpoint, decision):
+        events.append("submit")
+        assert isinstance(decision, PathDecision)
+        assert decision.reverse_plan is not None
+        assert request.request_id in scheduler._pe_pending_reverse_receive_bindings
+        assert request.request_id in scheduler._pe_forward_plans
+        return _completed_future()
+
+    coordinator.submit.side_effect = submit_after_install
+
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+    scheduler.update_state_after_alloc(request, blocks, 0)
+    scheduler.update_state_after_alloc(request, blocks, 0)
+
+    assert events[:3] == ["binding", "forward", "submit"]
+    assert policy.calls == 1
+    coordinator.submit.assert_called_once()
+
+
+def test_miss_de_read_freezes_reverse_hbm_range_and_no_store(scheduler_factory):
+    scheduler, _, _ = scheduler_factory(Path.DE_READ)
+    request = _make_request(
+        target_tokens=48,
+        prompt_tokens=49,
+        local_tokens=32,
+        store_tokens=32,
+        destination_block_ids=[[20, 21, 22, 23]],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+    scheduler.update_state_after_alloc(request, _blocks(([70, 71, 72, 73],)), 0)
+
+    binding = scheduler._pe_pending_reverse_receive_bindings[request.request_id]
+    forward = scheduler._pe_forward_plans[request.request_id]
+    decision = scheduler._path_decision_coordinator.submit.call_args.args[1]
+    assert decision.reverse_plan is not None
+    assert (binding.token_start, binding.token_end) == (16, 32)
+    assert (decision.reverse_plan.token_start, decision.reverse_plan.token_end) == (16, 32)
+    assert (forward.token_start, forward.token_end) == (32, 49)
+    metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+    assert isinstance(metadata, DualPathConnectorMetadata)
+    assert metadata.decode_store_metadata is None
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["group-count", "alignment", "coverage", "endpoint", "topology", "key", "wire-id"],
+)
+def test_activation_fact_mismatch_fails_with_local_control_failure(scheduler_factory, mismatch):
+    scheduler, _, coordinator = scheduler_factory(Path.DE_READ)
+    request = _make_request(
+        target_tokens=48,
+        prompt_tokens=49,
+        local_tokens=16,
+        store_tokens=32,
+        destination_block_ids=[[20, 21, 22, 23]],
+    )
+    blocks = _blocks(([70, 71, 72, 73],))
+    prefill_local_tokens = 8 if mismatch == "alignment" else 16
+
+    assert scheduler.get_num_new_matched_tokens(request, prefill_local_tokens) == (
+        32 - prefill_local_tokens,
+        True,
+    )
+    if mismatch == "group-count":
+        request.kv_transfer_params["remote_block_size"] = [16, 16]
+    elif mismatch == "coverage":
+        request.kv_transfer_params["remote_block_ids"] = [[20]]
+    elif mismatch == "endpoint":
+        request.kv_transfer_params["remote_host"] = ""
+    elif mismatch == "topology":
+        request.kv_transfer_params["remote_tp_size"] = 0
+    elif mismatch == "key":
+        request.kv_transfer_params["dual_path"]["decision_request"]["request_key"]["decode_request_id"] = (
+            "conflicting-decode-request"
+        )
+    wire_context = (
+        patch.object(connector_module, "get_external_request_id", return_value="")
+        if mismatch == "wire-id"
+        else nullcontext()
+    )
+
+    with wire_context:
+        scheduler.update_state_after_alloc(request, blocks, 0)
+
+    coordinator.submit.assert_not_called()
     assert scheduler._pe_forward_plans == {}
-    assert scheduler._reqs_need_send_layerwise == {}
-    assert scheduler._pe_invalid_request_ids == set()
-    blocks.get_block_ids.assert_not_called()
+    assert scheduler._pe_pending_reverse_receive_bindings == {}
+    expected_failure = DualPathControlFailureMetadata(
+        request_id=request.request_id,
+        invalid_block_ids=(70, 71) if mismatch == "alignment" else (71,),
+        reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+    )
+    assert scheduler._pe_control_failures == {request.request_id: expected_failure}
+
+    first = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
+    second = scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
+    assert first.control_failures == [expected_failure]
+    assert not isinstance(second, DualPathConnectorMetadata)
+
+
+def test_pe_read_local_plan_failure_sends_no_decision(scheduler_factory):
+    scheduler, _, coordinator = scheduler_factory(Path.PE_READ)
+    request = _make_request()
+    _decide(scheduler, request)
+
+    with patch.object(scheduler, "_try_install_forward_plan", side_effect=RuntimeError("local plan failed")):
+        scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
+
+    coordinator.submit.assert_not_called()
+    assert scheduler._pe_delivery_futures == {}
+
+
+def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
+    scheduler, _, _ = scheduler_factory(Path.DE_READ)
+    request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+    binding = ReverseReceiveBinding(
+        request_key=request_key,
+        wire_request_id="wire-request-7",
+        prefill_request_id="prefill-request-7",
+        destination_block_ids=((70, 71, 72, 73),),
+        token_start=16,
+        token_end=32,
+    )
+    failure = DualPathControlFailureMetadata(
+        request_id="prefill-failed",
+        invalid_block_ids=(81,),
+        reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+    )
+    scheduler._pe_pending_reverse_receive_bindings[binding.prefill_request_id] = binding
+    scheduler._pe_control_failures[failure.request_id] = failure
+    parent_metadata = MooncakeLayerwiseConnectorMetadata()
+
+    with patch.object(
+        MooncakeLayerwiseConnectorScheduler,
+        "build_connector_meta",
+        autospec=True,
+        return_value=parent_metadata,
+    ):
+        first = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
+        second = scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
+
+    assert isinstance(first, DualPathConnectorMetadata)
+    assert first.reverse_receive_bindings == [binding]
+    assert first.control_failures == [failure]
+    assert scheduler._pe_pending_reverse_receive_bindings == {}
+    assert scheduler._pe_control_failures == {}
+    assert second is parent_metadata
 
 
 @pytest.mark.parametrize(
