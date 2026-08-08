@@ -50,6 +50,8 @@ def _make_worker() -> DualPathConnectorWorker:
     worker.pd_head_ratio = 1
     worker.enable_kv_quant = False
     worker.enable_c8_quant = False
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), set())
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = set()
     return worker
 
 
@@ -152,6 +154,12 @@ def _register_two_layers(worker: DualPathConnectorWorker) -> dict[str, list[Magi
     return registered
 
 
+def _set_forward_terminal(worker: DualPathConnectorWorker, *, failed: bool = False) -> None:
+    worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set() if failed else {WIRE_REQUEST_ID}
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {WIRE_REQUEST_ID} if failed else set()
+
+
 def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
     worker = _make_worker()
     metadata = _make_split_metadata()
@@ -240,6 +248,115 @@ def test_store_done_marks_phase_without_outer_completion() -> None:
     assert finished == (set(), set())
     assert worker.get_block_ids_with_load_errors() == set()
     assert worker._split_trackers[DECODE_REQUEST_ID] is tracker
+
+
+def test_reverse_done_does_not_complete_decode_before_forward() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    worker.start_load_kv(metadata)
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+    with patch.object(worker, "_submit_reverse"):
+        worker._consume_store_completions({DECODE_REQUEST_ID}, set())
+    tracker.reverse_submitted = True
+
+    with patch.object(layerwise_module.MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+        worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, True)
+    finished = worker.get_finished(set(), metadata)
+
+    assert tracker.store_phase.value == "DONE"
+    assert tracker.reverse_phase.value == "DONE"
+    assert tracker.forward_phase.value == "PENDING"
+    assert finished == (set(), set())
+
+
+def test_decode_publishes_completion_only_when_full_predicate_satisfied() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    worker.start_load_kv(metadata)
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+    with patch.object(worker, "_submit_reverse"):
+        worker._consume_store_completions({DECODE_REQUEST_ID}, set())
+    tracker.reverse_submitted = True
+    with patch.object(layerwise_module.MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+        worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, True)
+    assert worker.get_finished(set(), metadata) == (set(), set())
+
+    _set_forward_terminal(worker)
+    first_finished = worker.get_finished(set(), metadata)
+    second_finished = worker.get_finished(set(), metadata)
+
+    assert tracker.store_phase.value == "DONE"
+    assert tracker.reverse_phase.value == "DONE"
+    assert tracker.forward_phase.value == "DONE"
+    assert tracker.terminal_published is True
+    assert first_finished == (set(), {DECODE_REQUEST_ID})
+    assert second_finished == (set(), set())
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_empty_reverse_creates_no_p2p_task_and_prefill_gate_starts_satisfied() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_store=False)
+    with patch.object(worker, "_enqueue_kv_layer_send") as enqueue:
+        worker.start_load_kv(metadata)
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+
+    _set_forward_terminal(worker)
+    finished = worker.get_finished(set(), metadata)
+
+    enqueue.assert_not_called()
+    assert tracker.reverse_phase.value == "SKIPPED"
+    assert finished == (set(), {DECODE_REQUEST_ID})
+
+
+def test_empty_store_and_reverse_still_waits_for_forward() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_store=False)
+    worker.start_load_kv(metadata)
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+
+    before_forward = worker.get_finished(set(), metadata)
+    _set_forward_terminal(worker)
+    after_forward = worker.get_finished(set(), metadata)
+
+    assert tracker.store_phase.value == "SKIPPED"
+    assert tracker.reverse_phase.value == "SKIPPED"
+    assert before_forward == (set(), set())
+    assert after_forward == (set(), {DECODE_REQUEST_ID})
+
+
+def test_after_reverse_done_prefill_executes_inherited_layerwise_forward() -> None:
+    worker = _make_prefill_worker()
+    reverse_metadata = DualPathConnectorMetadata()
+    binding = _make_reverse_receive_binding()
+    reverse_metadata.reverse_receive_bindings.append(binding)
+    worker.start_load_kv(reverse_metadata)
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
+    assert worker.get_finished(set(), reverse_metadata) == (set(), {binding.prefill_request_id})
+
+    forward_metadata = layerwise_module.MooncakeLayerwiseConnectorMetadata()
+    forward_metadata.add_new_req(
+        binding.prefill_request_id,
+        [[90, 91, 92, 93, 94, 95, 96, 97]],
+        {},
+        prompt_len=128,
+        local_computed_tokens=128,
+        local_transed_tokens=64,
+    )
+    worker.current_layer = 0
+    worker.total_layers = 2
+    worker.index_to_name = {0: ["model.layer.0"], 1: ["model.layer.1"]}
+    events = {
+        "model.layer.0": SimpleNamespace(reshape_cache_event=MagicMock()),
+        "model.layer.1": SimpleNamespace(reshape_cache_event=MagicMock()),
+    }
+
+    with patch.object(worker, "_enqueue_kv_layer_send") as enqueue:
+        worker.save_kv_layer("", [MagicMock(), MagicMock()], events, forward_metadata)
+        worker.save_kv_layer("", [MagicMock(), MagicMock()], events, forward_metadata)
+
+    assert forward_metadata.requests[binding.prefill_request_id].local_transed_tokens == 64
+    assert [call.kwargs["layer_name"] for call in enqueue.call_args_list] == ["model.layer.0", "model.layer.1"]
 
 
 def test_reverse_submission_iterates_registered_layer_order_through_shared_enqueue_helper() -> None:

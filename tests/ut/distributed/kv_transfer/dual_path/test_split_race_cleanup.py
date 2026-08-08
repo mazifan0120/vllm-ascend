@@ -13,8 +13,10 @@ from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     _make_reverse_receive_binding,
     _make_split_metadata,
     _make_worker,
+    _set_forward_terminal,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import DualPathConnectorMetadata
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import Path
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorWorker,
     get_external_request_id,
@@ -151,3 +153,100 @@ def test_identical_duplicate_bindings_are_idempotent_and_conflicts_preserve_firs
     with pytest.raises(RuntimeError, match="conflicting duplicate Reverse receive binding"):
         consumed_forward_worker._install_reverse_receive_binding(binding)
     assert consumed_forward_worker._reverse_receive_bindings == {}
+
+
+def test_failed_wins_over_duplicate_and_late_done_for_every_source() -> None:
+    store_worker = _make_worker()
+    store_metadata = _make_split_metadata()
+    store_worker._kvpool_worker_adapter.get_finished.side_effect = [
+        (set(), {DECODE_REQUEST_ID}),
+        (set(), {DECODE_REQUEST_ID}),
+    ]
+    store_worker._kvpool_worker_adapter.get_block_ids_with_load_errors.side_effect = [{20}, set(), set(), set()]
+    store_worker.start_load_kv(store_metadata)
+    assert store_worker.get_finished(set(), store_metadata) == (set(), {DECODE_REQUEST_ID})
+    assert store_worker.get_finished(set(), store_metadata) == (set(), set())
+
+    reverse_worker = _make_worker()
+    reverse_metadata = _make_split_metadata(include_store=False, include_reverse=True)
+    reverse_worker.start_load_kv(_make_split_metadata(include_store=False))
+    reverse_worker._install_reverse_plan(reverse_metadata.reverse_plans[0])
+    reverse_worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
+    with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+        reverse_worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, False)
+    assert reverse_worker.get_finished(set(), reverse_metadata) == (set(), {DECODE_REQUEST_ID})
+    with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+        reverse_worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, True)
+    assert reverse_worker.get_finished(set(), reverse_metadata) == (set(), set())
+
+    forward_worker = _make_worker()
+    forward_metadata = _make_split_metadata(include_store=False)
+    forward_worker.start_load_kv(forward_metadata)
+    forward_worker.kv_recv_layer_thread = MagicMock()
+    forward_worker.kv_recv_layer_thread.get_and_clear_failed_requests.side_effect = [{WIRE_REQUEST_ID}, set()]
+    forward_worker.kv_recv_layer_thread.get_and_clear_done_requests.side_effect = [set(), {WIRE_REQUEST_ID}]
+    assert forward_worker.get_finished(set(), forward_metadata) == (set(), {DECODE_REQUEST_ID})
+    assert forward_worker.get_finished(set(), forward_metadata) == (set(), set())
+
+    assert store_worker._split_trackers[DECODE_REQUEST_ID].store_phase.value == "FAILED"
+    assert reverse_worker._split_trackers[DECODE_REQUEST_ID].reverse_phase.value == "FAILED"
+    assert forward_worker._split_trackers[DECODE_REQUEST_ID].forward_phase.value == "FAILED"
+
+
+@pytest.mark.parametrize("source", ["store", "reverse", "forward"])
+def test_each_failure_publishes_exactly_one_local_terminal(source: str) -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=source == "reverse")
+    worker.start_load_kv(metadata)
+
+    if source == "store":
+        worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})
+        worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = {20}
+    elif source == "reverse":
+        tracker = worker._split_trackers[DECODE_REQUEST_ID]
+        tracker.reverse_submitted = True
+        with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+            worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, False)
+            worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, False)
+    else:
+        _set_forward_terminal(worker, failed=True)
+
+    first = worker.get_finished(set(), metadata)
+    second = worker.get_finished(set(), metadata)
+
+    assert first == (set(), {DECODE_REQUEST_ID})
+    assert second == (set(), set())
+
+
+@pytest.mark.parametrize("path", [Path.PE_READ, Path.DE_READ])
+def test_forward_early_terminal_reconciliation_passes_for_both_paths(path: Path) -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_store=False)
+    binding = replace(metadata.forward_receive_bindings[0], path=path)
+    metadata.forward_receive_bindings[:] = [binding]
+    worker.kv_recv_layer_thread = MagicMock()
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {WIRE_REQUEST_ID}
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
+    assert worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), set())
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+
+    worker.start_load_kv(metadata)
+    finished = worker.get_finished(set(), metadata)
+
+    assert finished == (set(), {DECODE_REQUEST_ID})
+    assert worker._pending_forward_done == set()
+
+
+def test_pe_read_forward_done_still_completes_immediately() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata()
+    binding = replace(metadata.forward_receive_bindings[0], path=Path.PE_READ)
+    metadata.forward_receive_bindings[:] = [binding]
+    metadata.decode_store_metadata = None
+    worker.start_load_kv(metadata)
+    _set_forward_terminal(worker)
+
+    finished = worker.get_finished(set(), metadata)
+
+    assert finished == (set(), {DECODE_REQUEST_ID})
+    assert worker._split_trackers == {}

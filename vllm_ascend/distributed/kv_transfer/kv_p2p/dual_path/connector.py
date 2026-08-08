@@ -1252,6 +1252,13 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             else:
                 tracker.store_phase = _SplitPhase.DONE
                 self._submit_reverse(request_id)
+                if (
+                    not tracker.terminal_published
+                    and tracker.reverse_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
+                    and tracker.forward_phase is _SplitPhase.DONE
+                ):
+                    tracker.terminal_published = True
+                    published_store_terminals.add(request_id)
         return published_store_terminals
 
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
@@ -1299,6 +1306,48 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             tracker = split_trackers.get(request_id)
             if tracker is not None and tracker.terminal_published:
                 split_trackers.pop(request_id)
+
+        done_sending: set[str] = set()
+        done_recving: set[str] = set()
+        store_metadata = getattr(metadata, "decode_store_metadata", None)
+        if store_metadata is not None:
+            assert self._kvpool_worker_adapter is not None
+            store_done_sending, store_done_recving = self._kvpool_worker_adapter.get_finished(
+                finished_req_ids,
+                store_metadata,
+            )
+            store_invalid_block_ids = self._kvpool_worker_adapter.get_block_ids_with_load_errors()
+            self._invalid_block_ids.update(store_invalid_block_ids)
+            done_sending.update(store_done_sending)
+            done_recving.update(self._consume_store_completions(store_done_recving, store_invalid_block_ids))
+
+        reverse_terminal_lock = getattr(self, "_reverse_terminal_lock", None)
+        if reverse_terminal_lock is None:
+            local_reverse_terminals = {}
+        else:
+            with reverse_terminal_lock:
+                local_reverse_terminals = dict(self._pending_local_reverse_terminals)
+                self._pending_local_reverse_terminals.clear()
+        for request_id, terminal_flag in local_reverse_terminals.items():
+            tracker = split_trackers.get(request_id)
+            if tracker is None or tracker.reverse_phase is not _SplitPhase.PENDING:
+                continue
+            if terminal_flag:
+                tracker.reverse_phase = _SplitPhase.DONE
+                if (
+                    not tracker.terminal_published
+                    and tracker.store_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
+                    and tracker.forward_phase is _SplitPhase.DONE
+                ):
+                    tracker.terminal_published = True
+                    done_recving.add(request_id)
+            else:
+                tracker.reverse_phase = _SplitPhase.FAILED
+                self._invalid_block_ids.update(tracker.forward_destination_slice)
+                if not tracker.terminal_published:
+                    tracker.terminal_published = True
+                    done_recving.add(request_id)
+
         if self.kv_recv_layer_thread is not None:
             raw_done = self.kv_recv_layer_thread.get_and_clear_done_requests()
             raw_failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
@@ -1372,10 +1421,24 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             if binding is None or binding.wire_request_id != wire_request_id:
                 ordinary_failed.add(decode_request_id)
                 continue
-            first_forward_block = binding.token_start // self.block_size[0]
-            last_forward_block = math.ceil(binding.token_end / self.block_size[0])
-            self._invalid_block_ids.update(binding.destination_block_ids[0][first_forward_block:last_forward_block])
-            forward_finished.add(decode_request_id)
+            match binding.path:
+                case Path.PE_READ:
+                    first_forward_block = binding.token_start // self.block_size[0]
+                    last_forward_block = math.ceil(binding.token_end / self.block_size[0])
+                    self._invalid_block_ids.update(
+                        binding.destination_block_ids[0][first_forward_block:last_forward_block]
+                    )
+                    forward_finished.add(decode_request_id)
+                case Path.DE_READ:
+                    tracker = split_trackers[decode_request_id]
+                    if tracker.forward_phase is _SplitPhase.PENDING:
+                        tracker.forward_phase = _SplitPhase.FAILED
+                        self._invalid_block_ids.update(tracker.forward_destination_slice)
+                        if not tracker.terminal_published:
+                            tracker.terminal_published = True
+                            forward_finished.add(decode_request_id)
+                case unreachable:
+                    assert_never(unreachable)
             self._consume_forward_receive_binding(binding)
 
         for wire_request_id in done_wire_ids:
@@ -1387,7 +1450,22 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             if binding is None or binding.wire_request_id != wire_request_id:
                 ordinary_done.add(decode_request_id)
                 continue
-            forward_finished.add(decode_request_id)
+            match binding.path:
+                case Path.PE_READ:
+                    forward_finished.add(decode_request_id)
+                case Path.DE_READ:
+                    tracker = split_trackers[decode_request_id]
+                    if tracker.forward_phase is _SplitPhase.PENDING:
+                        tracker.forward_phase = _SplitPhase.DONE
+                        if (
+                            not tracker.terminal_published
+                            and tracker.store_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
+                            and tracker.reverse_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
+                        ):
+                            tracker.terminal_published = True
+                            forward_finished.add(decode_request_id)
+                case unreachable:
+                    assert_never(unreachable)
             self._consume_forward_receive_binding(binding)
 
         for decode_request_id in ordinary_failed:
@@ -1399,7 +1477,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
         self._pending_forward_done = pending_done
         self._pending_forward_failed = pending_failed
-        done_recving = ordinary_done.union(forward_finished, reverse_finished, self.virtual_request)
+        done_recving.update(ordinary_done.union(forward_finished, reverse_finished, self.virtual_request))
         self.virtual_request = set()
         if done_recving:
             logger.info(
@@ -1409,18 +1487,6 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             )
         done_recving.update(self._control_failed_recving)
         self._control_failed_recving.clear()
-        done_sending: set[str] = set()
-        store_metadata = getattr(metadata, "decode_store_metadata", None)
-        if store_metadata is not None:
-            assert self._kvpool_worker_adapter is not None
-            store_done_sending, store_done_recving = self._kvpool_worker_adapter.get_finished(
-                finished_req_ids,
-                store_metadata,
-            )
-            store_invalid_block_ids = self._kvpool_worker_adapter.get_block_ids_with_load_errors()
-            self._invalid_block_ids.update(store_invalid_block_ids)
-            done_sending.update(store_done_sending)
-            done_recving.update(self._consume_store_completions(store_done_recving, store_invalid_block_ids))
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
