@@ -32,7 +32,7 @@ import math
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, assert_never
 
@@ -116,6 +116,7 @@ class DecodeKVSnapshot:
     external_tokens: int
     store_load_spec: LoadSpec | None
     final_block_ids: tuple[tuple[int, ...], ...]
+    allocated_blocks: KVCacheBlocks = field(compare=False, repr=False)
 
     @property
     def store_tokens(self) -> int:
@@ -653,6 +654,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             external_tokens=num_external_tokens,
             store_load_spec=detached_spec,
             final_block_ids=frozen_block_ids,
+            allocated_blocks=blocks,
         )
         self._decode_kv_snapshots[request_id] = snapshot
 

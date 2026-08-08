@@ -275,27 +275,43 @@ def test_commit_after_alloc_sets_can_load_only_on_the_copy(mock_lookup_client_cl
     assert detached_spec.can_load is False
 
 
-def test_commit_after_alloc_delegates_with_ready_delta_and_final_blocks(mock_lookup_client_cls):
+@pytest.mark.parametrize("kvpool_cached_tokens", [32, 48])
+def test_unified_commit_accepts_full_and_partial_specs(mock_lookup_client_cls, kvpool_cached_tokens):
     # Given
     adapter = _make_commit_adapter()
-    request = _make_request("req-delegate", 49)
+    request = _make_request(f"req-unified-{kvpool_cached_tokens}", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=kvpool_cached_tokens, can_load=False)
+
+    # When
+    adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
+
+    # Then
+    committed_spec = adapter._pool_scheduler.load_specs[request.request_id]
+    assert committed_spec.kvpool_cached_tokens == kvpool_cached_tokens
+
+
+def test_partial_commit_delegates_exact_delta_and_blocks(mock_lookup_client_cls):
+    # Given
+    adapter = _make_commit_adapter()
+    request = _make_request("req-partial-delegate", 49)
     blocks = _make_blocks([[7, 8, 9]])
-    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
 
     # When
     with patch.object(adapter._pool_scheduler, "update_state_after_alloc") as update_state_after_alloc:
         adapter.commit_after_alloc(request, blocks, detached_spec)
 
     # Then
-    update_state_after_alloc.assert_called_once_with(request, blocks, 32)
+    update_state_after_alloc.assert_called_once_with(request, blocks, 16)
 
 
-def test_commit_after_alloc_rejects_duplicate_commit(mock_lookup_client_cls):
+@pytest.mark.parametrize("kvpool_cached_tokens", [32, 48])
+def test_commit_after_alloc_rejects_duplicate_commit(mock_lookup_client_cls, kvpool_cached_tokens):
     # Given
     adapter = _make_commit_adapter()
     request = _make_request("req-duplicate", 49)
-    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
-    existing_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=True)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=kvpool_cached_tokens, can_load=False)
+    existing_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=kvpool_cached_tokens, can_load=True)
     adapter._pool_scheduler.load_specs[request.request_id] = existing_spec
 
     # When
@@ -363,8 +379,6 @@ def test_terminal_metadata_cleanup_releases_commit_ownership(mock_lookup_client_
     [
         ("kv_producer", False, 49, LoadSpec(16, 48, can_load=False)),
         ("kv_consumer", True, 49, LoadSpec(16, 48, can_load=False)),
-        ("kv_consumer", False, 49, LoadSpec(16, 32, can_load=False)),
-        ("kv_consumer", False, 17, LoadSpec(16, 16, can_load=False)),
     ],
 )
 def test_commit_after_alloc_rejects_invalid_preconditions_without_state(
@@ -391,11 +405,19 @@ def test_commit_after_alloc_rejects_invalid_preconditions_without_state(
     assert adapter._pool_scheduler._loading_req_ids == set()
 
 
-def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failure(mock_lookup_client_cls):
+@pytest.mark.parametrize(
+    "detached_spec",
+    [
+        LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False),
+        LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False),
+    ],
+)
+def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failure(
+    mock_lookup_client_cls, detached_spec
+):
     # Given
     adapter = _make_commit_adapter()
     request = _make_request("req-rollback", 49)
-    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
     original_update = adapter._pool_scheduler.update_state_after_alloc
 
     def fail_after_delegated_mutation(request_arg, blocks_arg, ready_delta):
@@ -419,6 +441,35 @@ def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failur
     assert request.request_id not in adapter._pool_scheduler._unfinished_request_ids
     assert request.request_id not in adapter._pool_scheduler._loading_req_ids
     assert detached_spec.can_load is False
+
+
+@pytest.mark.parametrize(
+    "detached_spec",
+    [
+        LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=16, can_load=False),
+        LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=49, can_load=False),
+        LoadSpec(vllm_cached_tokens=-1, kvpool_cached_tokens=32, can_load=False),
+    ],
+)
+def test_commit_rejects_out_of_range_partial_preconditions(mock_lookup_client_cls, detached_spec):
+    # Given
+    adapter = _make_commit_adapter()
+    request = _make_request("req-partial-range", 49)
+
+    # When
+    with (
+        patch.object(adapter._pool_scheduler, "update_state_after_alloc") as update_state_after_alloc,
+        pytest.raises(RuntimeError),
+    ):
+        adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
+
+    # Then
+    pool = adapter._pool_scheduler
+    assert pool.load_specs == {}
+    assert pool._unfinished_requests == {}
+    assert pool._unfinished_request_ids == set()
+    assert pool._loading_req_ids == set()
+    update_state_after_alloc.assert_not_called()
 
 
 def test_build_connector_meta_emits_one_async_load_reqmeta_with_ready_boundary(mock_lookup_client_cls):
@@ -457,6 +508,26 @@ def test_build_connector_meta_emits_one_async_load_reqmeta_with_ready_boundary(m
     assert request_metadata.load_spec.kvpool_cached_tokens == 48
     assert request_metadata.load_spec.can_load is True
     assert metadata.loading_req_ids == {request.request_id}
+
+
+def test_partial_commit_metadata_targets_k_de_only(mock_lookup_client_cls):
+    # Given
+    adapter = _make_commit_adapter()
+    request = _make_request("req-partial-metadata", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
+    adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.preempted_req_ids = set()
+
+    # When
+    metadata = adapter.build_connector_meta(scheduler_output)
+
+    # Then
+    assert len(metadata.requests) == 1
+    request_metadata = metadata.requests[0]
+    assert request_metadata.target_token_len == 32
+    assert request_metadata.load_spec is not None
+    assert request_metadata.load_spec.kvpool_cached_tokens == 32
 
 
 def test_build_connector_meta_filters_unowned_preemption_but_cleans_owned_tracker(mock_lookup_client_cls):

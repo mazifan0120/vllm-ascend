@@ -246,12 +246,14 @@ class TestDecodeAdmission(unittest.TestCase):
 
     def test_snapshot_derives_local_and_store_tokens(self):
         spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
+        allocated_blocks = _make_blocks(((1,),))
         snapshot = DecodeKVSnapshot(
             transfer_tokens=48,
             local_tokens=16,
             external_tokens=32,
             store_load_spec=spec,
             final_block_ids=((1,),),
+            allocated_blocks=allocated_blocks,
         )
         self.assertEqual(snapshot.local_tokens, 16)
         self.assertEqual(snapshot.store_tokens, 32)
@@ -261,8 +263,33 @@ class TestDecodeAdmission(unittest.TestCase):
             external_tokens=32,
             store_load_spec=None,
             final_block_ids=((1,),),
+            allocated_blocks=allocated_blocks,
         )
         self.assertEqual(miss_snapshot.store_tokens, miss_snapshot.local_tokens)
+
+    def test_snapshot_retains_non_comparing_allocation_wrapper(self):
+        first_blocks = _make_blocks(((1,),))
+        second_blocks = _make_blocks(((1,),))
+        first = DecodeKVSnapshot(
+            transfer_tokens=48,
+            local_tokens=16,
+            external_tokens=32,
+            store_load_spec=None,
+            final_block_ids=((1,),),
+            allocated_blocks=first_blocks,
+        )
+        second = DecodeKVSnapshot(
+            transfer_tokens=48,
+            local_tokens=16,
+            external_tokens=32,
+            store_load_spec=None,
+            final_block_ids=((1,),),
+            allocated_blocks=second_blocks,
+        )
+
+        self.assertEqual(first, second)
+        self.assertIs(first.allocated_blocks, first_blocks)
+        self.assertNotIn("allocated_blocks", repr(first))
 
     def test_identical_duplicate_lookup_performs_one_adapter_call(self):
         request = _make_request("req-dup", 48, _selected_params())

@@ -105,19 +105,15 @@ class KVPoolAdapter:
         pool = self._pool_scheduler
         request_id = request.request_id
         ready_tokens = max(request.num_tokens - 1, 0)
-        ready_delta = ready_tokens - load_spec.vllm_cached_tokens
+        store_delta = load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens
 
         if pool.kv_role not in {"kv_consumer", "kv_both"} or pool.use_layerwise:
             raise RuntimeError("DualPath KVPool commit requires a non-layerwise Decode-owned scheduler")
-        if load_spec.kvpool_cached_tokens != ready_tokens:
+        if not 0 <= load_spec.vllm_cached_tokens < load_spec.kvpool_cached_tokens <= ready_tokens:
             raise RuntimeError(
-                f"DualPath KVPool commit ready-token mismatch for request {request_id}: "
-                f"expected {ready_tokens}, detached LoadSpec has {load_spec.kvpool_cached_tokens}"
-            )
-        if ready_delta <= 0:
-            raise RuntimeError(
-                f"DualPath KVPool commit requires a positive ready-token delta for request {request_id}: "
-                f"ready={ready_tokens}, local={load_spec.vllm_cached_tokens}"
+                f"DualPath KVPool commit token range is invalid for request {request_id}: "
+                f"local={load_spec.vllm_cached_tokens}, store={load_spec.kvpool_cached_tokens}, "
+                f"ready={ready_tokens}"
             )
         if (
             request_id in pool.load_specs
@@ -129,7 +125,7 @@ class KVPoolAdapter:
 
         pool.load_specs[request_id] = dataclasses.replace(load_spec)
         try:
-            pool.update_state_after_alloc(request, blocks, ready_delta)
+            pool.update_state_after_alloc(request, blocks, store_delta)
         except Exception:
             pool.load_specs.pop(request_id, None)
             pool._unfinished_requests.pop(request_id, None)
