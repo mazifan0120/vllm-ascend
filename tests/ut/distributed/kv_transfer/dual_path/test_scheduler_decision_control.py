@@ -718,11 +718,14 @@ class TestPrefillDecisionHook:
 
         first = scheduler.get_num_new_matched_tokens(request, 0)
         second = scheduler.get_num_new_matched_tokens(request, 0)
+        _bind_prefill(scheduler, request)
+        _bind_prefill(scheduler, request)
 
         assert first == second == (0, False)
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_delivery_futures == {}
+        task04_seams.prefill_coordinator.submit.assert_called_once()
+        assert list(scheduler._pe_forward_plans) == [request.request_id]
+        assert list(scheduler._pe_delivery_futures) == [scheduler._pe_request_keys[request.request_id]]
 
     def test_conflicting_facts_fail_locally_without_second_policy_invocation(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
@@ -740,11 +743,54 @@ class TestPrefillDecisionHook:
         with patch.object(connector_module.logger, "error") as log_error:
             scheduler.get_num_new_matched_tokens(original, 0)
             result = scheduler.get_num_new_matched_tokens(conflicting, 0)
+            _bind_prefill(scheduler, conflicting)
 
         assert result == (0, False)
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_not_called()
         log_error.assert_called_once()
+        assert scheduler._pe_invalid_request_ids == {original.request_id}
+        assert scheduler._pe_forward_plans == {}
+        assert scheduler._pe_pending_reverse_receive_bindings == {}
+        assert scheduler._reqs_need_send_layerwise == {}
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+        assert scheduler._path_decider is not None
+        assert scheduler._path_decider._decision_records[request_key].request.decode_store_tokens == 24
+
+    def test_conflicting_frozen_prefill_prefix_fails_locally_before_allocation_activation(
+        self,
+        scheduler_factory,
+        task04_seams,
+    ):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-prefix-conflict", _remote_decode_params())
+
+        with (
+            patch.object(
+                connector_module.MooncakeLayerwiseConnectorScheduler,
+                "get_num_new_matched_tokens",
+                autospec=True,
+                return_value=(0, False),
+            ),
+            patch.object(connector_module.logger, "error") as log_error,
+        ):
+            scheduler.get_num_new_matched_tokens(request, 0)
+            result = scheduler.get_num_new_matched_tokens(request, 16)
+            _bind_prefill(scheduler, request)
+
+        assert result == (0, False)
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+        log_error.assert_called_once()
+        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        assert scheduler._pe_forward_plans == {}
+        assert scheduler._pe_pending_reverse_receive_bindings == {}
+        assert scheduler._reqs_need_send_layerwise == {}
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+        assert scheduler._path_decider is not None
+        assert scheduler._path_decider._decision_records[request_key].prefill_local_tokens == 0
 
     def test_malformed_nested_metadata_marks_invalid_and_sends_nothing(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")

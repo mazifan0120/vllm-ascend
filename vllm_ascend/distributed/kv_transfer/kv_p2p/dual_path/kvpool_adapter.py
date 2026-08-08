@@ -117,6 +117,7 @@ class KVPoolAdapter:
             )
         if (
             request_id in pool.load_specs
+            or request_id in pool._request_trackers
             or request_id in pool._unfinished_requests
             or request_id in pool._unfinished_request_ids
             or request_id in pool._loading_req_ids
@@ -128,6 +129,7 @@ class KVPoolAdapter:
             pool.update_state_after_alloc(request, blocks, store_delta)
         except Exception:
             pool.load_specs.pop(request_id, None)
+            pool._request_trackers.pop(request_id, None)
             pool._unfinished_requests.pop(request_id, None)
             pool._unfinished_request_ids.discard(request_id)
             pool._loading_req_ids.discard(request_id)

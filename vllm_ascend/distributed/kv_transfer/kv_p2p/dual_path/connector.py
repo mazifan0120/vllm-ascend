@@ -365,12 +365,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 request_id,
                 error,
             )
+            self._pe_invalid_request_ids.add(request_id)
             return parent_result
 
         retained_result = self._pe_path_results.get(request_id)
         if retained_result is None:
             self._pe_path_results[request_id] = result
         elif retained_result != result:
+            self._pe_invalid_request_ids.add(request_id)
             raise RuntimeError(
                 f"DualPath Prefill request {request_id} got a conflicting retained path result; "
                 "the original result is preserved"
@@ -706,6 +708,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         params = request.kv_transfer_params
         if self.dual_path_cfg.role == "prefill" and params is not None and "dual_path" in params:
             request_id = request.request_id
+            if request_id in self._pe_invalid_request_ids:
+                return
             result = self._pe_path_results.get(request_id)
             if result is None:
                 return

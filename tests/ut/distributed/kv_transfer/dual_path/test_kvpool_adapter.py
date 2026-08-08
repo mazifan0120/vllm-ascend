@@ -347,6 +347,23 @@ def test_commit_after_alloc_rejects_duplicate_after_metadata_consumes_load_spec(
         adapter.commit_after_alloc(request, blocks, detached_spec)
 
 
+def test_commit_after_alloc_rejects_request_tracker_owned_duplicate(mock_lookup_client_cls):
+    adapter = _make_commit_adapter()
+    request = _make_request("req-tracker-duplicate", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    existing_tracker = MagicMock(name="existing_tracker")
+    adapter._pool_scheduler._request_trackers[request.request_id] = existing_tracker
+
+    with (
+        patch.object(adapter._pool_scheduler, "update_state_after_alloc") as update_state_after_alloc,
+        pytest.raises(RuntimeError, match="already committed"),
+    ):
+        adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
+
+    assert adapter._pool_scheduler._request_trackers[request.request_id] is existing_tracker
+    update_state_after_alloc.assert_not_called()
+
+
 def test_terminal_metadata_cleanup_releases_commit_ownership(mock_lookup_client_cls):
     # Given
     adapter = _make_commit_adapter()
@@ -422,6 +439,7 @@ def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failur
 
     def fail_after_delegated_mutation(request_arg, blocks_arg, ready_delta):
         original_update(request_arg, blocks_arg, ready_delta)
+        adapter._pool_scheduler._request_trackers[request.request_id] = MagicMock(name="created_tracker")
         raise RuntimeError("delegated failure")
 
     # When
@@ -437,6 +455,7 @@ def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failur
 
     # Then
     assert request.request_id not in adapter._pool_scheduler.load_specs
+    assert request.request_id not in adapter._pool_scheduler._request_trackers
     assert request.request_id not in adapter._pool_scheduler._unfinished_requests
     assert request.request_id not in adapter._pool_scheduler._unfinished_request_ids
     assert request.request_id not in adapter._pool_scheduler._loading_req_ids
