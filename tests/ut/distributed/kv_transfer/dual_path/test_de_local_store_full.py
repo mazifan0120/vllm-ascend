@@ -33,7 +33,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     Path,
     PathDecisionResult,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import DecodeControlEndpoint
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DUAL_PATH_PROTOCOL_VERSION,
+    DecodeControlEndpoint,
+    PathDecision,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
     MooncakeLayerwiseConnectorScheduler,
@@ -154,7 +158,7 @@ def decode_scheduler():
         scheduler.executor.shutdown(wait=False)
         scheduler.metaserver_client.close()
         scheduler.executor = MagicMock(name="executor")
-        scheduler._path_decision_coordinator.take_received_results.return_value = []
+        scheduler._path_decision_coordinator.take_received_decisions.return_value = []
         scheduler._kvpool_adapter.build_connector_meta.return_value = _make_store_metadata()
         yield scheduler
         scheduler.shutdown()
@@ -825,9 +829,15 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
         order.append("parent")
         return MooncakeLayerwiseConnectorMetadata()
 
-    def take_results() -> list[PathDecisionResult]:
+    def take_decisions() -> list[PathDecision]:
         order.append("results")
-        return [result]
+        return [
+            PathDecision(
+                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+                result=result,
+                reverse_plan=None,
+            )
+        ]
 
     def build_binding(**kwargs) -> ForwardReceiveBinding:
         order.append("bindings")
@@ -841,7 +851,7 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
         order.append("store")
         return store_metadata
 
-    decode_scheduler._path_decision_coordinator.take_received_results.side_effect = take_results
+    decode_scheduler._path_decision_coordinator.take_received_decisions.side_effect = take_decisions
     decode_scheduler._kvpool_adapter.build_connector_meta.side_effect = build_store
     with (
         patch.object(

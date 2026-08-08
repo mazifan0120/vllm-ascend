@@ -11,28 +11,30 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionResult,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
+    PathDecision,
     PathDecisionCoordinator,
 )
 
 
-class _MidDrainInjectingQueue(queue.SimpleQueue[PathDecisionResult]):
+class _MidDrainInjectingQueue(queue.SimpleQueue[PathDecision]):
     def __init__(
         self,
         registry_lock: threading.Lock,
-        initial_result: PathDecisionResult,
-        late_result: PathDecisionResult,
+        initial_decision: PathDecision,
+        late_decision: PathDecision,
     ) -> None:
         super().__init__()
         self._registry_lock = registry_lock
-        self._late_result = late_result
+        self._late_decision = late_decision
         self._injection_started = False
         self._producer_started = threading.Event()
         self._producer_finished = threading.Event()
         self._producer_thread: threading.Thread | None = None
-        self.put(initial_result)
+        self.put(initial_decision)
 
-    def get_nowait(self) -> PathDecisionResult:
+    def get_nowait(self) -> PathDecision:
         try:
             return super().get_nowait()
         except queue.Empty:
@@ -40,7 +42,7 @@ class _MidDrainInjectingQueue(queue.SimpleQueue[PathDecisionResult]):
                 raise
             self._injection_started = True
             drain_holds_registry_lock = self._registry_lock.locked()
-            self._producer_thread = threading.Thread(target=self._enqueue_late_result)
+            self._producer_thread = threading.Thread(target=self._enqueue_late_decision)
             self._producer_thread.start()
             assert self._producer_started.wait(timeout=5)
             if drain_holds_registry_lock:
@@ -54,36 +56,44 @@ class _MidDrainInjectingQueue(queue.SimpleQueue[PathDecisionResult]):
         self._producer_thread.join(timeout=5)
         assert not self._producer_thread.is_alive()
 
-    def _enqueue_late_result(self) -> None:
+    def _enqueue_late_decision(self) -> None:
         self._producer_started.set()
         with self._registry_lock:
-            self.put(self._late_result)
+            self.put(self._late_decision)
         self._producer_finished.set()
 
 
-def test_take_received_results_defers_result_enqueued_during_drain() -> None:
+def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None:
     # Given
     coordinator = PathDecisionCoordinator()
     coordinator._role = "decode"
-    initial_result = PathDecisionResult(
-        request_key=DualPathRequestKey("decode-engine:0:boot", "request-initial"),
-        path=Path.PE_READ,
+    initial_decision = PathDecision(
+        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+        result=PathDecisionResult(
+            request_key=DualPathRequestKey("decode-engine:0:boot", "request-initial"),
+            path=Path.PE_READ,
+        ),
+        reverse_plan=None,
     )
-    late_result = PathDecisionResult(
-        request_key=DualPathRequestKey("decode-engine:0:boot", "request-late"),
-        path=Path.DE_READ,
+    late_decision = PathDecision(
+        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+        result=PathDecisionResult(
+            request_key=DualPathRequestKey("decode-engine:0:boot", "request-late"),
+            path=Path.DE_READ,
+        ),
+        reverse_plan=None,
     )
-    injecting_queue = _MidDrainInjectingQueue(coordinator._registry_lock, initial_result, late_result)
-    coordinator._received_results = injecting_queue
+    injecting_queue = _MidDrainInjectingQueue(coordinator._registry_lock, initial_decision, late_decision)
+    coordinator._received_decisions = injecting_queue
 
     # When
-    first_batch = coordinator.take_received_results()
+    first_batch = coordinator.take_received_decisions()
     injecting_queue.wait_for_injection()
-    second_batch = coordinator.take_received_results()
+    second_batch = coordinator.take_received_decisions()
 
     # Then
-    assert first_batch == [initial_result]
-    assert second_batch == [late_result]
+    assert first_batch == [initial_decision]
+    assert second_batch == [late_decision]
 
 
 class _BlockingRecvSocket:

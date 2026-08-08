@@ -10,20 +10,22 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Final, Protocol, TypeAlias
+from typing import Final, Protocol, TypeAlias, assert_never
 
 import msgspec
 import zmq
 from vllm.logger import logger
 
+from .metadata import ReversePlan
 from .path_decision import (
     DualPathRequestKey,
+    Path,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
 )
 
-DUAL_PATH_PROTOCOL_VERSION: Final[int] = 1
+DUAL_PATH_PROTOCOL_VERSION: Final[int] = 2
 PATH_DECISION_SEND_WORKERS: Final[int] = 32
 
 _MAX_DELIVERY_ATTEMPTS: Final[int] = 3
@@ -126,24 +128,30 @@ class DualPathDecisionMetadata:
 class PathDecision:
     protocol_version: int
     result: PathDecisionResult
+    reverse_plan: ReversePlan | None
 
     def __post_init__(self) -> None:
         _require_protocol_version(self.protocol_version)
         if not isinstance(self.result, PathDecisionResult):
             raise PathDecisionValidationError("result must be a PathDecisionResult")
+        if self.reverse_plan is not None and not isinstance(self.reverse_plan, ReversePlan):
+            raise PathDecisionValidationError("reverse_plan must be a ReversePlan or None")
 
     def to_dict(self) -> _JsonObject:
         return {
             "protocol_version": self.protocol_version,
             "result": self.result.to_dict(),
+            "reverse_plan": None if self.reverse_plan is None else self.reverse_plan.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: _JsonValue) -> PathDecision:
-        data = _require_exact_payload(payload, frozenset({"protocol_version", "result"}))
+        data = _require_exact_payload(payload, frozenset({"protocol_version", "result", "reverse_plan"}))
+        reverse_plan_payload = data["reverse_plan"]
         return cls(
             protocol_version=_require_protocol_version(data["protocol_version"]),
             result=PathDecisionResult.from_dict(data["result"]),
+            reverse_plan=None if reverse_plan_payload is None else ReversePlan.from_dict(reverse_plan_payload),
         )
 
 
@@ -257,8 +265,8 @@ class PathDecisionCoordinator:
         self._decode_engine_instance_id: str | None = None
         self._decode_control_endpoint: DecodeControlEndpoint | None = None
         self._pending_keys: set[DualPathRequestKey] = set()
-        self._accepted_results: dict[DualPathRequestKey, PathDecisionResult] = {}
-        self._received_results: queue.SimpleQueue[PathDecisionResult] = queue.SimpleQueue()
+        self._accepted_decisions: dict[DualPathRequestKey, PathDecision] = {}
+        self._received_decisions: queue.SimpleQueue[PathDecision] = queue.SimpleQueue()
         self._registry_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._context: zmq.Context | None = None
@@ -351,19 +359,19 @@ class PathDecisionCoordinator:
         self._require_role("decode")
         with self._registry_lock:
             self._pending_keys.discard(key)
-            self._accepted_results.pop(key, None)
+            self._accepted_decisions.pop(key, None)
 
-    def take_received_results(self) -> list[PathDecisionResult]:
+    def take_received_decisions(self) -> list[PathDecision]:
         self._require_role("decode")
         if self._closed:
             return []
-        results: list[PathDecisionResult] = []
+        decisions: list[PathDecision] = []
         with self._registry_lock:
             while True:
                 try:
-                    results.append(self._received_results.get_nowait())
+                    decisions.append(self._received_decisions.get_nowait())
                 except queue.Empty:
-                    return results
+                    return decisions
 
     def submit(
         self,
@@ -401,8 +409,8 @@ class PathDecisionCoordinator:
             self._receiver_thread.join()
             with self._registry_lock:
                 self._pending_keys.clear()
-                self._accepted_results.clear()
-            self._drain_received_results()
+                self._accepted_decisions.clear()
+            self._drain_received_decisions()
         elif self._role == "prefill":
             assert self._executor is not None
             self._executor.shutdown(wait=True, cancel_futures=True)
@@ -461,24 +469,38 @@ class PathDecisionCoordinator:
         if key.decode_engine_instance_id != self.decode_engine_instance_id:
             logger.warning("path decision result receiver rejected wrong-incarnation key")
             return
+        match result.path:
+            case Path.PE_READ:
+                if decision.reverse_plan is not None:
+                    logger.warning("path decision result receiver rejected PE_READ Reverse plan")
+                    return
+            case Path.DE_READ:
+                if decision.reverse_plan is None:
+                    logger.warning("path decision result receiver rejected DE_READ without Reverse plan")
+                    return
+                if decision.reverse_plan.request_key != key:
+                    logger.warning("path decision result receiver rejected mismatched Reverse plan key")
+                    return
+            case unreachable:
+                assert_never(unreachable)
         with self._registry_lock:
             if key not in self._pending_keys:
                 logger.warning("path decision result receiver rejected unknown or stale key")
                 return
-            retained = self._accepted_results.get(key)
+            retained = self._accepted_decisions.get(key)
             if retained is not None:
-                if retained != result:
+                if retained != decision:
                     logger.warning("path decision result receiver rejected conflicting duplicate")
                     return
             else:
-                self._accepted_results[key] = result
-                self._received_results.put(result)
+                self._accepted_decisions[key] = decision
+                self._received_decisions.put(decision)
 
         socket.send_multipart([identity, b"", _ACK])
 
-    def _drain_received_results(self) -> None:
+    def _drain_received_decisions(self) -> None:
         while True:
             try:
-                self._received_results.get_nowait()
+                self._received_decisions.get_nowait()
             except queue.Empty:
                 return

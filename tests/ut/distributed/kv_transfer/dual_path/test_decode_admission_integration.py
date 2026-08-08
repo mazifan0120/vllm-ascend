@@ -652,7 +652,7 @@ class TestDecisionTimeoutIntegration:
         scheduler = _make_scheduler(_make_vllm_config())
         dual = _dual_scheduler(scheduler)
         coordinator = dual._path_decision_coordinator
-        coordinator.take_received_results.return_value = []
+        coordinator.take_received_decisions.return_value = []
         block_pool = scheduler.kv_cache_manager.block_pool
         baseline_free_blocks = block_pool.free_block_queue.num_free_blocks
 

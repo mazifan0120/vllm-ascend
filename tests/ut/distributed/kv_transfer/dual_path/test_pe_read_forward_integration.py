@@ -34,7 +34,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionRequest,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
+    PathDecision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     LayerMetadata,
@@ -269,13 +271,18 @@ def _build_lifecycle(
     pe_scheduler.update_state_after_alloc(pe_request, full_blocks, 0)
     assert pe_scheduler._pe_forward_plans == {pe_request.request_id: forward_plan}
 
-    decode_scheduler._path_decision_coordinator.take_received_results.return_value = [pe_result]
+    pe_decision = PathDecision(
+        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+        result=pe_result,
+        reverse_plan=None,
+    )
+    decode_scheduler._path_decision_coordinator.take_received_decisions.return_value = [pe_decision]
     binding_output = scheduler.schedule()
     metadata = binding_output.kv_connector_metadata
     assert isinstance(metadata, DualPathConnectorMetadata)
     assert len(metadata.forward_receive_bindings) == 1
     binding = metadata.forward_receive_bindings[0]
-    decode_scheduler._path_decision_coordinator.take_received_results.return_value = [pe_result]
+    decode_scheduler._path_decision_coordinator.take_received_decisions.return_value = [pe_decision]
     duplicate_output = SchedulerOutput.make_empty()
     duplicate_output.preempted_req_ids = set()
     duplicate_metadata = decode_scheduler.build_connector_meta(duplicate_output)

@@ -22,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
+    PathDecision,
     PathDecisionDeliveryError,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -179,6 +180,14 @@ def _result(request_id: str = "request-local-7") -> PathDecisionResult:
     return PathDecisionResult(
         request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, request_id),
         path=Path.DE_READ,
+    )
+
+
+def _decision(result: PathDecisionResult | None = None) -> PathDecision:
+    return PathDecision(
+        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+        result=result or _result(),
+        reverse_plan=None,
     )
 
 
@@ -843,7 +852,7 @@ class TestDecodeResultConsumption:
         request, _ = _admit(decode_scheduler)
         request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
         result = _result()
-        task04_seams.decode_coordinator.take_received_results.return_value = [result]
+        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision(result)]
 
         # When
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
@@ -863,8 +872,8 @@ class TestDecodeResultConsumption:
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         events = []
-        task04_seams.decode_coordinator.take_received_results.side_effect = lambda: (
-            events.append("result") or [_result()]
+        task04_seams.decode_coordinator.take_received_decisions.side_effect = lambda: (
+            events.append("result") or [_decision()]
         )
         clock = MagicMock(name="time")
         clock.monotonic.side_effect = lambda: events.append("clock") or state.deadline + 1
@@ -887,7 +896,7 @@ class TestDecodeResultConsumption:
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_results.return_value = []
+        task04_seams.decode_coordinator.take_received_decisions.return_value = []
 
         # When
         with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
@@ -910,7 +919,7 @@ class TestDecodeResultConsumption:
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_results.return_value = []
+        task04_seams.decode_coordinator.take_received_decisions.return_value = []
 
         # When
         with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
@@ -926,10 +935,10 @@ class TestDecodeResultConsumption:
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_results.return_value = []
+        task04_seams.decode_coordinator.take_received_decisions.return_value = []
         with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
             decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
-        task04_seams.decode_coordinator.take_received_results.return_value = [_result()]
+        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
 
         # When
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_result_scheduler_output"))
@@ -1032,7 +1041,7 @@ class TestCleanupAndShutdown:
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_results.return_value = [_result()]
+        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
         decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
         assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
         task04_seams.decode_coordinator.unregister.assert_not_called()
@@ -1050,7 +1059,7 @@ class TestCleanupAndShutdown:
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_results.return_value = []
+        task04_seams.decode_coordinator.take_received_decisions.return_value = []
         with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
             decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
         assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
@@ -1150,7 +1159,7 @@ class TestCleanupAndShutdown:
         decode_scheduler = scheduler_factory(role="decode")
         decode_request, _ = _admit(decode_scheduler)
         decode_state = decode_scheduler._decode_decision_states[decode_request.request_id]
-        task04_seams.decode_coordinator.take_received_results.return_value = []
+        task04_seams.decode_coordinator.take_received_decisions.return_value = []
 
         delivery_error = PathDecisionDeliveryError("delivery exhausted")
         delivery_future: Future[None] = Future()
@@ -1251,13 +1260,15 @@ class TestCleanupAndShutdown:
         prefill_scheduler.get_num_new_matched_tokens(inflight_prefill_request, 0)
         prefill_scheduler.request_finished(committed_prefill_request, [4, 5])
 
-        task04_seams.decode_coordinator.take_received_results.return_value = [_result(committed_request.request_id)]
+        task04_seams.decode_coordinator.take_received_decisions.return_value = [
+            _decision(_result(committed_request.request_id))
+        ]
         with patch.object(connector_module.time, "monotonic", return_value=0.0):
             decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
 
         # When
         decode_scheduler.request_finished(cancelled_request, [61, 62, 63, 64])
-        task04_seams.decode_coordinator.take_received_results.return_value = []
+        task04_seams.decode_coordinator.take_received_decisions.return_value = []
         with patch.object(connector_module.time, "monotonic", return_value=timed_out_state.deadline):
             timeout_metadata = decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
 

@@ -17,7 +17,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionResult,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
+    PathDecision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     get_external_request_id,
@@ -30,6 +32,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 _CONNECTOR_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector"
 _DECODE_INSTANCE_ID = "decode-engine:2:boot-7"
 _CONTROL_ENDPOINT = DecodeControlEndpoint(host="192.0.2.44", port=24001)
+
+
+def _decision(result: PathDecisionResult) -> PathDecision:
+    return PathDecision(
+        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+        result=result,
+        reverse_plan=None,
+    )
 
 
 def _make_vllm_config() -> MagicMock:
@@ -75,7 +85,7 @@ def scheduler_factory(monkeypatch):
             coordinator = MagicMock(name="decode_coordinator")
             coordinator.decode_engine_instance_id = _DECODE_INSTANCE_ID
             coordinator.decode_control_endpoint = _CONTROL_ENDPOINT
-            coordinator.take_received_results.return_value = []
+            coordinator.take_received_decisions.return_value = []
             coordinator_cls.for_decode.return_value = coordinator
 
             scheduler = connector_module.DualPathConnectorScheduler(
@@ -185,7 +195,7 @@ def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_t
     scheduler, coordinator = scheduler_factory()
     request, snapshot, state = _admit_request(scheduler)
     result = PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
-    coordinator.take_received_results.return_value = [result]
+    coordinator.take_received_decisions.return_value = [_decision(result)]
     advertised_destination = tuple(
         tuple(group) for group in scheduler.executor.submit.call_args.kwargs["message"]["remote_block_ids"]
     )
@@ -220,8 +230,8 @@ def test_binding_destination_table_includes_hybrid_trimming(scheduler_factory):
     # Given
     scheduler, coordinator = scheduler_factory(need_truncate=True)
     _, snapshot, state = _admit_request(scheduler)
-    coordinator.take_received_results.return_value = [
-        PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
+    coordinator.take_received_decisions.return_value = [
+        _decision(PathDecisionResult(request_key=state.request_key, path=Path.PE_READ))
     ]
     advertised_destination = tuple(
         tuple(group) for group in scheduler.executor.submit.call_args.kwargs["message"]["remote_block_ids"]
@@ -243,7 +253,7 @@ def test_hybrid_timeout_uses_literal_frozen_table_suffix_without_changing_messag
     request, snapshot, state = _admit_request(scheduler)
     assert snapshot.final_block_ids == ((41, 42, 43, 44),)
     assert scheduler.executor.submit.call_args.kwargs["message"]["remote_block_ids"] == ([41, 42, 43],)
-    coordinator.take_received_results.return_value = []
+    coordinator.take_received_decisions.return_value = []
 
     # When
     with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
@@ -264,9 +274,9 @@ def test_duplicate_pe_read_result_does_not_emit_second_binding(scheduler_factory
     scheduler, coordinator = scheduler_factory()
     _, _, state = _admit_request(scheduler)
     result = PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
-    coordinator.take_received_results.return_value = [result]
+    coordinator.take_received_decisions.return_value = [_decision(result)]
     first_metadata = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
-    coordinator.take_received_results.return_value = [result]
+    coordinator.take_received_decisions.return_value = [_decision(result)]
 
     # When
     second_metadata = scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
@@ -282,7 +292,7 @@ def test_committed_de_read_result_emits_no_binding(scheduler_factory):
     scheduler, coordinator = scheduler_factory()
     _, _, state = _admit_request(scheduler)
     result = PathDecisionResult(request_key=state.request_key, path=Path.DE_READ)
-    coordinator.take_received_results.return_value = [result]
+    coordinator.take_received_decisions.return_value = [_decision(result)]
 
     # When
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
@@ -298,8 +308,8 @@ def test_pe_read_never_calls_decode_kvpool_or_store_commit_surfaces(scheduler_fa
     scheduler, coordinator = scheduler_factory()
     request, _, state = _admit_request(scheduler)
     scheduler._kvpool_adapter.reset_mock()
-    coordinator.take_received_results.return_value = [
-        PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
+    coordinator.take_received_decisions.return_value = [
+        _decision(PathDecisionResult(request_key=state.request_key, path=Path.PE_READ))
     ]
     worker = _make_worker()
 

@@ -157,6 +157,47 @@ def test_reverse_plan_deep_freezes_tables_and_peer_facts() -> None:
         plan.remote_port = 5001
 
 
+def test_reverse_plan_wire_round_trip() -> None:
+    payload = {
+        "request_key": {
+            "decode_engine_instance_id": "decode-engine-1",
+            "decode_request_id": "decode-request-1",
+        },
+        "wire_request_id": "wire-request-1",
+        "token_start": 16,
+        "token_end": 64,
+        "source_block_ids": [[10, 11, 12, 13]],
+        "destination_block_ids": [[20, 21, 22, 23]],
+        "remote_engine_id": "prefill-engine-1",
+        "remote_host": "192.0.2.10",
+        "remote_port": 5000,
+        "remote_block_sizes": [16],
+        "remote_tp_size": 2,
+        "remote_pcp_size": 1,
+        "remote_dcp_size": 1,
+    }
+    expected = _valid_reverse_plan_input().build()
+
+    reconstructed = metadata_module.ReversePlan.from_dict(payload)
+
+    assert expected.to_dict() == payload
+    assert reconstructed == expected
+    payload["source_block_ids"][0].append(99)
+    payload["destination_block_ids"][0][0] = -1
+    payload["remote_block_sizes"][0] = 32
+    assert reconstructed == expected
+
+    invalid_payloads = (
+        {key: value for key, value in expected.to_dict().items() if key != "remote_host"},
+        {**expected.to_dict(), "unexpected": None},
+        {**expected.to_dict(), "token_start": 64},
+        {**expected.to_dict(), "remote_block_sizes": [0]},
+    )
+    for invalid_payload in invalid_payloads:
+        with pytest.raises(PathDecisionValidationError):
+            metadata_module.ReversePlan.from_dict(invalid_payload)
+
+
 def test_reverse_receive_binding_deep_freezes_destination_ownership() -> None:
     destination = [[20, 21, 22, 23]]
     binding = _make_reverse_binding(destination)

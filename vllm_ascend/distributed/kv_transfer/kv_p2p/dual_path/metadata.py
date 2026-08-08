@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TypeAlias
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -16,10 +17,20 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 BlockTable = tuple[tuple[int, ...], ...]
+_JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | dict[str, "_JsonValue"]
+_JsonObject: TypeAlias = dict[str, _JsonValue]
 
 
 def _freeze_block_table(blocks: BlockTable) -> BlockTable:
     return tuple(tuple(group) for group in blocks)
+
+
+def _require_exact_payload(payload: _JsonValue, expected_keys: frozenset[str]) -> _JsonObject:
+    if not isinstance(payload, dict):
+        raise PathDecisionValidationError("serialized payload must be a dictionary")
+    if set(payload) != expected_keys:
+        raise PathDecisionValidationError(f"serialized payload fields must be exactly {sorted(expected_keys)}")
+    return payload
 
 
 def _validate_token_range(token_start: int, token_end: int) -> None:
@@ -168,6 +179,64 @@ class ReversePlan:
         object.__setattr__(self, "source_block_ids", source_block_ids)
         object.__setattr__(self, "destination_block_ids", destination_block_ids)
         object.__setattr__(self, "remote_block_sizes", remote_block_sizes)
+
+    def to_dict(self) -> _JsonObject:
+        return {
+            "request_key": self.request_key.to_dict(),
+            "wire_request_id": self.wire_request_id,
+            "token_start": self.token_start,
+            "token_end": self.token_end,
+            "source_block_ids": [list(group) for group in self.source_block_ids],
+            "destination_block_ids": [list(group) for group in self.destination_block_ids],
+            "remote_engine_id": self.remote_engine_id,
+            "remote_host": self.remote_host,
+            "remote_port": self.remote_port,
+            "remote_block_sizes": list(self.remote_block_sizes),
+            "remote_tp_size": self.remote_tp_size,
+            "remote_pcp_size": self.remote_pcp_size,
+            "remote_dcp_size": self.remote_dcp_size,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: _JsonValue) -> "ReversePlan":
+        data = _require_exact_payload(
+            payload,
+            frozenset(
+                {
+                    "request_key",
+                    "wire_request_id",
+                    "token_start",
+                    "token_end",
+                    "source_block_ids",
+                    "destination_block_ids",
+                    "remote_engine_id",
+                    "remote_host",
+                    "remote_port",
+                    "remote_block_sizes",
+                    "remote_tp_size",
+                    "remote_pcp_size",
+                    "remote_dcp_size",
+                }
+            ),
+        )
+        try:
+            return cls(
+                request_key=DualPathRequestKey.from_dict(data["request_key"]),
+                wire_request_id=data["wire_request_id"],
+                token_start=data["token_start"],
+                token_end=data["token_end"],
+                source_block_ids=_freeze_block_table(data["source_block_ids"]),
+                destination_block_ids=_freeze_block_table(data["destination_block_ids"]),
+                remote_engine_id=data["remote_engine_id"],
+                remote_host=data["remote_host"],
+                remote_port=data["remote_port"],
+                remote_block_sizes=tuple(data["remote_block_sizes"]),
+                remote_tp_size=data["remote_tp_size"],
+                remote_pcp_size=data["remote_pcp_size"],
+                remote_dcp_size=data["remote_dcp_size"],
+            )
+        except TypeError as error:
+            raise PathDecisionValidationError("serialized ReversePlan fields have invalid types") from error
 
 
 @dataclass(frozen=True)

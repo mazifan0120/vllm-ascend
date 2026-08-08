@@ -12,6 +12,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     Path,
     PathDecisionRequest,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DUAL_PATH_PROTOCOL_VERSION,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorScheduler,
     MooncakeLayerwiseConnectorWorker,
@@ -104,7 +107,7 @@ def scheduler_factory():
 
 def _decision_payload(*, target_tokens: int, local_tokens: int, store_tokens: int) -> dict:
     return {
-        "protocol_version": 1,
+        "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
         "decision_request": {
             "request_key": {
                 "decode_engine_instance_id": _DECODE_INSTANCE_ID,

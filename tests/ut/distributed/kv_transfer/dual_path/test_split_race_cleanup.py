@@ -27,6 +27,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as co
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorScheduler
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import DualPathConnectorMetadata
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import Path, PathDecisionResult
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DUAL_PATH_PROTOCOL_VERSION,
+    PathDecision,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorWorker,
     get_external_request_id,
@@ -519,8 +523,12 @@ def test_production_de_read_result_creates_no_plan_tracker_or_worker_operation(m
     try:
         scheduler, coordinator = scheduler_factory()
         _, _, state = _admit_request(scheduler)
-        coordinator.take_received_results.return_value = [
-            PathDecisionResult(request_key=state.request_key, path=Path.DE_READ)
+        coordinator.take_received_decisions.return_value = [
+            PathDecision(
+                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+                result=PathDecisionResult(request_key=state.request_key, path=Path.DE_READ),
+                reverse_plan=None,
+            )
         ]
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
         worker = _make_worker()

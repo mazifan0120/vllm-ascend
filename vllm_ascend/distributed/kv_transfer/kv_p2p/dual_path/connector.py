@@ -376,6 +376,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             decision = PathDecision(
                 protocol_version=DUAL_PATH_PROTOCOL_VERSION,
                 result=result,
+                reverse_plan=None,
             )
             delivery_future = self._path_decision_coordinator.submit(
                 metadata.decode_control_endpoint,
@@ -761,7 +762,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         metadata.send_task = parent_metadata.send_task
         coordinator = self._path_decision_coordinator
 
-        for result in coordinator.take_received_results():
+        for decision in coordinator.take_received_decisions():
+            result = decision.result
             request_key = result.request_key
             if request_key.decode_engine_instance_id != coordinator.decode_engine_instance_id:
                 continue
