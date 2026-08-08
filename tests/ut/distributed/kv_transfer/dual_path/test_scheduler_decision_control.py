@@ -538,11 +538,14 @@ class TestPrefillDecisionHook:
         assert len(request.prompt_token_ids) == 48
 
     def test_parent_accounting_runs_exactly_once_for_valid_dual_path(self, scheduler_factory):
-        scheduler = scheduler_factory(role="prefill")
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-valid", _remote_decode_params())
 
         self._assert_parent_accounting_once(scheduler, request, (32, True))
 
+        policy.choose.assert_called_once()
         assert scheduler._pe_prefill_local_tokens == {request.request_id: 0}
 
     def test_prefill_local_tokens_validate_against_effective_target_before_decide(
