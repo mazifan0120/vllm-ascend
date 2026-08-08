@@ -1695,3 +1695,56 @@ class TestDualPathRegistration(unittest.TestCase):
     def test_registered_module_path_resolves_to_dual_path_connector(self):
         module = importlib.import_module(self.MODULE_PATH)
         self.assertIs(module.DualPathConnector, DualPathConnector)
+
+
+class TestParentRuntimeStartExtraction(unittest.TestCase):
+    """Task-07 section 6: parent register_kv_caches delegates thread
+    construction to idempotent protected starters; ordinary roles remain
+    one-directional."""
+
+    def _make_parent_worker(self, role, kv_role):
+        config = MockVllmConfig(role, kv_role)
+        config.parallel_config.tensor_parallel_size = 1
+        return MooncakeLayerwiseConnectorWorker(config, MockKVCacheConfig(), "test_engine")
+
+    def test_ordinary_producer_registration_starts_only_send_runtime(self):
+        with worker_environment() as runtime:
+            worker = self._make_parent_worker("prefill", "kv_producer")
+            self.assertTrue(callable(getattr(worker, "_ensure_send_layer_runtime", None)))
+            self.assertTrue(callable(getattr(worker, "_ensure_receive_layer_runtime", None)))
+            worker.register_kv_caches(make_kv_caches())
+            self.assertIsNotNone(worker.kv_send_layer_thread)
+            self.assertIsNone(worker.kv_recv_layer_thread)
+            self.assertEqual(runtime.send_factory.call_count, 1)
+            self.assertEqual(runtime.recv_factory.call_count, 0)
+            self.assertEqual(worker.kv_send_layer_thread.start.call_count, 1)
+
+    def test_ordinary_consumer_registration_starts_only_receive_runtime(self):
+        with worker_environment() as runtime:
+            worker = self._make_parent_worker("decode", "kv_consumer")
+            self.assertTrue(callable(getattr(worker, "_ensure_send_layer_runtime", None)))
+            self.assertTrue(callable(getattr(worker, "_ensure_receive_layer_runtime", None)))
+            worker.register_kv_caches(make_kv_caches())
+            self.assertIsNone(worker.kv_send_layer_thread)
+            self.assertIsNotNone(worker.kv_recv_layer_thread)
+            self.assertEqual(runtime.send_factory.call_count, 0)
+            self.assertEqual(runtime.recv_factory.call_count, 1)
+            self.assertEqual(worker.kv_recv_layer_thread.start.call_count, 1)
+
+    def test_repeated_ensure_runtime_calls_create_no_duplicate_thread_port_engine_or_buffer(self):
+        with worker_environment() as runtime:
+            worker = self._make_parent_worker("prefill", "kv_producer")
+            worker.register_kv_caches(make_kv_caches())
+            engine_calls = runtime.get_transfer_engine.call_count
+            buffer_calls = runtime.register_buffer.call_count
+            for _ in range(2):
+                worker._ensure_send_layer_runtime()
+                worker._ensure_receive_layer_runtime()
+            self.assertEqual(runtime.send_factory.call_count, 1)
+            self.assertEqual(runtime.recv_factory.call_count, 1)
+            self.assertIs(worker.kv_send_layer_thread, runtime.send_threads[0])
+            self.assertIs(worker.kv_recv_layer_thread, runtime.recv_threads[0])
+            self.assertEqual(worker.kv_send_layer_thread.start.call_count, 1)
+            self.assertEqual(worker.kv_recv_layer_thread.start.call_count, 1)
+            self.assertEqual(runtime.get_transfer_engine.call_count, engine_calls)
+            self.assertEqual(runtime.register_buffer.call_count, buffer_calls)

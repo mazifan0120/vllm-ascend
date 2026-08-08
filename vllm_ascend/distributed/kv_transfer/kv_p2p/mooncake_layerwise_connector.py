@@ -1352,50 +1352,73 @@ class MooncakeLayerwiseConnectorWorker:
             self.total_layers = len(self.layer_metadata.keys())
 
         # After KV Caches registered, start the sending or receiving thread.
+        if self.vllm_config.kv_transfer_config.is_kv_producer:
+            self._ensure_send_layer_runtime()
+
+        if self.vllm_config.kv_transfer_config.is_kv_consumer:
+            self._ensure_receive_layer_runtime()
+
+    def _ensure_send_layer_runtime(self) -> None:
+        """Idempotently construct and start the layer-sending thread.
+
+        Uses the already-created TransferEngine, layer metadata, registered
+        buffers, ports, topology, reshard buffers, and callbacks. Never
+        registers buffers or changes the external producer/consumer
+        configuration.
+        """
+        if self.kv_send_layer_thread is not None:
+            return
+        ready_event = threading.Event()
+        self.kv_send_layer_thread = KVCacheSendingLayerThread(
+            engine=self.engine,
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            kv_cache_specs=self.kv_cache_specs,
+            attn_resharding_group_idx=self.attn_resharding_group_idx,
+            total_layers=self.total_layers,
+            ready_event=ready_event,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            pd_head_ratio=self.pd_head_ratio,
+            num_head_replica=self.num_head_replica,
+            layer_metadata=self.layer_metadata,
+            use_mla=self.use_mla,
+            use_attn_mamba_hybrid=self.use_attn_mamba_hybrid,
+            k_buffer=self.k_buffer,
+            v_buffer=self.v_buffer,
+            enable_kv_quant=self.enable_kv_quant,
+            enable_c8_quant=self.enable_c8_quant,
+            resharding_stream=self.resharding_stream,
+            callback_func=self.send_done_send_signal,
+        )
+        self.kv_send_layer_thread.start()
+        ready_event.wait()
+
+    def _ensure_receive_layer_runtime(self) -> None:
+        """Idempotently construct and start the layer-receiving thread.
+
+        Uses the already-created TransferEngine, layer metadata, registered
+        buffers, ports, and topology. Never registers buffers or changes the
+        external producer/consumer configuration.
+        """
+        if self.kv_recv_layer_thread is not None:
+            return
         metadata = MooncakeAgentMetadata(
             te_rpc_port=self.te_rpc_port,
             layer_metadata=self.layer_metadata,
         )
-        if self.vllm_config.kv_transfer_config.is_kv_producer:
-            ready_event = threading.Event()
-            self.kv_send_layer_thread = KVCacheSendingLayerThread(
-                engine=self.engine,
-                vllm_config=self.vllm_config,
-                kv_cache_config=self.kv_cache_config,
-                kv_cache_specs=self.kv_cache_specs,
-                attn_resharding_group_idx=self.attn_resharding_group_idx,
-                total_layers=self.total_layers,
-                ready_event=ready_event,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
-                pd_head_ratio=self.pd_head_ratio,
-                num_head_replica=self.num_head_replica,
-                layer_metadata=self.layer_metadata,
-                use_mla=self.use_mla,
-                use_attn_mamba_hybrid=self.use_attn_mamba_hybrid,
-                k_buffer=self.k_buffer,
-                v_buffer=self.v_buffer,
-                enable_kv_quant=self.enable_kv_quant,
-                enable_c8_quant=self.enable_c8_quant,
-                resharding_stream=self.resharding_stream,
-                callback_func=self.send_done_send_signal,
-            )
-            self.kv_send_layer_thread.start()
-            ready_event.wait()
-
-        if self.vllm_config.kv_transfer_config.is_kv_consumer:
-            ready_event = threading.Event()
-            self.kv_recv_layer_thread = KVCacheRecvingLayerThread(
-                self.tp_rank,
-                self.side_channel_port,
-                self.tp_size,
-                self.pd_head_ratio,
-                self.engine_id,
-                metadata,
-                ready_event,
-            )
-            self.kv_recv_layer_thread.start()
-            ready_event.wait()
+        ready_event = threading.Event()
+        self.kv_recv_layer_thread = KVCacheRecvingLayerThread(
+            self.tp_rank,
+            self.side_channel_port,
+            self.tp_size,
+            self.pd_head_ratio,
+            self.engine_id,
+            metadata,
+            ready_event,
+        )
+        self.kv_recv_layer_thread.start()
+        ready_event.wait()
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_recving = (
