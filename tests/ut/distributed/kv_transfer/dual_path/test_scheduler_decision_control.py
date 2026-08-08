@@ -284,6 +284,23 @@ def _make_prefill_request(request_id: str, params: dict) -> SimpleNamespace:
     )
 
 
+def _bind_prefill(scheduler, request: SimpleNamespace) -> MagicMock:
+    decision_request = request.kv_transfer_params["dual_path"]["decision_request"]
+    request.kv_transfer_params.update(
+        {
+            "remote_block_ids": [[4, 5, 6, 7]],
+            "remote_cached_tokens": decision_request["decode_local_tokens"],
+            "remote_tp_size": 1,
+            "remote_pcp_size": 1,
+            "remote_dcp_size": 1,
+        }
+    )
+    blocks = MagicMock(name=f"{request.request_id}_blocks")
+    blocks.get_block_ids.return_value = ([10, 11, 12, 13],)
+    scheduler.update_state_after_alloc(request, blocks, 0)
+    return blocks
+
+
 class TestDecisionTimeoutEnv:
     def test_default_is_60_seconds(self, monkeypatch, scheduler_factory):
         monkeypatch.delenv(_TIMEOUT_ENV, raising=False)
@@ -504,7 +521,7 @@ class TestDecodeAdmissionControl:
 
 class TestPrefillDecisionHook:
     @staticmethod
-    def _assert_parent_accounting_once(scheduler, request) -> None:
+    def _assert_parent_accounting_once(scheduler, request, expected_result=(0, False)) -> None:
         scheduler.need_truncate = True
         parent_method = connector_module.MooncakeLayerwiseConnectorScheduler.get_num_new_matched_tokens
         with patch.object(
@@ -515,7 +532,7 @@ class TestPrefillDecisionHook:
         ) as parent_spy:
             result = scheduler.get_num_new_matched_tokens(request, 0)
 
-        assert result == (0, False)
+        assert result == expected_result
         parent_spy.assert_called_once_with(scheduler, request, 0)
         assert request.kv_transfer_params["_p_side_truncated"] is True
         assert len(request.prompt_token_ids) == 48
@@ -524,7 +541,7 @@ class TestPrefillDecisionHook:
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request("prefill-valid", _remote_decode_params())
 
-        self._assert_parent_accounting_once(scheduler, request)
+        self._assert_parent_accounting_once(scheduler, request, (32, True))
 
         assert scheduler._pe_prefill_local_tokens == {request.request_id: 0}
 
@@ -570,8 +587,8 @@ class TestPrefillDecisionHook:
 
         assert result == (0, False)
         policy.choose.assert_not_called()
-        submitted = task04_seams.prefill_coordinator.submit.call_args.args[1]
-        assert submitted.result.path is Path.PE_READ
+        assert scheduler._pe_path_results[request.request_id].path is Path.PE_READ
+        task04_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._pe_prefill_local_tokens == {request.request_id: 32}
 
     def test_parent_accounting_runs_exactly_once_for_malformed_dual_path(self, scheduler_factory):
@@ -666,14 +683,13 @@ class TestPrefillDecisionHook:
 
         results = [scheduler.get_num_new_matched_tokens(request, 0) for request in requests]
 
-        assert results == [(0, False), (0, False)]
+        assert results == [(0, False), (32, True)]
         assert policy.choose.call_count == 2
-        assert [
-            submitted.args[1].result.path for submitted in task04_seams.prefill_coordinator.submit.call_args_list
-        ] == [
+        assert [scheduler._pe_path_results[request.request_id].path for request in requests] == [
             Path.PE_READ,
             Path.DE_READ,
         ]
+        task04_seams.prefill_coordinator.submit.assert_not_called()
 
     def test_identical_replay_neither_advances_policy_nor_submits_second_future(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
@@ -686,9 +702,8 @@ class TestPrefillDecisionHook:
 
         assert first == second == (0, False)
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
-        expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
-        assert scheduler._pe_delivery_futures[expected_key] is task04_seams.prefill_delivery_future
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+        assert scheduler._pe_delivery_futures == {}
 
     def test_conflicting_facts_fail_locally_without_second_policy_invocation(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
@@ -709,7 +724,7 @@ class TestPrefillDecisionHook:
 
         assert result == (0, False)
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
         log_error.assert_called_once()
 
     def test_malformed_nested_metadata_marks_invalid_and_sends_nothing(self, scheduler_factory, task04_seams):
@@ -1098,6 +1113,7 @@ class TestCleanupAndShutdown:
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-inflight", _remote_decode_params())
         scheduler.get_num_new_matched_tokens(request, 0)
+        _bind_prefill(scheduler, request)
         request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
         assert scheduler._path_decider is not None
 
@@ -1179,6 +1195,7 @@ class TestCleanupAndShutdown:
         with patch.object(connector_module.logger, "error") as log_error:
             prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
             prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
+            _bind_prefill(prefill_scheduler, prefill_request)
         with patch.object(connector_module.time, "monotonic", return_value=decode_state.deadline):
             metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
@@ -1258,6 +1275,8 @@ class TestCleanupAndShutdown:
         )
         prefill_scheduler.get_num_new_matched_tokens(committed_prefill_request, 0)
         prefill_scheduler.get_num_new_matched_tokens(inflight_prefill_request, 0)
+        _bind_prefill(prefill_scheduler, committed_prefill_request)
+        _bind_prefill(prefill_scheduler, inflight_prefill_request)
         prefill_scheduler.request_finished(committed_prefill_request, [4, 5])
 
         task04_seams.decode_coordinator.take_received_decisions.return_value = [
@@ -1346,6 +1365,7 @@ class TestCleanupAndShutdown:
         prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
         prefill_request = _make_prefill_request("prefill-shutdown", _remote_decode_params())
         prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
+        _bind_prefill(prefill_scheduler, prefill_request)
         invalid_request = _make_prefill_request(
             "prefill-invalid-shutdown",
             _remote_decode_params(dual_path={"malformed": True}),

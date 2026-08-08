@@ -212,21 +212,86 @@ def parent_forward_metadata_pair(scheduler_factory):
         parent_scheduler.metaserver_client.close()
 
 
-def test_pe_read_result_retained_once_and_single_plan_after_alloc_covers_T(scheduler_factory):
-    scheduler, policy, coordinator = scheduler_factory()
+@pytest.mark.parametrize(
+    ("local_tokens", "path", "expected_policy_calls"),
+    [
+        pytest.param(16, Path.DE_READ, 0, id="forced"),
+        pytest.param(0, Path.PE_READ, 1, id="policy"),
+    ],
+)
+def test_pe_read_returns_zero_false_for_forced_and_policy_paths(
+    scheduler_factory,
+    local_tokens,
+    path,
+    expected_policy_calls,
+):
+    scheduler, policy, coordinator = scheduler_factory(path)
+    request = _make_request()
+
+    result = scheduler.get_num_new_matched_tokens(request, local_tokens)
+
+    assert result == (0, False)
+    assert scheduler._pe_path_results[request.request_id].path is Path.PE_READ
+    assert policy.calls == expected_policy_calls
+    coordinator.submit.assert_not_called()
+
+
+def test_de_read_returns_exact_reverse_budget_and_wins_first_positive(scheduler_factory):
+    scheduler, policy, _ = scheduler_factory(Path.DE_READ)
+    dual_path = connector_module.DualPathConnector.__new__(connector_module.DualPathConnector)
+    dual_path.connector_scheduler = scheduler
+    store = MagicMock(name="ascend_store")
+    store.has_preempted_request = None
+    store.get_num_new_matched_tokens.return_value = (25, True)
+    multi = AscendMultiConnector.__new__(AscendMultiConnector)
+    multi._connectors = [dual_path, store]
+    multi._requests_to_connector = {}
+    request = _make_request(store_tokens=24)
+    request.num_computed_tokens = 8
+
+    result = multi.get_num_new_matched_tokens(request, 8)
+
+    assert result == (16, True)
+    assert policy.calls == 1
+    assert multi._requests_to_connector[request.request_id] == 0
+    store.get_num_new_matched_tokens.assert_called_once_with(request, 8)
+
+
+def test_no_sender_future_after_lookup_alone(scheduler_factory):
+    scheduler, _, coordinator = scheduler_factory()
     request = _make_request()
 
     _decide(scheduler, request)
+
+    assert scheduler._pe_delivery_futures == {}
+    coordinator.submit.assert_not_called()
+
+
+def test_successful_allocation_installs_before_creating_one_future(scheduler_factory):
+    scheduler, policy, coordinator = scheduler_factory()
+    request = _make_request()
+    blocks = _blocks(([10, 11, 12],))
+
+    def submit_after_install(_endpoint, _decision):
+        assert request.request_id in scheduler._pe_forward_plans
+        assert request.request_id in scheduler._reqs_need_send_layerwise
+        return _completed_future()
+
+    coordinator.submit.side_effect = submit_after_install
+
     _decide(scheduler, request)
-    scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
+    _decide(scheduler, request)
+    scheduler.update_state_after_alloc(request, blocks, 0)
+    scheduler.update_state_after_alloc(request, blocks, 0)
 
     assert list(scheduler._pe_path_results) == [request.request_id]
     assert list(scheduler._pe_forward_plans) == [request.request_id]
     assert policy.calls == 1
     coordinator.submit.assert_called_once()
+    assert list(scheduler._pe_delivery_futures) == [scheduler._pe_request_keys[request.request_id]]
 
 
-def test_plan_freezes_complete_tables_and_logical_range_ordinary_T_equals_P(scheduler_factory):
+def test_pe_read_freezes_forward_range_with_final_tables(scheduler_factory):
     scheduler, _, _ = scheduler_factory()
     destination = [[20, 21, 22]]
     source = [10, 11, 12]
@@ -244,7 +309,7 @@ def test_plan_freezes_complete_tables_and_logical_range_ordinary_T_equals_P(sche
     assert plan.destination_block_ids == ((20, 21, 22),)
 
 
-def test_plan_hybrid_truncates_once_T_equals_R_and_replay_never_double_truncates(scheduler_factory):
+def test_hybrid_transfer_target_applied_exactly_once(scheduler_factory):
     scheduler, policy, _ = scheduler_factory(need_truncate=True)
     request = _make_request(target_tokens=32, prompt_tokens=33)
 
@@ -322,7 +387,7 @@ def test_post_install_validation_failure_preserves_first_plan_and_send_state(sch
     assert request.request_id not in scheduler._pe_path_results
 
 
-def test_multi_connector_order_dual_path_decides_first_and_still_receives_real_blocks(scheduler_factory):
+def test_pe_ascendstore_may_win_after_pe_read_forward_still_installs(scheduler_factory):
     scheduler, policy, _ = scheduler_factory()
     dual_path = connector_module.DualPathConnector.__new__(connector_module.DualPathConnector)
     dual_path.connector_scheduler = scheduler
@@ -342,6 +407,34 @@ def test_multi_connector_order_dual_path_decides_first_and_still_receives_real_b
     assert multi._requests_to_connector[request.request_id] == 1
     assert scheduler._pe_forward_plans[request.request_id].source_block_ids == ((10, 11, 12),)
     store.update_state_after_alloc.assert_called_once_with(request, blocks, 17)
+
+
+def test_all_zero_sibling_still_installs_forward(scheduler_factory):
+    scheduler, policy, _ = scheduler_factory()
+    dual_path = connector_module.DualPathConnector.__new__(connector_module.DualPathConnector)
+    dual_path.connector_scheduler = scheduler
+    store = MagicMock(name="ascend_store")
+    store.has_preempted_request = None
+    store.get_num_new_matched_tokens.return_value = (0, False)
+    multi = AscendMultiConnector.__new__(AscendMultiConnector)
+    multi._connectors = [dual_path, store]
+    multi._requests_to_connector = {}
+    request = _make_request()
+    blocks = _blocks(([10, 11, 12],))
+
+    assert multi.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert request.request_id not in multi._requests_to_connector
+    multi.update_state_after_alloc(request, blocks, 0)
+
+    assert policy.calls == 1
+    assert scheduler._pe_forward_plans[request.request_id].source_block_ids == ((10, 11, 12),)
+    store.update_state_after_alloc.assert_called_once()
+
+
+def test_no_multiconnector_change_guard():
+    source = inspect.getsource(AscendMultiConnector)
+
+    assert "dual_path" not in source.lower()
 
 
 @pytest.mark.parametrize(
@@ -378,6 +471,20 @@ def test_scheduler_defers_plan_while_source_table_short_of_T(scheduler_factory):
     assert policy.calls == 0
 
 
+def test_allocation_retry_before_bind_sends_nothing_and_does_not_redecide(scheduler_factory):
+    scheduler, policy, coordinator = scheduler_factory()
+    request = _make_request()
+
+    _decide(scheduler, request)
+    scheduler.update_state_after_alloc(request, _blocks(([10, 11],)), 0)
+    _decide(scheduler, request)
+
+    assert policy.calls == 1
+    assert scheduler._pe_forward_plans == {}
+    assert scheduler._pe_delivery_futures == {}
+    coordinator.submit.assert_not_called()
+
+
 def test_lookup_or_install_alone_invokes_no_worker_p2p(scheduler_factory):
     scheduler, _, _ = scheduler_factory()
     request = _make_request()
@@ -394,7 +501,7 @@ def test_de_read_result_creates_no_plan_no_send_queue_no_error(scheduler_factory
     request = _make_request()
     blocks = _blocks(([10, 11, 12],))
 
-    _decide(scheduler, request)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
     scheduler.update_state_after_alloc(request, blocks, 0)
 
     assert scheduler._pe_path_results[request.request_id].path is Path.DE_READ

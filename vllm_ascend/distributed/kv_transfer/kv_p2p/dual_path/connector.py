@@ -372,31 +372,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 "the original result is preserved"
             )
 
-        if request_key not in self._pe_delivery_futures:
-            decision = PathDecision(
-                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-                result=result,
-                reverse_plan=None,
-            )
-            delivery_future = self._path_decision_coordinator.submit(
-                metadata.decode_control_endpoint,
-                decision,
-            )
-            self._pe_delivery_futures[request_key] = delivery_future
-
-            def log_delivery_failure(completed_future: Future[None]) -> None:
-                if completed_future.cancelled():
-                    return
-                error = completed_future.exception()
-                if error is not None:
-                    logger.error(
-                        "DualPath Prefill decision delivery failed for request %s: %s",
-                        request_id,
-                        error,
-                    )
-
-            delivery_future.add_done_callback(log_delivery_failure)
-        return parent_result
+        match result.path:
+            case Path.PE_READ:
+                return 0, False
+            case Path.DE_READ:
+                reverse_tokens = decision_request.decode_store_tokens - self._pe_prefill_local_tokens[request_id]
+                assert reverse_tokens > 0
+                return reverse_tokens, True
+            case unreachable:
+                assert_never(unreachable)
 
     def _try_install_forward_plan(self, request: Request, blocks: KVCacheBlocks) -> None:
         request_id = request.request_id
@@ -594,6 +578,45 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         params = request.kv_transfer_params
         if self.dual_path_cfg.role == "prefill" and params is not None and "dual_path" in params:
             self._try_install_forward_plan(request, blocks)
+            request_id = request.request_id
+            result = self._pe_path_results.get(request_id)
+            if result is None or request_id not in self._pe_forward_plans:
+                return
+            match result.path:
+                case Path.DE_READ:
+                    return
+                case Path.PE_READ:
+                    pass
+                case unreachable:
+                    assert_never(unreachable)
+
+            request_key = result.request_key
+            if request_key in self._pe_delivery_futures:
+                return
+            metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
+            decision = PathDecision(
+                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+                result=result,
+                reverse_plan=None,
+            )
+            delivery_future = self._path_decision_coordinator.submit(
+                metadata.decode_control_endpoint,
+                decision,
+            )
+            self._pe_delivery_futures[request_key] = delivery_future
+
+            def log_delivery_failure(completed_future: Future[None]) -> None:
+                if completed_future.cancelled():
+                    return
+                error = completed_future.exception()
+                if error is not None:
+                    logger.error(
+                        "DualPath Prefill decision delivery failed for request %s: %s",
+                        request_id,
+                        error,
+                    )
+
+            delivery_future.add_done_callback(log_delivery_failure)
             return
 
         if not self._is_task01_decode_request(request):
