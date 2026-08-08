@@ -23,8 +23,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import KVPoolWorkerAdapter
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
-    DecisionTimeoutMetadata,
     DualPathConnectorMetadata,
+    DualPathControlFailureMetadata,
+    DualPathControlFailureReason,
     ForwardReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
@@ -430,7 +431,13 @@ def test_start_load_kv_runs_store_adapter_once_between_control_and_parent() -> N
     metadata = DualPathConnectorMetadata()
     binding = MagicMock(name="forward_binding")
     metadata.forward_receive_bindings.append(binding)
-    metadata.decision_timeouts.append(DecisionTimeoutMetadata("timed-out-request", (91, 92)))
+    metadata.control_failures.append(
+        DualPathControlFailureMetadata(
+            "timed-out-request",
+            (91, 92),
+            DualPathControlFailureReason.DECISION_TIMEOUT,
+        )
+    )
     store_metadata = _make_store_metadata()
     store_metadata.loading_req_ids.add("store-request")
     metadata.decode_store_metadata = store_metadata
@@ -696,7 +703,13 @@ def test_parent_timeout_forward_and_store_completions_stay_isolated() -> None:
     )
     metadata = DualPathConnectorMetadata()
     metadata.forward_receive_bindings.append(binding)
-    metadata.decision_timeouts.append(DecisionTimeoutMetadata(timeout_request_id, (401, 402)))
+    metadata.control_failures.append(
+        DualPathControlFailureMetadata(
+            timeout_request_id,
+            (401, 402),
+            DualPathControlFailureReason.DECISION_TIMEOUT,
+        )
+    )
     store_metadata = _make_store_metadata()
     store_metadata.loading_req_ids.add(store_request_id)
     metadata.decode_store_metadata = store_metadata

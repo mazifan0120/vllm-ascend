@@ -51,8 +51,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import 
     KVPoolWorkerAdapter,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (  # noqa: E402
-    DecisionTimeoutMetadata,
     DualPathConnectorMetadata,
+    DualPathControlFailureMetadata,
+    DualPathControlFailureReason,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
     DecodeControlEndpoint,
@@ -688,10 +689,11 @@ class TestDecisionTimeoutIntegration:
             metadata = timeout_scheduler_output.kv_connector_metadata
             assert isinstance(metadata, DualPathConnectorMetadata)
             assert metadata.requests == {}
-            assert metadata.decision_timeouts == [
-                DecisionTimeoutMetadata(
+            assert metadata.control_failures == [
+                DualPathControlFailureMetadata(
                     request_id=request.request_id,
-                    external_block_ids=external_block_ids,
+                    invalid_block_ids=external_block_ids,
+                    reason=DualPathControlFailureReason.DECISION_TIMEOUT,
                 )
             ]
 

@@ -785,7 +785,7 @@ class TestDecodeResultConsumption:
         state = decode_scheduler._decode_decision_states[request.request_id]
         assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
         assert state.result is result
-        assert metadata.decision_timeouts == []
+        assert metadata.control_failures == []
         assert request.request_id not in metadata.requests
         assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
         assert decode_scheduler._reqs_need_recv == {}
@@ -809,7 +809,7 @@ class TestDecodeResultConsumption:
         # Then
         assert events == ["result", "clock"]
         assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
-        assert metadata.decision_timeouts == []
+        assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_not_called()
 
     def test_timeout_emits_one_aligned_suffix_record_and_unregisters_once(
@@ -830,10 +830,11 @@ class TestDecodeResultConsumption:
         assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
         assert state.timeout_reported is True
         assert metadata.requests == {}
-        assert metadata.decision_timeouts == [
-            connector_module.DecisionTimeoutMetadata(
+        assert metadata.control_failures == [
+            connector_module.DualPathControlFailureMetadata(
                 request_id=request.request_id,
-                external_block_ids=(42, 43, 44),
+                invalid_block_ids=(42, 43, 44),
+                reason=connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
             )
         ]
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
@@ -850,8 +851,8 @@ class TestDecodeResultConsumption:
             second_metadata = decode_scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
 
         # Then
-        assert len(first_metadata.decision_timeouts) == 1
-        assert second_metadata.decision_timeouts == []
+        assert len(first_metadata.control_failures) == 1
+        assert second_metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
     def test_late_result_after_timeout_is_stale(self, decode_scheduler, task04_seams):
@@ -869,7 +870,7 @@ class TestDecodeResultConsumption:
         # Then
         assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
         assert state.result is None
-        assert metadata.decision_timeouts == []
+        assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
 
@@ -878,7 +879,13 @@ class TestWorkerFailureRelay:
         # Given
         worker = _control_only_worker()
         metadata = connector_module.DualPathConnectorMetadata()
-        metadata.decision_timeouts.append(connector_module.DecisionTimeoutMetadata("request-local-7", (42, 43, 44)))
+        metadata.control_failures.append(
+            connector_module.DualPathControlFailureMetadata(
+                "request-local-7",
+                (42, 43, 44),
+                connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
+            )
+        )
         assert metadata.requests == {}
 
         # When
@@ -895,7 +902,13 @@ class TestWorkerFailureRelay:
         # Given
         worker = _control_only_worker()
         metadata = connector_module.DualPathConnectorMetadata()
-        metadata.decision_timeouts.append(connector_module.DecisionTimeoutMetadata("request-local-7", (42, 43, 44)))
+        metadata.control_failures.append(
+            connector_module.DualPathControlFailureMetadata(
+                "request-local-7",
+                (42, 43, 44),
+                connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
+            )
+        )
         worker.start_load_kv(metadata)
 
         # When
@@ -1100,10 +1113,11 @@ class TestCleanupAndShutdown:
         decode_scheduler.executor.submit.assert_called_once()
         assert decode_state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
         assert decode_state.result is None
-        assert metadata.decision_timeouts == [
-            connector_module.DecisionTimeoutMetadata(
+        assert metadata.control_failures == [
+            connector_module.DualPathControlFailureMetadata(
                 request_id=decode_request.request_id,
-                external_block_ids=(42, 43, 44),
+                invalid_block_ids=(42, 43, 44),
+                reason=connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
             )
         ]
 
@@ -1194,10 +1208,11 @@ class TestCleanupAndShutdown:
         assert committed_state.proxy_future is committed_proxy_future
         assert timed_out_state.proxy_future is timed_out_proxy_future
         assert cancelled_state.proxy_future is None
-        assert timeout_metadata.decision_timeouts == [
-            connector_module.DecisionTimeoutMetadata(
+        assert timeout_metadata.control_failures == [
+            connector_module.DualPathControlFailureMetadata(
                 request_id=timed_out_request.request_id,
-                external_block_ids=(52, 53, 54),
+                invalid_block_ids=(52, 53, 54),
+                reason=connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
             )
         ]
         assert task04_seams.decode_coordinator.register_pending.call_args_list == [

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
+from enum import Enum
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -193,21 +194,32 @@ class ReverseReceiveBinding:
         object.__setattr__(self, "destination_block_ids", destination_block_ids)
 
 
+class DualPathControlFailureReason(str, Enum):
+    DECISION_TIMEOUT = "DECISION_TIMEOUT"
+    ACTIVATION_FAILED = "ACTIVATION_FAILED"
+
+
 @dataclass(frozen=True)
-class DecisionTimeoutMetadata:
+class DualPathControlFailureMetadata:
     request_id: str
-    external_block_ids: tuple[int, ...]
+    invalid_block_ids: tuple[int, ...]
+    reason: DualPathControlFailureReason
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, DualPathControlFailureReason):
+            raise PathDecisionValidationError("reason must be a DualPathControlFailureReason")
+        object.__setattr__(self, "invalid_block_ids", tuple(self.invalid_block_ids))
 
 
 class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):
-    decision_timeouts: list[DecisionTimeoutMetadata]
+    control_failures: list[DualPathControlFailureMetadata]
     forward_receive_bindings: list[ForwardReceiveBinding]
     reverse_plans: list[ReversePlan]
     reverse_receive_bindings: list[ReverseReceiveBinding]
 
     def __init__(self) -> None:
         super().__init__()
-        self.decision_timeouts = []
+        self.control_failures = []
         self.forward_receive_bindings = []
         self.reverse_plans = []
         self.reverse_receive_bindings = []

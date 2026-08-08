@@ -53,8 +53,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import 
     KVPoolWorkerAdapter,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
-    DecisionTimeoutMetadata,
     DualPathConnectorMetadata,
+    DualPathControlFailureMetadata,
+    DualPathControlFailureReason,
     ForwardPlan,
     ForwardReceiveBinding,
     ReversePlan,
@@ -802,12 +803,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             block_size = self.block_size[0]
             assert snapshot.local_tokens % block_size == 0
             first_external_block = snapshot.local_tokens // block_size
-            external_block_ids = snapshot.final_block_ids[0][first_external_block:]
-            assert external_block_ids
-            metadata.decision_timeouts.append(
-                DecisionTimeoutMetadata(
+            invalid_block_ids = snapshot.final_block_ids[0][first_external_block:]
+            assert invalid_block_ids
+            metadata.control_failures.append(
+                DualPathControlFailureMetadata(
                     request_id=request_id,
-                    external_block_ids=external_block_ids,
+                    invalid_block_ids=invalid_block_ids,
+                    reason=DualPathControlFailureReason.DECISION_TIMEOUT,
                 )
             )
             state.timeout_reported = True
@@ -1310,9 +1312,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         for plan in getattr(metadata, "reverse_plans", ()):
             if self.dual_path_cfg.role == "decode":
                 self._install_reverse_plan(plan)
-        for timeout in getattr(metadata, "decision_timeouts", ()):
-            self._control_failed_recving.add(timeout.request_id)
-            self._invalid_block_ids.update(timeout.external_block_ids)
+        for failure in getattr(metadata, "control_failures", ()):
+            self._control_failed_recving.add(failure.request_id)
+            self._invalid_block_ids.update(failure.invalid_block_ids)
         split_store_accepted = getattr(self, "_accepting_task07", True) or not any(
             binding.path is Path.DE_READ for binding in getattr(metadata, "forward_receive_bindings", ())
         )

@@ -212,7 +212,7 @@ def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_t
     ]
     assert request.request_id not in metadata.requests
     assert scheduler._reqs_need_recv == receive_queue_before == {}
-    assert metadata.decision_timeouts == []
+    assert metadata.control_failures == []
     assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
 
 
@@ -250,10 +250,11 @@ def test_hybrid_timeout_uses_literal_frozen_table_suffix_without_changing_messag
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     # Then
-    assert metadata.decision_timeouts == [
-        connector_module.DecisionTimeoutMetadata(
+    assert metadata.control_failures == [
+        connector_module.DualPathControlFailureMetadata(
             request_id=request.request_id,
-            external_block_ids=(42, 43, 44),
+            invalid_block_ids=(42, 43, 44),
+            reason=connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
         )
     ]
 

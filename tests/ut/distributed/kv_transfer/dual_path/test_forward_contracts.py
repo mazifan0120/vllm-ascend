@@ -8,6 +8,8 @@ import pytest
 import vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata as metadata_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
+    DualPathControlFailureMetadata,
+    DualPathControlFailureReason,
     ForwardPlan,
     ForwardReceiveBinding,
 )
@@ -177,7 +179,33 @@ def test_dual_path_connector_metadata_initializes_forward_receive_bindings():
     metadata = DualPathConnectorMetadata()
 
     assert metadata.forward_receive_bindings == []
-    assert metadata.decision_timeouts == []
+    assert metadata.control_failures == []
+
+
+@pytest.mark.parametrize("reason", list(DualPathControlFailureReason))
+def test_control_failure_metadata_carries_reason(reason):
+    invalid_block_ids = [41, 42, 43]
+    metadata = DualPathControlFailureMetadata(
+        request_id="request-1",
+        invalid_block_ids=invalid_block_ids,
+        reason=reason,
+    )
+
+    invalid_block_ids.append(44)
+
+    assert metadata.invalid_block_ids == (41, 42, 43)
+    assert metadata.reason is reason
+    with pytest.raises(FrozenInstanceError):
+        metadata.reason = DualPathControlFailureReason.DECISION_TIMEOUT
+
+
+def test_control_failure_metadata_rejects_bad_reason():
+    with pytest.raises(PathDecisionValidationError, match="reason must be"):
+        DualPathControlFailureMetadata(
+            request_id="request-1",
+            invalid_block_ids=(41,),
+            reason="DECISION_TIMEOUT",
+        )
 
 
 def test_dual_path_connector_metadata_decode_store_metadata_defaults_none():
