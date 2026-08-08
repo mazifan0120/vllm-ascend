@@ -728,6 +728,11 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_pending_forward_done",
                 "_pending_forward_failed",
                 "_consumed_forward_terminals",
+                "_reverse_receive_bindings",
+                "_reverse_request_map",
+                "_pending_reverse_done",
+                "_pending_reverse_failed",
+                "_consumed_reverse_terminals",
             },
         )
 
@@ -1534,6 +1539,9 @@ class TestDualPathFoundationGuards(unittest.TestCase):
             "DualPathConnectorWorker": {
                 "__init__",
                 "_install_forward_receive_binding",
+                "_install_reverse_receive_binding",
+                "_release_finished_reverse_terminals",
+                "_consume_reverse_receive_binding",
                 "_install_split_tracker",
                 "_install_reverse_plan",
                 "_build_reverse_send_metadata",

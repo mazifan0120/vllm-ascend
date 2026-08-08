@@ -18,6 +18,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
     ForwardReceiveBinding,
     ReversePlan,
+    ReverseReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -49,6 +50,23 @@ def _make_worker() -> DualPathConnectorWorker:
     worker.pd_head_ratio = 1
     worker.enable_kv_quant = False
     worker.enable_c8_quant = False
+    return worker
+
+
+def _make_prefill_worker() -> DualPathConnectorWorker:
+    with (
+        worker_environment(),
+        patch.object(connector_module, "KVPoolWorkerAdapter"),
+    ):
+        worker = DualPathConnectorWorker(
+            _make_vllm_config(),
+            _make_kv_cache_config(),
+            "prefill-engine",
+            DualPathConfig(role="prefill"),
+        )
+    worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
     return worker
 
 
@@ -86,6 +104,21 @@ def _make_reverse_plan() -> ReversePlan:
         remote_tp_size=1,
         remote_pcp_size=1,
         remote_dcp_size=1,
+    )
+
+
+def _make_reverse_receive_binding(
+    *,
+    prefill_request_id: str = f"{WIRE_REQUEST_ID}prefill-local",
+    destination_block_ids: tuple[tuple[int, ...], ...] = REVERSE_DESTINATION_BLOCKS,
+) -> ReverseReceiveBinding:
+    return ReverseReceiveBinding(
+        request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID),
+        wire_request_id=WIRE_REQUEST_ID,
+        prefill_request_id=prefill_request_id,
+        destination_block_ids=destination_block_ids,
+        token_start=16,
+        token_end=64,
     )
 
 
@@ -158,6 +191,20 @@ def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
         tracker.reverse_submitted,
         tracker.terminal_published,
     ) == before_poll
+
+
+def test_prefill_publishes_no_completion_before_final_reverse_done() -> None:
+    worker = _make_prefill_worker()
+    metadata = DualPathConnectorMetadata()
+    binding = _make_reverse_receive_binding()
+    metadata.reverse_receive_bindings.append(binding)
+
+    worker.start_load_kv(metadata)
+    finished = worker.get_finished(set(), metadata)
+
+    assert finished == (set(), set())
+    assert worker._reverse_receive_bindings == {binding.prefill_request_id: binding}
+    assert worker._reverse_request_map == {binding.wire_request_id: binding.prefill_request_id}
 
 
 def test_store_full_creates_no_split_tracker_reverse_or_pe_work() -> None:
