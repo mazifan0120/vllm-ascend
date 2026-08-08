@@ -27,13 +27,16 @@ Block forwarding is free:
 
 from __future__ import annotations
 
+import copy
 import math
+import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, assert_never
 
+import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -79,6 +82,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     MooncakeLayerwiseConnectorMetadata,
     MooncakeLayerwiseConnectorScheduler,
     MooncakeLayerwiseConnectorWorker,
+    ReqMeta,
     SendReqInfo,
     get_external_request_id,
 )
@@ -87,7 +91,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 if TYPE_CHECKING:
-    import torch
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -912,6 +915,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._registered_kv_caches: dict[str, list[torch.Tensor]] | None = None
         self._registered_layer_order: tuple[tuple[int, str], ...] = ()
         self._split_trackers: dict[str, _SplitTracker] = {}
+        self._reverse_plans: dict[str, ReversePlan] = {}
+        self._reverse_terminal_lock = threading.Lock()
+        self._pending_local_reverse_terminals: dict[str, bool] = {}
         self._control_failed_recving: set[str] = set()
         self._forward_receive_bindings: dict[str, ForwardReceiveBinding] = {}
         self._pending_forward_done: set[str] = set()
@@ -1029,6 +1035,128 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             terminal_published=False,
         )
 
+    def _install_reverse_plan(self, plan: ReversePlan) -> None:
+        decode_request_id = plan.request_key.decode_request_id
+        if get_external_request_id(decode_request_id) != plan.wire_request_id:
+            raise RuntimeError(
+                f"DualPath Decode request {decode_request_id} got a Reverse plan whose wire request id "
+                "does not match the Decode-local request id"
+            )
+
+        binding = self._forward_receive_bindings.get(decode_request_id)
+        tracker = self._split_trackers.get(decode_request_id)
+        if binding is None or tracker is None:
+            raise RuntimeError(
+                f"DualPath Decode request {decode_request_id} got a Reverse plan before its split binding"
+            )
+        if binding.request_key != plan.request_key:
+            raise RuntimeError(
+                f"DualPath Decode request {decode_request_id} got a Reverse plan for a different request key"
+            )
+        if plan.token_end != binding.token_start:
+            raise RuntimeError(
+                f"DualPath Decode request {decode_request_id} got a Reverse plan with a conflicting split boundary"
+            )
+
+        existing_plan = self._reverse_plans.get(decode_request_id)
+        conflicts_with_retained_plan = any(
+            retained != plan
+            and (retained.request_key == plan.request_key or retained.wire_request_id == plan.wire_request_id)
+            for retained in self._reverse_plans.values()
+        )
+        if (existing_plan is not None and existing_plan != plan) or conflicts_with_retained_plan:
+            raise RuntimeError(
+                f"DualPath Decode request {decode_request_id} got a conflicting duplicate Reverse plan; "
+                "the original plan is preserved"
+            )
+        if existing_plan is not None:
+            return
+
+        self._reverse_plans[decode_request_id] = plan
+        tracker.plan = plan
+        tracker.reverse_phase = _SplitPhase.PENDING
+
+    def _build_reverse_send_metadata(
+        self,
+        plan: ReversePlan,
+        decode_request_id: str,
+    ) -> MooncakeLayerwiseConnectorMetadata:
+        assert self.pd_head_ratio == 1 and not self.enable_kv_quant and not self.enable_c8_quant, (
+            "Task-07 Stage-1 Reverse supports the plain Layerwise send path only"
+        )
+        metadata = MooncakeLayerwiseConnectorMetadata()
+        req_meta = ReqMeta(
+            local_block_ids=[list(group) for group in plan.source_block_ids],
+            token_ids=None,
+            remote_block_ids=[list(group) for group in plan.destination_block_ids],
+            remote_block_size=list(plan.remote_block_sizes),
+            remote_engine_id=plan.remote_engine_id,
+            remote_host=plan.remote_host,
+            remote_port=plan.remote_port,
+            remote_te_rpc_port=None,
+            remote_layer_metadata=None,
+            metaserver=None,
+            remote_tp_size=plan.remote_tp_size,
+            remote_pcp_size=plan.remote_pcp_size,
+            remote_dcp_size=plan.remote_dcp_size,
+            chunk_finish=False,
+            prompt_len=plan.token_end,
+            trans_count=[],
+            remote_cache_tokens=0,
+            local_computed_tokens=plan.token_end,
+            local_transed_tokens=plan.token_start,
+            do_virtual=False,
+        )
+        self._align_remote_block_ids(req_meta)
+        transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
+        for group_idx in range(self.num_kv_cache_groups):
+            group_mappings = self._get_kv_split_metadata(req_meta, 0, decode_request_id, group_idx)
+            for (host, port), block_mapping in group_mappings.items():
+                if (host, port) not in transfer_mappings:
+                    transfer_mappings[(host, port)] = {
+                        "local_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                        "remote_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                        "trans_count": [0 for _ in range(self.num_kv_cache_groups)],
+                    }
+                transfer_mappings[(host, port)]["local_block_ids"][group_idx].extend(block_mapping["local_block_ids"])
+                transfer_mappings[(host, port)]["remote_block_ids"][group_idx].extend(block_mapping["remote_block_ids"])
+                transfer_mappings[(host, port)]["trans_count"][group_idx] = block_mapping["trans_count"]
+
+        assert len(transfer_mappings) <= 1, f"Not support add mutil transfer task for req_id:{decode_request_id}"
+        for (host, port), block_mapping in transfer_mappings.items():
+            update_req_meta = copy.deepcopy(req_meta)
+            update_req_meta.remote_host = host
+            update_req_meta.remote_port = port
+            update_req_meta.local_block_ids = self._get_kernel_block_ids(block_mapping["local_block_ids"])
+            update_req_meta.remote_block_ids = self._get_kernel_block_ids(block_mapping["remote_block_ids"])
+            update_req_meta.trans_count = block_mapping["trans_count"]
+            metadata.requests[decode_request_id] = update_req_meta
+        return metadata
+
+    def _submit_reverse(self, decode_request_id: str) -> None:
+        tracker = self._split_trackers.get(decode_request_id)
+        if (
+            tracker is None
+            or tracker.store_phase not in {_SplitPhase.DONE, _SplitPhase.SKIPPED}
+            or tracker.plan is None
+            or tracker.reverse_submitted
+        ):
+            return
+
+        metadata = self._build_reverse_send_metadata(tracker.plan, decode_request_id)
+        assert self._registered_kv_caches is not None
+        ready_event = torch.npu.Event()
+        ready_event.record()
+        tracker.reverse_submitted = True
+        for layer_index, layer_name in self._registered_layer_order:
+            self._enqueue_kv_layer_send(
+                layer_index=layer_index,
+                layer_name=layer_name,
+                kv_layer=self._registered_kv_caches[layer_name],
+                ready_event=ready_event,
+                metadata=metadata,
+            )
+
     def _consume_store_completions(
         self,
         store_done_recving: set[str],
@@ -1051,6 +1179,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     published_store_terminals.add(request_id)
             else:
                 tracker.store_phase = _SplitPhase.DONE
+                self._submit_reverse(request_id)
         return published_store_terminals
 
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
@@ -1059,13 +1188,29 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._install_forward_receive_binding(binding)
             if binding.path is Path.DE_READ and self.dual_path_cfg.role == "decode":
                 self._install_split_tracker(binding, store_metadata)
+        for plan in getattr(metadata, "reverse_plans", ()):
+            if self.dual_path_cfg.role == "decode":
+                self._install_reverse_plan(plan)
         for timeout in getattr(metadata, "decision_timeouts", ()):
             self._control_failed_recving.add(timeout.request_id)
             self._invalid_block_ids.update(timeout.external_block_ids)
         if store_metadata is not None:
             assert self._kvpool_worker_adapter is not None
             self._kvpool_worker_adapter.start_load_kv(store_metadata)
+        for binding in getattr(metadata, "forward_receive_bindings", ()):
+            if binding.path is Path.DE_READ and self.dual_path_cfg.role == "decode":
+                self._submit_reverse(binding.decode_request_id)
         super().start_load_kv(metadata)
+
+    def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
+        if self.dual_path_cfg.role == "decode":
+            tracker = self._split_trackers.get(req_id)
+            if tracker is not None and tracker.reverse_submitted:
+                with self._reverse_terminal_lock:
+                    self._pending_local_reverse_terminals[req_id] = (
+                        self._pending_local_reverse_terminals.get(req_id, True) and trans_flag
+                    )
+        super().send_done_send_signal(req_id, req_meta, group_idx, trans_flag)
 
     def get_finished(
         self,

@@ -720,6 +720,9 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_registered_kv_caches",
                 "_registered_layer_order",
                 "_split_trackers",
+                "_reverse_plans",
+                "_reverse_terminal_lock",
+                "_pending_local_reverse_terminals",
                 "_control_failed_recving",
                 "_forward_receive_bindings",
                 "_pending_forward_done",
@@ -1233,7 +1236,8 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             self.assertEqual(runtime.send_factory.call_count, 2)
             parent_callback = runtime.send_factory.call_args_list[0].kwargs["callback_func"]
             dual_callback = runtime.send_factory.call_args_list[1].kwargs["callback_func"]
-            self.assertIs(parent_callback.__func__, dual_callback.__func__)
+            self.assertIs(parent_callback.__func__, MooncakeLayerwiseConnectorWorker.send_done_send_signal)
+            self.assertIs(dual_callback.__func__, DualPathConnectorWorker.send_done_send_signal)
 
     def test_completion_matches_parent(self):
         parent_consumer_config = MockVllmConfig("decode", "kv_consumer")
@@ -1531,6 +1535,9 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "__init__",
                 "_install_forward_receive_binding",
                 "_install_split_tracker",
+                "_install_reverse_plan",
+                "_build_reverse_send_metadata",
+                "_submit_reverse",
                 "_release_finished_forward_terminals",
                 "_consume_forward_receive_binding",
                 "_consume_store_completions",
@@ -1538,6 +1545,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "start_load_kv",
                 "get_finished",
                 "get_block_ids_with_load_errors",
+                "send_done_send_signal",
                 "shutdown",
             },
         }
