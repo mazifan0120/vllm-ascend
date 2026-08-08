@@ -1710,6 +1710,126 @@ class MooncakeLayerwiseConnectorWorker:
                     )
                     send_task.group_seq_start_tensor[i] = torch.tensor([0], dtype=torch.int32, device=device)
 
+    def _enqueue_kv_layer_send(
+        self,
+        *,
+        layer_index: int,
+        layer_name: str,
+        kv_layer: list[torch.Tensor],
+        ready_event: torch.npu.Event,
+        metadata: MooncakeLayerwiseConnectorMetadata,
+    ) -> None:
+        send_task = metadata.send_task
+        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+        keys = None
+        values = None
+        quant_keys = None
+        quant_values = None
+        if (
+            (
+                self.pd_head_ratio != 1
+                and (isinstance(self.kv_cache_specs[layer_group_idx], (FullAttentionSpec, SlidingWindowSpec)))
+                and send_task.group_num_blocks[layer_group_idx] > 0
+            )
+            or (self.enable_c8_quant and layer_index in self.vllm_config.quant_config.c8_quant_layers)
+            or (self.enable_kv_quant and layer_index in self.vllm_config.quant_config.kvcache_quant_layers)
+        ):
+            assert self.resharding_stream is not None
+            with npu_stream_switch(self.resharding_stream):
+                ready_event.wait()
+                device = self.k_buffer.device  # type: ignore
+                # Initialize buffers
+                keys = torch.empty(
+                    (send_task.group_num_tokens[layer_group_idx], *kv_layer[0].size()[-2:]),
+                    dtype=kv_layer[0].dtype,
+                    device=device,
+                )
+                values = torch.empty(
+                    (send_task.group_num_tokens[layer_group_idx], *kv_layer[1].size()[-2:]),
+                    dtype=kv_layer[1].dtype,
+                    device=device,
+                )
+
+                # Load cache data into buffers
+                torch_npu.atb.npu_paged_cache_load(
+                    kv_layer[0],
+                    kv_layer[1],
+                    send_task.group_block_table[layer_group_idx],
+                    send_task.group_block_len_tensor[layer_group_idx],
+                    seq_starts=send_task.group_seq_start_tensor[layer_group_idx],
+                    key=keys,
+                    value=values,
+                )
+                if self.pd_head_ratio != 1:
+                    # sort kv caches for each block
+                    keys = (
+                        keys.view(send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *keys.shape[1:])
+                        .transpose(0, 1)
+                        .reshape_as(keys)
+                    )
+                    values = (
+                        values.view(
+                            send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *values.shape[1:]
+                        )
+                        .transpose(0, 1)
+                        .reshape_as(values)
+                    )
+                    # reshard kv cache
+                    keys = keys.reshape(-1, *kv_layer[0].shape[2:])
+                    values = values.reshape(-1, *kv_layer[1].shape[2:])
+
+                    (keys, values) = kv_alltoall_and_rearrange(self.pd_head_ratio, keys, values)
+                if self.enable_c8_quant:
+                    layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
+                    quant_keys = torch.clamp(
+                        torch.round(keys * layer._c8_k_inv_scale + layer._c8_k_offset),
+                        -128,
+                        127,
+                    ).to(torch.int8)
+                    quant_values = torch.clamp(
+                        torch.round(values * layer._c8_v_inv_scale + layer._c8_v_offset),
+                        -128,
+                        127,
+                    ).to(torch.int8)
+                    quant_keys = self.get_nz_cache(quant_keys, layer_group_idx)
+                    quant_values = self.get_nz_cache(quant_values, layer_group_idx)
+                if self.enable_kv_quant and layer_index in self.vllm_config.quant_config.kvcache_quant_layers:
+                    layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
+                    keys = torch.ops.vllm.quantize(
+                        keys, layer.fak_descale, layer.fak_descale_reciprocal, layer.fak_offset
+                    )
+                    quant_keys = self.get_nz_cache(keys, layer_group_idx)
+                    quant_values = self.get_nz_cache(values, layer_group_idx)
+
+        assert self.kv_send_layer_thread is not None
+        layer_send_task = SendTask(
+            wait_event=ready_event,
+            k_cache=keys,
+            v_cache=values,
+            k_quant_cache=quant_keys,
+            v_quant_cache=quant_values,
+            layer_idx=layer_index,
+            layer_name=layer_name,
+            group_rearrange_block_ids=send_task.group_rearrange_block_ids,
+        )
+        for req_id, req_meta in metadata.requests.items():
+            if len(req_meta.local_block_ids[layer_group_idx]) == 0:
+                continue
+            try:
+                req_meta_update = self.update_decoder_info(req_id, req_meta)
+            except Exception as e:
+                logger.warning(
+                    "MooncakeLayerwiseConnector transfer fail. req_id=%s, layer_idx=%s, error=%s. ",
+                    req_id,
+                    layer_index,
+                    e,
+                )
+                continue
+            logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
+            layer_send_task.send_request[req_id] = req_meta_update
+
+        self.kv_send_layer_thread.send_queue.put(layer_send_task)
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -1741,122 +1861,13 @@ class MooncakeLayerwiseConnectorWorker:
             else:
                 reshape_cache_event = torch.npu.Event()
                 reshape_cache_event.record()
-            send_task = connector_metadata.send_task
-            layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
-            keys = None
-            values = None
-            quant_keys = None
-            quant_values = None
-            if (
-                (
-                    self.pd_head_ratio != 1
-                    and (isinstance(self.kv_cache_specs[layer_group_idx], (FullAttentionSpec, SlidingWindowSpec)))
-                    and send_task.group_num_blocks[layer_group_idx] > 0
-                )
-                or (self.enable_c8_quant and self.current_layer in self.vllm_config.quant_config.c8_quant_layers)
-                or (self.enable_kv_quant and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers)
-            ):
-                assert self.resharding_stream is not None
-                with npu_stream_switch(self.resharding_stream):
-                    reshape_cache_event.wait()
-                    device = self.k_buffer.device  # type: ignore
-                    # Initialize buffers
-                    keys = torch.empty(
-                        (send_task.group_num_tokens[layer_group_idx], *kv_layer[0].size()[-2:]),
-                        dtype=kv_layer[0].dtype,
-                        device=device,
-                    )
-                    values = torch.empty(
-                        (send_task.group_num_tokens[layer_group_idx], *kv_layer[1].size()[-2:]),
-                        dtype=kv_layer[1].dtype,
-                        device=device,
-                    )
-
-                    # Load cache data into buffers
-                    torch_npu.atb.npu_paged_cache_load(
-                        kv_layer[0],
-                        kv_layer[1],
-                        send_task.group_block_table[layer_group_idx],
-                        send_task.group_block_len_tensor[layer_group_idx],
-                        seq_starts=send_task.group_seq_start_tensor[layer_group_idx],
-                        key=keys,
-                        value=values,
-                    )
-                    if self.pd_head_ratio != 1:
-                        # sort kv caches for each block
-                        keys = (
-                            keys.view(
-                                send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *keys.shape[1:]
-                            )
-                            .transpose(0, 1)
-                            .reshape_as(keys)
-                        )
-                        values = (
-                            values.view(
-                                send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *values.shape[1:]
-                            )
-                            .transpose(0, 1)
-                            .reshape_as(values)
-                        )
-                        # reshard kv cache
-                        keys = keys.reshape(-1, *kv_layer[0].shape[2:])
-                        values = values.reshape(-1, *kv_layer[1].shape[2:])
-
-                        (keys, values) = kv_alltoall_and_rearrange(self.pd_head_ratio, keys, values)
-                    if self.enable_c8_quant:
-                        layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
-                        quant_keys = torch.clamp(
-                            torch.round(keys * layer._c8_k_inv_scale + layer._c8_k_offset),
-                            -128,
-                            127,
-                        ).to(torch.int8)
-                        quant_values = torch.clamp(
-                            torch.round(values * layer._c8_v_inv_scale + layer._c8_v_offset),
-                            -128,
-                            127,
-                        ).to(torch.int8)
-                        quant_keys = self.get_nz_cache(quant_keys, layer_group_idx)
-                        quant_values = self.get_nz_cache(quant_values, layer_group_idx)
-                    if (
-                        self.enable_kv_quant
-                        and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers
-                    ):
-                        layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
-                        keys = torch.ops.vllm.quantize(
-                            keys, layer.fak_descale, layer.fak_descale_reciprocal, layer.fak_offset
-                        )
-                        quant_keys = self.get_nz_cache(keys, layer_group_idx)
-                        quant_values = self.get_nz_cache(values, layer_group_idx)
-
-            assert self.kv_send_layer_thread is not None
-            assert reshape_cache_event is not None
-            layer_send_task = SendTask(
-                wait_event=reshape_cache_event,
-                k_cache=keys,
-                v_cache=values,
-                k_quant_cache=quant_keys,
-                v_quant_cache=quant_values,
-                layer_idx=self.current_layer,
+            self._enqueue_kv_layer_send(
+                layer_index=self.current_layer,
                 layer_name=layer_name,
-                group_rearrange_block_ids=send_task.group_rearrange_block_ids,
+                kv_layer=kv_layer,
+                ready_event=reshape_cache_event,
+                metadata=connector_metadata,
             )
-            for req_id, req_meta in connector_metadata.requests.items():
-                if len(req_meta.local_block_ids[layer_group_idx]) == 0:
-                    continue
-                try:
-                    req_meta_update = self.update_decoder_info(req_id, req_meta)
-                except Exception as e:
-                    logger.warning(
-                        "MooncakeLayerwiseConnector transfer fail. req_id=%s, layer_idx=%s, error=%s. ",
-                        req_id,
-                        self.current_layer,
-                        e,
-                    )
-                    continue
-                logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
-                layer_send_task.send_request[req_id] = req_meta_update
-
-            self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
 
     # NOTE: Due to the FIA operator constraints, the expected kv cache is ND format, NZ shape,

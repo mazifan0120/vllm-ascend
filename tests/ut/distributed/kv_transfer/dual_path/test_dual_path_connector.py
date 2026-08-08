@@ -1748,3 +1748,72 @@ class TestParentRuntimeStartExtraction(unittest.TestCase):
             self.assertEqual(worker.kv_recv_layer_thread.start.call_count, 1)
             self.assertEqual(runtime.get_transfer_engine.call_count, engine_calls)
             self.assertEqual(runtime.register_buffer.call_count, buffer_calls)
+
+
+class TestParentEnqueueExtraction(unittest.TestCase):
+    """Task-07 section 7: save_kv_layer derives the ready event and delegates
+    per-layer SendTask construction/enqueue to a protected helper shared by the
+    Forward and Reverse call sites, with unchanged parent behavior."""
+
+    @staticmethod
+    def _two_layer_kv_caches():
+        caches = {}
+        for index in range(2):
+            key_cache = MagicMock(name=f"key_cache_{index}")
+            key_cache.shape = (10, 16, 8, 16)
+            key_cache.data_ptr.return_value = 0x1000 + index * 0x1000
+            key_cache.element_size.return_value = 4
+            value_cache = MagicMock(name=f"value_cache_{index}")
+            value_cache.shape = (10, 16, 8, 16)
+            value_cache.data_ptr.return_value = 0x2000 + index * 0x1000
+            value_cache.element_size.return_value = 4
+            caches[f"encoder.layer.{index}"] = (key_cache, value_cache)
+        return caches
+
+    def test_parent_forward_send_task_parity_after_enqueue_extraction(self):
+        config = MockVllmConfig("prefill", "kv_producer")
+        config.parallel_config.tensor_parallel_size = 1
+        params = {
+            "remote_block_ids": [[4, 5]],
+            "remote_block_size": [[16]],
+            "remote_engine_id": "decode-engine",
+            "remote_host": "127.0.0.2",
+            "remote_port": 6000,
+            "remote_te_rpc_port": 9090,
+        }
+        metadata = MooncakeLayerwiseConnectorMetadata()
+        metadata.add_new_req("req-parity", [[7, 8]], dict(params), chunk_finish=True)
+        kv_cache_config = MockKVCacheConfig()
+        kv_cache_config.kv_cache_groups[0].layer_names = ["encoder.layer.0", "encoder.layer.1"]
+
+        with worker_environment():
+            worker = MooncakeLayerwiseConnectorWorker(config, kv_cache_config, "test_engine")
+            worker.register_kv_caches(self._two_layer_kv_caches())
+            self.assertTrue(callable(getattr(worker, "_enqueue_kv_layer_send", None)))
+            self.assertEqual(worker.total_layers, 2)
+            worker.kv_send_layer_thread.reset_mock()
+            worker.current_layer = 0
+            event_0 = MagicMock(name="reshape_cache_event_0")
+            event_1 = MagicMock(name="reshape_cache_event_1")
+            attn_events = {
+                "encoder.layer.0": SimpleNamespace(reshape_cache_event=event_0),
+                "encoder.layer.1": SimpleNamespace(reshape_cache_event=event_1),
+            }
+            with patch.object(
+                worker, "update_decoder_info", side_effect=lambda req_id, req_meta: req_meta
+            ) as decoder_info:
+                worker.save_kv_layer("", [MagicMock(name="k0"), MagicMock(name="v0")], attn_events, metadata)
+                worker.save_kv_layer("", [MagicMock(name="k1"), MagicMock(name="v1")], attn_events, metadata)
+            queue = worker.kv_send_layer_thread.send_queue
+            self.assertEqual(queue.put.call_count, 2)
+            first_task = queue.put.call_args_list[0].args[0]
+            second_task = queue.put.call_args_list[1].args[0]
+            self.assertEqual(first_task.layer_idx, 0)
+            self.assertEqual(first_task.layer_name, "encoder.layer.0")
+            self.assertIs(first_task.wait_event, event_0)
+            self.assertEqual(second_task.layer_idx, worker.total_layers - 1)
+            self.assertEqual(second_task.layer_name, "encoder.layer.1")
+            self.assertIs(second_task.wait_event, event_1)
+            self.assertEqual(set(first_task.send_request), {"req-parity"})
+            self.assertEqual(set(second_task.send_request), {"req-parity"})
+            self.assertEqual(decoder_info.call_count, 2)
