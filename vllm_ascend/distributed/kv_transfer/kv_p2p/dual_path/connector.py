@@ -224,6 +224,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         # maps rather than constructing policy state it never owns.
         self._path_decider: PathDecisionDecider | None = None
         self._pe_request_keys: dict[str, DualPathRequestKey] = {}
+        self._pe_prefill_local_tokens: dict[str, int] = {}
         self._pe_path_results: dict[str, PathDecisionResult] = {}
         self._pe_forward_plans: dict[str, ForwardPlan] = {}
         self._pe_forward_send_infos: dict[str, SendReqInfo] = {}
@@ -297,6 +298,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self,
         request: Request,
         parent_result: tuple[int, bool],
+        prefill_local_tokens: int,
     ) -> tuple[int, bool]:
         params = request.kv_transfer_params
         if (
@@ -335,11 +337,24 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return parent_result
 
         decision_request = metadata.decision_request
+        effective_prefill_tokens = (
+            decision_request.target_tokens if self.need_truncate else decision_request.target_tokens + 1
+        )
+        if not 0 <= prefill_local_tokens <= effective_prefill_tokens:
+            logger.error(
+                "DualPath Prefill local tokens are invalid for request %s: expected 0 <= %s <= %s",
+                request_id,
+                prefill_local_tokens,
+                effective_prefill_tokens,
+            )
+            return parent_result
+
         request_key = decision_request.request_key
         self._pe_request_keys[request_id] = request_key
+        self._pe_prefill_local_tokens.setdefault(request_id, prefill_local_tokens)
         assert self._path_decider is not None
         try:
-            result = self._path_decider.decide(decision_request)
+            result = self._path_decider.decide(decision_request, prefill_local_tokens)
         except Exception as error:  # noqa: BLE001
             logger.error(
                 "DualPath Prefill decision failed locally for request %s: %s",
@@ -513,7 +528,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if not self._is_task01_decode_request(request):
             parent_result = super().get_num_new_matched_tokens(request, num_computed_tokens)
             if self.dual_path_cfg.role == "prefill" and request.kv_transfer_params is not None:
-                return self._handle_prefill_decision(request, parent_result)
+                return self._handle_prefill_decision(request, parent_result, num_computed_tokens)
             return parent_result
 
         request_id = request.request_id
@@ -837,6 +852,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             state.proxy_future = None
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
+            self._pe_prefill_local_tokens.pop(request_id, None)
             self._pe_path_results.pop(request_id, None)
             self._pe_forward_plans.pop(request_id, None)
             owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
@@ -859,6 +875,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             state.proxy_future = None
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
+            self._pe_prefill_local_tokens.pop(request_id, None)
             self._pe_path_results.pop(request_id, None)
             self._pe_forward_plans.pop(request_id, None)
             owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
@@ -888,6 +905,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_kv_snapshots.clear()
         self._decode_decision_states.clear()
         self._pe_request_keys.clear()
+        self._pe_prefill_local_tokens.clear()
         self._pe_path_results.clear()
         for request_id, owned_send_req_info in self._pe_forward_send_infos.items():
             if self._reqs_need_send_layerwise.get(request_id) is owned_send_req_info:

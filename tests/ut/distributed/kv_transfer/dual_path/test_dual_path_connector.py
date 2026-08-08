@@ -702,6 +702,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_path_decision_coordinator",
             "_path_decider",
             "_pe_request_keys",
+            "_pe_prefill_local_tokens",
             "_pe_path_results",
             "_pe_forward_plans",
             "_pe_forward_send_infos",

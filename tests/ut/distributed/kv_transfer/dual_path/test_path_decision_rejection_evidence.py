@@ -35,7 +35,8 @@ def test_store_full_request_construction_rejects_before_decider_policy_choice() 
                 target_tokens=32,
                 decode_local_tokens=16,
                 decode_store_tokens=32,
-            )
+            ),
+            0,
         )
 
     # Then
@@ -55,7 +56,8 @@ def test_store_full_rejection_does_not_advance_seeded_round_robin_first_choice()
                 target_tokens=32,
                 decode_local_tokens=16,
                 decode_store_tokens=32,
-            )
+            ),
+            0,
         )
     result = decider.decide(
         PathDecisionRequest(
@@ -63,7 +65,8 @@ def test_store_full_rejection_does_not_advance_seeded_round_robin_first_choice()
             target_tokens=32,
             decode_local_tokens=16,
             decode_store_tokens=24,
-        )
+        ),
+        0,
     )
 
     # Then

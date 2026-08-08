@@ -372,7 +372,7 @@ def test_scheduler_defers_plan_while_source_table_short_of_T(scheduler_factory):
     scheduler.update_state_after_alloc(request, _blocks(([10, 11],)), 0)
 
     assert list(scheduler._pe_forward_plans) == [request.request_id]
-    assert policy.calls == 1
+    assert policy.calls == 0
 
 
 def test_lookup_or_install_alone_invokes_no_worker_p2p(scheduler_factory):

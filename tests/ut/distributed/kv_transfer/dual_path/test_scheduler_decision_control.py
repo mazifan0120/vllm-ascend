@@ -343,6 +343,24 @@ class TestDecodeAdmissionControl:
         decode_scheduler._path_decision_coordinator.register_pending.assert_not_called()
         decode_scheduler.executor.submit.assert_not_called()
 
+    def test_hbm_complete_and_store_full_never_reach_decider(self, decode_scheduler):
+        hbm_complete = _make_request(request_id="hbm-complete")
+        store_full = _make_request(request_id="store-full")
+        store_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+        store_blocks = MagicMock(name="store_full_blocks")
+        store_blocks.get_block_ids.return_value = ([11, 12, 13],)
+
+        with patch.object(connector_module.PathDecisionDecider, "decide", autospec=True) as decide:
+            assert decode_scheduler.get_num_new_matched_tokens(hbm_complete, 48) == (0, False)
+            decode_scheduler.update_state_after_alloc(hbm_complete, MagicMock(name="hbm_blocks"), 0)
+            decode_scheduler._kvpool_adapter.lookup.return_value = store_spec
+            assert decode_scheduler.get_num_new_matched_tokens(store_full, 16) == (32, True)
+            decode_scheduler.update_state_after_alloc(store_full, store_blocks, 32)
+
+        decide.assert_not_called()
+        decode_scheduler._path_decision_coordinator.register_pending.assert_not_called()
+        decode_scheduler.executor.submit.assert_not_called()
+
     def test_snapshot_builds_exact_key_request_and_metadata(self, decode_scheduler):
         with patch.object(connector_module.time, "monotonic", return_value=10.0):
             request, _ = _admit(decode_scheduler)
@@ -498,6 +516,54 @@ class TestPrefillDecisionHook:
         request = _make_prefill_request("prefill-valid", _remote_decode_params())
 
         self._assert_parent_accounting_once(scheduler, request)
+
+        assert scheduler._pe_prefill_local_tokens == {request.request_id: 0}
+
+    def test_prefill_local_tokens_validate_against_effective_target_before_decide(
+        self,
+        scheduler_factory,
+        task04_seams,
+    ):
+        policy = MagicMock(name="path_policy")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-invalid-local", _remote_decode_params())
+
+        with patch.object(
+            connector_module.MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            return_value=(0, False),
+        ):
+            result = scheduler.get_num_new_matched_tokens(request, 50)
+
+        assert result == (0, False)
+        policy.choose.assert_not_called()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+        assert scheduler._pe_prefill_local_tokens == {}
+
+    def test_prefill_hook_passes_incoming_l_pe_to_forced_eligibility(
+        self,
+        scheduler_factory,
+        task04_seams,
+    ):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = Path.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-forced", _remote_decode_params())
+
+        with patch.object(
+            connector_module.MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            return_value=(0, False),
+        ):
+            result = scheduler.get_num_new_matched_tokens(request, 32)
+
+        assert result == (0, False)
+        policy.choose.assert_not_called()
+        submitted = task04_seams.prefill_coordinator.submit.call_args.args[1]
+        assert submitted.result.path is Path.PE_READ
+        assert scheduler._pe_prefill_local_tokens == {request.request_id: 32}
 
     def test_parent_accounting_runs_exactly_once_for_malformed_dual_path(self, scheduler_factory):
         scheduler = scheduler_factory(role="prefill")
@@ -664,11 +730,20 @@ class TestPrefillDecisionHook:
         policy.choose.assert_not_called()
         task04_seams.prefill_coordinator.submit.assert_not_called()
 
-    def test_policy_exception_is_retained_and_never_reinvoked(self, scheduler_factory, task04_seams):
+    @pytest.mark.parametrize("failure", ["exception", "invalid-return"])
+    def test_policy_exception_or_invalid_return_records_failure_sends_nothing(
+        self,
+        failure,
+        scheduler_factory,
+        task04_seams,
+    ):
         policy = MagicMock(name="path_policy")
-        policy.choose.side_effect = RuntimeError("policy failed")
+        if failure == "exception":
+            policy.choose.side_effect = RuntimeError("policy failed")
+        else:
+            policy.choose.return_value = "PE_READ"
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        request = _make_prefill_request("prefill-policy-error", _remote_decode_params())
+        request = _make_prefill_request(f"prefill-policy-{failure}", _remote_decode_params())
 
         scheduler.get_num_new_matched_tokens(request, 0)
         scheduler.get_num_new_matched_tokens(request, 0)
@@ -676,17 +751,9 @@ class TestPrefillDecisionHook:
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_not_called()
 
-    def test_invalid_policy_result_is_retained_and_never_reinvoked(self, scheduler_factory, task04_seams):
-        policy = MagicMock(name="path_policy")
-        policy.choose.return_value = "PE_READ"
-        scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        request = _make_prefill_request("prefill-invalid-result", _remote_decode_params())
-
-        scheduler.get_num_new_matched_tokens(request, 0)
-        scheduler.get_num_new_matched_tokens(request, 0)
-
-        policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+        assert scheduler._path_decider is not None
+        assert scheduler._path_decider._decision_records[request_key].result is None
 
     def test_local_failures_never_enter_parent_forward_queue(self, scheduler_factory):
         policy = MagicMock(name="path_policy")
@@ -1033,6 +1100,7 @@ class TestCleanupAndShutdown:
         ) as discard:
             getattr(scheduler, method_name)(request, block_ids)
             assert request.request_id not in scheduler._pe_request_keys
+            assert request.request_id not in scheduler._pe_prefill_local_tokens
             assert scheduler._pe_delivery_futures == {request_key: delivery_future}
             discard.assert_not_called()
 
@@ -1344,6 +1412,7 @@ class TestCleanupAndShutdown:
         assert decode_scheduler._decode_kv_snapshots == {}
         assert decode_scheduler._decode_decision_states == {}
         assert prefill_scheduler._pe_request_keys == {}
+        assert prefill_scheduler._pe_prefill_local_tokens == {}
         assert prefill_scheduler._pe_delivery_futures == {}
         assert prefill_scheduler._pe_invalid_request_ids == set()
         assert prefill_scheduler._path_decider is not None

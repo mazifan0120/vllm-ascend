@@ -159,6 +159,7 @@ class RoundRobinPathPolicy:
 @dataclass(frozen=True)
 class _DecisionRecord:
     request: PathDecisionRequest
+    prefill_local_tokens: int
     result: PathDecisionResult | None
 
 
@@ -167,29 +168,46 @@ class PathDecisionDecider:
         self._policy = policy
         self._decision_records: dict[DualPathRequestKey, _DecisionRecord] = {}
 
-    def decide(self, request: PathDecisionRequest) -> PathDecisionResult:
+    def decide(self, request: PathDecisionRequest, prefill_local_tokens: int) -> PathDecisionResult:
         if not isinstance(request, PathDecisionRequest):
             raise PathDecisionValidationError("decision input must be a PathDecisionRequest")
 
         existing = self._decision_records.get(request.request_key)
         if existing is not None:
-            if request != existing.request:
-                raise PathDecisionValidationError("request key is already associated with different token facts")
+            if request != existing.request or prefill_local_tokens != existing.prefill_local_tokens:
+                raise PathDecisionValidationError(
+                    "request key is already associated with different token facts or Prefill local tokens"
+                )
             if existing.result is None:
                 raise PathDecisionValidationError("decision previously failed locally")
             return existing.result
 
-        try:
-            path = self._policy.choose(request)
-        except Exception as error:  # noqa: BLE001
-            self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
-            raise PathDecisionValidationError("path policy raised an exception") from error
-        if not isinstance(path, Path):
-            self._decision_records[request.request_key] = _DecisionRecord(request=request, result=None)
-            raise PathDecisionValidationError(f"policy returned an invalid path: {path!r}")
+        if prefill_local_tokens >= request.decode_store_tokens:
+            path = Path.PE_READ
+        else:
+            try:
+                path = self._policy.choose(request)
+            except Exception as error:  # noqa: BLE001
+                self._decision_records[request.request_key] = _DecisionRecord(
+                    request=request,
+                    prefill_local_tokens=prefill_local_tokens,
+                    result=None,
+                )
+                raise PathDecisionValidationError("path policy raised an exception") from error
+            if not isinstance(path, Path):
+                self._decision_records[request.request_key] = _DecisionRecord(
+                    request=request,
+                    prefill_local_tokens=prefill_local_tokens,
+                    result=None,
+                )
+                raise PathDecisionValidationError(f"policy returned an invalid path: {path!r}")
 
         result = PathDecisionResult(request_key=request.request_key, path=path)
-        self._decision_records[request.request_key] = _DecisionRecord(request=request, result=result)
+        self._decision_records[request.request_key] = _DecisionRecord(
+            request=request,
+            prefill_local_tokens=prefill_local_tokens,
+            result=result,
+        )
         return result
 
     def discard(self, request_key: DualPathRequestKey) -> None:
