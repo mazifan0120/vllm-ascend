@@ -883,6 +883,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.dual_path_cfg = dual_path_cfg
         self._kvpool_worker_adapter: KVPoolWorkerAdapter | None = None
+        self._registered_kv_caches: dict[str, list[torch.Tensor]] | None = None
+        self._registered_layer_order: tuple[tuple[int, str], ...] = ()
         self._control_failed_recving: set[str] = set()
         self._forward_receive_bindings: dict[str, ForwardReceiveBinding] = {}
         self._pending_forward_done: set[str] = set()
@@ -898,6 +900,15 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         super().register_kv_caches(kv_caches)
+        self._registered_kv_caches = {
+            layer_name: list(kv_cache) if isinstance(kv_cache, (list, tuple)) else [kv_cache]
+            for layer_name, kv_cache in kv_caches.items()
+        }
+        self._registered_layer_order = tuple((index, names[0]) for index, names in sorted(self.index_to_name.items()))
+        if self.dual_path_cfg.role == "prefill":
+            self._ensure_receive_layer_runtime()
+        else:
+            self._ensure_send_layer_runtime()
         if self._kvpool_worker_adapter is not None:
             self._kvpool_worker_adapter.register_kv_caches(kv_caches)
 
@@ -964,8 +975,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         metadata: MooncakeLayerwiseConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
         finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
-        if self.vllm_config.kv_transfer_config.is_kv_consumer:
-            assert self.kv_recv_layer_thread is not None
+        if self.kv_recv_layer_thread is not None:
             raw_done = self.kv_recv_layer_thread.get_and_clear_done_requests()
             raw_failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
         else:

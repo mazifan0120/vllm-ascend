@@ -6,10 +6,12 @@ optional Mooncake engine, torch_npu, and uvloop extensions are stubbed before
 any vllm_ascend import so the suites run on a plain CPU checkout.
 """
 
+import contextlib
 import importlib.util
 import sys
 import types
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -29,3 +31,86 @@ torch.npu = _fake_torch_npu.npu  # type: ignore[attr-defined]
 _fake_uvloop = types.ModuleType("uvloop")
 _fake_uvloop.__spec__ = importlib.util.spec_from_loader("uvloop", loader=None)
 sys.modules.setdefault("uvloop", _fake_uvloop)
+
+from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as layerwise_module  # noqa: E402
+
+
+@contextlib.contextmanager
+def worker_environment():
+    transfer_engine = MagicMock(name="transfer_engine")
+    transfer_engine.get_rpc_port.return_value = 9090
+    transfer_engine.initialize.return_value = 0
+    transfer_engine.register_memory.return_value = 0
+    send_threads = []
+    recv_threads = []
+
+    def make_send_thread(*_args, **_kwargs):
+        thread = MagicMock(name=f"send_thread_{len(send_threads)}")
+        send_threads.append(thread)
+        return thread
+
+    def make_recv_thread(*_args, **_kwargs):
+        thread = MagicMock(name=f"recv_thread_{len(recv_threads)}")
+        recv_threads.append(thread)
+        return thread
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("torch.Tensor.size", return_value=(10, 16, 8, 16)))
+        stack.enter_context(patch("torch.Tensor.element_size", return_value=4))
+        stack.enter_context(patch("torch.Tensor.data_ptr", return_value=0x1000))
+        stack.enter_context(patch("math.prod", return_value=128))
+        stack.enter_context(patch("random.Random"))
+        stack.enter_context(patch.object(layerwise_module, "get_tensor_model_parallel_rank", return_value=0))
+        stack.enter_context(patch.object(layerwise_module, "get_tp_group", return_value=None))
+        stack.enter_context(patch.object(layerwise_module, "get_ip", return_value="127.0.0.1"))
+        stack.enter_context(
+            patch.object(layerwise_module, "string_to_int64_hash", side_effect=lambda value: hash(value))
+        )
+        get_transfer_engine = stack.enter_context(
+            patch.object(layerwise_module.global_te, "get_transfer_engine", return_value=transfer_engine)
+        )
+        register_buffer = stack.enter_context(
+            patch.object(layerwise_module.global_te, "register_buffer", return_value=None)
+        )
+        send_factory = stack.enter_context(
+            patch.object(layerwise_module, "KVCacheSendingLayerThread", side_effect=make_send_thread)
+        )
+        recv_factory = stack.enter_context(
+            patch.object(layerwise_module, "KVCacheRecvingLayerThread", side_effect=make_recv_thread)
+        )
+        stack.enter_context(patch.object(layerwise_module, "logger", MagicMock()))
+        stack.enter_context(patch.object(layerwise_module.threading, "Event", MagicMock()))
+        stack.enter_context(
+            patch.object(
+                layerwise_module,
+                "get_ascend_config",
+                return_value=SimpleNamespace(pd_tp_ratio=1, num_head_replica=1, pd_head_ratio=1),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                layerwise_module,
+                "get_pcp_group",
+                return_value=SimpleNamespace(world_size=1, rank_in_group=0),
+            )
+        )
+        stack.enter_context(
+            patch.object(layerwise_module, "get_decode_context_model_parallel_world_size", return_value=1, create=True)
+        )
+        stack.enter_context(patch.object(layerwise_module, "get_decode_context_model_parallel_rank", return_value=0))
+        stack.enter_context(
+            patch.object(
+                layerwise_module,
+                "npu_stream_switch",
+                side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+            )
+        )
+        yield SimpleNamespace(
+            transfer_engine=transfer_engine,
+            get_transfer_engine=get_transfer_engine,
+            register_buffer=register_buffer,
+            send_factory=send_factory,
+            recv_factory=recv_factory,
+            send_threads=send_threads,
+            recv_threads=recv_threads,
+        )

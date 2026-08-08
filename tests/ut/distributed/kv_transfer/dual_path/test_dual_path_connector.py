@@ -9,7 +9,6 @@ It is deterministic and stubs optional Mooncake/NPU extensions before imports.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import importlib
 import importlib.util
@@ -93,6 +92,8 @@ for _module_name, _module in _saved_modules.items():
     sys.modules[_module_name] = _module
 
 import pytest  # noqa: E402
+
+from tests.ut.distributed.kv_transfer.dual_path.conftest import worker_environment  # noqa: E402
 
 
 # Task-01: Decode-role DualPath components compose KVPool lookup adapters.
@@ -247,87 +248,6 @@ def make_kv_caches():
     value_cache.data_ptr.return_value = 0x2000
     value_cache.element_size.return_value = 4
     return {"encoder.layer.0": (key_cache, value_cache)}
-
-
-@contextlib.contextmanager
-def worker_environment():
-    transfer_engine = MagicMock(name="transfer_engine")
-    transfer_engine.get_rpc_port.return_value = 9090
-    transfer_engine.initialize.return_value = 0
-    transfer_engine.register_memory.return_value = 0
-    send_threads = []
-    recv_threads = []
-
-    def make_send_thread(*_args, **_kwargs):
-        thread = MagicMock(name=f"send_thread_{len(send_threads)}")
-        send_threads.append(thread)
-        return thread
-
-    def make_recv_thread(*_args, **_kwargs):
-        thread = MagicMock(name=f"recv_thread_{len(recv_threads)}")
-        recv_threads.append(thread)
-        return thread
-
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(patch("torch.Tensor.size", return_value=(10, 16, 8, 16)))
-        stack.enter_context(patch("torch.Tensor.element_size", return_value=4))
-        stack.enter_context(patch("torch.Tensor.data_ptr", return_value=0x1000))
-        stack.enter_context(patch("math.prod", return_value=128))
-        stack.enter_context(patch("random.Random"))
-        stack.enter_context(patch.object(layerwise_module, "get_tensor_model_parallel_rank", return_value=0))
-        stack.enter_context(patch.object(layerwise_module, "get_tp_group", return_value=None))
-        stack.enter_context(patch.object(layerwise_module, "get_ip", return_value="127.0.0.1"))
-        stack.enter_context(
-            patch.object(layerwise_module, "string_to_int64_hash", side_effect=lambda value: hash(value))
-        )
-        get_transfer_engine = stack.enter_context(
-            patch.object(layerwise_module.global_te, "get_transfer_engine", return_value=transfer_engine)
-        )
-        register_buffer = stack.enter_context(
-            patch.object(layerwise_module.global_te, "register_buffer", return_value=None)
-        )
-        send_factory = stack.enter_context(
-            patch.object(layerwise_module, "KVCacheSendingLayerThread", side_effect=make_send_thread)
-        )
-        recv_factory = stack.enter_context(
-            patch.object(layerwise_module, "KVCacheRecvingLayerThread", side_effect=make_recv_thread)
-        )
-        stack.enter_context(patch.object(layerwise_module, "logger", MagicMock()))
-        stack.enter_context(patch.object(layerwise_module.threading, "Event", MagicMock()))
-        stack.enter_context(
-            patch.object(
-                layerwise_module,
-                "get_ascend_config",
-                return_value=SimpleNamespace(pd_tp_ratio=1, num_head_replica=1, pd_head_ratio=1),
-            )
-        )
-        stack.enter_context(
-            patch.object(
-                layerwise_module,
-                "get_pcp_group",
-                return_value=SimpleNamespace(world_size=1, rank_in_group=0),
-            )
-        )
-        stack.enter_context(
-            patch.object(layerwise_module, "get_decode_context_model_parallel_world_size", return_value=1, create=True)
-        )
-        stack.enter_context(patch.object(layerwise_module, "get_decode_context_model_parallel_rank", return_value=0))
-        stack.enter_context(
-            patch.object(
-                layerwise_module,
-                "npu_stream_switch",
-                side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
-            )
-        )
-        yield SimpleNamespace(
-            transfer_engine=transfer_engine,
-            get_transfer_engine=get_transfer_engine,
-            register_buffer=register_buffer,
-            send_factory=send_factory,
-            recv_factory=recv_factory,
-            send_threads=send_threads,
-            recv_threads=recv_threads,
-        )
 
 
 def metadata_snapshot(metadata):
@@ -797,6 +717,8 @@ class TestDualPathConstructionParity(unittest.TestCase):
             | {
                 "dual_path_cfg",
                 "_kvpool_worker_adapter",
+                "_registered_kv_caches",
+                "_registered_layer_order",
                 "_control_failed_recving",
                 "_forward_receive_bindings",
                 "_pending_forward_done",
@@ -1209,7 +1131,8 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             parent.register_kv_caches(make_kv_caches())
             dual.register_kv_caches(make_kv_caches())
             self.assertIsNone(parent.kv_send_layer_thread)
-            self.assertIsNone(dual.kv_send_layer_thread)
+            self.assertIsNotNone(dual.kv_send_layer_thread)
+            self.assertEqual(dual.kv_send_layer_thread.start.call_count, 1)
             self.assertIsNotNone(parent.kv_recv_layer_thread)
             self.assertIsNotNone(dual.kv_recv_layer_thread)
             self.assertEqual(parent.kv_recv_layer_thread.start.call_count, dual.kv_recv_layer_thread.start.call_count)
@@ -1260,7 +1183,8 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             self.assertIsNotNone(parent.kv_send_layer_thread)
             self.assertIsNotNone(dual.kv_send_layer_thread)
             self.assertIsNone(parent.kv_recv_layer_thread)
-            self.assertIsNone(dual.kv_recv_layer_thread)
+            self.assertIsNotNone(dual.kv_recv_layer_thread)
+            self.assertEqual(dual.kv_recv_layer_thread.start.call_count, 1)
             parent.kv_send_layer_thread.reset_mock()
             dual.kv_send_layer_thread.reset_mock()
             parent.current_layer = 0

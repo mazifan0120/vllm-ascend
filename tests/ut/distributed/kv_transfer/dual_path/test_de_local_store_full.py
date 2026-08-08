@@ -393,6 +393,8 @@ def test_decode_register_kv_caches_delegates_to_parent_and_store_worker_exactly_
     with (
         patch.object(MooncakeLayerwiseConnectorWorker, "__init__", autospec=True, return_value=None) as parent_init,
         patch.object(MooncakeLayerwiseConnectorWorker, "register_kv_caches", autospec=True) as parent_register,
+        patch.object(MooncakeLayerwiseConnectorWorker, "_ensure_send_layer_runtime", autospec=True),
+        patch.object(MooncakeLayerwiseConnectorWorker, "_ensure_receive_layer_runtime", autospec=True),
         patch.object(connector_module, "KVPoolWorkerAdapter") as adapter_cls,
     ):
         decode_worker = DualPathConnectorWorker(
@@ -407,6 +409,8 @@ def test_decode_register_kv_caches_delegates_to_parent_and_store_worker_exactly_
             "prefill-engine",
             DualPathConfig(role="prefill"),
         )
+        decode_worker.index_to_name = {0: ["layer.0"]}
+        prefill_worker.index_to_name = {0: ["layer.0"]}
 
         decode_worker.register_kv_caches(kv_caches)
         prefill_worker.register_kv_caches(kv_caches)
