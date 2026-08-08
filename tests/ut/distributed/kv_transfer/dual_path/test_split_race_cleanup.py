@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+import threading
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,50 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     MooncakeLayerwiseConnectorWorker,
     get_external_request_id,
 )
+
+
+class _RecordingLock:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.enter_count = 0
+
+    @property
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._lock.release()
+
+
+class _LockObservedDict(dict):
+    def __init__(self, lock: _RecordingLock, values: dict) -> None:
+        super().__init__(values)
+        self._lock = lock
+        self.accesses: list[tuple[str, bool]] = []
+
+    def _record(self, operation: str) -> None:
+        self.accesses.append((operation, self._lock.locked))
+
+    def get(self, key, default=None):
+        self._record("get")
+        return super().get(key, default)
+
+    def pop(self, key, default=None):
+        self._record("pop")
+        return super().pop(key, default)
+
+    def clear(self) -> None:
+        self._record("clear")
+        super().clear()
+
+    def __setitem__(self, key, value) -> None:
+        self._record("set")
+        super().__setitem__(key, value)
 
 
 def test_identical_duplicate_plans_are_idempotent_and_conflicts_preserve_first() -> None:
@@ -381,6 +426,91 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     parent_shutdown.assert_called_once_with()
     parent_shutdown_prefill.assert_called_once_with()
     enqueue.assert_not_called()
+
+
+def test_release_prevents_late_reverse_callback_from_recreating_terminal_state() -> None:
+    worker = _make_worker()
+    worker.start_load_kv(_make_split_metadata(include_store=False))
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
+    worker._pending_local_reverse_terminals[DECODE_REQUEST_ID] = True
+
+    worker._release_task07_request_state({DECODE_REQUEST_ID})
+    with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+        worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=False)
+
+    assert worker._pending_local_reverse_terminals == {}
+
+
+def test_shutdown_prevents_late_reverse_callback_from_recreating_terminal_state() -> None:
+    worker = _make_worker()
+    worker.start_load_kv(_make_split_metadata(include_store=False))
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
+    worker._pending_local_reverse_terminals[DECODE_REQUEST_ID] = True
+
+    with patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True):
+        worker.shutdown()
+    with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+        worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=False)
+
+    assert worker._pending_local_reverse_terminals == {}
+
+
+@pytest.mark.parametrize("cleanup", ["release", "shutdown"])
+def test_reverse_callback_and_cleanup_share_one_lock_for_tracker_and_terminal_state(cleanup: str) -> None:
+    worker = _make_worker()
+    worker.start_load_kv(_make_split_metadata(include_store=False))
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
+    recording_lock = _RecordingLock()
+    tracked_trackers = _LockObservedDict(recording_lock, worker._split_trackers)
+    tracked_terminals = _LockObservedDict(recording_lock, worker._pending_local_reverse_terminals)
+    worker._reverse_terminal_lock = recording_lock
+    worker._split_trackers = tracked_trackers
+    worker._pending_local_reverse_terminals = tracked_terminals
+
+    with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
+        worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=False)
+    if cleanup == "release":
+        worker._release_task07_request_state({DECODE_REQUEST_ID})
+    else:
+        with patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True):
+            worker.shutdown()
+
+    accesses = tracked_trackers.accesses + tracked_terminals.accesses
+    assert recording_lock.enter_count >= 2
+    assert accesses
+    assert all(lock_held for _, lock_held in accesses), accesses
+    assert tracked_terminals == {}
+
+
+def test_shutdown_makes_public_split_start_load_inert_but_preserves_pre_shutdown_store_delegation() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    store_metadata = metadata.decode_store_metadata
+
+    worker.start_load_kv(metadata)
+
+    worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
+    assert DECODE_REQUEST_ID in worker._split_trackers
+    assert DECODE_REQUEST_ID in worker._reverse_plans
+
+    with (
+        patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True),
+        patch.object(worker, "_enqueue_kv_layer_send") as enqueue,
+    ):
+        worker.shutdown()
+        worker._kvpool_worker_adapter.start_load_kv.reset_mock()
+        worker.start_load_kv(metadata)
+
+    worker._kvpool_worker_adapter.start_load_kv.assert_not_called()
+    assert worker._split_trackers == {}
+    assert worker._reverse_plans == {}
+    assert worker._forward_receive_bindings == {}
+    enqueue.assert_not_called()
+
+    ordinary_store_metadata = DualPathConnectorMetadata()
+    ordinary_store_metadata.decode_store_metadata = store_metadata
+    worker.start_load_kv(ordinary_store_metadata)
+    worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
 
 
 def test_production_de_read_result_creates_no_plan_tracker_or_worker_operation(monkeypatch) -> None:

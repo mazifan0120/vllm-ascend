@@ -1762,3 +1762,125 @@ class TestParentEnqueueExtraction(unittest.TestCase):
             self.assertEqual(set(first_task.send_request), {"req-parity"})
             self.assertEqual(set(second_task.send_request), {"req-parity"})
             self.assertEqual(decoder_info.call_count, 2)
+
+    def test_parent_forward_transform_branch_parity_after_enqueue_extraction(self):
+        config = MockVllmConfig("prefill", "kv_producer")
+        config.parallel_config.tensor_parallel_size = 1
+        config.quant_config = SimpleNamespace(
+            enable_fa_quant=False,
+            enable_c8_quant=True,
+            c8_quant_layers=[0],
+            kvcache_quant_layers=[],
+        )
+        config.compilation_config = SimpleNamespace(
+            static_forward_context={
+                "encoder.layer.0": SimpleNamespace(
+                    _c8_k_inv_scale=1.0,
+                    _c8_k_offset=0.0,
+                    _c8_v_inv_scale=1.0,
+                    _c8_v_offset=0.0,
+                )
+            }
+        )
+        metadata = MooncakeLayerwiseConnectorMetadata()
+        metadata.add_new_req(
+            "req-transform",
+            [[7, 8]],
+            {
+                "remote_block_ids": [[4, 5]],
+                "remote_block_size": [[16]],
+                "remote_engine_id": "decode-engine",
+                "remote_host": "127.0.0.2",
+                "remote_port": 6000,
+                "remote_te_rpc_port": 9090,
+            },
+            chunk_finish=True,
+        )
+        block_table = torch.tensor([[7, 8]], dtype=torch.int32)
+        block_lengths = torch.tensor([32], dtype=torch.int32)
+        sequence_starts = torch.tensor([0], dtype=torch.int32)
+        metadata.send_task.group_rearrange_block_ids = [[7, 8]]
+        metadata.send_task.group_num_blocks = [2]
+        metadata.send_task.group_num_tokens = [32]
+        metadata.send_task.group_block_table = [block_table]
+        metadata.send_task.group_block_len_tensor = [block_lengths]
+        metadata.send_task.group_seq_start_tensor = [sequence_starts]
+        ready_event = MagicMock(name="reshape_cache_event")
+        key_cache = torch.zeros((10, 16, 2, 2), dtype=torch.float32)
+        value_cache = torch.ones((10, 16, 2, 2), dtype=torch.float32)
+        transformed_keys = torch.full((32, 2, 2), 3.0)
+        transformed_values = torch.full((32, 2, 2), 4.0)
+        quant_keys = MagicMock(name="quant_keys")
+        quant_values = MagicMock(name="quant_values")
+        stream_order = []
+        stream_context = MagicMock(name="stream_context")
+        stream_context.__enter__.side_effect = lambda: stream_order.append("enter")
+        stream_context.__exit__.side_effect = lambda *_args: stream_order.append("exit")
+        ready_event.wait.side_effect = lambda: stream_order.append("wait")
+        paged_cache_load = MagicMock(name="npu_paged_cache_load")
+        atb = SimpleNamespace(npu_paged_cache_load=paged_cache_load)
+        ascend_config = SimpleNamespace(pd_tp_ratio=2, num_head_replica=1, pd_head_ratio=2)
+
+        with (
+            worker_environment(),
+            patch.object(layerwise_module, "get_ascend_config", return_value=ascend_config),
+            patch.object(layerwise_module.torch_npu, "atb", atb, create=True),
+        ):
+            worker = MooncakeLayerwiseConnectorWorker(config, MockKVCacheConfig(), "test_engine")
+            worker.current_layer = 0
+            worker.layer_metadata = {"encoder.layer.0": SimpleNamespace(tensor_group_idx=[0])}
+            worker.kv_cache_specs = [
+                layerwise_module.FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=2,
+                    head_size=2,
+                    dtype=torch.float32,
+                )
+            ]
+            worker.k_buffer = torch.empty(1)
+            worker.kv_send_layer_thread = MagicMock(name="kv_send_layer_thread")
+
+            with (
+                patch.object(layerwise_module, "npu_stream_switch", return_value=stream_context) as stream_switch,
+                patch.object(
+                    layerwise_module,
+                    "kv_alltoall_and_rearrange",
+                    return_value=(transformed_keys, transformed_values),
+                ) as rearrange,
+                patch.object(
+                    worker,
+                    "get_nz_cache",
+                    side_effect=[quant_keys, quant_values],
+                ) as get_nz_cache,
+                patch.object(worker, "update_decoder_info", side_effect=lambda req_id, req_meta: req_meta),
+                patch.object(worker, "_enqueue_kv_layer_send", wraps=worker._enqueue_kv_layer_send) as enqueue,
+            ):
+                worker.save_kv_layer(
+                    "encoder.layer.0",
+                    [key_cache, value_cache],
+                    SimpleNamespace(reshape_cache_event=ready_event),
+                    metadata,
+                )
+
+        enqueue.assert_called_once()
+        stream_switch.assert_called_once_with(worker.resharding_stream)
+        assert stream_order == ["enter", "wait", "exit"]
+        paged_cache_load.assert_called_once()
+        paged_cache_args = paged_cache_load.call_args
+        assert paged_cache_args.args[:4] == (key_cache, value_cache, block_table, block_lengths)
+        assert paged_cache_args.kwargs["seq_starts"] is sequence_starts
+        rearrange.assert_called_once()
+        assert rearrange.call_args.args[0] == 2
+        assert get_nz_cache.call_count == 2
+        queue = worker.kv_send_layer_thread.send_queue
+        queue.put.assert_called_once()
+        send_task = queue.put.call_args.args[0]
+        assert send_task.k_cache is transformed_keys
+        assert send_task.v_cache is transformed_values
+        assert send_task.k_quant_cache is quant_keys
+        assert send_task.v_quant_cache is quant_values
+        assert send_task.wait_event is ready_event
+        assert send_task.layer_idx == 0
+        assert send_task.layer_name == "encoder.layer.0"
+        assert send_task.group_rearrange_block_ids == [[7, 8]]
+        assert set(send_task.send_request) == {"req-transform"}
