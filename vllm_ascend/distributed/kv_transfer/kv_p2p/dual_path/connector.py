@@ -378,6 +378,32 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 "the original result is preserved"
             )
 
+        eligibility = "singleton" if prefill_local_tokens >= decision_request.decode_store_tokens else "policy"
+        match result.path:
+            case Path.PE_READ:
+                store_coverage = "none"
+            case Path.DE_READ:
+                store_coverage = (
+                    "partial"
+                    if decision_request.decode_store_tokens > decision_request.decode_local_tokens
+                    else "skipped"
+                )
+            case unreachable:
+                assert_never(unreachable)
+        logger.info(
+            "dual_path decision key=%s/%s L_DE=%s K_DE=%s L_PE=%s R=%s T=%s eligibility=%s selected_path=%s store=%s",
+            request_key.decode_engine_instance_id,
+            request_key.decode_request_id,
+            decision_request.decode_local_tokens,
+            decision_request.decode_store_tokens,
+            prefill_local_tokens,
+            decision_request.target_tokens,
+            effective_prefill_tokens,
+            eligibility,
+            result.path.value,
+            store_coverage,
+        )
+
         match result.path:
             case Path.PE_READ:
                 return 0, False
@@ -788,14 +814,30 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
             def log_delivery_failure(completed_future: Future[None]) -> None:
                 if completed_future.cancelled():
+                    logger.warning(
+                        "dual_path delivery key=%s/%s protocol=%s delivery_terminal=CANCELLED",
+                        request_key.decode_engine_instance_id,
+                        request_key.decode_request_id,
+                        DUAL_PATH_PROTOCOL_VERSION,
+                    )
                     return
                 error = completed_future.exception()
                 if error is not None:
                     logger.error(
-                        "DualPath Prefill decision delivery failed for request %s: %s",
-                        request_id,
+                        "dual_path delivery key=%s/%s protocol=%s delivery_terminal=FAILED "
+                        "failure_source=DELIVERY error=%s",
+                        request_key.decode_engine_instance_id,
+                        request_key.decode_request_id,
+                        DUAL_PATH_PROTOCOL_VERSION,
                         error,
                     )
+                    return
+                logger.info(
+                    "dual_path delivery key=%s/%s protocol=%s delivery_terminal=SUCCEEDED",
+                    request_key.decode_engine_instance_id,
+                    request_key.decode_request_id,
+                    DUAL_PATH_PROTOCOL_VERSION,
+                )
 
             delivery_future.add_done_callback(log_delivery_failure)
             return
@@ -1090,6 +1132,37 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         metadata.forward_receive_bindings.append(binding)
         state.result = result
         state.status = DecodeDecisionStatus.COMMITTED
+        match result.path:
+            case Path.PE_READ:
+                store_coverage = "none"
+                store_end = snapshot.local_tokens
+                reverse_start = snapshot.local_tokens
+                reverse_end = snapshot.local_tokens
+            case Path.DE_READ:
+                store_coverage = "partial" if snapshot.store_load_spec is not None else "skipped"
+                store_end = snapshot.store_tokens
+                assert reverse_plan is not None
+                reverse_start = reverse_plan.token_start
+                reverse_end = reverse_plan.token_end
+            case unreachable:
+                assert_never(unreachable)
+        logger.info(
+            "dual_path activation key=%s/%s protocol=%s selected_path=%s store=%s "
+            "store_range=[%s,%s) reverse_range=[%s,%s) compute_range=[%s,%s) forward_range=[%s,%s)",
+            state.request_key.decode_engine_instance_id,
+            state.request_key.decode_request_id,
+            decision.protocol_version,
+            result.path.value,
+            store_coverage,
+            snapshot.local_tokens,
+            store_end,
+            reverse_start,
+            reverse_end,
+            binding.token_start,
+            binding.token_end,
+            binding.token_start,
+            binding.token_end,
+        )
 
     def build_connector_meta(
         self,
@@ -1631,6 +1704,10 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             if store_invalid_block_ids.intersection(tracker.store_destination_slice):
                 tracker.store_phase = _SplitPhase.FAILED
                 self._invalid_block_ids.update(tracker.store_destination_slice)
+                logger.warning(
+                    "dual_path data_terminal key=%s failure_source=STORE final_predicate=FAILED",
+                    request_id,
+                )
                 if not tracker.terminal_published:
                     tracker.terminal_published = True
                     published_store_terminals.add(request_id)
@@ -1661,6 +1738,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         for failure in getattr(metadata, "control_failures", ()):
             self._control_failed_recving.add(failure.request_id)
             self._invalid_block_ids.update(failure.invalid_block_ids)
+            logger.warning(
+                "dual_path control_terminal key=%s failure_source=%s final_predicate=FAILED",
+                failure.request_id,
+                failure.reason.value,
+            )
         split_store_accepted = getattr(self, "_accepting_task07", True) or not any(
             binding.path is Path.DE_READ for binding in getattr(metadata, "forward_receive_bindings", ())
         )
@@ -1727,6 +1809,10 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             else:
                 tracker.reverse_phase = _SplitPhase.FAILED
                 self._invalid_block_ids.update(tracker.forward_destination_slice)
+                logger.warning(
+                    "dual_path data_terminal key=%s failure_source=REVERSE final_predicate=FAILED",
+                    request_id,
+                )
                 if not tracker.terminal_published:
                     tracker.terminal_published = True
                     done_recving.add(request_id)
@@ -1769,11 +1855,19 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._invalid_block_ids.update(binding.destination_block_ids[0][first_reverse_block:last_reverse_block])
             reverse_finished.add(prefill_request_id)
             self._consume_reverse_receive_binding(binding, False)
+            logger.warning(
+                "dual_path data_terminal key=%s failure_source=REVERSE final_predicate=FAILED",
+                prefill_request_id,
+            )
         for wire_request_id in reverse_done_wire_ids:
             prefill_request_id = reverse_request_map[wire_request_id]
             binding = reverse_receive_bindings[prefill_request_id]
             reverse_finished.add(prefill_request_id)
             self._consume_reverse_receive_binding(binding, True)
+            logger.info(
+                "dual_path reverse_terminal key=%s terminal=DONE final_predicate=SUCCESS",
+                prefill_request_id,
+            )
         pending_reverse_done.clear()
         pending_reverse_failed.clear()
 
@@ -1817,6 +1911,10 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     if tracker.forward_phase is _SplitPhase.PENDING:
                         tracker.forward_phase = _SplitPhase.FAILED
                         self._invalid_block_ids.update(tracker.forward_destination_slice)
+                        logger.warning(
+                            "dual_path data_terminal key=%s failure_source=FORWARD final_predicate=FAILED",
+                            decode_request_id,
+                        )
                         if not tracker.terminal_published:
                             tracker.terminal_published = True
                             forward_finished.add(decode_request_id)
@@ -1862,6 +1960,23 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._pending_forward_failed = pending_failed
         done_recving.update(ordinary_done.union(forward_finished, reverse_finished, self.virtual_request))
         self.virtual_request = set()
+        for request_id in done_recving:
+            tracker = split_trackers.get(request_id)
+            if tracker is None or not tracker.terminal_published:
+                continue
+            final_predicate = (
+                "FAILED"
+                if _SplitPhase.FAILED in {tracker.store_phase, tracker.reverse_phase, tracker.forward_phase}
+                else "SUCCESS"
+            )
+            logger.info(
+                "dual_path final key=%s store=%s reverse=%s forward=%s final_predicate=%s",
+                request_id,
+                tracker.store_phase.value,
+                tracker.reverse_phase.value,
+                tracker.forward_phase.value,
+                final_predicate,
+            )
         if done_recving:
             logger.info(
                 "Number of completed KV cache recv requests: %s, receive requests: %s",
