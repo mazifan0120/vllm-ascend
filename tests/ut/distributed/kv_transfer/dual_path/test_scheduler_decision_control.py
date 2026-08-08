@@ -1384,6 +1384,44 @@ class TestCleanupAndShutdown:
         assert scheduler._pe_pending_reverse_receive_bindings == {}
         assert scheduler._pe_control_failures == {}
 
+    def test_de_read_delivery_failure_before_first_build_emits_control_only(
+        self,
+        scheduler_factory,
+        task04_seams,
+    ):
+        # Given
+        delivery_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        policy = MagicMock(name="de_read_path_policy")
+        policy.choose.return_value = Path.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request(
+            "prefill-de-read-pre-drain-failure",
+            _remote_decode_params(),
+        )
+        scheduler.get_num_new_matched_tokens(request, 0)
+        _bind_prefill(scheduler, request)
+        assert request.request_id in scheduler._pe_pending_reverse_receive_bindings
+        delivery_future.set_exception(PathDecisionDeliveryError("delivery exhausted"))
+
+        # When
+        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+        # Then
+        assert metadata.reverse_receive_bindings == []
+        assert metadata.control_failures == [
+            connector_module.DualPathControlFailureMetadata(
+                request_id=request.request_id,
+                invalid_block_ids=(10, 11),
+                reason=connector_module.DualPathControlFailureReason.ACTIVATION_FAILED,
+            )
+        ]
+        worker = _make_prefill_worker()
+        worker.start_load_kv(metadata)
+        assert worker.request_map == {}
+        assert worker._reverse_receive_bindings == {}
+        assert worker.get_finished(set(), metadata) == (set(), {request.request_id})
+
     def test_concurrent_requests_stay_isolated_across_outcomes(
         self,
         decode_scheduler,

@@ -334,6 +334,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                     )
                                 self._pe_control_failures[request_id] = failure
                                 self._pe_invalid_request_ids.add(request_id)
+                                self._pe_pending_reverse_receive_bindings.pop(request_id, None)
                             case Path.PE_READ:
                                 pass
                             case unreachable:
