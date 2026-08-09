@@ -1525,9 +1525,9 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 )
 
     def test_dual_path_classes_define_only_contracted_methods(self):
-        # Task-00 contracted __init__ only; Task-01 adds exactly the Decode
-        # admission surface below. Any further method must update this guard
-        # together with its owning Task spec.
+        # This guard pins the full contracted method surface for every dual
+        # path class. Any new method must update this guard together with its
+        # owning Task spec.
         expected_methods = {
             "DualPathConnector": {"__init__", "get_finished", "shutdown"},
             "DualPathConnectorScheduler": {

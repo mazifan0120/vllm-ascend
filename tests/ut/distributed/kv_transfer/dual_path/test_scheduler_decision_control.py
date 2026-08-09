@@ -970,7 +970,7 @@ class TestDecodeResultConsumption:
         assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_not_called()
 
-    def test_timeout_emits_one_aligned_suffix_record_and_unregisters_once(
+    def test_timeout_emits_one_aligned_suffix_control_failure_and_unregisters_once(
         self,
         decode_scheduler,
         task04_seams,
@@ -996,7 +996,7 @@ class TestDecodeResultConsumption:
         ]
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
-    def test_timeout_record_is_never_emitted_twice(self, decode_scheduler, task04_seams):
+    def test_timeout_control_failure_is_never_emitted_twice(self, decode_scheduler, task04_seams):
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
@@ -1051,7 +1051,7 @@ class TestDecodeResultConsumption:
 
 
 class TestWorkerFailureRelay:
-    def test_timeout_only_metadata_starts_no_store_or_p2p_operation(self):
+    def test_control_failure_metadata_starts_no_store_or_p2p_operation(self):
         # Given
         worker = _control_only_worker()
         metadata = connector_module.DualPathConnectorMetadata()
@@ -1480,7 +1480,7 @@ class TestCleanupAndShutdown:
         decode_scheduler.request_finished(cancelled_request, [61, 62, 63, 64])
         task04_seams.decode_coordinator.take_received_decisions.return_value = []
         with patch.object(connector_module.time, "monotonic", return_value=timed_out_state.deadline):
-            timeout_metadata = decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
+            failure_metadata = decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
 
         # Then
         assert committed_state.status is connector_module.DecodeDecisionStatus.COMMITTED
@@ -1494,7 +1494,7 @@ class TestCleanupAndShutdown:
             committed_request.request_id,
             timed_out_request.request_id,
         }
-        assert timeout_metadata.control_failures == [
+        assert failure_metadata.control_failures == [
             connector_module.DualPathControlFailureMetadata(
                 request_id=timed_out_request.request_id,
                 invalid_block_ids=(52, 53, 54),

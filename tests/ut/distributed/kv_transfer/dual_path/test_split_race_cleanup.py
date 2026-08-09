@@ -553,7 +553,7 @@ def test_production_de_read_result_creates_plan_binding_store_without_scheduler_
             next(fixture)
 
 
-def test_task07_adds_no_scheduler_split_state_or_blocking_hooks() -> None:
+def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
     expected_scheduler_methods = {
         "__init__",
         "_is_task01_decode_request",
