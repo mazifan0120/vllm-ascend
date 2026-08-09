@@ -13,9 +13,14 @@ from tests.ut.distributed.kv_transfer.dual_path import test_pe_read_forward as p
 from tests.ut.distributed.kv_transfer.dual_path import test_split_integration as split_helpers
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as layerwise_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import DualPathConnectorMetadata
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import PathKind
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
+    DualPathRequestKey,
+    PathDecisionRequest,
+    PathKind,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import DecodeControlEndpoint
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
@@ -33,6 +38,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 CONNECTOR_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector"
+SCHEDULER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler"
 DECODE_REQUEST_ID = "request-local-7"
 PREFILL_REQUEST_ID = "reques123456789"
 L_DE = 16
@@ -167,9 +173,9 @@ def production_harness_factory(monkeypatch):
     monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
     schedulers = []
     with (
-        patch(f"{CONNECTOR_NS}.KVPoolSchedulerAdapter"),
-        patch(f"{CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
-        patch(f"{CONNECTOR_NS}.get_ip", return_value="192.0.2.44"),
+        patch(f"{SCHEDULER_NS}.KVPoolSchedulerAdapter"),
+        patch(f"{SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{SCHEDULER_NS}.get_ip", return_value="192.0.2.44"),
     ):
 
         def make(*, include_store: bool = True, path: PathKind = PathKind.DE_READ) -> ProductionHarness:
@@ -212,7 +218,7 @@ def production_harness_factory(monkeypatch):
             if not include_store:
                 snapshot = replace(snapshot, store_load_spec=None)
                 decode_scheduler._decode_kv_snapshots[DECODE_REQUEST_ID] = snapshot
-                state.decision_request = connector_module.PathDecisionRequest(
+                state.decision_request = PathDecisionRequest(
                     request_key=state.request_key,
                     target_tokens=R,
                     decode_local_tokens=L_DE,
@@ -398,7 +404,7 @@ def test_production_metadata_failed_wins_over_late_done(production_harness_facto
 
 def test_request_finish_releases_all_task08_state_idempotently(production_harness_factory) -> None:
     harness = production_harness_factory()
-    unrelated_key = connector_module.DualPathRequestKey("decode-instance", "unrelated")
+    unrelated_key = DualPathRequestKey("decode-instance", "unrelated")
     harness.prefill_scheduler._pe_prefill_local_tokens["unrelated"] = 7
     harness.prefill_scheduler._path_decider._decision_records[unrelated_key] = MagicMock()
 
@@ -453,9 +459,9 @@ def test_shutdown_leaves_no_task08_residue(production_harness_factory) -> None:
 
 def test_structured_logs_reconstruct_request_facts(production_harness_factory) -> None:
     with (
-        patch.object(connector_module.logger, "info") as info,
-        patch.object(connector_module.logger, "warning") as warning,
-        patch.object(connector_module.logger, "error") as error,
+        patch.object(scheduler_module.logger, "info") as info,
+        patch.object(scheduler_module.logger, "warning") as warning,
+        patch.object(scheduler_module.logger, "error") as error,
     ):
         harness = production_harness_factory()
         harness.finish_store()
@@ -477,7 +483,7 @@ def test_structured_logs_reconstruct_request_facts(production_harness_factory) -
 
 
 def test_pe_read_logs_store_as_not_authorized(production_harness_factory) -> None:
-    with patch.object(connector_module.logger, "info") as info:
+    with patch.object(scheduler_module.logger, "info") as info:
         production_harness_factory(path=PathKind.PE_READ)
     messages = "\n".join(call.args[0] % call.args[1:] for call in info.call_args_list)
 

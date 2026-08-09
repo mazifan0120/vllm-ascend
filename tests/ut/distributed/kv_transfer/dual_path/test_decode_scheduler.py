@@ -27,6 +27,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 _CONNECTOR_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector"
+_SCHEDULER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler"
+_WORKER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.worker"
 
 
 def _make_vllm_config(kv_role="kv_consumer"):
@@ -99,11 +101,11 @@ def _selected_params():
 
 class TestDecodeAdmission(unittest.TestCase):
     def setUp(self):
-        self._adapter_patch = patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter")
-        self._worker_adapter_patch = patch(f"{_CONNECTOR_NS}.KVPoolWorkerAdapter")
-        self._coordinator_patch = patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator")
-        self._get_ip_patch = patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1")
-        self._derive_control_port_patch = patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100)
+        self._adapter_patch = patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter")
+        self._worker_adapter_patch = patch(f"{_WORKER_NS}.KVPoolWorkerAdapter")
+        self._coordinator_patch = patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator")
+        self._get_ip_patch = patch(f"{_SCHEDULER_NS}.get_ip", return_value="127.0.0.1")
+        self._derive_control_port_patch = patch(f"{_SCHEDULER_NS}.derive_decode_control_port", return_value=7100)
         self._adapter_patch.start()
         self._worker_adapter_patch.start()
         coordinator_cls = self._coordinator_patch.start()
@@ -202,7 +204,7 @@ class TestDecodeAdmission(unittest.TestCase):
                 # When
                 with (
                     patch.object(self.scheduler, "_hybrid_prefill_token_count", return_value=transfer_tokens),
-                    patch(f"{_CONNECTOR_NS}.logger.warning") as log_warning,
+                    patch(f"{_SCHEDULER_NS}.logger.warning") as log_warning,
                 ):
                     result = self.scheduler.get_num_new_matched_tokens(request, local_tokens)
                     self.scheduler.update_state_after_alloc(request, blocks, num_external_tokens=result[0])

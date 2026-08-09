@@ -18,7 +18,7 @@ from vllm.v1.request import Request, RequestStatus
 from tests.ut.distributed.kv_transfer.dual_path import test_decode_admission_integration as admission_harness
 from tests.ut.distributed.kv_transfer.dual_path import test_pe_read_forward as forward_harness
 from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
     DualPathConnector,
@@ -126,7 +126,7 @@ def _make_pe_request(message: dict) -> SimpleNamespace:
 
 
 def _make_pe_scheduler() -> tuple[DualPathConnectorScheduler, AlwaysPEReadPolicy]:
-    coordinator = connector_module.PathDecisionCoordinator.for_prefill.return_value
+    coordinator = scheduler_module.PathDecisionCoordinator.for_prefill.return_value
     coordinator.submit.return_value = _completed_future()
     policy = AlwaysPEReadPolicy()
     scheduler = DualPathConnectorScheduler(
@@ -362,8 +362,8 @@ def _constrain_external_seams():
         patch(
             "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient"
         ) as lookup_client_cls,
-        patch.object(connector_module, "PathDecisionCoordinator") as coordinator_cls,
-        patch.object(connector_module, "get_ip", return_value="127.0.0.1"),
+        patch.object(scheduler_module, "PathDecisionCoordinator") as coordinator_cls,
+        patch.object(scheduler_module, "get_ip", return_value="127.0.0.1"),
     ):
         backend = MagicMock(name="kvpool_backend")
         mock_importlib.import_module.return_value = backend

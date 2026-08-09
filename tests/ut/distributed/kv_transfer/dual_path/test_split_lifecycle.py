@@ -11,7 +11,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_decode_scheduler import (
     _make_vllm_config,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as layerwise_module
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import worker as worker_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorWorker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
@@ -39,7 +39,7 @@ REVERSE_DESTINATION_BLOCKS = ((70, 71, 80, 81),)
 def _make_worker() -> DualPathConnectorWorker:
     with (
         worker_environment(),
-        patch.object(connector_module, "KVPoolWorkerAdapter"),
+        patch.object(worker_module, "KVPoolWorkerAdapter"),
     ):
         worker = DualPathConnectorWorker(
             _make_vllm_config(),
@@ -58,7 +58,7 @@ def _make_worker() -> DualPathConnectorWorker:
 def _make_prefill_worker() -> DualPathConnectorWorker:
     with (
         worker_environment(),
-        patch.object(connector_module, "KVPoolWorkerAdapter"),
+        patch.object(worker_module, "KVPoolWorkerAdapter"),
     ):
         worker = DualPathConnectorWorker(
             _make_vllm_config(),

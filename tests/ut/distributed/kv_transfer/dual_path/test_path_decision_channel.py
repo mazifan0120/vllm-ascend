@@ -1131,10 +1131,10 @@ def test_scheduler_constructs_role_specific_coordinator() -> None:
     )
     with (
         patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.get_ip",
             return_value="127.0.0.1",
         ),
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolSchedulerAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.KVPoolSchedulerAdapter"),
     ):
         decode_scheduler = DualPathConnectorScheduler(
             decode_config,
@@ -1174,7 +1174,7 @@ def test_scheduler_constructs_role_specific_coordinator() -> None:
 
 def test_scheduler_shutdown_closes_coordinator_idempotently() -> None:
     with patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.PathDecisionCoordinator"
     ) as coordinator_cls:
         scheduler = DualPathConnectorScheduler(
             _make_scheduler_vllm_config(dual_role="prefill", kv_role="kv_producer"),
@@ -1201,12 +1201,12 @@ def test_facade_shutdown_delegates_coordinator_close() -> None:
     )
     with (
         patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.get_ip",
             return_value="127.0.0.1",
         ),
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolSchedulerAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.KVPoolSchedulerAdapter"),
         patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.PathDecisionCoordinator"
         ) as coordinator_cls,
         patch.object(MooncakeLayerwiseConnector, "shutdown", autospec=True) as base_shutdown,
     ):

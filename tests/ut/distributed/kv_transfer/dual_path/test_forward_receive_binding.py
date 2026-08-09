@@ -8,9 +8,12 @@ import pytest
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
+    DualPathControlFailureMetadata,
+    DualPathControlFailureReason,
     ForwardReceiveBinding,
     ReversePlan,
 )
@@ -33,6 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 _CONNECTOR_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector"
+_SCHEDULER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler"
 _DECODE_INSTANCE_ID = "decode-engine:2:boot-7"
 _CONTROL_ENDPOINT = DecodeControlEndpoint(host="192.0.2.44", port=24001)
 
@@ -107,9 +111,9 @@ def scheduler_factory(monkeypatch):
     monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
     schedulers = []
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
-        patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
-        patch(f"{_CONNECTOR_NS}.get_ip", return_value="192.0.2.44"),
+        patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter"),
+        patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{_SCHEDULER_NS}.get_ip", return_value="192.0.2.44"),
     ):
 
         def make(*, need_truncate: bool = False):
@@ -249,7 +253,7 @@ def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_t
     assert request.request_id not in metadata.requests
     assert scheduler._reqs_need_recv == receive_queue_before == {}
     assert metadata.control_failures == []
-    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
+    assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_binding_destination_table_includes_hybrid_trimming(scheduler_factory):
@@ -282,15 +286,15 @@ def test_hybrid_timeout_uses_literal_frozen_table_suffix_without_changing_messag
     coordinator.take_received_decisions.return_value = []
 
     # When
-    with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
+    with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline):
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     # Then
     assert metadata.control_failures == [
-        connector_module.DualPathControlFailureMetadata(
+        DualPathControlFailureMetadata(
             request_id=request.request_id,
             invalid_block_ids=(42, 43, 44),
-            reason=connector_module.DualPathControlFailureReason.DECISION_TIMEOUT,
+            reason=DualPathControlFailureReason.DECISION_TIMEOUT,
         )
     ]
 
@@ -310,7 +314,7 @@ def test_duplicate_pe_read_result_does_not_emit_second_binding(scheduler_factory
     # Then
     assert len(first_metadata.forward_receive_bindings) == 1
     assert second_metadata.forward_receive_bindings == []
-    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
+    assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_de_read_decision_requires_non_empty_reverse_plan(scheduler_factory):
@@ -328,7 +332,7 @@ def test_de_read_decision_requires_non_empty_reverse_plan(scheduler_factory):
     assert metadata.forward_receive_bindings == []
     assert metadata.reverse_plans == []
     assert len(metadata.control_failures) == 1
-    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
 
 
 def test_wrapper_mismatch_before_commit_fails_without_kvpool_mutation(scheduler_factory):
@@ -340,7 +344,7 @@ def test_wrapper_mismatch_before_commit_fails_without_kvpool_mutation(scheduler_
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
     assert metadata.reverse_plans == []
     assert metadata.forward_receive_bindings == []
@@ -386,7 +390,7 @@ def test_store_miss_commits_nothing_and_enters_skipped(scheduler_factory):
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
     assert metadata.decode_store_metadata is None
     assert metadata.reverse_plans == [decision.reverse_plan]
-    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
+    assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_commit_failure_rolls_back_and_emits_one_activation_failure(scheduler_factory):
@@ -398,7 +402,7 @@ def test_commit_failure_rolls_back_and_emits_one_activation_failure(scheduler_fa
     first_metadata = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
     second_metadata = scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
 
-    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
     assert len(first_metadata.control_failures) == 1
     assert second_metadata.control_failures == []
     assert first_metadata.reverse_plans == []
@@ -413,11 +417,11 @@ def test_snapshot_plan_mismatch_uses_activation_failure_not_timeout(scheduler_fa
         _de_read_decision(state, snapshot, source_block_ids=((51, 52, 53, 54),))
     ]
 
-    with patch.object(connector_module.time, "monotonic", return_value=state.deadline + 1):
+    with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline + 1):
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
-    assert metadata.control_failures[0].reason is connector_module.DualPathControlFailureReason.ACTIVATION_FAILED
+    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert metadata.control_failures[0].reason is DualPathControlFailureReason.ACTIVATION_FAILED
 
 
 def test_activation_failure_invalidates_all_external_destinations(scheduler_factory):
@@ -430,10 +434,10 @@ def test_activation_failure_invalidates_all_external_destinations(scheduler_fact
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     assert metadata.control_failures == [
-        connector_module.DualPathControlFailureMetadata(
+        DualPathControlFailureMetadata(
             request_id=request.request_id,
             invalid_block_ids=(42, 43, 44),
-            reason=connector_module.DualPathControlFailureReason.ACTIVATION_FAILED,
+            reason=DualPathControlFailureReason.ACTIVATION_FAILED,
         )
     ]
     coordinator.unregister.assert_called_once_with(state.request_key)
@@ -462,7 +466,7 @@ def test_de_read_activation_emits_plan_binding_store_in_one_lifecycle(scheduler_
         )
     ]
     assert metadata.decode_store_metadata is store_metadata
-    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
+    assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_decisions_processed_before_store_metadata_build(scheduler_factory):
@@ -495,7 +499,7 @@ def test_de_read_committed_only_after_all_steps_succeed(scheduler_factory, failu
 
     scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
 
 
 def test_pe_read_never_calls_decode_kvpool_or_store_commit_surfaces(scheduler_factory):

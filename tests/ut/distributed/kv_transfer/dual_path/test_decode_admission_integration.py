@@ -42,7 +42,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_de_local_store_full import 
     _make_real_store_worker_adapter,
 )
 from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # noqa: E402
     DualPathConnector,
     DualPathConnectorScheduler,
@@ -198,10 +198,10 @@ def _constrain_kvpool_seams():
             "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient"
         ) as mock_lookup_client_cls,
         patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.PathDecisionCoordinator"
         ) as coordinator_cls,
         patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.get_ip",
             return_value="127.0.0.1",
         ),
     ):
@@ -654,7 +654,7 @@ class TestDecisionTimeoutIntegration:
 
         try:
             with (
-                patch.object(connector_module.time, "monotonic", return_value=100.0),
+                patch.object(scheduler_module.time, "monotonic", return_value=100.0),
                 patch.object(dual, "_access_metaserver") as proxy_http,
             ):
                 request, scheduler_output, matched_returns, lookup_mock, _, alloc_mock = _admit_one_request(scheduler)
@@ -671,7 +671,7 @@ class TestDecisionTimeoutIntegration:
             coordinator.register_pending.assert_called_once_with(state.request_key)
             proxy_http.assert_not_called()
             coordinator.submit.assert_not_called()
-            assert state.status is connector_module._DecodeDecisionStatus.PENDING
+            assert state.status is scheduler_module._DecodeDecisionStatus.PENDING
             assert state.deadline == 101.0
             assert dual._reqs_need_recv == {}
             assert block_pool.free_block_queue.num_free_blocks < baseline_free_blocks
@@ -679,7 +679,7 @@ class TestDecisionTimeoutIntegration:
             scheduler.update_from_output(scheduler_output, _runner_output_for([]))
 
             # When
-            with patch.object(connector_module.time, "monotonic", return_value=state.deadline + 1):
+            with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline + 1):
                 timeout_scheduler_output = scheduler.schedule()
 
             metadata = timeout_scheduler_output.kv_connector_metadata
@@ -711,7 +711,7 @@ class TestDecisionTimeoutIntegration:
             scheduler.update_from_output(timeout_scheduler_output, model_runner_output)
 
             # Then
-            assert state.status is connector_module._DecodeDecisionStatus.TIMED_OUT
+            assert state.status is scheduler_module._DecodeDecisionStatus.TIMED_OUT
             assert connector_output.finished_recving == {request.request_id}
             assert connector_output.invalid_block_ids == set(external_block_ids)
             assert request.status is RequestStatus.FINISHED_ERROR

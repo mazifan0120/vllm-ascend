@@ -22,7 +22,7 @@ def _make_worker(role: str) -> DualPathConnectorWorker:
 def test_dual_path_worker_repeated_runtime_ensure_is_idempotent(role: str) -> None:
     with (
         worker_environment() as runtime,
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolWorkerAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.worker.KVPoolWorkerAdapter"),
     ):
         worker = _make_worker(role)
         worker.register_kv_caches(make_kv_caches())
@@ -62,7 +62,7 @@ def test_decode_dual_path_worker_owns_exactly_one_receive_and_one_send_runtime()
 
     with (
         worker_environment() as runtime,
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolWorkerAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.worker.KVPoolWorkerAdapter"),
     ):
         worker = _make_worker("decode")
         worker.register_kv_caches(kv_caches)

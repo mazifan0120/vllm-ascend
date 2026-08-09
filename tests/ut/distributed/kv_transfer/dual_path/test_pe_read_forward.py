@@ -8,6 +8,7 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import AscendMultiConnector
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
@@ -32,6 +33,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 )
 
 _CONNECTOR_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector"
+_SCHEDULER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler"
 _DECODE_INSTANCE_ID = "decode-engine:2:boot-7"
 _BLOCK_SIZE = 16
 
@@ -86,8 +88,8 @@ def _completed_future() -> Future[None]:
 def scheduler_factory():
     schedulers = []
     with (
-        patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
-        patch(f"{_CONNECTOR_NS}.get_ip", return_value="192.0.2.44"),
+        patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{_SCHEDULER_NS}.get_ip", return_value="192.0.2.44"),
     ):
         coordinator = MagicMock(name="prefill_coordinator")
         coordinator.submit.return_value = _completed_future()
@@ -637,7 +639,7 @@ def test_activation_fact_mismatch_fails_with_local_control_failure(scheduler_fac
     elif mismatch == "topology":
         request.kv_transfer_params["remote_tp_size"] = 0
     wire_context = (
-        patch.object(connector_module, "get_external_request_id", return_value="")
+        patch.object(scheduler_module, "get_external_request_id", return_value="")
         if mismatch == "wire-id"
         else nullcontext()
     )

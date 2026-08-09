@@ -109,13 +109,13 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (  # noqa: E402
 @pytest.fixture(autouse=True)
 def _patch_task01_adapters():
     with (
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolSchedulerAdapter"),
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolWorkerAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.KVPoolSchedulerAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.worker.KVPoolWorkerAdapter"),
         patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.PathDecisionCoordinator"
         ) as coordinator_cls,
         patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.get_ip",
             return_value="127.0.0.1",
         ),
     ):

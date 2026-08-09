@@ -10,13 +10,15 @@ from vllm.v1.outputs import KVConnectorOutput
 from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
 from tests.ut.distributed.kv_transfer.dual_path.test_decode_scheduler import (
     _CONNECTOR_NS,
+    _SCHEDULER_NS,
     _make_blocks,
     _make_kv_cache_config,
     _make_request,
     _make_vllm_config,
     _selected_params,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import worker as worker_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
     DualPathConnectorScheduler,
@@ -136,10 +138,10 @@ def _make_real_store_metadata(request_id: str) -> DualPathConnectorMetadata:
 @pytest.fixture()
 def decode_scheduler():
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
-        patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
-        patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1"),
-        patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100),
+        patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter"),
+        patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{_SCHEDULER_NS}.get_ip", return_value="127.0.0.1"),
+        patch(f"{_SCHEDULER_NS}.derive_decode_control_port", return_value=7100),
     ):
         coordinator = MagicMock(name="decode_coordinator")
         coordinator.decode_engine_instance_id = "test_engine:0:test-boot"
@@ -177,10 +179,10 @@ def test_full_uses_ready_delta_partial_and_miss_use_transfer_delta(decode_schedu
 
 def test_hybrid_full_and_non_full_share_boundary_but_not_route() -> None:
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
-        patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
-        patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1"),
-        patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100),
+        patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter"),
+        patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{_SCHEDULER_NS}.get_ip", return_value="127.0.0.1"),
+        patch(f"{_SCHEDULER_NS}.derive_decode_control_port", return_value=7100),
     ):
         coordinator_cls.for_decode.return_value.decode_engine_instance_id = "test_engine:0:test-boot"
         coordinator_cls.for_decode.return_value.decode_control_endpoint = DecodeControlEndpoint(
@@ -338,7 +340,7 @@ def test_store_full_alloc_creates_no_decision_side_effects(decode_scheduler) -> 
     assert decode_scheduler.get_num_new_matched_tokens(request, 16) == (31, True)
 
     with (
-        patch(f"{_CONNECTOR_NS}.DualPathRequestKey", side_effect=AssertionError("request key constructed")),
+        patch(f"{_SCHEDULER_NS}.DualPathRequestKey", side_effect=AssertionError("request key constructed")),
         patch(
             f"{_CONNECTOR_NS}.DualPathConnectorScheduler._build_remote_decode_message",
             side_effect=AssertionError("envelope built"),
@@ -356,10 +358,10 @@ def test_store_full_alloc_creates_no_decision_side_effects(decode_scheduler) -> 
 def test_store_full_never_touches_path_policy() -> None:
     policy = MagicMock(name="path_policy")
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
-        patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
-        patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1"),
-        patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100),
+        patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter"),
+        patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{_SCHEDULER_NS}.get_ip", return_value="127.0.0.1"),
+        patch(f"{_SCHEDULER_NS}.derive_decode_control_port", return_value=7100),
     ):
         coordinator_cls.for_decode.return_value.decode_engine_instance_id = "test_engine:0:test-boot"
         coordinator_cls.for_decode.return_value.decode_control_endpoint = DecodeControlEndpoint(
@@ -399,7 +401,7 @@ def test_decode_register_kv_caches_delegates_to_parent_and_store_worker_exactly_
         patch.object(MooncakeLayerwiseConnectorWorker, "register_kv_caches", autospec=True) as parent_register,
         patch.object(MooncakeLayerwiseConnectorWorker, "_ensure_send_layer_runtime", autospec=True),
         patch.object(MooncakeLayerwiseConnectorWorker, "_ensure_receive_layer_runtime", autospec=True),
-        patch.object(connector_module, "KVPoolWorkerAdapter") as adapter_cls,
+        patch.object(worker_module, "KVPoolWorkerAdapter") as adapter_cls,
     ):
         decode_worker = DualPathConnectorWorker(
             decode_config,
@@ -859,8 +861,8 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
             autospec=True,
             side_effect=build_parent,
         ),
-        patch.object(connector_module, "ForwardReceiveBinding", side_effect=build_binding),
-        patch.object(connector_module.time, "monotonic", side_effect=read_deadline_clock),
+        patch.object(scheduler_module, "ForwardReceiveBinding", side_effect=build_binding),
+        patch.object(scheduler_module.time, "monotonic", side_effect=read_deadline_clock),
     ):
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
