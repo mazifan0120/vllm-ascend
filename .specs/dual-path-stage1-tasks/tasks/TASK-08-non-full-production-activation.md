@@ -491,7 +491,8 @@ Consequences:
   AscendStore connector may load a longer PE prefix or all connectors may
   return zero;
 - `DE_READ` contributes a strictly positive Reverse budget and becomes the
-  first-positive winner before the PE AscendStore sibling is queried; and
+  first-positive winner, so the PE AscendStore sibling's result cannot affect
+  accounting for this request; and
 - there is no zero-token DualPath winner and no new MultiConnector
   terminal/sibling-stop seam.
 
@@ -899,8 +900,10 @@ test belongs with the existing Layerwise suite.
     receives real blocks and installs Forward.
 12. If PE AscendStore also returns zero, no connector is recorded as a
     token-accounting winner and Forward still installs.
-13. `DE_READ` returns exactly `(K_DE-L_PE,True)` and prevents the Store sibling
-    lookup through first-positive selection.
+13. `DE_READ` returns exactly `(K_DE-L_PE,True)` and wins first-positive
+    accounting regardless of the Store sibling's result. The Store sibling is
+    still queried by the current upstream `MultiConnector`, but cannot replace
+    DualPath as the accounting winner.
 14. No Task-08 change to `AscendMultiConnector` is required.
 
 ### 17.3 Protocol and delivery timing
@@ -1078,7 +1081,8 @@ Task-08 is accepted only when all of the following are true:
 4. PE sends the Decision only after final allocation and local plan/binding
    installation.
 5. `PE_READ` composes with PE AscendStore through existing first-positive
-   accounting; `DE_READ` becomes the positive winner before that sibling.
+   accounting; `DE_READ` secures the first-positive accounting win regardless
+   of that sibling's result.
 6. `DecodeKVSnapshot` retains immutable IDs plus the allocation wrapper, and
    the unified Store commit supports exact full/partial deltas.
 7. A real partial/miss `DE_READ` activates Task-07 Store/Reverse/Forward
