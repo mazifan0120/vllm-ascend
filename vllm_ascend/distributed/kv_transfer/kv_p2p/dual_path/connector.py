@@ -701,14 +701,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         local_tokens = num_computed_tokens
         if local_tokens < 0 or ready_tokens > transfer_tokens:
             logger.warning(
-                "DualPath initial admission is inconsistent for request %s; delegating to parent: "
+                "DualPath initial admission is inconsistent for request %s; using local allocation: "
                 "local_tokens=%d, ready_tokens=%d, transfer_tokens=%d",
                 request_id,
                 local_tokens,
                 ready_tokens,
                 transfer_tokens,
             )
-            return super().get_num_new_matched_tokens(request, num_computed_tokens)
+            return 0, False
         if local_tokens >= ready_tokens:
             # HBM-complete: no KVPool lookup, no Task-01 state.
             self._lookup_results.pop(request_id, None)

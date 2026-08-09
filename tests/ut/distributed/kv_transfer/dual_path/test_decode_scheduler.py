@@ -186,7 +186,7 @@ class TestDecodeAdmission(unittest.TestCase):
         self.scheduler._kvpool_adapter.lookup.assert_not_called()
         self.assertEqual(self.scheduler._lookup_results, {})
 
-    def test_admission_invariant_violation_degrades_without_engine_crash(self):
+    def test_admission_invariant_violation_degrades_through_full_lifecycle(self):
         scenarios = (
             ("req-negative-local", -1, 48),
             ("req-ready-past-transfer", 0, 32),
@@ -196,28 +196,26 @@ class TestDecodeAdmission(unittest.TestCase):
             with self.subTest(request_id=request_id):
                 # Given
                 request = _make_request(request_id, 48, _selected_params())
+                blocks = _make_blocks(((1, 2, 3),))
                 self.scheduler._kvpool_adapter.reset_mock()
 
                 # When
                 with (
                     patch.object(self.scheduler, "_hybrid_prefill_token_count", return_value=transfer_tokens),
-                    patch(
-                        f"{_CONNECTOR_NS}.MooncakeLayerwiseConnectorScheduler.get_num_new_matched_tokens",
-                        autospec=True,
-                        return_value=(7, False),
-                    ) as parent_lookup,
                     patch(f"{_CONNECTOR_NS}.logger.warning") as log_warning,
                 ):
                     result = self.scheduler.get_num_new_matched_tokens(request, local_tokens)
+                    self.scheduler.update_state_after_alloc(request, blocks, num_external_tokens=result[0])
 
                 # Then
-                self.assertEqual(result, (7, False))
-                parent_lookup.assert_called_once_with(self.scheduler, request, local_tokens)
+                self.assertEqual(result, (0, False))
                 log_warning.assert_called_once()
                 self.scheduler._kvpool_adapter.lookup.assert_not_called()
                 self.assertEqual(self.scheduler._lookup_results, {})
                 self.assertEqual(self.scheduler._decode_kv_snapshots, {})
                 self.assertEqual(self.scheduler._decode_decision_states, {})
+                self.assertEqual(self.scheduler._reqs_need_recv, {})
+                self.assertEqual(self.scheduler._reqs_need_send_layerwise, {})
                 self.coordinator.register_pending.assert_not_called()
                 self.scheduler.executor.submit.assert_not_called()
 
