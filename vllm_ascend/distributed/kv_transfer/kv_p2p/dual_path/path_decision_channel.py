@@ -299,13 +299,13 @@ class PathDecisionCoordinator:
         coordinator._receiver_thread = threading.Thread(
             target=coordinator._receive_results,
             args=(ready_event,),
-            name=f"path-decision-receiver-{data_parallel_rank}",
+            name=f"path-decision-result-receiver-{data_parallel_rank}",
             daemon=True,
         )
         coordinator._receiver_thread.start()
         if not ready_event.wait(timeout=_RECEIVER_READY_TIMEOUT_S):
             coordinator.close()
-            raise RuntimeError("path decision receiver did not become ready")
+            raise RuntimeError("path decision result receiver did not become ready")
         if coordinator._receiver_error is not None:
             error = coordinator._receiver_error
             coordinator.close()
@@ -437,12 +437,12 @@ class PathDecisionCoordinator:
                 except zmq.ZMQError:
                     if not self._running:
                         break
-                    logger.exception("path decision receiver socket failure")
+                    logger.exception("path decision result receiver socket failure")
                     continue
                 try:
                     self._handle_frames(socket, frames)
                 except Exception:  # noqa: BLE001
-                    logger.exception("path decision receiver rejected an unexpected message failure")
+                    logger.exception("path decision result receiver rejected an unexpected message failure")
         except BaseException as error:  # noqa: BLE001
             self._receiver_error = error
             ready_event.set()
@@ -452,45 +452,45 @@ class PathDecisionCoordinator:
 
     def _handle_frames(self, socket: zmq.Socket, frames: list[bytes]) -> None:
         if len(frames) != 3 or frames[1] != b"":
-            logger.warning("path decision receiver rejected invalid frame shape")
+            logger.warning("path decision result receiver rejected invalid frame shape")
             return
         identity, _, payload = frames
         try:
             decision = decode_path_decision(payload)
         except PathDecisionValidationError:
-            logger.warning("path decision receiver rejected malformed payload")
+            logger.warning("path decision result receiver rejected malformed payload")
             return
         if decision.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-            logger.warning("path decision receiver rejected unsupported protocol version")
+            logger.warning("path decision result receiver rejected unsupported protocol version")
             return
 
         result = decision.result
         key = result.request_key
         if key.decode_engine_instance_id != self.decode_engine_instance_id:
-            logger.warning("path decision receiver rejected wrong-incarnation key")
+            logger.warning("path decision result receiver rejected wrong-incarnation key")
             return
         match result.path:
             case Path.PE_READ:
                 if decision.reverse_plan is not None:
-                    logger.warning("path decision receiver rejected PE_READ Reverse plan")
+                    logger.warning("path decision result receiver rejected PE_READ Reverse plan")
                     return
             case Path.DE_READ:
                 if decision.reverse_plan is None:
-                    logger.warning("path decision receiver rejected DE_READ without Reverse plan")
+                    logger.warning("path decision result receiver rejected DE_READ without Reverse plan")
                     return
                 if decision.reverse_plan.request_key != key:
-                    logger.warning("path decision receiver rejected mismatched Reverse plan key")
+                    logger.warning("path decision result receiver rejected mismatched Reverse plan key")
                     return
             case unreachable:
                 assert_never(unreachable)
         with self._registry_lock:
             if key not in self._pending_keys:
-                logger.warning("path decision receiver rejected unknown or stale key")
+                logger.warning("path decision result receiver rejected unknown or stale key")
                 return
             retained = self._accepted_decisions.get(key)
             if retained is not None:
                 if retained != decision:
-                    logger.warning("path decision receiver rejected conflicting duplicate")
+                    logger.warning("path decision result receiver rejected conflicting duplicate")
                     return
             else:
                 self._accepted_decisions[key] = decision
