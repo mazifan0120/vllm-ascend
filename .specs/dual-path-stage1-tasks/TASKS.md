@@ -100,12 +100,10 @@ flowchart TD
     T07 --> T08
 ```
 
-Task-01 and Task-02 may proceed independently after Task-00. For the current
-delivery state, Task-01 through Task-05 are implemented and Task-06 owns all
-backward reconciliation required to install the local Store-full branch.
-Store-full requests activate only after Task-06. Non-full production policy
-selection remains disabled until Task-08 joins the tested `PE_READ` and split
-`DE_READ` paths.
+Task-01 and Task-02 may proceed independently after Task-00. Tasks 01 through
+08 are implemented. The full Stage 1 route set is active: HBM-complete bypass,
+DE-local Store-full, eligibility-forced `PE_READ`, policy-selected `PE_READ`,
+and split `DE_READ`.
 
 ## 5. Merge-state summary
 
@@ -120,6 +118,9 @@ selection remains disabled until Task-08 joins the tested `PE_READ` and split
 | 06 | A Store-full request completes through DE-local Decode Store without a Decision/PE request | Deterministic DE-local Store-full |
 | 07 | Injected non-full split plans execute on one bidirectional runtime | No non-full policy activation |
 | 08 | Non-full `PE_READ`/`DE_READ` policy results execute with all barriers | Complete Stage 1 route set |
+
+Rows record each Task's acceptance-time state. With Task-08 merged, the final
+production state is the complete Stage 1 route set described in row 08.
 
 ## 6. Task-00 — DualPath foundation
 

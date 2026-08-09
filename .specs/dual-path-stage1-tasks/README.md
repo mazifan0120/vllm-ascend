@@ -18,17 +18,19 @@ re-admitted into a new Task detailed spec.
 
 ## Current baseline
 
-- Task-00 through Task-05 are the implementation baseline: connector
-  foundation, Decode admission, non-full PE-owned decision policy, direct
-  PE-to-DE result channel, Scheduler control loop, and controlled `PE_READ`
-  Forward are treated as implemented.
-- Task-06 is the next delivery. It changes Store-full from a PE-decided
-  `DE_READ` result into a DE-local admission and completion path.
-- Because Task-01 through Task-05 are already implemented, the Task-06 spec
-  contains a normative backward-delta section that must be applied together
-  with its Store runtime. These are implementation changes, not code changes
-  made by this documentation revision.
-- Reverse and non-full split `DE_READ` remain unimplemented Task-07/08 work.
+- Task-00 implements the behavior-preserving DualPath connector foundation.
+- Task-01 implements Decode admission through final slot allocation and
+  `WAITING_FOR_REMOTE_KVS`.
+- Task-02 implements non-full decision schemas, identity, and PE-owned policy.
+- Task-03 implements direct PE-to-DE decision delivery with ACK and retry.
+- Task-04 implements the Scheduler decision control loop and fail-closed state.
+- Task-05 implements the controlled `PE_READ` Forward route.
+- Task-06 implements DE-local Store-full admission and completion.
+- Task-07 implements the bidirectional runtime for injected split plans.
+- Task-08 activates eligibility-forced and policy-selected `PE_READ`, plus
+  split `DE_READ`, completing the Stage 1 production route set.
+- Task-00 through Task-08 are all implemented. NPU acceptance executions
+  remain deferred hardware runs; their skeletons exist.
 
 ## Documents
 
@@ -53,6 +55,11 @@ re-admitted into a new Task detailed spec.
 - [`Task-06 detailed spec`](tasks/TASK-06-de-local-store-full.md) is
   self-contained and defines DE-local Store-full admission, commit, Worker
   load, terminal output, and every required Task-01 through Task-05 delta.
+- [`Task-07 detailed spec`](tasks/TASK-07-bidirectional-split-runtime.md)
+  defines the bidirectional Worker runtime and injected split-plan execution.
+- [`Task-08 detailed spec`](tasks/TASK-08-non-full-production-activation.md)
+  defines final non-full policy activation, eligibility, and production
+  `PE_READ` and split `DE_READ` composition.
 
 ## Decomposition rules
 
