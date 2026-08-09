@@ -1,29 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dual-path KV transfer built on ``MooncakeLayerwiseConnector``.
 
-``DualPathConnector`` preserves ordinary Layerwise behavior while adding
-Decode admission through the local Store, Prefill-owned path selection, and
-production ``PE_READ`` and ``DE_READ`` transfer routes. Store-full requests
-remain local to Decode; non-full requests use the selected forward or split
-Reverse/Forward route.
+Extends ordinary Layerwise with Decode Store admission, Prefill-owned path
+selection, and ``PE_READ`` / ``DE_READ`` routes. Store-full stays on Decode;
+non-full uses the selected forward or split Reverse/Forward path.
 
-Why inheritance + a custom ``__init__``:
-    ``MooncakeLayerwiseConnector.__init__`` hard-instantiates its own
-    ``MooncakeLayerwiseConnectorScheduler`` / ``MooncakeLayerwiseConnectorWorker``
-    (see ``mooncake_layerwise_connector.py``). To give DualPath its own
-    scheduler/worker subclasses, we cannot call ``super().__init__``; instead we
-    replicate the parent's facade setup and build OUR subclasses, calling
-    ``KVConnectorBase_V1.__init__`` directly. The copied facade state is exactly
-    ``_is_kv_producer``, ``engine_id``, ``_connector_metadata``,
-    ``connector_scheduler``, and ``connector_worker``; a drift guard in the
-    unit tests fails if the parent facade grows additional state.
-
-Block forwarding is free:
-    Because ``DualPathConnector`` IS-A ``MooncakeLayerwiseConnector``,
-    ``AscendMultiConnector.update_state_after_alloc`` already forwards it the
-    real blocks whenever it wins the first-wins routing (its
-    ``isinstance(c, MooncakeLayerwiseConnector)`` check covers subclasses). No
-    change to ``AscendMultiConnector`` is required.
+``MooncakeLayerwiseConnector.__init__`` hard-builds the parent scheduler and
+worker, so DualPath calls ``KVConnectorBase_V1.__init__`` and constructs its
+own subclasses instead of ``super().__init__``.
 """
 
 from __future__ import annotations
@@ -36,7 +20,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, assert_never
+from typing import TYPE_CHECKING, Any, NamedTuple, assert_never
 
 import torch
 from vllm.config import VllmConfig
@@ -51,10 +35,11 @@ from vllm.utils.network_utils import get_ip
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (
-    KVPoolAdapter,
+    KVPoolSchedulerAdapter,
     KVPoolWorkerAdapter,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
+    BlockIdGroups,
     DualPathConnectorMetadata,
     DualPathControlFailureMetadata,
     DualPathControlFailureReason,
@@ -65,11 +50,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionDecider,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
+    PathKind,
     PathPolicy,
     RoundRobinPathPolicy,
 )
@@ -128,7 +113,7 @@ class DecodeKVSnapshot:
         return self.store_load_spec.kvpool_cached_tokens
 
 
-class DecodeDecisionStatus(str, Enum):
+class _DecodeDecisionStatus(str, Enum):
     PENDING = "PENDING"
     COMMITTED = "COMMITTED"
     TIMED_OUT = "TIMED_OUT"
@@ -153,41 +138,65 @@ class _SplitTracker:
     forward_destination_slice: tuple[int, ...]
     plan: ReversePlan | None
     reverse_submitted: bool
+    store_load_failed: bool
     terminal_published: bool
 
 
-@dataclass
+@dataclass(slots=True)
 class DecodePathDecisionState:
-    request_key: DualPathRequestKey
     decision_request: PathDecisionRequest
     request: Request
     deadline: float
-    status: DecodeDecisionStatus
+    status: _DecodeDecisionStatus
+
+    @property
+    def request_key(self) -> DualPathRequestKey:
+        return self.decision_request.request_key
 
 
-def build_remote_decode_message(
-    scheduler: DualPathConnectorScheduler,
-    request_id: str,
-    trimmed_final_block_ids: tuple[list[int], ...],
-    snapshot: DecodeKVSnapshot,
-    decision_metadata: DualPathDecisionMetadata,
-) -> dict[str, Any]:
-    return {
-        "token_ids": [],
-        "request_id": get_external_request_id(request_id),
-        "do_remote_prefill": False,
-        "do_remote_decode": True,
-        "remote_block_ids": trimmed_final_block_ids,
-        "remote_block_size": scheduler.block_size,
-        "remote_engine_id": scheduler.engine_id,
-        "remote_host": scheduler.side_channel_host,
-        "remote_port": scheduler.side_channel_port,
-        "remote_tp_size": scheduler.vllm_config.parallel_config.tensor_parallel_size,
-        "remote_pcp_size": scheduler.vllm_config.parallel_config.prefill_context_parallel_size,
-        "remote_dcp_size": scheduler.vllm_config.parallel_config.decode_context_parallel_size,
-        "remote_cached_tokens": snapshot.local_tokens,
-        "dual_path": decision_metadata.to_dict(),
-    }
+class _AdmissionLookup(NamedTuple):
+    """Detached KVPool lookup outcome bound to one admission, keyed by request id."""
+
+    local_tokens: int
+    external_tokens: int
+    load_spec: LoadSpec | None
+
+
+def _decode_ready_token_count(num_tokens: int) -> int:
+    """Tokens Decode can receive: the last token is always computed locally."""
+    return max(num_tokens - 1, 0)
+
+
+def _classify_store_hit(
+    spec: LoadSpec | None,
+    local_tokens: int,
+    ready_tokens: int,
+    transfer_tokens: int,
+) -> tuple[bool, int]:
+    """A Store hit is full only when the detached spec covers exactly up to the
+    ready boundary; external tokens then stop there instead of the transfer target."""
+    store_full = (
+        spec is not None and spec.vllm_cached_tokens == local_tokens and spec.kvpool_cached_tokens == ready_tokens
+    )
+    return store_full, (ready_tokens if store_full else transfer_tokens) - local_tokens
+
+
+def _expected_prefill_token_end(decision_request: PathDecisionRequest, need_truncate: bool) -> int:
+    """Hybrid (truncating) deployments advertise one fewer token than the prompt."""
+    return decision_request.target_tokens if need_truncate else decision_request.target_tokens + 1
+
+
+def _is_open_decision_status(status: _DecodeDecisionStatus) -> bool:
+    """Only PENDING decisions still accept an outcome or a timeout."""
+    if status is _DecodeDecisionStatus.PENDING:
+        return True
+    if status in (
+        _DecodeDecisionStatus.COMMITTED,
+        _DecodeDecisionStatus.TIMED_OUT,
+        _DecodeDecisionStatus.ACTIVATION_FAILED,
+    ):
+        return False
+    assert_never(status)
 
 
 class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
@@ -212,17 +221,18 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     ) -> None:
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.dual_path_cfg = dual_path_cfg
-        self._lookup_results: dict[str, tuple[int, int, LoadSpec | None]] = {}
+        self._lookup_results: dict[str, _AdmissionLookup] = {}
         self._decode_kv_snapshots: dict[str, DecodeKVSnapshot] = {}
         self._decode_decision_states: dict[str, DecodePathDecisionState] = {}
         self._decision_timeout_seconds: int | None = None
-        self._kvpool_adapter: KVPoolAdapter | None = None
+        self._kvpool_adapter: KVPoolSchedulerAdapter | None = None
         self._accepting_decode_admission = True
         self._accepting_pe_decisions = True
         # PE fields exist on both roles; Decode keeps a None decider and empty
         # maps rather than constructing policy state it never owns.
         self._path_decider: PathDecisionDecider | None = None
         self._pe_request_keys: dict[str, DualPathRequestKey] = {}
+        self._pe_decision_metadata: dict[str, DualPathDecisionMetadata] = {}
         self._pe_prefill_local_tokens: dict[str, int] = {}
         self._pe_path_results: dict[str, PathDecisionResult] = {}
         self._pe_forward_plans: dict[str, ForwardPlan] = {}
@@ -237,14 +247,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if vllm_config.kv_transfer_config.kv_load_failure_policy != "fail":
                 raise ValueError("DualPath Decode requires kv_load_failure_policy='fail'")
             decision_timeout_seconds = ascend_envs.VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT
-            if (
-                isinstance(decision_timeout_seconds, bool)
-                or not isinstance(decision_timeout_seconds, int)
-                or decision_timeout_seconds <= 0
-            ):
+            if decision_timeout_seconds <= 0:
                 raise ValueError("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT must be an integer greater than zero")
             self._decision_timeout_seconds = decision_timeout_seconds
-            self._kvpool_adapter = KVPoolAdapter(vllm_config, kv_cache_config)
+            self._kvpool_adapter = KVPoolSchedulerAdapter(vllm_config, kv_cache_config)
             data_parallel_rank = vllm_config.parallel_config.data_parallel_rank
             control_port = derive_decode_control_port(
                 dual_path_control_port=dual_path_cfg.dual_path_control_port,
@@ -318,7 +324,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     )
                     result = self._pe_path_results.get(request_id) if request_id is not None else None
                     if result is not None and request_id not in self._pe_invalid_request_ids:
-                        if result.path is Path.DE_READ:
+                        if result.path is PathKind.DE_READ:
                             binding = self._pe_pending_reverse_receive_bindings.get(request_id)
                             if binding is not None:
                                 destination_block_ids = binding.destination_block_ids[0]
@@ -339,7 +345,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             )
                             self._pe_invalid_request_ids.add(request_id)
                             self._pe_pending_reverse_receive_bindings.pop(request_id, None)
-                        elif result.path is Path.PE_READ:
+                        elif result.path is PathKind.PE_READ:
                             pass
                         else:
                             assert_never(result.path)
@@ -350,7 +356,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._path_decider.discard(request_key)
             self._pe_delivery_futures.pop(request_key, None)
 
-    def _handle_prefill_decision(
+    def _decide_prefill_path_for_admission(
         self,
         request: Request,
         parent_result: tuple[int, bool],
@@ -392,9 +398,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return parent_result
 
         decision_request = metadata.decision_request
-        effective_prefill_tokens = (
-            decision_request.target_tokens if self.need_truncate else decision_request.target_tokens + 1
-        )
+        effective_prefill_tokens = _expected_prefill_token_end(decision_request, self.need_truncate)
         if not 0 <= prefill_local_tokens <= effective_prefill_tokens:
             logger.error(
                 "DualPath Prefill local tokens are invalid for request %s: expected 0 <= %s <= %s",
@@ -406,6 +410,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         request_key = decision_request.request_key
         self._pe_request_keys[request_id] = request_key
+        self._pe_decision_metadata[request_id] = metadata
         self._pe_prefill_local_tokens.setdefault(request_id, prefill_local_tokens)
         assert self._path_decider is not None
         try:
@@ -421,17 +426,44 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         self._pe_path_results.setdefault(request_id, result)
 
-        eligibility = "singleton" if prefill_local_tokens >= decision_request.decode_store_tokens else "policy"
-        if result.path is Path.PE_READ:
+        self._log_prefill_decision(
+            request_key,
+            decision_request,
+            prefill_local_tokens,
+            effective_prefill_tokens,
+            result,
+        )
+
+        if result.path is PathKind.PE_READ:
+            return 0, False
+        elif result.path is PathKind.DE_READ:
+            reverse_tokens = decision_request.decode_store_tokens - prefill_local_tokens
+            assert reverse_tokens > 0
+            return reverse_tokens, True
+        else:
+            assert_never(result.path)
+
+    def _log_prefill_decision(
+        self,
+        request_key: DualPathRequestKey,
+        decision_request: PathDecisionRequest,
+        prefill_local_tokens: int,
+        effective_prefill_tokens: int,
+        result: PathDecisionResult,
+    ) -> None:
+        # Field layout is consumed by ops log parsing; keep it stable.
+        eligibility = "forced" if prefill_local_tokens >= decision_request.decode_store_tokens else "policy"
+        if result.path is PathKind.PE_READ:
             store_coverage = "none"
-        elif result.path is Path.DE_READ:
+        elif result.path is PathKind.DE_READ:
             store_coverage = (
                 "partial" if decision_request.decode_store_tokens > decision_request.decode_local_tokens else "skipped"
             )
         else:
             assert_never(result.path)
         logger.info(
-            "dual_path decision key=%s/%s L_DE=%s K_DE=%s L_PE=%s R=%s T=%s eligibility=%s selected_path=%s store=%s",
+            "dual_path decision key=%s/%s decode_local_tokens=%s decode_store_tokens=%s prefill_local_tokens=%s "
+            "decode_ready_tokens=%s target_tokens=%s eligibility=%s selected_path=%s store=%s",
             request_key.decode_engine_instance_id,
             request_key.decode_request_id,
             decision_request.decode_local_tokens,
@@ -444,15 +476,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             store_coverage,
         )
 
-        if result.path is Path.PE_READ:
-            return 0, False
-        elif result.path is Path.DE_READ:
-            reverse_tokens = decision_request.decode_store_tokens - self._pe_prefill_local_tokens[request_id]
-            assert reverse_tokens > 0
-            return reverse_tokens, True
-        else:
-            assert_never(result.path)
-
     def _prepare_forward_plan(
         self,
         request: Request,
@@ -461,20 +484,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     ) -> tuple[ForwardPlan, SendReqInfo] | None:
         params = request.kv_transfer_params
         assert params is not None
-        metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
-        if metadata.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-            raise PathDecisionValidationError(
-                f"protocol version must be {DUAL_PATH_PROTOCOL_VERSION}, got {metadata.protocol_version}"
-            )
+        metadata = self._pe_decision_metadata[request.request_id]
         decision_request = metadata.decision_request
         result = self._pe_path_results[request.request_id]
         if result.request_key != decision_request.request_key:
             raise PathDecisionValidationError("retained result key does not match the Decision Request key")
 
         token_end = request.num_prompt_tokens
-        expected_token_end = (
-            decision_request.target_tokens if self.need_truncate else decision_request.target_tokens + 1
-        )
+        expected_token_end = _expected_prefill_token_end(decision_request, self.need_truncate)
         if token_end != expected_token_end:
             raise PathDecisionValidationError(
                 f"effective Prefill token count {token_end} does not match the expected transfer target "
@@ -491,7 +508,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             "remote_port",
             *topology_fields,
         )
-        missing_fields = [field for field in required_fields if field not in params]
+        missing_fields = [field_name for field_name in required_fields if field_name not in params]
         if missing_fields:
             raise PathDecisionValidationError(f"missing inherited remote fields: {missing_fields}")
         for field_name in ("remote_engine_id", "remote_host"):
@@ -518,17 +535,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if len(destination_block_ids) != len(remote_block_sizes):
             raise PathDecisionValidationError("destination block-table group count does not match block sizes")
         for group, block_size in zip(destination_block_ids, remote_block_sizes, strict=True):
-            if not group or any(isinstance(block_id, bool) or not isinstance(block_id, int) for block_id in group):
-                raise PathDecisionValidationError("destination block groups must contain integer block ids")
             if len(group) * block_size < token_end:
                 raise PathDecisionValidationError("destination block table does not cover token_end")
 
         source_block_ids = tuple(tuple(group) for group in blocks.get_block_ids())
         if len(source_block_ids) != len(local_block_sizes):
             raise PathDecisionValidationError("source block-table group count does not match block sizes")
-        for group in source_block_ids:
-            if any(isinstance(block_id, bool) or not isinstance(block_id, int) for block_id in group):
-                raise PathDecisionValidationError("source block groups must contain integer block ids")
+        # get_block_ids() may re-enter and mutate kv_transfer_params; re-read the advertised table.
         advertised_destination = tuple(tuple(group) for group in params["remote_block_ids"])
         if advertised_destination != destination_block_ids:
             raise PathDecisionValidationError("destination block table changed during Forward plan installation")
@@ -558,9 +571,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         result = self._pe_path_results.get(request_id)
         if result is None:
             return
-        token_start = DualPathDecisionMetadata.from_dict(
-            request.kv_transfer_params["dual_path"]
-        ).decision_request.decode_local_tokens
+        token_start = self._pe_decision_metadata[request_id].decision_request.decode_local_tokens
 
         try:
             prepared = self._prepare_forward_plan(request, blocks, token_start)
@@ -599,11 +610,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         request_id = request.request_id
         params = request.kv_transfer_params
         assert params is not None
-        metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
-        if metadata.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-            raise PathDecisionValidationError(
-                f"protocol version must be {DUAL_PATH_PROTOCOL_VERSION}, got {metadata.protocol_version}"
-            )
+        metadata = self._pe_decision_metadata[request_id]
         decision_request = metadata.decision_request
         if result.request_key != decision_request.request_key:
             raise PathDecisionValidationError("retained result key does not match the Decision Request key")
@@ -673,31 +680,16 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._reqs_need_send_layerwise[request_id] = send_req_info
         return reverse_plan
 
-    def _emit_prefill_control_failure(
-        self,
-        request: Request,
-        blocks: KVCacheBlocks,
-        token_start: int,
-        token_end: int,
-    ) -> None:
-        destination_block_ids = blocks.get_block_ids()[0]
-        self._stage_prefill_activation_failure(
-            request.request_id,
-            destination_block_ids,
-            token_start,
-            token_end,
-        )
-
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         if not self._is_dual_path_decode_admission(request):
             parent_result = super().get_num_new_matched_tokens(request, num_computed_tokens)
-            if self.dual_path_cfg.role == "prefill" and request.kv_transfer_params is not None:
-                return self._handle_prefill_decision(request, parent_result, num_computed_tokens)
+            if self.dual_path_cfg.role == "prefill":
+                return self._decide_prefill_path_for_admission(request, parent_result, num_computed_tokens)
             return parent_result
 
         request_id = request.request_id
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
-        ready_tokens = max(request.num_tokens - 1, 0)
+        ready_tokens = _decode_ready_token_count(request.num_tokens)
         local_tokens = num_computed_tokens
         if local_tokens < 0 or ready_tokens > transfer_tokens:
             logger.warning(
@@ -710,179 +702,182 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
             return 0, False
         if local_tokens >= ready_tokens:
-            # HBM-complete: no KVPool lookup, no Task-01 state.
+            # HBM-complete: no KVPool lookup and no KVPool admission state to bind for this request.
             self._lookup_results.pop(request_id, None)
             return 0, False
 
         cached = self._lookup_results.get(request_id)
         if cached is not None:
-            cached_spec = cached[2]
+            cached_spec = cached.load_spec
             cached_spec_is_current = cached_spec is None or (
                 cached_spec.vllm_cached_tokens == local_tokens and cached_spec.kvpool_cached_tokens <= ready_tokens
             )
-            cached_store_full = (
-                cached_spec is not None
-                and cached_spec.vllm_cached_tokens == local_tokens
-                and cached_spec.kvpool_cached_tokens == ready_tokens
+            cached_store_full, expected_external_tokens = _classify_store_hit(
+                cached_spec, local_tokens, ready_tokens, transfer_tokens
             )
-            expected_external_tokens = (ready_tokens if cached_store_full else transfer_tokens) - local_tokens
-            if cached_spec_is_current and cached[0] == local_tokens and cached[1] == expected_external_tokens:
+            if (
+                cached_spec_is_current
+                and cached.local_tokens == local_tokens
+                and cached.external_tokens == expected_external_tokens
+            ):
                 # Identical duplicate lookup (e.g. allocation-failure retry):
                 # reuse the detached result instead of re-probing the KV pool.
-                return cached[1], True
+                return cached.external_tokens, True
             # Changed admission facts invalidate the unbound result; discard it before
             # the fresh lookup so a failing re-probe cannot leave it behind.
             del self._lookup_results[request_id]
 
         assert self._kvpool_adapter is not None
         detached_spec = self._kvpool_adapter.lookup(request, local_tokens)
-        store_full = (
-            detached_spec is not None
-            and detached_spec.vllm_cached_tokens == local_tokens
-            and detached_spec.kvpool_cached_tokens == ready_tokens
+        store_full, external_tokens = _classify_store_hit(detached_spec, local_tokens, ready_tokens, transfer_tokens)
+        self._lookup_results[request_id] = _AdmissionLookup(
+            local_tokens=local_tokens,
+            external_tokens=external_tokens,
+            load_spec=detached_spec,
         )
-        external_tokens = (ready_tokens if store_full else transfer_tokens) - local_tokens
-        self._lookup_results[request_id] = (local_tokens, external_tokens, detached_spec)
         return external_tokens, True
 
     def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:
         params = request.kv_transfer_params
         if self.dual_path_cfg.role == "prefill" and params is not None and "dual_path" in params:
-            request_id = request.request_id
-            if request_id in self._pe_invalid_request_ids:
-                return
-            result = self._pe_path_results.get(request_id)
-            if result is None:
-                return
-
-            reverse_plan: ReversePlan | None = None
-            try:
-                if result.path is Path.DE_READ:
-                    reverse_plan = self._activate_de_read_path(request, blocks, result)
-                elif result.path is Path.PE_READ:
-                    self._try_install_forward_plan(request, blocks)
-                else:
-                    assert_never(result.path)
-            except (KeyError, PathDecisionValidationError, RuntimeError, TypeError) as error:
-                logger.error(
-                    "DualPath Prefill activation failed locally for request %s: %s",
-                    request_id,
-                    error,
-                )
-                if result.path is Path.DE_READ:
-                    decision_request = DualPathDecisionMetadata.from_dict(params["dual_path"]).decision_request
-                    self._emit_prefill_control_failure(
-                        request,
-                        blocks,
-                        self._pe_prefill_local_tokens[request_id],
-                        decision_request.decode_store_tokens,
-                    )
-                self._pe_invalid_request_ids.add(request_id)
-                self._pe_path_results.pop(request_id, None)
-                return
-
-            result = self._pe_path_results.get(request_id)
-            if result is None or request_id not in self._pe_forward_plans:
-                return
-
-            request_key = result.request_key
-            if request_key in self._pe_delivery_futures:
-                return
-            metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
-            decision = PathDecision(
-                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-                result=result,
-                reverse_plan=reverse_plan,
-            )
-            try:
-                delivery_future = self._path_decision_coordinator.submit(
-                    metadata.decode_control_endpoint,
-                    decision,
-                )
-            except RuntimeError as error:
-                logger.error(
-                    "DualPath Prefill decision submission failed locally for request %s: %s",
-                    request_id,
-                    error,
-                )
-                if result.path is Path.DE_READ:
-                    decision_request = metadata.decision_request
-                    self._emit_prefill_control_failure(
-                        request,
-                        blocks,
-                        self._pe_prefill_local_tokens[request_id],
-                        decision_request.decode_store_tokens,
-                    )
-                self._pe_invalid_request_ids.add(request_id)
-                self._pe_path_results.pop(request_id, None)
-                self._pe_pending_reverse_receive_bindings.pop(request_id, None)
-                self._pe_forward_plans.pop(request_id, None)
-                owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
-                if (
-                    owned_send_req_info is not None
-                    and self._reqs_need_send_layerwise.get(request_id) is owned_send_req_info
-                ):
-                    self._reqs_need_send_layerwise.pop(request_id)
-                return
-            self._pe_delivery_futures[request_key] = delivery_future
-
-            def log_delivery_failure(completed_future: Future[None]) -> None:
-                if completed_future.cancelled():
-                    logger.warning(
-                        "dual_path delivery key=%s/%s protocol=%s delivery_terminal=CANCELLED",
-                        request_key.decode_engine_instance_id,
-                        request_key.decode_request_id,
-                        DUAL_PATH_PROTOCOL_VERSION,
-                    )
-                    return
-                error = completed_future.exception()
-                if error is not None:
-                    logger.error(
-                        "dual_path delivery key=%s/%s protocol=%s delivery_terminal=FAILED "
-                        "failure_source=DELIVERY error=%s",
-                        request_key.decode_engine_instance_id,
-                        request_key.decode_request_id,
-                        DUAL_PATH_PROTOCOL_VERSION,
-                        error,
-                    )
-                    return
-                logger.info(
-                    "dual_path delivery key=%s/%s protocol=%s delivery_terminal=SUCCEEDED",
-                    request_key.decode_engine_instance_id,
-                    request_key.decode_request_id,
-                    DUAL_PATH_PROTOCOL_VERSION,
-                )
-
-            delivery_future.add_done_callback(log_delivery_failure)
+            self._update_prefill_state_after_alloc(request, blocks)
             return
-
         if not self._is_dual_path_decode_admission(request):
             # Non-selected requests delegate untouched; in particular a request
             # resumed after a completed async load (its admission flag is already
             # consumed and num_external_tokens == 0) must not re-enter the
             # duplicate-bind check against its own earlier snapshot.
             return super().update_state_after_alloc(request, blocks, num_external_tokens)
+        self._bind_decode_admission_after_alloc(request, blocks, num_external_tokens)
 
+    def _update_prefill_state_after_alloc(self, request: Request, blocks: KVCacheBlocks) -> None:
+        # Prefill role: activate the retained path decision, then deliver the
+        # Decision to Decode exactly once per request.
+        request_id = request.request_id
+        if request_id in self._pe_invalid_request_ids:
+            return
+        result = self._pe_path_results.get(request_id)
+        if result is None:
+            return
+
+        reverse_plan: ReversePlan | None = None
+        try:
+            if result.path is PathKind.DE_READ:
+                reverse_plan = self._activate_de_read_path(request, blocks, result)
+            elif result.path is PathKind.PE_READ:
+                self._try_install_forward_plan(request, blocks)
+            else:
+                assert_never(result.path)
+        except (KeyError, PathDecisionValidationError, RuntimeError, TypeError) as error:
+            logger.error(
+                "DualPath Prefill activation failed locally for request %s: %s",
+                request_id,
+                error,
+            )
+            self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=False)
+            return
+
+        result = self._pe_path_results.get(request_id)
+        if result is None or request_id not in self._pe_forward_plans:
+            return
+
+        request_key = result.request_key
+        if request_key in self._pe_delivery_futures:
+            return
+        metadata = self._pe_decision_metadata[request_id]
+        decision = PathDecision(
+            protocol_version=DUAL_PATH_PROTOCOL_VERSION,
+            result=result,
+            reverse_plan=reverse_plan,
+        )
+        try:
+            delivery_future = self._path_decision_coordinator.submit(
+                metadata.decode_control_endpoint,
+                decision,
+            )
+        except RuntimeError as error:
+            logger.error(
+                "DualPath Prefill decision submission failed locally for request %s: %s",
+                request_id,
+                error,
+            )
+            self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
+            return
+        self._pe_delivery_futures[request_key] = delivery_future
+
+        def log_delivery_failure(completed_future: Future[None]) -> None:
+            if completed_future.cancelled():
+                logger.warning(
+                    "dual_path delivery key=%s/%s protocol=%s delivery_terminal=CANCELLED",
+                    request_key.decode_engine_instance_id,
+                    request_key.decode_request_id,
+                    DUAL_PATH_PROTOCOL_VERSION,
+                )
+                return
+            error = completed_future.exception()
+            if error is not None:
+                logger.error(
+                    "dual_path delivery key=%s/%s protocol=%s delivery_terminal=FAILED "
+                    "failure_source=DELIVERY error=%s",
+                    request_key.decode_engine_instance_id,
+                    request_key.decode_request_id,
+                    DUAL_PATH_PROTOCOL_VERSION,
+                    error,
+                )
+                return
+            logger.info(
+                "dual_path delivery key=%s/%s protocol=%s delivery_terminal=SUCCEEDED",
+                request_key.decode_engine_instance_id,
+                request_key.decode_request_id,
+                DUAL_PATH_PROTOCOL_VERSION,
+            )
+
+        delivery_future.add_done_callback(log_delivery_failure)
+
+    def _invalidate_prefill_activation(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        result: PathDecisionResult,
+        *,
+        discard_installed_plans: bool,
+    ) -> None:
+        # DE_READ stages a control failure so Decode drops the advertised blocks.
+        # discard_installed_plans is set only when the Decision was never
+        # delivered, in which case the installed Forward/Reverse artifacts must
+        # not be handed to the Worker.
+        request_id = request.request_id
+        if result.path is PathKind.DE_READ:
+            decision_request = self._pe_decision_metadata[request_id].decision_request
+            self._stage_prefill_activation_failure(
+                request_id,
+                blocks.get_block_ids()[0],
+                self._pe_prefill_local_tokens[request_id],
+                decision_request.decode_store_tokens,
+            )
+        self._pe_invalid_request_ids.add(request_id)
+        self._pe_path_results.pop(request_id, None)
+        if not discard_installed_plans:
+            return
+        self._pe_pending_reverse_receive_bindings.pop(request_id, None)
+        self._pe_forward_plans.pop(request_id, None)
+        owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
+        if owned_send_req_info is not None and self._reqs_need_send_layerwise.get(request_id) is owned_send_req_info:
+            self._reqs_need_send_layerwise.pop(request_id)
+
+    def _bind_decode_admission_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ) -> None:
+        # Decode role: freeze the allocation into the admission snapshot, then
+        # either commit a Store-full load locally or register the pending path
+        # decision and notify the proxy.
         request_id = request.request_id
         allocated_block_ids = blocks.get_block_ids()
         frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
 
         existing = self._decode_kv_snapshots.get(request_id)
         if existing is not None:
-            ready_tokens = max(request.num_tokens - 1, 0)
-            transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
-            existing_store_full = (
-                existing.store_load_spec is not None
-                and existing.store_load_spec.vllm_cached_tokens == existing.local_tokens
-                and existing.store_load_spec.kvpool_cached_tokens == ready_tokens
-            )
-            duplicate_local_tokens = (ready_tokens if existing_store_full else transfer_tokens) - num_external_tokens
-            if (
-                existing.transfer_tokens == transfer_tokens
-                and existing.local_tokens == duplicate_local_tokens
-                and existing.external_tokens == num_external_tokens
-                and existing.final_block_ids == frozen_block_ids
-            ):
+            if self._is_identical_duplicate_admission(request, existing, frozen_block_ids, num_external_tokens):
                 return
             raise RuntimeError(
                 f"DualPath request {request_id} got a conflicting duplicate admission bind; "
@@ -890,8 +885,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
 
         if num_external_tokens == 0:
-            # HBM-complete admission returned (0, False): no Task-01 state, and
-            # the parent must not fire its remote-prefill/metaserver flow.
+            # HBM-complete admission returned (0, False): no KVPool admission
+            # state to bind, and the parent must not fire its remote-prefill/metaserver flow.
             self._lookup_results.pop(request_id, None)
             return
 
@@ -899,14 +894,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if entry is None:
             raise RuntimeError(f"DualPath request {request_id} has no admission lookup result to bind after allocation")
         local_tokens, cached_external_tokens, detached_spec = entry
-        ready_tokens = max(request.num_tokens - 1, 0)
+        ready_tokens = _decode_ready_token_count(request.num_tokens)
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
-        store_full = (
-            detached_spec is not None
-            and detached_spec.vllm_cached_tokens == local_tokens
-            and detached_spec.kvpool_cached_tokens == ready_tokens
+        store_full, expected_external_tokens = _classify_store_hit(
+            detached_spec, local_tokens, ready_tokens, transfer_tokens
         )
-        expected_external_tokens = (ready_tokens if store_full else transfer_tokens) - local_tokens
         if not num_external_tokens == cached_external_tokens == expected_external_tokens:
             raise RuntimeError(
                 f"DualPath request {request_id} external-token mismatch: vLLM allocated "
@@ -944,11 +936,69 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             params["do_remote_prefill"] = False
             return
 
+        self._register_pending_decode_decision(request, snapshot, allocated_block_ids, params)
+
+    def _is_identical_duplicate_admission(
+        self,
+        request: Request,
+        existing: DecodeKVSnapshot,
+        frozen_block_ids: tuple[tuple[int, ...], ...],
+        num_external_tokens: int,
+    ) -> bool:
+        # A repeated allocation carrying facts identical to the bound snapshot
+        # is a benign retry (e.g. allocation-failure retry); a mismatch conflicts.
+        ready_tokens = _decode_ready_token_count(request.num_tokens)
+        transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
+        existing_store_full, _ = _classify_store_hit(
+            existing.store_load_spec, existing.local_tokens, ready_tokens, transfer_tokens
+        )
+        duplicate_local_tokens = (ready_tokens if existing_store_full else transfer_tokens) - num_external_tokens
+        return (
+            existing.transfer_tokens == transfer_tokens
+            and existing.local_tokens == duplicate_local_tokens
+            and existing.external_tokens == num_external_tokens
+            and existing.final_block_ids == frozen_block_ids
+        )
+
+    def _build_remote_decode_message(
+        self,
+        request_id: str,
+        trimmed_final_block_ids: tuple[list[int], ...],
+        snapshot: DecodeKVSnapshot,
+        decision_metadata: DualPathDecisionMetadata,
+    ) -> dict[str, Any]:
+        return {
+            "token_ids": [],
+            "request_id": get_external_request_id(request_id),
+            "do_remote_prefill": False,
+            "do_remote_decode": True,
+            "remote_block_ids": trimmed_final_block_ids,
+            "remote_block_size": self.block_size,
+            "remote_engine_id": self.engine_id,
+            "remote_host": self.side_channel_host,
+            "remote_port": self.side_channel_port,
+            "remote_tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
+            "remote_pcp_size": self.vllm_config.parallel_config.prefill_context_parallel_size,
+            "remote_dcp_size": self.vllm_config.parallel_config.decode_context_parallel_size,
+            "remote_cached_tokens": snapshot.local_tokens,
+            "dual_path": decision_metadata.to_dict(),
+        }
+
+    def _register_pending_decode_decision(
+        self,
+        request: Request,
+        snapshot: DecodeKVSnapshot,
+        allocated_block_ids: tuple[list[int], ...],
+        params: dict[str, Any],
+    ) -> None:
+        # Register the pending decision before notifying the proxy so a decision
+        # arriving ahead of the proxy round-trip still finds its state.
+        request_id = request.request_id
         coordinator = self._path_decision_coordinator
         request_key = DualPathRequestKey(coordinator.decode_engine_instance_id, request_id)
         decision_request = PathDecisionRequest(
             request_key=request_key,
-            target_tokens=ready_tokens,
+            target_tokens=_decode_ready_token_count(request.num_tokens),
             decode_local_tokens=snapshot.local_tokens,
             decode_store_tokens=snapshot.store_tokens,
         )
@@ -961,8 +1011,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             allocated_block_ids,
             len(request.prompt_token_ids),
         )
-        message = build_remote_decode_message(
-            self,
+        message = self._build_remote_decode_message(
             request_id,
             remote_block_ids,
             snapshot,
@@ -972,11 +1021,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         coordinator.register_pending(request_key)
         assert self._decision_timeout_seconds is not None
         state = DecodePathDecisionState(
-            request_key=request_key,
             decision_request=decision_request,
             request=request,
             deadline=time.monotonic() + self._decision_timeout_seconds,
-            status=DecodeDecisionStatus.PENDING,
+            status=_DecodeDecisionStatus.PENDING,
         )
         self._decode_decision_states[request_id] = state
 
@@ -984,7 +1032,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             try:
                 future = self.executor.submit(
                     self._access_metaserver,
-                    url=params.get("metaserver", None),
+                    url=params.get("metaserver"),
                     message=message,
                 )
             except RuntimeError as error:
@@ -1008,7 +1056,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         params["do_remote_prefill"] = False
 
-    def _build_external_control_failure(
+    def _build_decode_control_failure(
         self,
         request_id: str,
         snapshot: DecodeKVSnapshot,
@@ -1021,14 +1069,67 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 f"local_tokens ({snapshot.local_tokens}) to be aligned to block_size ({block_size})"
             )
         invalid_block_ids = snapshot.final_block_ids[0][snapshot.local_tokens // block_size :]
-        assert invalid_block_ids
+        if not invalid_block_ids:
+            raise RuntimeError(
+                f"DualPath control failure metadata for request {request_id} has no blocks "
+                f"beyond local_tokens ({snapshot.local_tokens}) to invalidate"
+            )
         return DualPathControlFailureMetadata(
             request_id=request_id,
             invalid_block_ids=invalid_block_ids,
             reason=reason,
         )
 
-    def _activate_committed_decision(
+    def _validate_committed_decision(
+        self,
+        decision: PathDecision,
+        state: DecodePathDecisionState,
+        snapshot: DecodeKVSnapshot,
+    ) -> tuple[BlockIdGroups, int, ReversePlan | None]:
+        # A received Decision must reproduce the frozen admission facts exactly;
+        # any mismatch fails the activation before binding construction.
+        result = decision.result
+        request_id = result.request_key.decode_request_id
+        if state.request_key != result.request_key:
+            raise PathDecisionValidationError("Decision key does not match the pending Decode state")
+        if state.decision_request.decode_local_tokens != snapshot.local_tokens:
+            raise PathDecisionValidationError("Decision local prefix does not match the frozen snapshot")
+        if state.decision_request.decode_store_tokens != snapshot.store_tokens:
+            raise PathDecisionValidationError("Decision Store boundary does not match the frozen snapshot")
+
+        destination_block_ids = tuple(
+            tuple(group)
+            for group in self._trim_hybrid_remote_block_ids(
+                snapshot.final_block_ids,
+                state.decision_request.target_tokens + 1,
+            )
+        )
+        reverse_plan: ReversePlan | None = None
+        if result.path is PathKind.PE_READ:
+            forward_token_start = snapshot.local_tokens
+        elif result.path is PathKind.DE_READ:
+            forward_token_start = snapshot.store_tokens
+        else:
+            assert_never(result.path)
+
+        if result.path is PathKind.DE_READ:
+            # The receive path already guarantees a DE_READ Decision carries a Reverse plan.
+            reverse_plan = decision.reverse_plan
+            assert reverse_plan is not None
+            if reverse_plan.wire_request_id != get_external_request_id(request_id):
+                raise PathDecisionValidationError("Reverse plan wire id does not match the Decode request")
+            if reverse_plan.token_end != snapshot.store_tokens:
+                raise PathDecisionValidationError("Reverse plan range does not end at the frozen Store boundary")
+            if reverse_plan.source_block_ids != destination_block_ids:
+                raise PathDecisionValidationError("Reverse plan source does not match the advertised Decode table")
+            if len(reverse_plan.remote_block_sizes) != len(self.block_size):
+                raise PathDecisionValidationError("Reverse plan block-size group count does not match Decode")
+            frozen_wrapper_blocks = tuple(tuple(group) for group in snapshot.allocated_blocks.get_block_ids())
+            if frozen_wrapper_blocks != snapshot.final_block_ids:
+                raise PathDecisionValidationError("retained allocation wrapper no longer matches the snapshot")
+        return destination_block_ids, forward_token_start, reverse_plan
+
+    def _activate_received_decision(
         self,
         decision: PathDecision,
         metadata: DualPathConnectorMetadata,
@@ -1038,34 +1139,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         state = self._decode_decision_states.get(request_id)
         if state is None:
             return
-        if state.status is DecodeDecisionStatus.PENDING:
-            pass
-        elif state.status in (
-            DecodeDecisionStatus.COMMITTED,
-            DecodeDecisionStatus.TIMED_OUT,
-            DecodeDecisionStatus.ACTIVATION_FAILED,
-        ):
+        if not _is_open_decision_status(state.status):
             return
-        else:
-            assert_never(state.status)
 
         snapshot = self._decode_kv_snapshots[request_id]
         try:
-            if decision.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-                raise PathDecisionValidationError("Decision protocol version does not match the local protocol")
-            if state.request_key != result.request_key or state.decision_request.request_key != result.request_key:
-                raise PathDecisionValidationError("Decision key does not match the pending Decode state")
-            if state.decision_request.decode_local_tokens != snapshot.local_tokens:
-                raise PathDecisionValidationError("Decision local prefix does not match the frozen snapshot")
-            if state.decision_request.decode_store_tokens != snapshot.store_tokens:
-                raise PathDecisionValidationError("Decision Store boundary does not match the frozen snapshot")
-
-            destination_block_ids = tuple(
-                tuple(group)
-                for group in self._trim_hybrid_remote_block_ids(
-                    snapshot.final_block_ids,
-                    state.decision_request.target_tokens + 1,
-                )
+            destination_block_ids, forward_token_start, reverse_plan = self._validate_committed_decision(
+                decision, state, snapshot
             )
             binding = ForwardReceiveBinding(
                 request_key=state.request_key,
@@ -1073,69 +1153,22 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 wire_request_id=get_external_request_id(request_id),
                 decode_request_id=request_id,
                 destination_block_ids=destination_block_ids,
-                token_start=snapshot.local_tokens,
+                token_start=forward_token_start,
                 token_end=snapshot.transfer_tokens,
             )
-            reverse_plan: ReversePlan | None = None
-
-            if result.path is Path.PE_READ:
-                if decision.reverse_plan is not None:
-                    raise PathDecisionValidationError("PE_READ Decision must not carry a Reverse plan")
-            elif result.path is Path.DE_READ:
-                reverse_plan = decision.reverse_plan
-                if reverse_plan is None:
-                    raise PathDecisionValidationError("DE_READ Decision requires a Reverse plan")
-                if reverse_plan.request_key != state.request_key:
-                    raise PathDecisionValidationError("Reverse plan key does not match the pending Decode state")
-                if reverse_plan.wire_request_id != get_external_request_id(request_id):
-                    raise PathDecisionValidationError("Reverse plan wire id does not match the Decode request")
-                if reverse_plan.token_end != snapshot.store_tokens or reverse_plan.token_start >= snapshot.store_tokens:
-                    raise PathDecisionValidationError("Reverse plan range does not end at the frozen Store boundary")
-                if reverse_plan.source_block_ids != destination_block_ids:
-                    raise PathDecisionValidationError("Reverse plan source does not match the advertised Decode table")
-                if len(reverse_plan.remote_block_sizes) != len(self.block_size):
-                    raise PathDecisionValidationError("Reverse plan block-size group count does not match Decode")
-                if len(reverse_plan.destination_block_ids) != len(reverse_plan.remote_block_sizes):
-                    raise PathDecisionValidationError("Reverse plan destination group count does not match block sizes")
-                if not reverse_plan.remote_engine_id or not reverse_plan.remote_host or reverse_plan.remote_port <= 0:
-                    raise PathDecisionValidationError("Reverse plan peer endpoint is invalid")
-                if (
-                    min(
-                        reverse_plan.remote_tp_size,
-                        reverse_plan.remote_pcp_size,
-                        reverse_plan.remote_dcp_size,
-                    )
-                    <= 0
-                ):
-                    raise PathDecisionValidationError("Reverse plan topology is invalid")
-                frozen_wrapper_blocks = tuple(tuple(group) for group in snapshot.allocated_blocks.get_block_ids())
-                if frozen_wrapper_blocks != snapshot.final_block_ids:
-                    raise PathDecisionValidationError("retained allocation wrapper no longer matches the snapshot")
-
-                binding = ForwardReceiveBinding(
-                    request_key=state.request_key,
-                    path=Path.DE_READ,
-                    wire_request_id=get_external_request_id(request_id),
-                    decode_request_id=request_id,
-                    destination_block_ids=destination_block_ids,
-                    token_start=snapshot.store_tokens,
-                    token_end=snapshot.transfer_tokens,
+            if result.path is PathKind.DE_READ and snapshot.store_load_spec is not None:
+                assert self._kvpool_adapter is not None
+                self._kvpool_adapter.commit_after_alloc(
+                    state.request,
+                    snapshot.allocated_blocks,
+                    snapshot.store_load_spec,
                 )
-                if snapshot.store_load_spec is not None:
-                    assert self._kvpool_adapter is not None
-                    self._kvpool_adapter.commit_after_alloc(
-                        state.request,
-                        snapshot.allocated_blocks,
-                        snapshot.store_load_spec,
-                    )
-            else:
-                assert_never(result.path)
         except Exception as error:  # noqa: BLE001
             logger.error("DualPath Decode activation failed for request %s: %s", request_id, error)
-            state.status = DecodeDecisionStatus.ACTIVATION_FAILED
+            state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
             self._path_decision_coordinator.unregister(state.request_key)
             metadata.control_failures.append(
-                self._build_external_control_failure(
+                self._build_decode_control_failure(
                     request_id,
                     snapshot,
                     DualPathControlFailureReason.ACTIVATION_FAILED,
@@ -1146,13 +1179,25 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if reverse_plan is not None:
             metadata.reverse_plans.append(reverse_plan)
         metadata.forward_receive_bindings.append(binding)
-        state.status = DecodeDecisionStatus.COMMITTED
-        if result.path is Path.PE_READ:
+        state.status = _DecodeDecisionStatus.COMMITTED
+        self._log_decision_activation(decision, state, snapshot, reverse_plan, binding)
+
+    def _log_decision_activation(
+        self,
+        decision: PathDecision,
+        state: DecodePathDecisionState,
+        snapshot: DecodeKVSnapshot,
+        reverse_plan: ReversePlan | None,
+        binding: ForwardReceiveBinding,
+    ) -> None:
+        # Field layout is consumed by ops log parsing; keep it stable.
+        result = decision.result
+        if result.path is PathKind.PE_READ:
             store_coverage = "none"
             store_end = snapshot.local_tokens
             reverse_start = snapshot.local_tokens
             reverse_end = snapshot.local_tokens
-        elif result.path is Path.DE_READ:
+        elif result.path is PathKind.DE_READ:
             store_coverage = "partial" if snapshot.store_load_spec is not None else "skipped"
             store_end = snapshot.store_tokens
             assert reverse_plan is not None
@@ -1162,7 +1207,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             assert_never(result.path)
         logger.info(
             "dual_path activation key=%s/%s protocol=%s selected_path=%s store=%s "
-            "store_range=[%s,%s) reverse_range=[%s,%s) compute_range=[%s,%s) forward_range=[%s,%s)",
+            "store_range=[%s,%s) reverse_range=[%s,%s) forward_range=[%s,%s)",
             state.request_key.decode_engine_instance_id,
             state.request_key.decode_request_id,
             decision.protocol_version,
@@ -1174,57 +1219,42 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             reverse_end,
             binding.token_start,
             binding.token_end,
-            binding.token_start,
-            binding.token_end,
         )
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
-    ) -> MooncakeLayerwiseConnectorMetadata:
+    ) -> DualPathConnectorMetadata:
         parent_metadata = super().build_connector_meta(scheduler_output)
+        # Always return the DualPath subclass (possibly with empty fields) so
+        # Worker-side consumers never defend against a plain parent instance.
+        metadata = DualPathConnectorMetadata()
+        metadata.requests = parent_metadata.requests
+        metadata.send_task = parent_metadata.send_task
         if self.dual_path_cfg.role != "decode":
             self._sweep_pe_delivery()
-            if not self._pe_pending_reverse_receive_bindings and not self._pe_control_failures:
-                return parent_metadata
-            metadata = DualPathConnectorMetadata()
-            metadata.requests = parent_metadata.requests
-            metadata.send_task = parent_metadata.send_task
             metadata.reverse_receive_bindings.extend(self._pe_pending_reverse_receive_bindings.values())
             metadata.control_failures.extend(self._pe_control_failures.values())
             self._pe_pending_reverse_receive_bindings.clear()
             self._pe_control_failures.clear()
             return metadata
 
-        metadata = DualPathConnectorMetadata()
-        metadata.requests = parent_metadata.requests
-        metadata.send_task = parent_metadata.send_task
         coordinator = self._path_decision_coordinator
 
         for decision in coordinator.take_received_decisions():
-            request_key = decision.result.request_key
-            if request_key.decode_engine_instance_id != coordinator.decode_engine_instance_id:
-                continue
-            self._activate_committed_decision(decision, metadata)
+            self._activate_received_decision(decision, metadata)
 
         now = time.monotonic()
         for request_id, state in self._decode_decision_states.items():
-            if state.status is DecodeDecisionStatus.PENDING:
-                if state.deadline > now:
-                    continue
-            elif state.status in (
-                DecodeDecisionStatus.COMMITTED,
-                DecodeDecisionStatus.TIMED_OUT,
-                DecodeDecisionStatus.ACTIVATION_FAILED,
-            ):
+            if not _is_open_decision_status(state.status):
                 continue
-            else:
-                assert_never(state.status)
-            state.status = DecodeDecisionStatus.TIMED_OUT
+            if state.deadline > now:
+                continue
+            state.status = _DecodeDecisionStatus.TIMED_OUT
             coordinator.unregister(state.request_key)
             snapshot = self._decode_kv_snapshots[request_id]
             metadata.control_failures.append(
-                self._build_external_control_failure(
+                self._build_decode_control_failure(
                     request_id,
                     snapshot,
                     DualPathControlFailureReason.DECISION_TIMEOUT,
@@ -1233,14 +1263,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         assert self._kvpool_adapter is not None
         store_metadata = self._kvpool_adapter.build_connector_meta(scheduler_output)
-        attach_store_metadata = bool(
+        if (
             store_metadata.requests
             or store_metadata.unfinished_request_ids
             or store_metadata.preempted_req_ids
             or store_metadata.loading_req_ids
             or store_metadata.delayed_free_req_ids
-        )
-        if attach_store_metadata:
+        ):
             metadata.decode_store_metadata = store_metadata
 
         return metadata
@@ -1253,6 +1282,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
+            self._pe_decision_metadata.pop(request_id, None)
             self._pe_prefill_local_tokens.pop(request_id, None)
             self._pe_path_results.pop(request_id, None)
             self._pe_forward_plans.pop(request_id, None)
@@ -1260,19 +1290,19 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._pe_control_failures.pop(request_id, None)
             owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
             send_req_info = self._reqs_need_send_layerwise.get(request_id)
-            if owned_send_req_info is send_req_info and send_req_info is not None and send_req_info.request is request:
+            if send_req_info is not None and send_req_info is owned_send_req_info and send_req_info.request is request:
                 self._reqs_need_send_layerwise.pop(request_id)
             released_key = self._pe_request_keys.pop(request_id, None)
             self._pe_invalid_request_ids.discard(request_id)
             self._sweep_pe_delivery(released_key)
 
-    def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict | None]:
+    def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         self._release_scheduler_request_state(request)
         return super().request_finished(request, block_ids)
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
-    ) -> tuple[bool, dict | None]:
+    ) -> tuple[bool, dict[str, Any] | None]:
         self._release_scheduler_request_state(request)
         return super().request_finished_all_groups(request, block_ids)
 
@@ -1292,6 +1322,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_kv_snapshots.clear()
         self._decode_decision_states.clear()
         self._pe_request_keys.clear()
+        self._pe_decision_metadata.clear()
         self._pe_prefill_local_tokens.clear()
         self._pe_path_results.clear()
         for request_id, owned_send_req_info in self._pe_forward_send_infos.items():
@@ -1328,19 +1359,18 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._registered_layer_order: tuple[tuple[int, str], ...] = ()
         self._accepting_split_requests = True
         self._split_trackers: dict[str, _SplitTracker] = {}
-        self._reverse_plans: dict[str, ReversePlan] = {}
         self._reverse_terminal_lock = threading.Lock()
         self._pending_local_reverse_terminals: dict[str, bool] = {}
         self._control_failed_recving: set[str] = set()
         self._forward_receive_bindings: dict[str, ForwardReceiveBinding] = {}
-        self._pending_forward_done: set[str] = set()
-        self._pending_forward_failed: set[str] = set()
-        self._consumed_forward_terminals: dict[str, str] = {}
+        self._pending_forward_done_wire_ids: set[str] = set()
+        self._pending_forward_failed_wire_ids: set[str] = set()
+        self._consumed_forward_terminal_wire_ids: dict[str, str] = {}
         self._reverse_receive_bindings: dict[str, ReverseReceiveBinding] = {}
         self._reverse_request_map: dict[str, str] = {}
-        self._pending_reverse_done: set[str] = set()
-        self._pending_reverse_failed: set[str] = set()
-        self._consumed_reverse_terminals: dict[str, bool] = {}
+        self._pending_reverse_done_wire_ids: set[str] = set()
+        self._pending_reverse_failed_wire_ids: set[str] = set()
+        self._consumed_reverse_terminal_wire_ids: dict[str, bool] = {}
         if dual_path_cfg.role == "decode":
             self._kvpool_worker_adapter = KVPoolWorkerAdapter(vllm_config, kv_cache_config)
         logger.info(
@@ -1356,6 +1386,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             for layer_name, kv_cache in kv_caches.items()
         }
         self._registered_layer_order = tuple((index, names[0]) for index, names in sorted(self.index_to_name.items()))
+        # The parent already started the role-native runtime (producer send / consumer
+        # receive); this adds the opposite-direction runtime for dual-path transfers.
         if self.dual_path_cfg.role == "prefill":
             self._ensure_receive_layer_runtime()
         else:
@@ -1364,9 +1396,12 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._kvpool_worker_adapter.register_kv_caches(kv_caches)
 
     def _install_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
-        if binding.path is Path.DE_READ and not getattr(self, "_accepting_split_requests", True):
+        # PE_READ bindings ride the ordinary Layerwise recv path and own no
+        # split state, so they stay accepted after split shutdown; only
+        # DE_READ bindings gate the split state machine.
+        if binding.path is PathKind.DE_READ and not self._accepting_split_requests:
             return
-        consumed_decode_request_id = self._consumed_forward_terminals.get(binding.wire_request_id)
+        consumed_decode_request_id = self._consumed_forward_terminal_wire_ids.get(binding.wire_request_id)
         if consumed_decode_request_id is not None:
             if consumed_decode_request_id == binding.decode_request_id:
                 return
@@ -1398,15 +1433,21 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     def _release_finished_forward_terminals(self, finished_req_ids: set[str]) -> set[str]:
         finished_wire_ids = {get_external_request_id(request_id) for request_id in finished_req_ids}
         for wire_request_id in finished_wire_ids:
-            decode_request_id = self._consumed_forward_terminals.get(wire_request_id)
+            decode_request_id = self._consumed_forward_terminal_wire_ids.get(wire_request_id)
             if decode_request_id in finished_req_ids:
-                self._consumed_forward_terminals.pop(wire_request_id)
-        self._pending_forward_done.difference_update(finished_wire_ids)
-        self._pending_forward_failed.difference_update(finished_wire_ids)
+                self._consumed_forward_terminal_wire_ids.pop(wire_request_id)
+        self._pending_forward_done_wire_ids.difference_update(finished_wire_ids)
+        self._pending_forward_failed_wire_ids.difference_update(finished_wire_ids)
+        for request_id in finished_req_ids:
+            binding = self._forward_receive_bindings.get(request_id)
+            if binding is not None:
+                if self.request_map.get(binding.wire_request_id) == request_id:
+                    self.request_map.pop(binding.wire_request_id)
+                self._forward_receive_bindings.pop(request_id)
         return finished_wire_ids
 
     def _install_reverse_receive_binding(self, binding: ReverseReceiveBinding) -> None:
-        if not getattr(self, "_accepting_split_requests", True):
+        if not self._accepting_split_requests:
             return
         existing_binding = self._reverse_receive_bindings.get(binding.prefill_request_id)
         retained_wire_binding = next(
@@ -1417,6 +1458,13 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             ),
             None,
         )
+        if binding.wire_request_id in self._consumed_reverse_terminal_wire_ids:
+            if retained_wire_binding == binding:
+                return
+            raise RuntimeError(
+                f"DualPath wire request {binding.wire_request_id} already belongs to a consumed Reverse terminal; "
+                "the original binding is preserved"
+            )
         existing_prefill_request_id = self._reverse_request_map.get(binding.wire_request_id)
         existing_parent_request_id = self.request_map.get(binding.wire_request_id)
         conflicts_with_retained_binding = any(
@@ -1426,80 +1474,61 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         )
         if (
             (existing_binding is not None and existing_binding != binding)
-            or (retained_wire_binding is not None and retained_wire_binding != binding)
             or (existing_prefill_request_id is not None and existing_prefill_request_id != binding.prefill_request_id)
             or existing_parent_request_id is not None
-            or binding.wire_request_id in self._consumed_forward_terminals
+            or binding.wire_request_id in self._consumed_forward_terminal_wire_ids
             or conflicts_with_retained_binding
         ):
             raise RuntimeError(
                 f"DualPath Prefill request {binding.prefill_request_id} got a conflicting duplicate "
                 "Reverse receive binding; the original binding is preserved"
             )
-        if binding.wire_request_id in self._consumed_reverse_terminals:
-            if retained_wire_binding == binding:
-                return
-            raise RuntimeError(
-                f"DualPath wire request {binding.wire_request_id} already belongs to a consumed Reverse terminal; "
-                "the original binding is preserved"
-            )
 
         self._reverse_request_map[binding.wire_request_id] = binding.prefill_request_id
         self._reverse_receive_bindings[binding.prefill_request_id] = binding
-        if binding.wire_request_id in self._pending_forward_done:
-            self._pending_forward_done.remove(binding.wire_request_id)
-            self._pending_reverse_done.add(binding.wire_request_id)
-        if binding.wire_request_id in self._pending_forward_failed:
-            self._pending_forward_failed.remove(binding.wire_request_id)
-            self._pending_reverse_failed.add(binding.wire_request_id)
+        if binding.wire_request_id in self._pending_forward_done_wire_ids:
+            self._pending_forward_done_wire_ids.remove(binding.wire_request_id)
+            self._pending_reverse_done_wire_ids.add(binding.wire_request_id)
+        if binding.wire_request_id in self._pending_forward_failed_wire_ids:
+            self._pending_forward_failed_wire_ids.remove(binding.wire_request_id)
+            self._pending_reverse_failed_wire_ids.add(binding.wire_request_id)
 
     def _release_split_request_state(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
         finished_reverse_wire_ids = self._release_finished_reverse_terminals(finished_req_ids)
         self._control_failed_recving.difference_update(finished_req_ids)
-        split_trackers = getattr(self, "_split_trackers", {})
-        reverse_plans = getattr(self, "_reverse_plans", {})
-        for request_id in finished_req_ids:
-            binding = self._forward_receive_bindings.get(request_id)
-            if binding is not None:
-                if self.request_map.get(binding.wire_request_id) == request_id:
-                    self.request_map.pop(binding.wire_request_id)
-                self._forward_receive_bindings.pop(request_id)
-            reverse_plans.pop(request_id, None)
-        reverse_terminal_lock = getattr(self, "_reverse_terminal_lock", None)
-        if reverse_terminal_lock is not None:
-            with reverse_terminal_lock:
-                for request_id in finished_req_ids:
-                    split_trackers.pop(request_id, None)
-                    self._pending_local_reverse_terminals.pop(request_id, None)
-        else:
+        with self._reverse_terminal_lock:
             for request_id in finished_req_ids:
-                split_trackers.pop(request_id, None)
-                getattr(self, "_pending_local_reverse_terminals", {}).pop(request_id, None)
+                self._split_trackers.pop(request_id, None)
+                self._pending_local_reverse_terminals.pop(request_id, None)
         return finished_wire_ids, finished_reverse_wire_ids
 
     def _release_finished_reverse_terminals(self, finished_req_ids: set[str]) -> set[str]:
         finished_wire_ids: set[str] = set()
-        reverse_receive_bindings = getattr(self, "_reverse_receive_bindings", {})
-        reverse_request_map = getattr(self, "_reverse_request_map", {})
-        consumed_reverse_terminals = getattr(self, "_consumed_reverse_terminals", {})
         for prefill_request_id in finished_req_ids:
-            binding = reverse_receive_bindings.pop(prefill_request_id, None)
+            binding = self._reverse_receive_bindings.pop(prefill_request_id, None)
             if binding is None:
                 continue
             finished_wire_ids.add(binding.wire_request_id)
-            reverse_request_map.pop(binding.wire_request_id, None)
-            consumed_reverse_terminals.pop(binding.wire_request_id, None)
-        getattr(self, "_pending_reverse_done", set()).difference_update(finished_wire_ids)
-        getattr(self, "_pending_reverse_failed", set()).difference_update(finished_wire_ids)
+            self._reverse_request_map.pop(binding.wire_request_id, None)
+            self._consumed_reverse_terminal_wire_ids.pop(binding.wire_request_id, None)
+        self._pending_reverse_done_wire_ids.difference_update(finished_wire_ids)
+        self._pending_reverse_failed_wire_ids.difference_update(finished_wire_ids)
         return finished_wire_ids
 
     def _consume_reverse_receive_binding(self, binding: ReverseReceiveBinding, terminal_flag: bool) -> None:
-        self._consumed_reverse_terminals[binding.wire_request_id] = terminal_flag
+        """Record the terminal and drop the wire-id mapping, but retain the
+        binding itself: ``_release_finished_reverse_terminals`` later recovers
+        the wire id from it when the Prefill-local request finishes."""
+        self._consumed_reverse_terminal_wire_ids[binding.wire_request_id] = terminal_flag
         self._reverse_request_map.pop(binding.wire_request_id, None)
 
     def _consume_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
-        self._consumed_forward_terminals[binding.wire_request_id] = binding.decode_request_id
+        """Record the terminal and pop the binding eagerly: unlike the Reverse
+        side, the Forward side needs no later lookup because
+        ``_release_finished_forward_terminals`` recovers wire ids via
+        ``get_external_request_id``."""
+        self._consumed_forward_terminal_wire_ids[binding.wire_request_id] = binding.decode_request_id
         self.request_map.pop(binding.wire_request_id, None)
         self._forward_receive_bindings.pop(binding.decode_request_id, None)
 
@@ -1508,7 +1537,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         binding: ForwardReceiveBinding,
         store_metadata: AscendConnectorMetadata | None,
     ) -> None:
-        if not getattr(self, "_accepting_split_requests", True):
+        if not self._accepting_split_requests:
             return
         if binding.decode_request_id in self._split_trackers:
             return
@@ -1547,11 +1576,12 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             forward_destination_slice=forward_destination_slice,
             plan=None,
             reverse_submitted=False,
+            store_load_failed=False,
             terminal_published=False,
         )
 
     def _install_reverse_plan(self, plan: ReversePlan) -> None:
-        if not getattr(self, "_accepting_split_requests", True):
+        if not self._accepting_split_requests:
             return
         decode_request_id = plan.request_key.decode_request_id
         if get_external_request_id(decode_request_id) != plan.wire_request_id:
@@ -1575,11 +1605,12 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 f"DualPath Decode request {decode_request_id} got a Reverse plan with a conflicting split boundary"
             )
 
-        existing_plan = self._reverse_plans.get(decode_request_id)
+        existing_plan = tracker.plan
         conflicts_with_retained_plan = any(
             retained != plan
             and (retained.request_key == plan.request_key or retained.wire_request_id == plan.wire_request_id)
-            for retained in self._reverse_plans.values()
+            for retained in (split_tracker.plan for split_tracker in self._split_trackers.values())
+            if retained is not None
         )
         if (existing_plan is not None and existing_plan != plan) or conflicts_with_retained_plan:
             raise RuntimeError(
@@ -1589,7 +1620,6 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         if existing_plan is not None:
             return
 
-        self._reverse_plans[decode_request_id] = plan
         tracker.plan = plan
         tracker.reverse_phase = _SplitPhase.PENDING
 
@@ -1651,7 +1681,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return metadata
 
     def _submit_reverse(self, decode_request_id: str) -> None:
-        if not getattr(self, "_accepting_split_requests", True):
+        if not self._accepting_split_requests:
             return
         tracker = self._split_trackers.get(decode_request_id)
         if (
@@ -1663,7 +1693,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             return
 
         metadata = self._build_reverse_send_metadata(tracker.plan, decode_request_id)
-        assert self._registered_kv_caches is not None
+        if self._registered_kv_caches is None:
+            raise RuntimeError("DualPath Reverse submission requires registered KV caches")
         ready_event = torch.npu.Event()
         ready_event.record()
         tracker.reverse_submitted = True
@@ -1682,15 +1713,20 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         store_invalid_block_ids: set[int],
     ) -> set[str]:
         published_store_terminals: set[str] = set()
-        split_trackers = getattr(self, "_split_trackers", {})
+        if store_invalid_block_ids:
+            for tracker in self._split_trackers.values():
+                if tracker.store_phase is _SplitPhase.PENDING and store_invalid_block_ids.intersection(
+                    tracker.store_destination_slice
+                ):
+                    tracker.store_load_failed = True
         for request_id in store_done_recving:
-            tracker = split_trackers.get(request_id)
+            tracker = self._split_trackers.get(request_id)
             if tracker is None:
                 published_store_terminals.add(request_id)
                 continue
             if tracker.store_phase is not _SplitPhase.PENDING:
                 continue
-            if store_invalid_block_ids.intersection(tracker.store_destination_slice):
+            if tracker.store_load_failed:
                 tracker.store_phase = _SplitPhase.FAILED
                 self._invalid_block_ids.update(tracker.store_destination_slice)
                 logger.warning(
@@ -1712,19 +1748,23 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     published_store_terminals.add(request_id)
         return published_store_terminals
 
-    def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
-        store_metadata = getattr(metadata, "decode_store_metadata", None)
-        for binding in getattr(metadata, "reverse_receive_bindings", ()):
-            if self.dual_path_cfg.role == "prefill":
+    def start_load_kv(self, metadata: DualPathConnectorMetadata) -> None:
+        store_metadata = metadata.decode_store_metadata
+        is_prefill = self.dual_path_cfg.role == "prefill"
+        is_decode = self.dual_path_cfg.role == "decode"
+        if is_prefill:
+            for binding in metadata.reverse_receive_bindings:
                 self._install_reverse_receive_binding(binding)
-        for binding in getattr(metadata, "forward_receive_bindings", ()):
+        de_read_bindings: list[ForwardReceiveBinding] = []
+        for binding in metadata.forward_receive_bindings:
             self._install_forward_receive_binding(binding)
-            if binding.path is Path.DE_READ and self.dual_path_cfg.role == "decode":
+            if binding.path is PathKind.DE_READ and is_decode:
                 self._install_split_tracker(binding, store_metadata)
-        for plan in getattr(metadata, "reverse_plans", ()):
-            if self.dual_path_cfg.role == "decode":
+                de_read_bindings.append(binding)
+        if is_decode:
+            for plan in metadata.reverse_plans:
                 self._install_reverse_plan(plan)
-        for failure in getattr(metadata, "control_failures", ()):
+        for failure in metadata.control_failures:
             self._control_failed_recving.add(failure.request_id)
             self._invalid_block_ids.update(failure.invalid_block_ids)
             logger.warning(
@@ -1732,15 +1772,17 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 failure.request_id,
                 failure.reason.value,
             )
-        split_store_accepted = getattr(self, "_accepting_split_requests", True) or not any(
-            binding.path is Path.DE_READ for binding in getattr(metadata, "forward_receive_bindings", ())
+        # Non-DE_READ Store loads bypass the split state machine and stay accepted after shutdown.
+        split_store_accepted = self._accepting_split_requests or not any(
+            binding.path is PathKind.DE_READ for binding in metadata.forward_receive_bindings
         )
         if store_metadata is not None and split_store_accepted:
             assert self._kvpool_worker_adapter is not None
             self._kvpool_worker_adapter.start_load_kv(store_metadata)
-        for binding in getattr(metadata, "forward_receive_bindings", ()):
-            if binding.path is Path.DE_READ and self.dual_path_cfg.role == "decode":
-                self._submit_reverse(binding.decode_request_id)
+        # Reverse submission waits for the plan install loop above; the DE_READ
+        # bindings collected in the first pass drive it without re-scanning.
+        for binding in de_read_bindings:
+            self._submit_reverse(binding.decode_request_id)
         super().start_load_kv(metadata)
 
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
@@ -1756,14 +1798,13 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     def get_finished(
         self,
         finished_req_ids: set[str],
-        metadata: MooncakeLayerwiseConnectorMetadata,
+        metadata: DualPathConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
         finished_wire_ids, finished_reverse_wire_ids = self._release_split_request_state(finished_req_ids)
-        split_trackers = getattr(self, "_split_trackers", {})
 
         done_sending: set[str] = set()
         done_recving: set[str] = set()
-        store_metadata = getattr(metadata, "decode_store_metadata", None)
+        store_metadata = metadata.decode_store_metadata
         if store_metadata is not None:
             assert self._kvpool_worker_adapter is not None
             store_done_sending, store_done_recving = self._kvpool_worker_adapter.get_finished(
@@ -1775,15 +1816,40 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             done_sending.update(store_done_sending)
             done_recving.update(self._consume_store_completions(store_done_recving, store_invalid_block_ids))
 
-        reverse_terminal_lock = getattr(self, "_reverse_terminal_lock", None)
-        if reverse_terminal_lock is None:
-            local_reverse_terminals = {}
+        done_recving.update(self._drain_local_reverse_terminals())
+
+        if self.kv_recv_layer_thread is not None:
+            raw_done = self.kv_recv_layer_thread.get_and_clear_done_requests()
+            raw_failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
         else:
-            with reverse_terminal_lock:
-                local_reverse_terminals = dict(self._pending_local_reverse_terminals)
-                self._pending_local_reverse_terminals.clear()
+            raw_done = set()
+            raw_failed = set()
+
+        reverse_finished = self._consume_reverse_wire_terminals(
+            raw_done, raw_failed, finished_wire_ids, finished_reverse_wire_ids
+        )
+        pending_done, pending_failed, ordinary_done, ordinary_failed, forward_finished = (
+            self._consume_forward_wire_terminals(raw_done, raw_failed)
+        )
+        self._finish_ordinary_requests(ordinary_done, ordinary_failed)
+
+        self._pending_forward_done_wire_ids = pending_done
+        self._pending_forward_failed_wire_ids = pending_failed
+        done_recving.update(ordinary_done.union(forward_finished, reverse_finished, self.virtual_request))
+        self.virtual_request = set()
+        self._log_published_split_terminals(done_recving)
+        done_recving.update(self._control_failed_recving)
+        self._control_failed_recving.clear()
+        return done_sending, done_recving
+
+    def _drain_local_reverse_terminals(self) -> set[str]:
+        """Drain locally-observed Reverse send terminals into the split trackers."""
+        with self._reverse_terminal_lock:
+            local_reverse_terminals = dict(self._pending_local_reverse_terminals)
+            self._pending_local_reverse_terminals.clear()
+        finished: set[str] = set()
         for request_id, terminal_flag in local_reverse_terminals.items():
-            tracker = split_trackers.get(request_id)
+            tracker = self._split_trackers.get(request_id)
             if tracker is None or tracker.reverse_phase is not _SplitPhase.PENDING:
                 continue
             if terminal_flag:
@@ -1794,7 +1860,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     and tracker.forward_phase is _SplitPhase.DONE
                 ):
                     tracker.terminal_published = True
-                    done_recving.add(request_id)
+                    finished.add(request_id)
             else:
                 tracker.reverse_phase = _SplitPhase.FAILED
                 self._invalid_block_ids.update(tracker.forward_destination_slice)
@@ -1804,41 +1870,43 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 )
                 if not tracker.terminal_published:
                     tracker.terminal_published = True
-                    done_recving.add(request_id)
+                    finished.add(request_id)
+        return finished
 
-        if self.kv_recv_layer_thread is not None:
-            raw_done = self.kv_recv_layer_thread.get_and_clear_done_requests()
-            raw_failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
-        else:
-            raw_done = set()
-            raw_failed = set()
-
-        reverse_request_map = getattr(self, "_reverse_request_map", {})
-        reverse_receive_bindings = getattr(self, "_reverse_receive_bindings", {})
-        pending_reverse_done = getattr(self, "_pending_reverse_done", set())
-        pending_reverse_failed = getattr(self, "_pending_reverse_failed", set())
-        ignored_wire_ids = set(self._consumed_forward_terminals).union(getattr(self, "_consumed_reverse_terminals", {}))
+    def _consume_reverse_wire_terminals(
+        self,
+        raw_done: set[str],
+        raw_failed: set[str],
+        finished_wire_ids: set[str],
+        finished_reverse_wire_ids: set[str],
+    ) -> set[str]:
+        """Attribute wire terminals owned by Reverse bindings to their Prefill
+        requests. ``raw_done``/``raw_failed`` are filtered in place: ignored
+        and Reverse-owned wire ids are removed before return."""
+        ignored_wire_ids = set(self._consumed_forward_terminal_wire_ids).union(self._consumed_reverse_terminal_wire_ids)
         ignored_wire_ids.update(
             wire_request_id for wire_request_id in finished_wire_ids if wire_request_id not in self.request_map
         )
         ignored_wire_ids.update(
             wire_request_id
             for wire_request_id in finished_reverse_wire_ids
-            if wire_request_id not in reverse_request_map
+            if wire_request_id not in self._reverse_request_map
         )
         raw_done.difference_update(ignored_wire_ids)
         raw_failed.difference_update(ignored_wire_ids)
 
-        reverse_owned_wire_ids = set(reverse_request_map)
-        reverse_done_wire_ids = raw_done.intersection(reverse_owned_wire_ids).union(pending_reverse_done)
-        reverse_failed_wire_ids = raw_failed.intersection(reverse_owned_wire_ids).union(pending_reverse_failed)
+        reverse_owned_wire_ids = set(self._reverse_request_map)
+        reverse_done_wire_ids = raw_done.intersection(reverse_owned_wire_ids).union(self._pending_reverse_done_wire_ids)
+        reverse_failed_wire_ids = raw_failed.intersection(reverse_owned_wire_ids).union(
+            self._pending_reverse_failed_wire_ids
+        )
         raw_done.difference_update(reverse_owned_wire_ids)
         raw_failed.difference_update(reverse_owned_wire_ids)
         reverse_done_wire_ids.difference_update(reverse_failed_wire_ids)
         reverse_finished: set[str] = set()
         for wire_request_id in reverse_failed_wire_ids:
-            prefill_request_id = reverse_request_map[wire_request_id]
-            binding = reverse_receive_bindings[prefill_request_id]
+            prefill_request_id = self._reverse_request_map[wire_request_id]
+            binding = self._reverse_receive_bindings[prefill_request_id]
             first_reverse_block = binding.token_start // self.block_size[0]
             last_reverse_block = math.ceil(binding.token_end / self.block_size[0])
             self._invalid_block_ids.update(binding.destination_block_ids[0][first_reverse_block:last_reverse_block])
@@ -1849,19 +1917,28 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 prefill_request_id,
             )
         for wire_request_id in reverse_done_wire_ids:
-            prefill_request_id = reverse_request_map[wire_request_id]
-            binding = reverse_receive_bindings[prefill_request_id]
+            prefill_request_id = self._reverse_request_map[wire_request_id]
+            binding = self._reverse_receive_bindings[prefill_request_id]
             reverse_finished.add(prefill_request_id)
             self._consume_reverse_receive_binding(binding, True)
             logger.info(
                 "dual_path reverse_terminal key=%s terminal=DONE final_predicate=SUCCESS",
                 prefill_request_id,
             )
-        pending_reverse_done.clear()
-        pending_reverse_failed.clear()
+        self._pending_reverse_done_wire_ids.clear()
+        self._pending_reverse_failed_wire_ids.clear()
+        return reverse_finished
 
-        done_wire_ids = raw_done.union(self._pending_forward_done)
-        failed_wire_ids = raw_failed.union(self._pending_forward_failed)
+    def _consume_forward_wire_terminals(
+        self,
+        raw_done: set[str],
+        raw_failed: set[str],
+    ) -> tuple[set[str], set[str], set[str], set[str], set[str]]:
+        """Classify the remaining wire terminals into pending, ordinary, and
+        split-Forward buckets. Returns ``(pending_done, pending_failed,
+        ordinary_done, ordinary_failed, forward_finished)``."""
+        done_wire_ids = raw_done.union(self._pending_forward_done_wire_ids)
+        failed_wire_ids = raw_failed.union(self._pending_forward_failed_wire_ids)
         failed_wins_wire_ids: set[str] = set()
         for wire_request_id in failed_wire_ids:
             decode_request_id = self.request_map.get(wire_request_id)
@@ -1887,13 +1964,13 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             if binding is None or binding.wire_request_id != wire_request_id:
                 ordinary_failed.add(decode_request_id)
                 continue
-            if binding.path is Path.PE_READ:
+            if binding.path is PathKind.PE_READ:
                 first_forward_block = binding.token_start // self.block_size[0]
                 last_forward_block = math.ceil(binding.token_end / self.block_size[0])
                 self._invalid_block_ids.update(binding.destination_block_ids[0][first_forward_block:last_forward_block])
                 forward_finished.add(decode_request_id)
-            elif binding.path is Path.DE_READ:
-                tracker = split_trackers[decode_request_id]
+            elif binding.path is PathKind.DE_READ:
+                tracker = self._split_trackers[decode_request_id]
                 if tracker.forward_phase is _SplitPhase.PENDING:
                     tracker.forward_phase = _SplitPhase.FAILED
                     self._invalid_block_ids.update(tracker.forward_destination_slice)
@@ -1917,10 +1994,10 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             if binding is None or binding.wire_request_id != wire_request_id:
                 ordinary_done.add(decode_request_id)
                 continue
-            if binding.path is Path.PE_READ:
+            if binding.path is PathKind.PE_READ:
                 forward_finished.add(decode_request_id)
-            elif binding.path is Path.DE_READ:
-                tracker = split_trackers[decode_request_id]
+            elif binding.path is PathKind.DE_READ:
+                tracker = self._split_trackers[decode_request_id]
                 if tracker.forward_phase is _SplitPhase.PENDING:
                     tracker.forward_phase = _SplitPhase.DONE
                     if (
@@ -1933,20 +2010,21 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             else:
                 assert_never(binding.path)
             self._consume_forward_receive_binding(binding)
+        return pending_done, pending_failed, ordinary_done, ordinary_failed, forward_finished
 
+    def _finish_ordinary_requests(self, ordinary_done: set[str], ordinary_failed: set[str]) -> None:
+        """Release ordinary (non-DualPath) recv bookkeeping for finished requests."""
         for decode_request_id in ordinary_failed:
-            if metadata := self._recving_metadata.get(decode_request_id):
-                self._invalid_block_ids.update(block_id for group in metadata.local_block_ids for block_id in group)
+            if meta := self._recving_metadata.get(decode_request_id):
+                self._invalid_block_ids.update(block_id for group in meta.local_block_ids for block_id in group)
         for decode_request_id in ordinary_done.union(ordinary_failed):
             self.request_map.pop(get_external_request_id(decode_request_id), None)
             self._recving_metadata.pop(decode_request_id, None)
 
-        self._pending_forward_done = pending_done
-        self._pending_forward_failed = pending_failed
-        done_recving.update(ordinary_done.union(forward_finished, reverse_finished, self.virtual_request))
-        self.virtual_request = set()
+    def _log_published_split_terminals(self, done_recving: set[str]) -> None:
+        """Emit the per-request split summary and the aggregate recv summary."""
         for request_id in done_recving:
-            tracker = split_trackers.get(request_id)
+            tracker = self._split_trackers.get(request_id)
             if tracker is None or not tracker.terminal_published:
                 continue
             final_predicate = (
@@ -1968,9 +2046,6 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 len(done_recving),
                 done_recving,
             )
-        done_recving.update(self._control_failed_recving)
-        self._control_failed_recving.clear()
-        return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid_block_ids = super().get_block_ids_with_load_errors()
@@ -1980,35 +2055,25 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
     def shutdown(self) -> None:
         """Release local state without promising cancellation of remote DMA."""
-        if not getattr(self, "_accepting_split_requests", True):
+        if not self._accepting_split_requests:
             return
         self._accepting_split_requests = False
         for binding in self._forward_receive_bindings.values():
             if self.request_map.get(binding.wire_request_id) == binding.decode_request_id:
                 self.request_map.pop(binding.wire_request_id)
         self._forward_receive_bindings.clear()
-        self._pending_forward_done.clear()
-        self._pending_forward_failed.clear()
-        self._consumed_forward_terminals.clear()
-        getattr(self, "_reverse_plans", {}).clear()
-        reverse_terminal_lock = getattr(self, "_reverse_terminal_lock", None)
-        if reverse_terminal_lock is not None:
-            with reverse_terminal_lock:
-                getattr(self, "_split_trackers", {}).clear()
-                self._pending_local_reverse_terminals.clear()
-        else:
-            getattr(self, "_split_trackers", {}).clear()
-        getattr(self, "_reverse_receive_bindings", {}).clear()
-        getattr(self, "_reverse_request_map", {}).clear()
-        getattr(self, "_pending_reverse_done", set()).clear()
-        getattr(self, "_pending_reverse_failed", set()).clear()
-        getattr(self, "_consumed_reverse_terminals", {}).clear()
+        self._pending_forward_done_wire_ids.clear()
+        self._pending_forward_failed_wire_ids.clear()
+        self._consumed_forward_terminal_wire_ids.clear()
+        with self._reverse_terminal_lock:
+            self._split_trackers.clear()
+            self._pending_local_reverse_terminals.clear()
+        self._reverse_receive_bindings.clear()
+        self._reverse_request_map.clear()
+        self._pending_reverse_done_wire_ids.clear()
+        self._pending_reverse_failed_wire_ids.clear()
+        self._consumed_reverse_terminal_wire_ids.clear()
         self._control_failed_recving.clear()
-        if self._kvpool_worker_adapter is not None:
-            self._kvpool_worker_adapter.close()
-        parent_shutdown = getattr(super(), "shutdown", None)
-        if parent_shutdown is not None:
-            parent_shutdown()
 
 
 class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
@@ -2026,15 +2091,14 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig | None = None,
     ) -> None:
-        # NOTE: do NOT call MooncakeLayerwiseConnector.__init__ — it hard-builds
-        # the parent scheduler/worker. Call KVConnectorBase_V1.__init__ exactly
-        # once and replicate only the facade state listed in the PR-00
-        # construction contract.
+        # Do not call MooncakeLayerwiseConnector.__init__; replicate only the
+        # parent facade: _is_kv_producer, engine_id, _connector_metadata,
+        # connector_scheduler, connector_worker.
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         self._is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
         self.engine_id = vllm_config.kv_transfer_config.engine_id
-        self._connector_metadata = MooncakeLayerwiseConnectorMetadata()
+        self._connector_metadata = DualPathConnectorMetadata()
         dual_path_cfg = DualPathConfig.from_extra_config(
             vllm_config.kv_transfer_config.kv_connector_extra_config,
             vllm_config.kv_transfer_config,
@@ -2054,10 +2118,11 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
             raise ValueError(f"Unsupported KVConnectorRole: {role!r}")
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        # Deliberately bypasses super().get_finished(): the parent facade drops Core-finished ids.
         assert isinstance(self.connector_worker, DualPathConnectorWorker)
         return self.connector_worker.get_finished(finished_req_ids, self._connector_metadata)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Release DualPath-owned state and adapters, then defer to the base."""
         if isinstance(self.connector_scheduler, DualPathConnectorScheduler):
             self.connector_scheduler.shutdown()

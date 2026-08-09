@@ -99,7 +99,7 @@ def _selected_params():
 
 class TestDecodeAdmission(unittest.TestCase):
     def setUp(self):
-        self._adapter_patch = patch(f"{_CONNECTOR_NS}.KVPoolAdapter")
+        self._adapter_patch = patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter")
         self._worker_adapter_patch = patch(f"{_CONNECTOR_NS}.KVPoolWorkerAdapter")
         self._coordinator_patch = patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator")
         self._get_ip_patch = patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1")

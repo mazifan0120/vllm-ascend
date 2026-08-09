@@ -8,11 +8,11 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionDecider,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
+    PathKind,
     PathPolicy,
     RoundRobinPathPolicy,
 )
@@ -41,12 +41,12 @@ def _make_request(
 
 
 class SpyPolicy:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: PathKind) -> None:
         self._path = path
         self.choose_count = 0
         self.requests: list[PathDecisionRequest] = []
 
-    def choose(self, request: PathDecisionRequest) -> Path:
+    def choose(self, request: PathDecisionRequest) -> PathKind:
         self.choose_count += 1
         self.requests.append(request)
         return self._path
@@ -63,20 +63,20 @@ class InvalidResultPolicy:
 
 
 class AlwaysPePolicy:
-    def choose(self, request: PathDecisionRequest) -> Path:
-        return Path.PE_READ
+    def choose(self, request: PathDecisionRequest) -> PathKind:
+        return PathKind.PE_READ
 
 
 class AlwaysDePolicy:
-    def choose(self, request: PathDecisionRequest) -> Path:
-        return Path.DE_READ
+    def choose(self, request: PathDecisionRequest) -> PathKind:
+        return PathKind.DE_READ
 
 
 class ExplodingPolicy:
     def __init__(self) -> None:
         self.choose_count = 0
 
-    def choose(self, request: PathDecisionRequest) -> Path:
+    def choose(self, request: PathDecisionRequest) -> PathKind:
         self.choose_count += 1
         raise RuntimeError("policy failed")
 
@@ -178,27 +178,27 @@ def test_request_rejects_hbm_complete_local_equals_target() -> None:
 def test_eligibility_forces_pe_read_when_l_pe_equals_k_de() -> None:
     request = _make_request(decode_store_tokens=16)
     policy = MagicMock(spec=PathPolicy)
-    policy.choose.return_value = Path.DE_READ
+    policy.choose.return_value = PathKind.DE_READ
 
     result = PathDecisionDecider(policy).decide(request, 16)
 
-    assert result == PathDecisionResult(request_key=request.request_key, path=Path.PE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=PathKind.PE_READ)
     policy.choose.assert_not_called()
 
 
 def test_eligibility_forces_pe_read_when_l_pe_exceeds_k_de() -> None:
     request = _make_request(decode_store_tokens=16)
     policy = MagicMock(spec=PathPolicy)
-    policy.choose.return_value = Path.DE_READ
+    policy.choose.return_value = PathKind.DE_READ
 
     result = PathDecisionDecider(policy).decide(request, 24)
 
-    assert result == PathDecisionResult(request_key=request.request_key, path=Path.PE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=PathKind.PE_READ)
     policy.choose.assert_not_called()
 
 
-@pytest.mark.parametrize("selected_path", [Path.PE_READ, Path.DE_READ])
-def test_eligibility_invokes_policy_once_when_l_pe_below_k_de(selected_path: Path) -> None:
+@pytest.mark.parametrize("selected_path", [PathKind.PE_READ, PathKind.DE_READ])
+def test_eligibility_invokes_policy_once_when_l_pe_below_k_de(selected_path: PathKind) -> None:
     request = _make_request(decode_store_tokens=16)
     policy = MagicMock(spec=PathPolicy)
     policy.choose.return_value = selected_path
@@ -217,8 +217,8 @@ def test_forced_pe_read_does_not_advance_seeded_round_robin() -> None:
     singleton_result = decider.decide(singleton, 16)
     ambiguous_result = decider.decide(ambiguous, 0)
 
-    assert singleton_result.path is Path.PE_READ
-    assert ambiguous_result.path is Path.PE_READ
+    assert singleton_result.path is PathKind.PE_READ
+    assert ambiguous_result.path is PathKind.PE_READ
 
 
 def test_round_robin_initial_choice_seeded_pe_read() -> None:
@@ -227,7 +227,7 @@ def test_round_robin_initial_choice_seeded_pe_read() -> None:
 
     result = decider.decide(request, 0)
 
-    assert result == PathDecisionResult(request_key=request.request_key, path=Path.PE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=PathKind.PE_READ)
 
 
 def test_round_robin_initial_choice_seeded_de_read() -> None:
@@ -236,7 +236,7 @@ def test_round_robin_initial_choice_seeded_de_read() -> None:
 
     result = decider.decide(request, 0)
 
-    assert result == PathDecisionResult(request_key=request.request_key, path=Path.DE_READ)
+    assert result == PathDecisionResult(request_key=request.request_key, path=PathKind.DE_READ)
 
 
 def test_ambiguous_requests_follow_seeded_round_robin() -> None:
@@ -246,17 +246,17 @@ def test_ambiguous_requests_follow_seeded_round_robin() -> None:
     results = [decider.decide(request, 0) for request in requests]
 
     assert results == [
-        PathDecisionResult(request_key=requests[0].request_key, path=Path.PE_READ),
-        PathDecisionResult(request_key=requests[1].request_key, path=Path.DE_READ),
-        PathDecisionResult(request_key=requests[2].request_key, path=Path.PE_READ),
-        PathDecisionResult(request_key=requests[3].request_key, path=Path.DE_READ),
+        PathDecisionResult(request_key=requests[0].request_key, path=PathKind.PE_READ),
+        PathDecisionResult(request_key=requests[1].request_key, path=PathKind.DE_READ),
+        PathDecisionResult(request_key=requests[2].request_key, path=PathKind.PE_READ),
+        PathDecisionResult(request_key=requests[3].request_key, path=PathKind.DE_READ),
     ]
 
 
 def test_identical_replay_reuses_result_without_policy_turn() -> None:
     request = _make_request()
     equal_but_distinct = _make_request()
-    policy = SpyPolicy(Path.PE_READ)
+    policy = SpyPolicy(PathKind.PE_READ)
     decider = PathDecisionDecider(policy)
 
     first_result = decider.decide(request, 8)
@@ -274,7 +274,7 @@ def test_conflicting_l_pe_or_facts_retain_first_record(conflict: str) -> None:
     original = _make_request()
     conflicting = _make_request(decode_store_tokens=24) if conflict == "request-facts" else _make_request()
     conflicting_prefill_local_tokens = 9 if conflict == "prefill-local" else 8
-    policy = SpyPolicy(Path.PE_READ)
+    policy = SpyPolicy(PathKind.PE_READ)
     decider = PathDecisionDecider(policy)
 
     retained_result = decider.decide(original, 8)
@@ -290,7 +290,7 @@ def test_conflicting_l_pe_or_facts_retain_first_record(conflict: str) -> None:
 
 def test_decide_with_invalid_protocol_input_raises_without_retaining_record() -> None:
     invalid_request = SimpleNamespace(request_key=_key())
-    policy = SpyPolicy(Path.PE_READ)
+    policy = SpyPolicy(PathKind.PE_READ)
     decider = PathDecisionDecider(policy)
 
     with pytest.raises(PathDecisionValidationError):
@@ -301,7 +301,7 @@ def test_decide_with_invalid_protocol_input_raises_without_retaining_record() ->
 
 
 def test_decide_with_invalid_protocol_input_without_key_raises_validation_error() -> None:
-    policy = SpyPolicy(Path.PE_READ)
+    policy = SpyPolicy(PathKind.PE_READ)
     decider = PathDecisionDecider(policy)
 
     with pytest.raises(PathDecisionValidationError):
@@ -347,7 +347,7 @@ def test_policy_exception_is_chained_retained_and_invoked_once() -> None:
 
 def test_discard_removes_retained_result_record() -> None:
     request = _make_request()
-    policy = SpyPolicy(Path.PE_READ)
+    policy = SpyPolicy(PathKind.PE_READ)
     decider = PathDecisionDecider(policy)
     decider.decide(request, 0)
 
@@ -375,12 +375,12 @@ def test_discard_is_idempotent_and_does_not_rewind_policy() -> None:
     decider = PathDecisionDecider(RoundRobinPathPolicy(random.Random(1)))
     first = _make_request(request_id="request-1")
     second = _make_request(request_id="request-2")
-    assert decider.decide(first, 0).path is Path.PE_READ
+    assert decider.decide(first, 0).path is PathKind.PE_READ
 
     decider.discard(first.request_key)
     decider.discard(first.request_key)
 
-    assert decider.decide(second, 0).path is Path.DE_READ
+    assert decider.decide(second, 0).path is PathKind.DE_READ
 
 
 def test_retained_failure_replay_raises_without_policy() -> None:
@@ -397,9 +397,9 @@ def test_retained_failure_replay_raises_without_policy() -> None:
 
 
 def test_second_policy_satisfies_path_policy_without_caller_change() -> None:
-    policies: tuple[tuple[PathPolicy, Path], ...] = (
-        (AlwaysPePolicy(), Path.PE_READ),
-        (AlwaysDePolicy(), Path.DE_READ),
+    policies: tuple[tuple[PathPolicy, PathKind], ...] = (
+        (AlwaysPePolicy(), PathKind.PE_READ),
+        (AlwaysDePolicy(), PathKind.DE_READ),
     )
 
     def decide(policy: PathPolicy, request: PathDecisionRequest) -> PathDecisionResult:
@@ -455,8 +455,8 @@ def test_request_serialization_round_trips_both_directions(
     assert PathDecisionRequest.from_dict(payload).to_dict() == payload
 
 
-@pytest.mark.parametrize("path", [Path.PE_READ, Path.DE_READ])
-def test_result_serialization_round_trips_both_directions(path: Path) -> None:
+@pytest.mark.parametrize("path", [PathKind.PE_READ, PathKind.DE_READ])
+def test_result_serialization_round_trips_both_directions(path: PathKind) -> None:
     result = PathDecisionResult(request_key=_key(), path=path)
     payload = {
         "request_key": {

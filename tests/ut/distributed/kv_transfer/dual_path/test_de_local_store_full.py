@@ -7,6 +7,7 @@ import pytest
 import torch
 from vllm.v1.outputs import KVConnectorOutput
 
+from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
 from tests.ut.distributed.kv_transfer.dual_path.test_decode_scheduler import (
     _CONNECTOR_NS,
     _make_blocks,
@@ -30,8 +31,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionResult,
+    PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
@@ -60,7 +61,7 @@ def _make_store_metadata() -> AscendConnectorMetadata:
 
 
 def _make_worker() -> DualPathConnectorWorker:
-    worker = object.__new__(DualPathConnectorWorker)
+    worker = init_dual_path_worker_state(object.__new__(DualPathConnectorWorker))
     worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
     worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
@@ -69,11 +70,6 @@ def _make_worker() -> DualPathConnectorWorker:
     worker.virtual_request = set()
     worker._recving_metadata = {}
     worker._invalid_block_ids = set()
-    worker._control_failed_recving = set()
-    worker._forward_receive_bindings = {}
-    worker._pending_forward_done = set()
-    worker._pending_forward_failed = set()
-    worker._consumed_forward_terminals = {}
     worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
     worker._kvpool_worker_adapter.get_finished.return_value = (set(), set())
     worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = set()
@@ -140,7 +136,7 @@ def _make_real_store_metadata(request_id: str) -> DualPathConnectorMetadata:
 @pytest.fixture()
 def decode_scheduler():
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolAdapter"),
+        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
         patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
         patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1"),
         patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100),
@@ -181,7 +177,7 @@ def test_full_uses_ready_delta_partial_and_miss_use_transfer_delta(decode_schedu
 
 def test_hybrid_full_and_non_full_share_boundary_but_not_route() -> None:
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolAdapter"),
+        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
         patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
         patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1"),
         patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100),
@@ -343,7 +339,10 @@ def test_store_full_alloc_creates_no_decision_side_effects(decode_scheduler) -> 
 
     with (
         patch(f"{_CONNECTOR_NS}.DualPathRequestKey", side_effect=AssertionError("request key constructed")),
-        patch(f"{_CONNECTOR_NS}.build_remote_decode_message", side_effect=AssertionError("envelope built")),
+        patch(
+            f"{_CONNECTOR_NS}.DualPathConnectorScheduler._build_remote_decode_message",
+            side_effect=AssertionError("envelope built"),
+        ),
     ):
         decode_scheduler.update_state_after_alloc(request, _make_blocks(((1, 2, 3),)), 31)
 
@@ -357,7 +356,7 @@ def test_store_full_alloc_creates_no_decision_side_effects(decode_scheduler) -> 
 def test_store_full_never_touches_path_policy() -> None:
     policy = MagicMock(name="path_policy")
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolAdapter"),
+        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
         patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
         patch(f"{_CONNECTOR_NS}.get_ip", return_value="127.0.0.1"),
         patch(f"{_CONNECTOR_NS}.derive_decode_control_port", return_value=7100),
@@ -608,7 +607,7 @@ def test_real_store_worker_miss_reports_only_external_blocks_and_finishes_withou
     assert request.kv_transfer_params["do_remote_prefill"] is False
 
 
-def test_real_store_worker_withholds_load_errors_until_done_recving() -> None:
+def test_real_store_worker_publishes_load_errors_before_done_recving() -> None:
     # Given
     request_id = "real-store-publication-race"
     adapter, _ = _make_real_store_worker_adapter(None)
@@ -642,9 +641,9 @@ def test_real_store_worker_withholds_load_errors_until_done_recving() -> None:
 
     # Then
     assert early_finished == (set(), set())
-    assert early_invalid_blocks == set()
+    assert early_invalid_blocks == {102, 103}
     assert completed == (set(), {request_id})
-    assert completed_invalid_blocks == {102, 103}
+    assert completed_invalid_blocks == set()
 
 
 def test_full_probe_then_worker_miss_fails_closed_without_proxy_fallback(decode_scheduler) -> None:
@@ -698,7 +697,7 @@ def test_parent_timeout_forward_and_store_completions_stay_isolated() -> None:
     ordinary_wire_id = get_external_request_id(ordinary_request_id)
     binding = ForwardReceiveBinding(
         request_key=DualPathRequestKey("decode-instance", forward_request_id),
-        path=Path.PE_READ,
+        path=PathKind.PE_READ,
         wire_request_id=get_external_request_id(forward_request_id),
         decode_request_id=forward_request_id,
         destination_block_ids=((201, 202),),
@@ -820,7 +819,7 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
     assert decode_scheduler.get_num_new_matched_tokens(request, 16) == (32, True)
     decode_scheduler.update_state_after_alloc(request, _make_blocks(((101, 102, 103),)), 32)
     state = decode_scheduler._decode_decision_states[request.request_id]
-    result = PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
+    result = PathDecisionResult(request_key=state.request_key, path=PathKind.PE_READ)
     store_metadata = _make_store_metadata()
     order: list[str] = []
     original_binding_type = ForwardReceiveBinding
@@ -925,4 +924,4 @@ def test_terminal_hooks_and_shutdown_release_all_store_records(
     decode_scheduler._kvpool_adapter.build_connector_meta.assert_called_once_with(scheduler_output)
     worker._kvpool_worker_adapter.get_finished.assert_called_once_with({request.request_id}, store_metadata)
     assert decode_scheduler._kvpool_adapter.close.call_count == 1
-    assert worker._kvpool_worker_adapter.close.call_count == 1
+    worker._kvpool_worker_adapter.close.assert_not_called()

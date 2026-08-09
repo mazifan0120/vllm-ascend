@@ -9,6 +9,7 @@ any vllm_ascend import so the suites run on a plain CPU checkout.
 import contextlib
 import importlib.util
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -33,6 +34,38 @@ _fake_uvloop.__spec__ = importlib.util.spec_from_loader("uvloop", loader=None)
 sys.modules.setdefault("uvloop", _fake_uvloop)
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as layerwise_module  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorWorker  # noqa: E402
+
+
+def init_dual_path_worker_state(worker: DualPathConnectorWorker, role: str = "decode") -> DualPathConnectorWorker:
+    """Initialize every DualPath-owned field of a bare worker instance.
+
+    ``DualPathConnectorWorker.__init__`` initializes these fields
+    unconditionally, so production code reads them via direct attribute
+    access. Tests that build a worker with ``object.__new__`` must route
+    through this helper to stay pinned to that field set. The KVPool worker
+    adapter is left as None; tests override it with their own stub.
+    """
+    worker.dual_path_cfg = DualPathConfig(role=role)
+    worker._kvpool_worker_adapter = None
+    worker._registered_kv_caches = None
+    worker._registered_layer_order = ()
+    worker._accepting_split_requests = True
+    worker._split_trackers = {}
+    worker._reverse_terminal_lock = threading.Lock()
+    worker._pending_local_reverse_terminals = {}
+    worker._control_failed_recving = set()
+    worker._forward_receive_bindings = {}
+    worker._pending_forward_done_wire_ids = set()
+    worker._pending_forward_failed_wire_ids = set()
+    worker._consumed_forward_terminal_wire_ids = {}
+    worker._reverse_receive_bindings = {}
+    worker._reverse_request_map = {}
+    worker._pending_reverse_done_wire_ids = set()
+    worker._pending_reverse_failed_wire_ids = set()
+    worker._consumed_reverse_terminal_wire_ids = {}
+    return worker
 
 
 @contextlib.contextmanager

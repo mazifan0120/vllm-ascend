@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the Task-01 Decode ``KVPoolAdapter`` (spec §11.1).
+"""Unit tests for the Task-01 Decode ``KVPoolSchedulerAdapter`` (spec §11.1).
 
 The adapter owns a dedicated non-layerwise ``KVPoolScheduler``; these tests
 prove lookup results are always detached from the owned ``load_specs`` map,
@@ -14,7 +14,7 @@ import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (  # noqa: E402
-    KVPoolAdapter,
+    KVPoolSchedulerAdapter,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (  # noqa: E402
     LoadSpec,
@@ -73,7 +73,7 @@ def _make_kv_cache_config():
 
 
 def _make_adapter(extra_config=None):
-    adapter = KVPoolAdapter(_make_vllm_config(extra_config), _make_kv_cache_config())
+    adapter = KVPoolSchedulerAdapter(_make_vllm_config(extra_config), _make_kv_cache_config())
     return adapter
 
 
@@ -151,7 +151,7 @@ def test_lookup_multi_group_forwards_all_group_ids_and_returns_common_prefix(moc
         ]
     )
     config = _make_vllm_config(disable_hybrid=False)
-    adapter = KVPoolAdapter(config, kv_cache_config)
+    adapter = KVPoolSchedulerAdapter(config, kv_cache_config)
     assert adapter._pool_scheduler.kv_cache_group_ids == [0, 1]
 
     mock_lookup_client_cls.return_value.lookup.return_value = 48
@@ -165,7 +165,7 @@ def test_lookup_multi_group_forwards_all_group_ids_and_returns_common_prefix(moc
 
 def test_lookup_with_discard_partial_chunks_disabled_uses_unfloored_length(mock_lookup_client_cls):
     config = _make_vllm_config(from_extra={"discard_partial_chunks": False})
-    adapter = KVPoolAdapter(config, _make_kv_cache_config())
+    adapter = KVPoolSchedulerAdapter(config, _make_kv_cache_config())
     mock_lookup_client_cls.return_value.lookup.return_value = 50
     spec = adapter.lookup(_make_request("req-nofloor", 50), 0)
     called_token_len = mock_lookup_client_cls.return_value.lookup.call_args[0][0]
@@ -259,7 +259,7 @@ def test_lookup_leaves_private_load_specs_empty(mock_lookup_client_cls):
     assert adapter._pool_scheduler.load_specs == {}
 
 
-def _make_commit_adapter() -> KVPoolAdapter:
+def _make_commit_adapter() -> KVPoolSchedulerAdapter:
     return _make_adapter(extra_config={"consumer_is_to_load": True, "load_async": True})
 
 

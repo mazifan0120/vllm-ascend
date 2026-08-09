@@ -28,7 +28,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorScheduler
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import DualPathConnectorMetadata
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import Path
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import PathKind
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorWorker,
     get_external_request_id,
@@ -89,8 +89,6 @@ def test_identical_duplicate_plans_are_idempotent_and_conflicts_preserve_first()
     with pytest.raises(RuntimeError, match="conflicting duplicate Reverse plan"):
         worker._install_reverse_plan(replace(plan, remote_port=plan.remote_port + 1))
 
-    assert worker._reverse_plans == {DECODE_REQUEST_ID: plan}
-    assert worker._reverse_plans[DECODE_REQUEST_ID] is plan
     tracker = worker._split_trackers[DECODE_REQUEST_ID]
     assert tracker.plan is plan
     assert tracker.reverse_phase.value == "PENDING"
@@ -106,7 +104,6 @@ def test_reverse_plan_install_rejects_wire_and_split_boundary_mismatch() -> None
     with pytest.raises(RuntimeError, match="split boundary"):
         worker._install_reverse_plan(replace(plan, token_end=48))
 
-    assert worker._reverse_plans == {}
     assert worker._split_trackers[DECODE_REQUEST_ID].plan is None
 
 
@@ -133,7 +130,7 @@ def test_reverse_done_before_binding_is_retained_and_reconciled() -> None:
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
 
     assert worker.get_finished(set(), empty_metadata) == (set(), set())
-    assert worker._pending_forward_done == {binding.wire_request_id}
+    assert worker._pending_forward_done_wire_ids == {binding.wire_request_id}
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
     metadata = DualPathConnectorMetadata()
     metadata.reverse_receive_bindings.append(binding)
@@ -141,8 +138,8 @@ def test_reverse_done_before_binding_is_retained_and_reconciled() -> None:
 
     assert worker.get_finished(set(), metadata) == (set(), {binding.prefill_request_id})
     assert worker.get_finished(set(), metadata) == (set(), set())
-    assert worker._pending_reverse_done == set()
-    assert worker._consumed_reverse_terminals == {binding.wire_request_id: True}
+    assert worker._pending_reverse_done_wire_ids == set()
+    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: True}
 
 
 def test_reverse_failed_before_binding_is_retained_and_reconciled() -> None:
@@ -152,7 +149,7 @@ def test_reverse_failed_before_binding_is_retained_and_reconciled() -> None:
     worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {binding.wire_request_id}
 
     assert worker.get_finished(set(), empty_metadata) == (set(), set())
-    assert worker._pending_forward_failed == {binding.wire_request_id}
+    assert worker._pending_forward_failed_wire_ids == {binding.wire_request_id}
     worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
     metadata = DualPathConnectorMetadata()
     metadata.reverse_receive_bindings.append(binding)
@@ -163,7 +160,7 @@ def test_reverse_failed_before_binding_is_retained_and_reconciled() -> None:
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
     assert worker.get_finished(set(), metadata) == (set(), set())
     assert worker.get_block_ids_with_load_errors() == set()
-    assert worker._consumed_reverse_terminals == {binding.wire_request_id: False}
+    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: False}
 
 
 def test_unknown_and_ordinary_parent_terminals_are_never_attributed_to_split_requests() -> None:
@@ -175,9 +172,9 @@ def test_unknown_and_ordinary_parent_terminals_are_never_attributed_to_split_req
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {ordinary_wire_request_id, "unknown-wire"}
 
     assert worker.get_finished(set(), metadata) == (set(), {ordinary_request_id})
-    assert worker._pending_forward_done == {"unknown-wire"}
-    assert worker._pending_reverse_done == set()
-    assert worker._pending_reverse_failed == set()
+    assert worker._pending_forward_done_wire_ids == {"unknown-wire"}
+    assert worker._pending_reverse_done_wire_ids == set()
+    assert worker._pending_reverse_failed_wire_ids == set()
     assert worker._reverse_receive_bindings == {}
 
 
@@ -205,7 +202,7 @@ def test_identical_duplicate_bindings_are_idempotent_and_conflicts_preserve_firs
     assert ordinary_owner_worker._reverse_receive_bindings == {}
 
     consumed_forward_worker = _make_prefill_worker()
-    consumed_forward_worker._consumed_forward_terminals[binding.wire_request_id] = "forward-request"
+    consumed_forward_worker._consumed_forward_terminal_wire_ids[binding.wire_request_id] = "forward-request"
     with pytest.raises(RuntimeError, match="conflicting duplicate Reverse receive binding"):
         consumed_forward_worker._install_reverse_receive_binding(binding)
     assert consumed_forward_worker._reverse_receive_bindings == {}
@@ -274,8 +271,8 @@ def test_each_failure_publishes_exactly_one_local_terminal(source: str) -> None:
     assert second == (set(), set())
 
 
-@pytest.mark.parametrize("path", [Path.PE_READ, Path.DE_READ])
-def test_forward_early_terminal_reconciliation_passes_for_both_paths(path: Path) -> None:
+@pytest.mark.parametrize("path", [PathKind.PE_READ, PathKind.DE_READ])
+def test_forward_early_terminal_reconciliation_passes_for_both_paths(path: PathKind) -> None:
     worker = _make_worker()
     metadata = _make_split_metadata(include_store=False)
     binding = replace(metadata.forward_receive_bindings[0], path=path)
@@ -290,13 +287,13 @@ def test_forward_early_terminal_reconciliation_passes_for_both_paths(path: Path)
     finished = worker.get_finished(set(), metadata)
 
     assert finished == (set(), {DECODE_REQUEST_ID})
-    assert worker._pending_forward_done == set()
+    assert worker._pending_forward_done_wire_ids == set()
 
 
 def test_pe_read_forward_done_still_completes_immediately() -> None:
     worker = _make_worker()
     metadata = _make_split_metadata()
-    binding = replace(metadata.forward_receive_bindings[0], path=Path.PE_READ)
+    binding = replace(metadata.forward_receive_bindings[0], path=PathKind.PE_READ)
     metadata.forward_receive_bindings[:] = [binding]
     metadata.decode_store_metadata = None
     worker.start_load_kv(metadata)
@@ -311,7 +308,7 @@ def test_pe_read_forward_done_still_completes_immediately() -> None:
 def test_unconsumed_pe_read_forward_binding_is_released_on_request_finish() -> None:
     worker = _make_worker()
     metadata = _make_split_metadata(include_store=False)
-    binding = replace(metadata.forward_receive_bindings[0], path=Path.PE_READ)
+    binding = replace(metadata.forward_receive_bindings[0], path=PathKind.PE_READ)
     metadata.forward_receive_bindings[:] = [binding]
     worker.start_load_kv(metadata)
 
@@ -329,15 +326,18 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     plan = _make_reverse_plan()
     decode_worker._install_reverse_plan(plan)
     decode_worker._pending_local_reverse_terminals[DECODE_REQUEST_ID] = True
-    decode_worker._pending_forward_done.add(WIRE_REQUEST_ID)
-    decode_worker._consumed_forward_terminals[WIRE_REQUEST_ID] = DECODE_REQUEST_ID
+    decode_worker._pending_forward_done_wire_ids.add(WIRE_REQUEST_ID)
+    decode_worker._consumed_forward_terminal_wire_ids[WIRE_REQUEST_ID] = DECODE_REQUEST_ID
 
     unrelated_decode_id = "unrelated-wire-id123456789"
     unrelated_wire_id = get_external_request_id(unrelated_decode_id)
     decode_worker._split_trackers[unrelated_decode_id] = decode_worker._split_trackers[DECODE_REQUEST_ID]
-    decode_worker._reverse_plans[unrelated_decode_id] = plan
     decode_worker._forward_receive_bindings[unrelated_decode_id] = replace(
         decode_metadata.forward_receive_bindings[0],
+        request_key=replace(
+            decode_metadata.forward_receive_bindings[0].request_key,
+            decode_request_id=unrelated_decode_id,
+        ),
         wire_request_id=unrelated_wire_id,
         decode_request_id=unrelated_decode_id,
     )
@@ -346,8 +346,8 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     prefill_worker = _make_prefill_worker()
     reverse_binding = _make_reverse_receive_binding()
     prefill_worker._install_reverse_receive_binding(reverse_binding)
-    prefill_worker._pending_reverse_done.add(reverse_binding.wire_request_id)
-    prefill_worker._consumed_reverse_terminals[reverse_binding.wire_request_id] = True
+    prefill_worker._pending_reverse_done_wire_ids.add(reverse_binding.wire_request_id)
+    prefill_worker._consumed_reverse_terminal_wire_ids[reverse_binding.wire_request_id] = True
     unrelated_prefill_id = "unrelated-prefill-local"
     unrelated_reverse_binding = replace(
         reverse_binding,
@@ -364,27 +364,26 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     )
 
     assert DECODE_REQUEST_ID not in decode_worker._split_trackers
-    assert DECODE_REQUEST_ID not in decode_worker._reverse_plans
     assert DECODE_REQUEST_ID not in decode_worker._forward_receive_bindings
     assert WIRE_REQUEST_ID not in decode_worker.request_map
     assert DECODE_REQUEST_ID not in decode_worker._pending_local_reverse_terminals
-    assert WIRE_REQUEST_ID not in decode_worker._pending_forward_done
-    assert WIRE_REQUEST_ID not in decode_worker._consumed_forward_terminals
+    assert WIRE_REQUEST_ID not in decode_worker._pending_forward_done_wire_ids
+    assert WIRE_REQUEST_ID not in decode_worker._consumed_forward_terminal_wire_ids
     assert unrelated_decode_id in decode_worker._split_trackers
-    assert unrelated_decode_id in decode_worker._reverse_plans
+    assert decode_worker._split_trackers[unrelated_decode_id].plan is plan
     assert unrelated_decode_id in decode_worker._forward_receive_bindings
     assert decode_worker.request_map[unrelated_wire_id] == unrelated_decode_id
 
     assert reverse_binding.prefill_request_id not in prefill_worker._reverse_receive_bindings
     assert reverse_binding.wire_request_id not in prefill_worker._reverse_request_map
-    assert reverse_binding.wire_request_id not in prefill_worker._pending_reverse_done
-    assert reverse_binding.wire_request_id not in prefill_worker._consumed_reverse_terminals
+    assert reverse_binding.wire_request_id not in prefill_worker._pending_reverse_done_wire_ids
+    assert reverse_binding.wire_request_id not in prefill_worker._consumed_reverse_terminal_wire_ids
     assert prefill_worker._reverse_receive_bindings[unrelated_prefill_id] == unrelated_reverse_binding
     assert prefill_worker._reverse_request_map[unrelated_reverse_binding.wire_request_id] == unrelated_prefill_id
 
     decode_state = (
         dict(decode_worker._split_trackers),
-        dict(decode_worker._reverse_plans),
+        {request_id: tracker.plan for request_id, tracker in decode_worker._split_trackers.items()},
         dict(decode_worker._forward_receive_bindings),
         dict(decode_worker.request_map),
     )
@@ -399,7 +398,7 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     )
     assert decode_state == (
         decode_worker._split_trackers,
-        decode_worker._reverse_plans,
+        {request_id: tracker.plan for request_id, tracker in decode_worker._split_trackers.items()},
         decode_worker._forward_receive_bindings,
         decode_worker.request_map,
     )
@@ -408,10 +407,7 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
         prefill_worker._reverse_request_map,
     )
 
-    with (
-        patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True) as parent_shutdown,
-        patch.object(decode_worker, "_enqueue_kv_layer_send") as enqueue,
-    ):
+    with patch.object(decode_worker, "_enqueue_kv_layer_send") as enqueue:
         decode_worker.shutdown()
         decode_worker.shutdown()
         decode_worker._install_forward_receive_binding(decode_metadata.forward_receive_bindings[0])
@@ -419,28 +415,24 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
         decode_worker._install_reverse_plan(plan)
         decode_worker._submit_reverse(DECODE_REQUEST_ID)
 
-    with patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True) as parent_shutdown_prefill:
-        prefill_worker.shutdown()
-        prefill_worker.shutdown()
-        prefill_worker._install_reverse_receive_binding(reverse_binding)
+    prefill_worker.shutdown()
+    prefill_worker.shutdown()
+    prefill_worker._install_reverse_receive_binding(reverse_binding)
 
     assert decode_worker._accepting_split_requests is False
     assert prefill_worker._accepting_split_requests is False
     assert decode_worker._split_trackers == {}
-    assert decode_worker._reverse_plans == {}
     assert decode_worker._forward_receive_bindings == {}
     assert decode_worker._pending_local_reverse_terminals == {}
-    assert decode_worker._pending_forward_done == set()
-    assert decode_worker._pending_forward_failed == set()
-    assert decode_worker._consumed_forward_terminals == {}
+    assert decode_worker._pending_forward_done_wire_ids == set()
+    assert decode_worker._pending_forward_failed_wire_ids == set()
+    assert decode_worker._consumed_forward_terminal_wire_ids == {}
     assert prefill_worker._reverse_receive_bindings == {}
     assert prefill_worker._reverse_request_map == {}
-    assert prefill_worker._pending_reverse_done == set()
-    assert prefill_worker._pending_reverse_failed == set()
-    assert prefill_worker._consumed_reverse_terminals == {}
-    decode_worker._kvpool_worker_adapter.close.assert_called_once_with()
-    parent_shutdown.assert_called_once_with()
-    parent_shutdown_prefill.assert_called_once_with()
+    assert prefill_worker._pending_reverse_done_wire_ids == set()
+    assert prefill_worker._pending_reverse_failed_wire_ids == set()
+    assert prefill_worker._consumed_reverse_terminal_wire_ids == {}
+    decode_worker._kvpool_worker_adapter.close.assert_not_called()
     enqueue.assert_not_called()
 
 
@@ -507,7 +499,7 @@ def test_shutdown_makes_public_split_start_load_inert_but_preserves_pre_shutdown
 
     worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
     assert DECODE_REQUEST_ID in worker._split_trackers
-    assert DECODE_REQUEST_ID in worker._reverse_plans
+    assert worker._split_trackers[DECODE_REQUEST_ID].plan is not None
 
     with (
         patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True),
@@ -519,7 +511,6 @@ def test_shutdown_makes_public_split_start_load_inert_but_preserves_pre_shutdown
 
     worker._kvpool_worker_adapter.start_load_kv.assert_not_called()
     assert worker._split_trackers == {}
-    assert worker._reverse_plans == {}
     assert worker._forward_receive_bindings == {}
     enqueue.assert_not_called()
 
@@ -542,7 +533,7 @@ def test_production_de_read_result_creates_plan_binding_store_without_scheduler_
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
         assert len(metadata.forward_receive_bindings) == 1
-        assert metadata.forward_receive_bindings[0].path is Path.DE_READ
+        assert metadata.forward_receive_bindings[0].path is PathKind.DE_READ
         assert metadata.reverse_plans == [decision.reverse_plan]
         assert metadata.reverse_receive_bindings == []
         assert metadata.decode_store_metadata is store_metadata
@@ -558,14 +549,22 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "__init__",
         "_is_dual_path_decode_admission",
         "_stage_prefill_activation_failure",
-        "_handle_prefill_decision",
+        "_decide_prefill_path_for_admission",
+        "_log_prefill_decision",
         "_prepare_forward_plan",
         "_try_install_forward_plan",
         "_activate_de_read_path",
-        "_activate_committed_decision",
-        "_build_external_control_failure",
-        "_emit_prefill_control_failure",
+        "_activate_received_decision",
+        "_validate_committed_decision",
+        "_log_decision_activation",
+        "_build_decode_control_failure",
+        "_build_remote_decode_message",
         "_sweep_pe_delivery",
+        "_update_prefill_state_after_alloc",
+        "_invalidate_prefill_activation",
+        "_bind_decode_admission_after_alloc",
+        "_is_identical_duplicate_admission",
+        "_register_pending_decode_decision",
         "_release_scheduler_request_state",
         "get_num_new_matched_tokens",
         "update_state_after_alloc",

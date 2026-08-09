@@ -15,7 +15,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import DualPathConnectorMetadata
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import Path
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import PathKind
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import DecodeControlEndpoint
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
@@ -119,7 +119,7 @@ class ProductionHarness:
         return de_result, pe_result
 
     def run_forward(self) -> MooncakeLayerwiseConnectorMetadata:
-        metadata = MooncakeLayerwiseConnectorMetadata()
+        metadata = DualPathConnectorMetadata()
         metadata.requests[PREFILL_REQUEST_ID] = LayerwiseReqMeta(
             local_block_ids=[list(PE_BLOCKS)],
             token_ids=None,
@@ -167,12 +167,12 @@ def production_harness_factory(monkeypatch):
     monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
     schedulers = []
     with (
-        patch(f"{CONNECTOR_NS}.KVPoolAdapter"),
+        patch(f"{CONNECTOR_NS}.KVPoolSchedulerAdapter"),
         patch(f"{CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
         patch(f"{CONNECTOR_NS}.get_ip", return_value="192.0.2.44"),
     ):
 
-        def make(*, include_store: bool = True, path: Path = Path.DE_READ) -> ProductionHarness:
+        def make(*, include_store: bool = True, path: PathKind = PathKind.DE_READ) -> ProductionHarness:
             decode_coordinator = MagicMock(name="decode_coordinator")
             decode_coordinator.decode_engine_instance_id = decode_helpers._DECODE_INSTANCE_ID
             decode_coordinator.decode_control_endpoint = DecodeControlEndpoint(host="192.0.2.44", port=24001)
@@ -202,7 +202,9 @@ def production_harness_factory(monkeypatch):
                 scheduler.executor = MagicMock(name=f"{scheduler.dual_path_cfg.role}_executor")
                 scheduler.side_channel_host = "198.51.100.20"
             decode_scheduler._kvpool_adapter.build_connector_meta.return_value = (
-                _store_metadata() if include_store and path is Path.DE_READ else AscendConnectorMetadata(set(), set())
+                _store_metadata()
+                if include_store and path is PathKind.DE_READ
+                else AscendConnectorMetadata(set(), set())
             )
             schedulers.extend((decode_scheduler, prefill_scheduler))
 
@@ -229,7 +231,9 @@ def production_harness_factory(monkeypatch):
             decision_request["request_key"]["decode_request_id"] = DECODE_REQUEST_ID
             prefill_local_tokens = L_PE if include_store else 0
             expected_match = (
-                ((K_DE if include_store else L_DE) - prefill_local_tokens, True) if path is Path.DE_READ else (0, False)
+                ((K_DE if include_store else L_DE) - prefill_local_tokens, True)
+                if path is PathKind.DE_READ
+                else (0, False)
             )
             assert prefill_scheduler.get_num_new_matched_tokens(prefill_request, prefill_local_tokens) == expected_match
             assert policy.calls == 1
@@ -421,7 +425,6 @@ def test_request_finish_releases_all_task08_state_idempotently(production_harnes
     assert harness.decode_scheduler._decode_kv_snapshots == {}
     assert harness.decode_scheduler._decode_decision_states == {}
     assert harness.de_worker._split_trackers == {}
-    assert harness.de_worker._reverse_plans == {}
     assert harness.de_worker._forward_receive_bindings == {}
     assert harness.pe_worker._reverse_receive_bindings == {}
     assert harness.pe_worker._reverse_request_map == {}
@@ -462,9 +465,12 @@ def test_structured_logs_reconstruct_request_facts(production_harness_factory) -
     messages = "\n".join(call.args[0] % call.args[1:] for call in log_calls)
 
     assert "key=decode-engine:2:boot-7/request-local-7" in messages
-    assert "L_DE=16 K_DE=32 L_PE=16 R=48 T=49" in messages
+    assert (
+        "decode_local_tokens=16 decode_store_tokens=32 prefill_local_tokens=16 "
+        "decode_ready_tokens=48 target_tokens=49" in messages
+    )
     assert "eligibility=policy selected_path=DE_READ store=partial" in messages
-    assert "store_range=[16,32) reverse_range=[16,32) compute_range=[32,49) forward_range=[32,49)" in messages
+    assert "store_range=[16,32) reverse_range=[16,32) forward_range=[32,49)" in messages
     assert "protocol=2 delivery_terminal=SUCCEEDED" in messages
     assert "final_predicate=SUCCESS" in messages
     assert "PathDecision" not in messages
@@ -472,7 +478,7 @@ def test_structured_logs_reconstruct_request_facts(production_harness_factory) -
 
 def test_pe_read_logs_store_as_not_authorized(production_harness_factory) -> None:
     with patch.object(connector_module.logger, "info") as info:
-        production_harness_factory(path=Path.PE_READ)
+        production_harness_factory(path=PathKind.PE_READ)
     messages = "\n".join(call.args[0] % call.args[1:] for call in info.call_args_list)
 
     assert "selected_path=PE_READ store=none" in messages

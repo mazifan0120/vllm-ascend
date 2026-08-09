@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import TypeAlias
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -24,10 +23,12 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
+    PathKind,
+    _JsonObject,
+    _JsonValue,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
@@ -43,9 +44,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnector,
 )
-
-_JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | dict[str, "_JsonValue"]
-_JsonObject: TypeAlias = dict[str, _JsonValue]
 
 
 def _request() -> PathDecisionRequest:
@@ -193,7 +191,7 @@ def test_dual_path_decision_metadata_rejects_non_exact_keys(payload: _JsonValue)
 def test_path_decision_msgpack_round_trip_result() -> None:
     decision = PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionResult(request_key=_request().request_key, path=Path.PE_READ),
+        result=PathDecisionResult(request_key=_request().request_key, path=PathKind.PE_READ),
         reverse_plan=None,
     )
     expected_bytes = msgspec.msgpack.encode(
@@ -213,7 +211,7 @@ def test_protocol_v2_decision_request_and_result_round_trip() -> None:
     key = metadata.decision_request.request_key
     decision = PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionResult(request_key=key, path=Path.DE_READ),
+        result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
         reverse_plan=_reverse_plan(key),
     )
 
@@ -229,7 +227,7 @@ def test_protocol_v2_decision_request_and_result_round_trip() -> None:
 def test_pe_read_serializes_none_reverse_plan() -> None:
     decision = PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionResult(request_key=_request().request_key, path=Path.PE_READ),
+        result=PathDecisionResult(request_key=_request().request_key, path=PathKind.PE_READ),
         reverse_plan=None,
     )
 
@@ -366,11 +364,11 @@ def _coordinator(endpoint: DecodeControlEndpoint, *, boot_id: str | None = "boot
     )
 
 
-def _decision(key: DualPathRequestKey, *, path: Path = Path.PE_READ) -> PathDecision:
+def _decision(key: DualPathRequestKey, *, path: PathKind = PathKind.PE_READ) -> PathDecision:
     return PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=key, path=path),
-        reverse_plan=_reverse_plan(key) if path is Path.DE_READ else None,
+        reverse_plan=_reverse_plan(key) if path is PathKind.DE_READ else None,
     )
 
 
@@ -476,7 +474,7 @@ def test_prefill_coordinator_construction_creates_no_sockets() -> None:
         calls += 1
         yield _FakeDeliverySocket(ack=b"ACK")
 
-    coordinator = PathDecisionCoordinator.for_prefill(_socket_opener=opener)
+    coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener)
     try:
         assert calls == 0
     finally:
@@ -495,7 +493,7 @@ def test_prefill_submit_does_no_socket_io_on_caller_thread() -> None:
         assert release.wait(timeout=5)
         yield _FakeDeliverySocket(ack=b"ACK")
 
-    coordinator = PathDecisionCoordinator.for_prefill(_socket_opener=opener)
+    coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener)
     caller_thread_id = threading.get_ident()
     try:
         future = coordinator.submit(_free_control_endpoint(), _decision(_request().request_key))
@@ -598,9 +596,9 @@ def test_submit_retries_identical_bytes_until_ack() -> None:
     thread.start()
     assert ready.wait(timeout=5)
     sender = PathDecisionCoordinator.for_prefill(
-        _send_timeout_ms=50,
-        _poll_timeout_ms=50,
-        _retry_spacing_s=0.01,
+        send_timeout_ms=50,
+        poll_timeout_ms=50,
+        retry_spacing_s=0.01,
     )
     decision = _decision(_request().request_key)
     try:
@@ -619,7 +617,7 @@ def test_conflicting_duplicate_gets_no_ack_and_no_received_result_growth() -> No
     try:
         receiver.register_pending(key)
         assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
-        assert _raw_request(endpoint, encode_path_decision(_decision(key, path=Path.DE_READ))) is None
+        assert _raw_request(endpoint, encode_path_decision(_decision(key, path=PathKind.DE_READ))) is None
         assert receiver.take_received_decisions() == [_decision(key)]
         assert receiver.take_received_decisions() == []
     finally:
@@ -630,7 +628,7 @@ def test_identical_duplicate_accepted_once_conflict_rejected() -> None:
     endpoint = _free_control_endpoint()
     receiver = _coordinator(endpoint)
     key = _request().request_key
-    decision = _decision(key, path=Path.DE_READ)
+    decision = _decision(key, path=PathKind.DE_READ)
     conflicting = PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=decision.result,
@@ -675,13 +673,13 @@ def test_de_read_requires_serialized_reverse_plan() -> None:
     key = _request().request_key
     without_plan = PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionResult(request_key=key, path=Path.DE_READ),
+        result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
         reverse_plan=None,
     )
     other_key = DualPathRequestKey(key.decode_engine_instance_id, "request-2")
     mismatched_plan = PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionResult(request_key=key, path=Path.DE_READ),
+        result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
         reverse_plan=_reverse_plan(other_key),
     )
     try:
@@ -798,7 +796,7 @@ def test_delivery_uses_spec_send_timeout_poll_bound_and_retry_spacing() -> None:
         sockets.append(socket)
         yield socket
 
-    coordinator = PathDecisionCoordinator.for_prefill(_socket_opener=opener, _sleep=sleeps.append)
+    coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener, sleep=sleeps.append)
     try:
         future = coordinator.submit(_free_control_endpoint(), _decision(_request().request_key))
         with pytest.raises(PathDecisionDeliveryError):
@@ -819,7 +817,7 @@ def test_delivery_exhaustion_raises_typed_transport_error() -> None:
         calls += 1
         yield _FakeDeliverySocket()
 
-    coordinator = PathDecisionCoordinator.for_prefill(_socket_opener=opener, _sleep=lambda _: None)
+    coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener, sleep=lambda _: None)
     try:
         with pytest.raises(PathDecisionDeliveryError):
             coordinator.submit(_free_control_endpoint(), _decision(_request().request_key)).result(timeout=5)
@@ -833,7 +831,7 @@ def test_successful_delivery_completes_future_with_none() -> None:
     def opener(endpoint: DecodeControlEndpoint):
         yield _FakeDeliverySocket(ack=b"ACK")
 
-    coordinator = PathDecisionCoordinator.for_prefill(_socket_opener=opener)
+    coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener)
     try:
         assert coordinator.submit(_free_control_endpoint(), _decision(_request().request_key)).result(timeout=5) is None
     finally:
@@ -846,7 +844,7 @@ def test_concurrent_submissions_stay_isolated() -> None:
     sender = PathDecisionCoordinator.for_prefill()
     keys = [DualPathRequestKey(receiver.decode_engine_instance_id, f"request-{index}") for index in range(8)]
     decisions = [
-        _decision(key, path=Path.PE_READ if index % 2 == 0 else Path.DE_READ) for index, key in enumerate(keys)
+        _decision(key, path=PathKind.PE_READ if index % 2 == 0 else PathKind.DE_READ) for index, key in enumerate(keys)
     ]
     try:
         for key in keys:
@@ -957,7 +955,7 @@ def test_prefill_close_cancels_outstanding_futures_and_stops_executor() -> None:
                 entered.set()
         yield _FakeDeliverySocket(blocked=release)
 
-    coordinator = PathDecisionCoordinator.for_prefill(_socket_opener=opener, _sleep=lambda _: None)
+    coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener, sleep=lambda _: None)
     futures = [coordinator.submit(_free_control_endpoint(), _decision(_request().request_key)) for _ in range(40)]
     assert entered.wait(timeout=5)
     close_thread = threading.Thread(target=coordinator.close)
@@ -1066,8 +1064,6 @@ def _make_scheduler_vllm_config(
     config.kv_transfer_config.kv_connector_extra_config = extra_config
     config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {
         "tls_config": {},
-        "prefill": {"tp_size": tensor_parallel_size, "dp_size": data_parallel_size},
-        "decode": {"tp_size": tensor_parallel_size, "dp_size": data_parallel_size},
     }.get(key, default)
     return config
 
@@ -1138,7 +1134,7 @@ def test_scheduler_constructs_role_specific_coordinator() -> None:
             "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
             return_value="127.0.0.1",
         ),
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolSchedulerAdapter"),
     ):
         decode_scheduler = DualPathConnectorScheduler(
             decode_config,
@@ -1208,7 +1204,7 @@ def test_facade_shutdown_delegates_coordinator_close() -> None:
             "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.get_ip",
             return_value="127.0.0.1",
         ),
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolSchedulerAdapter"),
         patch(
             "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
         ) as coordinator_cls,

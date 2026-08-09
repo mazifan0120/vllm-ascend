@@ -23,7 +23,7 @@ def _require_exact_payload(payload: _JsonValue, expected_keys: frozenset[str]) -
     return payload
 
 
-class Path(str, Enum):
+class PathKind(str, Enum):
     PE_READ = "PE_READ"
     DE_READ = "DE_READ"
 
@@ -69,12 +69,13 @@ class PathDecisionRequest:
             raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
 
         token_counts = (
-            self.target_tokens,
-            self.decode_local_tokens,
-            self.decode_store_tokens,
+            ("target_tokens", self.target_tokens),
+            ("decode_local_tokens", self.decode_local_tokens),
+            ("decode_store_tokens", self.decode_store_tokens),
         )
-        if any(isinstance(token_count, bool) or not isinstance(token_count, int) for token_count in token_counts):
-            raise PathDecisionValidationError("token counts must be integers and must not be booleans")
+        for name, value in token_counts:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise PathDecisionValidationError(f"{name} must be an integer and must not be a boolean")
         if not 0 <= self.decode_local_tokens <= self.decode_store_tokens < self.target_tokens:
             raise PathDecisionValidationError(
                 "token counts must satisfy 0 <= decode_local_tokens <= decode_store_tokens < target_tokens"
@@ -112,13 +113,13 @@ class PathDecisionRequest:
 @dataclass(frozen=True)
 class PathDecisionResult:
     request_key: DualPathRequestKey
-    path: Path
+    path: PathKind
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
             raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
-        if not isinstance(self.path, Path):
-            raise PathDecisionValidationError("path must be a Path")
+        if not isinstance(self.path, PathKind):
+            raise PathDecisionValidationError("path must be a PathKind")
 
     def to_dict(self) -> _JsonObject:
         return {
@@ -133,7 +134,7 @@ class PathDecisionResult:
             frozenset({"request_key", "path"}),
         )
         try:
-            path = Path(data["path"])
+            path = PathKind(data["path"])
         except (TypeError, ValueError) as error:
             raise PathDecisionValidationError("serialized path is not valid") from error
         return cls(
@@ -143,16 +144,20 @@ class PathDecisionResult:
 
 
 class PathPolicy(Protocol):
-    def choose(self, request: PathDecisionRequest) -> Path: ...
+    def choose(self, request: PathDecisionRequest) -> PathKind: ...
 
 
 class RoundRobinPathPolicy:
-    def __init__(self, rng: random.Random | None = None) -> None:
-        self._next = (rng or random.Random()).choice((Path.PE_READ, Path.DE_READ))
+    """Round-robin whose initial phase is randomized so co-located Prefill instances do not
+    rotate in lockstep. Eligibility-forced decisions bypass this policy and do
+    not advance the rotation phase."""
 
-    def choose(self, request: PathDecisionRequest) -> Path:
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self._next = (rng or random.Random()).choice((PathKind.PE_READ, PathKind.DE_READ))
+
+    def choose(self, request: PathDecisionRequest) -> PathKind:
         selected = self._next
-        self._next = Path.DE_READ if selected is Path.PE_READ else Path.PE_READ
+        self._next = PathKind.DE_READ if selected is PathKind.PE_READ else PathKind.PE_READ
         return selected
 
 
@@ -176,30 +181,22 @@ class PathDecisionDecider:
         if existing is not None:
             if request != existing.request or prefill_local_tokens != existing.prefill_local_tokens:
                 raise PathDecisionValidationError(
-                    "request key is already associated with different token facts or Prefill local tokens"
+                    "request key is already associated with different token facts or prefill_local_tokens"
                 )
             if existing.result is None:
                 raise PathDecisionValidationError("decision previously failed locally")
             return existing.result
 
         if prefill_local_tokens >= request.decode_store_tokens:
-            path = Path.PE_READ
+            path = PathKind.PE_READ
         else:
             try:
                 path = self._policy.choose(request)
             except Exception as error:  # noqa: BLE001
-                self._decision_records[request.request_key] = _DecisionRecord(
-                    request=request,
-                    prefill_local_tokens=prefill_local_tokens,
-                    result=None,
-                )
+                self._record_failure(request, prefill_local_tokens)
                 raise PathDecisionValidationError("path policy raised an exception") from error
-            if not isinstance(path, Path):
-                self._decision_records[request.request_key] = _DecisionRecord(
-                    request=request,
-                    prefill_local_tokens=prefill_local_tokens,
-                    result=None,
-                )
+            if not isinstance(path, PathKind):
+                self._record_failure(request, prefill_local_tokens)
                 raise PathDecisionValidationError(f"policy returned an invalid path: {path!r}")
 
         result = PathDecisionResult(request_key=request.request_key, path=path)
@@ -209,6 +206,15 @@ class PathDecisionDecider:
             result=result,
         )
         return result
+
+    def _record_failure(self, request: PathDecisionRequest, prefill_local_tokens: int) -> None:
+        # Recording the failure pins the request facts so a retry with
+        # different facts is still rejected as conflicting.
+        self._decision_records[request.request_key] = _DecisionRecord(
+            request=request,
+            prefill_local_tokens=prefill_local_tokens,
+            result=None,
+        )
 
     def discard(self, request_key: DualPathRequestKey) -> None:
         self._decision_records.pop(request_key, None)

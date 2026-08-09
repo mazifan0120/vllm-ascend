@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode-side KVPool adapters for ``DualPathConnector``.
 
-``KVPoolAdapter`` gives the Decode Scheduler a private, non-layerwise
+``KVPoolSchedulerAdapter`` gives the Decode Scheduler a private, non-layerwise
 ``KVPoolScheduler``. Lookup detaches candidate ``LoadSpec`` records; an
 explicit post-allocation commit authorizes the existing async load lifecycle
 using a copy so the detached admission fact remains unchanged.
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-class KVPoolAdapter:
+class KVPoolSchedulerAdapter:
     """Private Decode Scheduler adapter over one dedicated KVPoolScheduler."""
 
     def __init__(
@@ -87,6 +87,8 @@ class KVPoolAdapter:
             logger.exception("DualPath KVPool lookup failed for request %s; treating as Store miss", request_id)
             return None
 
+        # Defensive clamp: a worker-reported hit may exceed the decode-ready
+        # boundary; the pool scheduler only clamps the exactly-full case.
         target_tokens = max(request.num_tokens - 1, 0)
         usable_store_tokens = min(spec.kvpool_cached_tokens, target_tokens)
         if usable_store_tokens != spec.kvpool_cached_tokens:
@@ -101,10 +103,13 @@ class KVPoolAdapter:
         blocks: KVCacheBlocks,
         load_spec: LoadSpec,
     ) -> None:
+        """Commit a copy of load_spec so pool-side can_load mutation cannot pollute the
+        detached admission fact; on failure, roll back the state created above."""
         pool = self._pool_scheduler
         request_id = request.request_id
         store_delta = load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens
 
+        # Copy detaches the committed spec from the caller's object (alias isolation).
         pool.load_specs[request_id] = dataclasses.replace(load_spec)
         try:
             pool.update_state_after_alloc(request, blocks, store_delta)
@@ -117,6 +122,8 @@ class KVPoolAdapter:
             raise
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> AscendConnectorMetadata:
+        """Forward only requests owned by this pool scheduler; unowned request ids are
+        filtered out of the forwarded scheduler output."""
         pool = self._pool_scheduler
         owned_request_ids = set(pool._unfinished_requests)
         owned_request_ids.update(pool._request_trackers)
@@ -148,6 +155,8 @@ class KVPoolAdapter:
             for request_id, token_count in scheduler_output.num_scheduled_tokens.items()
             if request_id in owned_request_ids
         }
+        # finished_req_ids intentionally passes through unfiltered so the pool releases
+        # owned request state; pops for unowned ids are no-ops.
         pool_scheduler_output = dataclasses.replace(
             scheduler_output,
             scheduled_new_reqs=[
@@ -171,7 +180,8 @@ class KVPoolAdapter:
         return pool.build_connector_meta(pool_scheduler_output)
 
     def close(self) -> None:
-        """Close the lazily created LookupKeyClient, if any. Idempotent."""
+        """Clear all per-request scheduler state, then close the lazily created
+        LookupKeyClient, if any. Idempotent."""
         pool = self._pool_scheduler
         pool.load_specs.clear()
         pool._request_trackers.clear()
@@ -222,9 +232,3 @@ class KVPoolWorkerAdapter:
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         return self._pool_worker.get_block_ids_with_load_errors()
-
-    def close(self) -> None:
-        """Terminate the lookup server if bound. Idempotent."""
-        if self._lookup_server is not None:
-            self._lookup_server.close()
-            self._lookup_server = None

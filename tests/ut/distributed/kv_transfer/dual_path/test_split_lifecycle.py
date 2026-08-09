@@ -22,7 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
+    PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
@@ -129,7 +129,7 @@ def _make_split_metadata(*, include_store: bool = True, include_reverse: bool = 
     metadata.forward_receive_bindings.append(
         ForwardReceiveBinding(
             request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID),
-            path=Path.DE_READ,
+            path=PathKind.DE_READ,
             wire_request_id=WIRE_REQUEST_ID,
             decode_request_id=DECODE_REQUEST_ID,
             destination_block_ids=DESTINATION_BLOCKS,

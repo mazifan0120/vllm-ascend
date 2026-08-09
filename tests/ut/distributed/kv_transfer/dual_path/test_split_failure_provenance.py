@@ -45,6 +45,54 @@ def test_store_failure_starts_no_reverse_and_invalidates_only_store_destination_
     assert second_invalid == {20}
 
 
+def test_store_failure_seen_before_done_stays_failed_when_done_arrives_later() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata()
+    worker._kvpool_worker_adapter.get_finished.side_effect = [
+        (set(), set()),
+        (set(), {DECODE_REQUEST_ID}),
+    ]
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.side_effect = [
+        {20},
+        set(),
+    ]
+
+    worker.start_load_kv(metadata)
+    with patch.object(worker, "_submit_reverse") as submit_reverse:
+        first_finished = worker.get_finished(set(), metadata)
+        tracker = worker._split_trackers[DECODE_REQUEST_ID]
+
+        assert first_finished == (set(), set())
+        assert tracker.store_load_failed is True
+        assert tracker.store_phase.value == "PENDING"
+        assert tracker.terminal_published is False
+        submit_reverse.assert_not_called()
+
+        second_finished = worker.get_finished(set(), metadata)
+
+    assert second_finished == (set(), {DECODE_REQUEST_ID})
+    assert tracker.store_phase.value == "FAILED"
+    assert tracker.terminal_published is True
+    submit_reverse.assert_not_called()
+
+
+def test_unrelated_store_invalid_block_does_not_fail_split_request() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata()
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = {999}
+
+    worker.start_load_kv(metadata)
+    with patch.object(worker, "_submit_reverse") as submit_reverse:
+        finished = worker.get_finished(set(), metadata)
+
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+    assert finished == (set(), set())
+    assert tracker.store_load_failed is False
+    assert tracker.store_phase.value == "DONE"
+    submit_reverse.assert_called_once_with(DECODE_REQUEST_ID)
+
+
 def test_reverse_failure_records_local_terminal_invalidates_pe_destinations_and_never_arriving_forward_suffix() -> None:
     decode_worker = _make_worker()
     decode_metadata = _make_split_metadata(include_store=False, include_reverse=True)

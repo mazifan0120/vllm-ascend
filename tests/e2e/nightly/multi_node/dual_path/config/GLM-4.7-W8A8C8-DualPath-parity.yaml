@@ -43,15 +43,7 @@ deployment:
         "kv_role": "kv_producer",
         "kv_port": "30000",
         "kv_connector_extra_config": {
-                  "role": "prefill",
-                  "prefill": {
-                          "dp_size": 2,
-                          "tp_size": 8
-                  },
-                  "decode": {
-                          "dp_size": 2,
-                          "tp_size": 8
-                  }
+                  "role": "prefill"
             }
         }'
   -
@@ -80,15 +72,7 @@ deployment:
         "kv_role": "kv_consumer",
         "kv_port": "30200",
         "kv_connector_extra_config": {
-                  "role": "decode",
-                  "prefill": {
-                          "dp_size": 2,
-                          "tp_size": 8
-                  },
-                  "decode": {
-                          "dp_size": 2,
-                          "tp_size": 8
-                  }
+                  "role": "decode"
             }
         }'
 

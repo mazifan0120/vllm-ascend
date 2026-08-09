@@ -17,6 +17,7 @@ from vllm.v1.request import Request, RequestStatus
 
 from tests.ut.distributed.kv_transfer.dual_path import test_decode_admission_integration as admission_harness
 from tests.ut.distributed.kv_transfer.dual_path import test_pe_read_forward as forward_harness
+from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
@@ -30,8 +31,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     ForwardReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
-    Path,
     PathDecisionRequest,
+    PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
@@ -54,9 +55,9 @@ class AlwaysPEReadPolicy:
     def __init__(self) -> None:
         self.calls = 0
 
-    def choose(self, request: PathDecisionRequest) -> Path:
+    def choose(self, request: PathDecisionRequest) -> PathKind:
         self.calls += 1
-        return Path.PE_READ
+        return PathKind.PE_READ
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +85,7 @@ def _completed_future() -> Future[None]:
 
 
 def _make_worker() -> DualPathConnectorWorker:
-    worker = object.__new__(DualPathConnectorWorker)
+    worker = init_dual_path_worker_state(object.__new__(DualPathConnectorWorker))
     worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
     worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
@@ -93,11 +94,6 @@ def _make_worker() -> DualPathConnectorWorker:
     worker.virtual_request = set()
     worker._recving_metadata = {}
     worker._invalid_block_ids = set()
-    worker._control_failed_recving = set()
-    worker._forward_receive_bindings = {}
-    worker._pending_forward_done = set()
-    worker._pending_forward_failed = set()
-    worker._consumed_forward_terminals = {}
     worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
     worker.engine = MagicMock(name="transfer_engine")
     worker.block_size = [_BLOCK_SIZE]
@@ -166,7 +162,7 @@ def _send_parent_metadata_through_connector(
     metadata: MooncakeLayerwiseConnectorMetadata,
 ) -> SimpleNamespace:
     request_metadata = metadata.requests[request.request_id]
-    worker = object.__new__(DualPathConnectorWorker)
+    worker = init_dual_path_worker_state(object.__new__(DualPathConnectorWorker), role="prefill")
     worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=False, is_kv_producer=True))
     worker.current_layer = 0
     worker.total_layers = 1
@@ -212,7 +208,7 @@ def _build_lifecycle(
     decode_scheduler = admission_harness._dual_scheduler(scheduler)
     baseline_free_blocks = scheduler.kv_cache_manager.block_pool.free_block_queue.num_free_blocks
     captured_messages: list[dict] = []
-    real_message_builder = connector_module.build_remote_decode_message
+    real_message_builder = DualPathConnectorScheduler._build_remote_decode_message
 
     def capture_message(*args, **kwargs) -> dict:
         message = real_message_builder(*args, **kwargs)
@@ -234,7 +230,9 @@ def _build_lifecycle(
     )
     scheduler.add_request(decode_request)
     with (
-        patch.object(connector_module, "build_remote_decode_message", side_effect=capture_message),
+        patch.object(
+            DualPathConnectorScheduler, "_build_remote_decode_message", autospec=True, side_effect=capture_message
+        ),
         patch.object(decode_scheduler, "_access_metaserver") as proxy_http,
         patch.object(scheduler.connector, "get_num_new_matched_tokens", side_effect=capture_matched),
         patch.object(

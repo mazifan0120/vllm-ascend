@@ -7,8 +7,8 @@ import zmq
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionResult,
+    PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
@@ -71,7 +71,7 @@ def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(
             request_key=DualPathRequestKey("decode-engine:0:boot", "request-initial"),
-            path=Path.PE_READ,
+            path=PathKind.PE_READ,
         ),
         reverse_plan=None,
     )
@@ -79,7 +79,7 @@ def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(
             request_key=DualPathRequestKey("decode-engine:0:boot", "request-late"),
-            path=Path.DE_READ,
+            path=PathKind.DE_READ,
         ),
         reverse_plan=None,
     )

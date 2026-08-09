@@ -4,10 +4,10 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionDecider,
     PathDecisionRequest,
     PathDecisionValidationError,
+    PathKind,
     RoundRobinPathPolicy,
 )
 
@@ -16,9 +16,9 @@ class _SpyPolicy:
     def __init__(self) -> None:
         self.choose_count = 0
 
-    def choose(self, request: PathDecisionRequest) -> Path:
+    def choose(self, request: PathDecisionRequest) -> PathKind:
         self.choose_count += 1
-        return Path.PE_READ
+        return PathKind.PE_READ
 
 
 def test_store_full_request_construction_rejects_before_decider_policy_choice() -> None:
@@ -70,4 +70,4 @@ def test_store_full_rejection_does_not_advance_seeded_round_robin_first_choice()
     )
 
     # Then
-    assert result.path is Path.PE_READ
+    assert result.path is PathKind.PE_READ

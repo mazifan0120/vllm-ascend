@@ -163,7 +163,7 @@ class SplitHarness:
         return self.poll_de(de_metadata), self.poll_pe(pe_metadata)
 
     def run_forward(self) -> MooncakeLayerwiseConnectorMetadata:
-        metadata = MooncakeLayerwiseConnectorMetadata()
+        metadata = DualPathConnectorMetadata()
         metadata.requests[PREFILL_REQUEST_ID] = ReqMeta(
             local_block_ids=[list(PE_BLOCKS)],
             token_ids=None,

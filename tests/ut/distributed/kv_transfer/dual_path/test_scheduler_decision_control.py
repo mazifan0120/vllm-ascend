@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from vllm.v1.request import RequestStatus
 
+from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
 from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     _make_prefill_worker,
 )
@@ -18,9 +19,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPath
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionRequest,
     PathDecisionResult,
+    PathKind,
     RoundRobinPathPolicy,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
@@ -96,7 +97,7 @@ def _completed_future(error: RuntimeError | None = None) -> Future[None]:
 @pytest.fixture()
 def task04_seams():
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolAdapter") as adapter_cls,
+        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter") as adapter_cls,
         patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
         patch(f"{_CONNECTOR_NS}.get_ip", return_value="192.0.2.44"),
     ):
@@ -186,7 +187,7 @@ def _admit(scheduler, params: dict | None = None):
 def _result(request_id: str = "request-local-7") -> PathDecisionResult:
     return PathDecisionResult(
         request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, request_id),
-        path=Path.DE_READ,
+        path=PathKind.DE_READ,
     )
 
 
@@ -214,7 +215,7 @@ def _decision(result: PathDecisionResult | None = None) -> PathDecision:
 
 
 def _control_only_worker():
-    worker = object.__new__(connector_module.DualPathConnectorWorker)
+    worker = init_dual_path_worker_state(object.__new__(connector_module.DualPathConnectorWorker))
     worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
     worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
@@ -223,11 +224,6 @@ def _control_only_worker():
     worker.virtual_request = set()
     worker._recving_metadata = {}
     worker._invalid_block_ids = set()
-    worker._control_failed_recving = set()
-    worker._forward_receive_bindings = {}
-    worker._pending_forward_done = set()
-    worker._pending_forward_failed = set()
-    worker._consumed_forward_terminals = {}
     worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
     worker.engine = MagicMock(name="transfer_engine")
     worker.block_size = [16]
@@ -344,11 +340,6 @@ class TestDecisionTimeoutEnv:
         with pytest.raises(ValueError):
             scheduler_factory()
 
-    def test_boolean_runtime_value_fails_fast(self, monkeypatch, scheduler_factory):
-        monkeypatch.setitem(ascend_envs.env_variables, _TIMEOUT_ENV, lambda: True)
-        with pytest.raises(ValueError):
-            scheduler_factory()
-
     def test_prefill_role_never_reads_timeout_env(self, monkeypatch, scheduler_factory):
         reader = MagicMock(side_effect=AssertionError("prefill read decode timeout"))
         monkeypatch.setitem(ascend_envs.env_variables, _TIMEOUT_ENV, reader)
@@ -420,7 +411,7 @@ class TestDecodeAdmissionControl:
         assert snapshot.external_tokens == 33
         assert state.request_key == expected_key
         assert state.decision_request == PathDecisionRequest(expected_key, 48, 16, 32)
-        assert state.status is connector_module.DecodeDecisionStatus.PENDING
+        assert state.status is connector_module._DecodeDecisionStatus.PENDING
         assert state.deadline == 70.0
         assert (
             decode_scheduler.executor.submit.call_args.kwargs["message"]["dual_path"] == _expected_dual_path_payload()
@@ -502,7 +493,7 @@ class TestDecodeAdmissionControl:
         decode_scheduler.executor.submit.return_value = future
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        assert state.status is connector_module.DecodeDecisionStatus.PENDING
+        assert state.status is connector_module._DecodeDecisionStatus.PENDING
         decode_scheduler.executor.submit.assert_called_once()
 
     def test_synchronous_executor_failure_remains_pending_without_retry(self, decode_scheduler):
@@ -510,7 +501,7 @@ class TestDecodeAdmissionControl:
         with patch.object(connector_module.logger, "error") as log_error:
             request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        assert state.status is connector_module.DecodeDecisionStatus.PENDING
+        assert state.status is connector_module._DecodeDecisionStatus.PENDING
         decode_scheduler.executor.submit.assert_called_once()
         log_error.assert_called_once()
 
@@ -520,7 +511,7 @@ class TestDecodeAdmissionControl:
         with patch.object(connector_module.logger, "error") as log_error:
             request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        assert state.status is connector_module.DecodeDecisionStatus.PENDING
+        assert state.status is connector_module._DecodeDecisionStatus.PENDING
         decode_scheduler.executor.submit.assert_called_once()
         log_error.assert_called_once()
 
@@ -533,7 +524,7 @@ class TestDecodeAdmissionControl:
         with patch.object(connector_module.time, "monotonic", return_value=30.0):
             request, _ = _admit(decode_scheduler, params)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        assert state.status is connector_module.DecodeDecisionStatus.PENDING
+        assert state.status is connector_module._DecodeDecisionStatus.PENDING
         assert state.deadline == 90.0
         decode_scheduler.executor.submit.assert_not_called()
 
@@ -558,7 +549,7 @@ class TestPrefillDecisionHook:
 
     def test_parent_accounting_runs_exactly_once_for_valid_dual_path(self, scheduler_factory):
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.DE_READ
+        policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-valid", _remote_decode_params())
 
@@ -595,7 +586,7 @@ class TestPrefillDecisionHook:
         task04_seams,
     ):
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.DE_READ
+        policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-forced", _remote_decode_params())
 
@@ -609,7 +600,7 @@ class TestPrefillDecisionHook:
 
         assert result == (0, False)
         policy.choose.assert_not_called()
-        assert scheduler._pe_path_results[request.request_id].path is Path.PE_READ
+        assert scheduler._pe_path_results[request.request_id].path is PathKind.PE_READ
         task04_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._pe_prefill_local_tokens == {request.request_id: 32}
 
@@ -708,14 +699,14 @@ class TestPrefillDecisionHook:
         assert results == [(0, False), (32, True)]
         assert policy.choose.call_count == 2
         assert [scheduler._pe_path_results[request.request_id].path for request in requests] == [
-            Path.PE_READ,
-            Path.DE_READ,
+            PathKind.PE_READ,
+            PathKind.DE_READ,
         ]
         task04_seams.prefill_coordinator.submit.assert_not_called()
 
     def test_identical_replay_neither_advances_policy_nor_submits_second_future(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.PE_READ
+        policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-replay", _remote_decode_params())
 
@@ -732,7 +723,7 @@ class TestPrefillDecisionHook:
 
     def test_conflicting_facts_fail_locally_without_second_policy_invocation(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.PE_READ
+        policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         original = _make_prefill_request(
             "prefill-conflict",
@@ -766,7 +757,7 @@ class TestPrefillDecisionHook:
         task04_seams,
     ):
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.PE_READ
+        policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-prefix-conflict", _remote_decode_params())
 
@@ -942,7 +933,7 @@ class TestDecodeResultConsumption:
 
         # Then
         state = decode_scheduler._decode_decision_states[request.request_id]
-        assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+        assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
         assert metadata.control_failures == []
         assert request.request_id not in metadata.requests
         assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -966,7 +957,7 @@ class TestDecodeResultConsumption:
 
         # Then
         assert events == ["result", "clock"]
-        assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+        assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
         assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_not_called()
 
@@ -985,7 +976,7 @@ class TestDecodeResultConsumption:
             metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
         # Then
-        assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert state.status is connector_module._DecodeDecisionStatus.TIMED_OUT
         assert metadata.requests == {}
         assert metadata.control_failures == [
             connector_module.DualPathControlFailureMetadata(
@@ -1025,7 +1016,7 @@ class TestDecodeResultConsumption:
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_result_scheduler_output"))
 
         # Then
-        assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert state.status is connector_module._DecodeDecisionStatus.TIMED_OUT
         assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
@@ -1044,7 +1035,7 @@ class TestDecodeResultConsumption:
         late_metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_scheduler_output"))
 
         assert snapshot.get_block_ids.return_value == ([41, 42, 43, 44],)
-        assert state.status is connector_module.DecodeDecisionStatus.ACTIVATION_FAILED
+        assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
         assert len(first_metadata.control_failures) == 1
         assert late_metadata.control_failures == []
         assert late_metadata.reverse_plans == []
@@ -1162,7 +1153,7 @@ class TestCleanupAndShutdown:
         state = decode_scheduler._decode_decision_states[request.request_id]
         task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
         decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+        assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
         task04_seams.decode_coordinator.unregister.assert_not_called()
 
         # When
@@ -1180,7 +1171,7 @@ class TestCleanupAndShutdown:
         task04_seams.decode_coordinator.take_received_decisions.return_value = []
         with patch.object(connector_module.time, "monotonic", return_value=state.deadline):
             decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert state.status is connector_module._DecodeDecisionStatus.TIMED_OUT
 
         # When
         result = decode_scheduler.request_finished(request, [41, 42, 43, 44])
@@ -1211,7 +1202,7 @@ class TestCleanupAndShutdown:
         delivery_future: Future[None] = Future()
         task04_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.PE_READ
+        policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-inflight", _remote_decode_params())
         scheduler.get_num_new_matched_tokens(request, 0)
@@ -1284,7 +1275,7 @@ class TestCleanupAndShutdown:
         delivery_future.set_exception(delivery_error)
         task04_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.PE_READ
+        policy.choose.return_value = PathKind.PE_READ
         prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
         prefill_request = _make_prefill_request(
             "prefill-delivery-failure",
@@ -1307,7 +1298,7 @@ class TestCleanupAndShutdown:
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
         decode_scheduler.executor.submit.assert_called_once()
-        assert decode_state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert decode_state.status is connector_module._DecodeDecisionStatus.TIMED_OUT
         assert metadata.control_failures == [
             connector_module.DualPathControlFailureMetadata(
                 request_id=decode_request.request_id,
@@ -1328,7 +1319,7 @@ class TestCleanupAndShutdown:
         delivery_future: Future[None] = Future()
         task04_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="de_read_path_policy")
-        policy.choose.return_value = Path.DE_READ
+        policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request(
             "prefill-de-read-delivery-failure",
@@ -1383,7 +1374,7 @@ class TestCleanupAndShutdown:
         delivery_future: Future[None] = Future()
         task04_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="de_read_path_policy")
-        policy.choose.return_value = Path.DE_READ
+        policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request(
             "prefill-de-read-pre-drain-failure",
@@ -1450,7 +1441,7 @@ class TestCleanupAndShutdown:
             inflight_delivery_future,
         ]
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.PE_READ
+        policy.choose.return_value = PathKind.PE_READ
         prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
         committed_prefill_request = _make_prefill_request(
             "prefill-committed",
@@ -1483,8 +1474,8 @@ class TestCleanupAndShutdown:
             failure_metadata = decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
 
         # Then
-        assert committed_state.status is connector_module.DecodeDecisionStatus.COMMITTED
-        assert timed_out_state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+        assert committed_state.status is connector_module._DecodeDecisionStatus.COMMITTED
+        assert timed_out_state.status is connector_module._DecodeDecisionStatus.TIMED_OUT
         assert cancelled_request.request_id not in decode_scheduler._decode_decision_states
         assert set(decode_scheduler._decode_decision_states) == {
             committed_request.request_id,
@@ -1545,7 +1536,7 @@ class TestCleanupAndShutdown:
         delivery_future: Future[None] = Future()
         task04_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = Path.PE_READ
+        policy.choose.return_value = PathKind.PE_READ
         prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
         prefill_request = _make_prefill_request("prefill-shutdown", _remote_decode_params())
         prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
@@ -1592,13 +1583,9 @@ class TestCleanupAndShutdown:
                 )
             )
 
-        def record_worker_adapter_close():
-            events.append(("worker-adapter", not worker._control_failed_recving))
-
         task04_seams.decode_coordinator.close.side_effect = record_decode_close
         task04_seams.prefill_coordinator.close.side_effect = record_prefill_close
         decode_scheduler._kvpool_adapter.close.side_effect = record_decode_adapter_close
-        worker._kvpool_worker_adapter.close.side_effect = record_worker_adapter_close
 
         # When
         decode_scheduler.shutdown()
@@ -1612,11 +1599,10 @@ class TestCleanupAndShutdown:
         post_shutdown_result = prefill_scheduler.get_num_new_matched_tokens(post_shutdown_request, 0)
 
         # Then
-        assert events[:4] == [
+        assert events[:3] == [
             ("decode-coordinator", False, False, True),
             ("decode-adapter", 1, True),
             ("prefill-coordinator", False, False, True, True),
-            ("worker-adapter", True),
         ]
         assert post_shutdown_result == (0, False)
         policy.choose.assert_called_once()
@@ -1635,4 +1621,4 @@ class TestCleanupAndShutdown:
         assert task04_seams.decode_coordinator.close.call_count == 2
         assert task04_seams.prefill_coordinator.close.call_count == 2
         assert decode_scheduler._kvpool_adapter.close.call_count == 2
-        assert worker._kvpool_worker_adapter.close.call_count == 1
+        worker._kvpool_worker_adapter.close.assert_not_called()

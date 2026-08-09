@@ -14,8 +14,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionValidationError,
+    PathKind,
 )
 
 BlockTableInput: TypeAlias = tuple[tuple[int, ...], ...] | list[list[int]]
@@ -107,7 +107,7 @@ def test_forward_receive_binding_path_is_required_and_typed() -> None:
             token_end=64,
         )
 
-    for path in (Path.PE_READ, Path.DE_READ):
+    for path in (PathKind.PE_READ, PathKind.DE_READ):
         binding = ForwardReceiveBinding(
             request_key=_key(),
             path=path,
@@ -119,7 +119,7 @@ def test_forward_receive_binding_path_is_required_and_typed() -> None:
         )
         assert binding.path is path
 
-    for invalid_path in (Path.PE_READ.value, None):
+    for invalid_path in (PathKind.PE_READ.value, None):
         with pytest.raises(PathDecisionValidationError):
             ForwardReceiveBinding(
                 request_key=_key(),

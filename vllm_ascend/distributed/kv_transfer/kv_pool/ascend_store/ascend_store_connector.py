@@ -298,55 +298,31 @@ class LookupKeyServer:
 
         self.pool_worker = pool_worker
         self.running = True
-        self._closed = False
 
         def process_request():
-            try:
-                while self.running:
-                    try:
-                        all_frames = self.socket.recv_multipart(copy=False)
-                        token_len = int.from_bytes(all_frames[0], byteorder="big")
-                        kv_group_ids = self.decoder.decode([all_frames[1]])
-                        hash_frames = all_frames[2:]
-                        hashes_str = self.decoder.decode(hash_frames)
-                        result = self.pool_worker.lookup_scheduler(
-                            token_len,
-                            hashes_str,
-                            kv_group_ids,
-                            use_layerwise=False,
-                        )
-                        logger.debug(
-                            "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
-                            token_len,
-                            kv_group_ids,
-                            result,
-                        )
-                        response = result.to_bytes(4, "big")
-                        self.socket.send(response)
-                    except zmq.error.ZMQError:
-                        # close() terminates the context, which interrupts any
-                        # blocking socket call with ContextTerminated; that is
-                        # the intended exit signal for this daemon loop. Any
-                        # other ZMQ failure while running is surfaced as before.
-                        if not self.running:
-                            break
-                        raise
-            finally:
-                self.socket.close(linger=0)
+            while self.running:
+                all_frames = self.socket.recv_multipart(copy=False)
+                token_len = int.from_bytes(all_frames[0], byteorder="big")
+                kv_group_ids = self.decoder.decode([all_frames[1]])
+                hash_frames = all_frames[2:]
+                hashes_str = self.decoder.decode(hash_frames)
+                result = self.pool_worker.lookup_scheduler(
+                    token_len,
+                    hashes_str,
+                    kv_group_ids,
+                    use_layerwise=False,
+                )
+                logger.debug(
+                    "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
+                    token_len,
+                    kv_group_ids,
+                    result,
+                )
+                response = result.to_bytes(4, "big")
+                self.socket.send(response)
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        self.running = False
-        # zmq_ctx_term is the documented way to interrupt a blocking recv; the
-        # daemon thread then closes its own socket with zero linger, which lets
-        # term() complete. Closing the socket cross-thread (or ctx.destroy())
-        # is not thread-safe in libzmq and can deadlock inside term().
-        self.ctx.term()
-        self.thread.join(timeout=5)
-        if self.thread.is_alive():
-            logger.warning("KV pool lookup server thread did not exit within 5s of close()")
+        self.socket.close(linger=0)

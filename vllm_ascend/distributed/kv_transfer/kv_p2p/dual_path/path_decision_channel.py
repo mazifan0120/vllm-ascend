@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -16,27 +16,29 @@ import msgspec
 import zmq
 from vllm.logger import logger
 
-from .metadata import ReversePlan
-from .path_decision import (
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
+    PathKind,
+    _JsonObject,
+    _JsonValue,
+    _require_exact_payload,
 )
 
 DUAL_PATH_PROTOCOL_VERSION: Final[int] = 2
-PATH_DECISION_SEND_WORKERS: Final[int] = 32
+_PATH_DECISION_SEND_WORKERS: Final[int] = 32
 
+_MIN_TCP_PORT: Final[int] = 1
+_MAX_TCP_PORT: Final[int] = 65535
 _MAX_DELIVERY_ATTEMPTS: Final[int] = 3
 _SEND_TIMEOUT_MS: Final[int] = 1000
 _POLL_TIMEOUT_MS: Final[int] = 1000
 _RETRY_SPACING_S: Final[float] = 0.1
 _ACK: Final[bytes] = b"ACK"
 _RECEIVER_READY_TIMEOUT_S: Final[float] = 5.0
-
-_JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | dict[str, "_JsonValue"]
-_JsonObject: TypeAlias = dict[str, _JsonValue]
 
 
 def derive_decode_control_port(
@@ -47,7 +49,7 @@ def derive_decode_control_port(
     worker_port_span: int,
 ) -> int:
     derived_port = dual_path_control_port + data_parallel_rank
-    if not 1 <= derived_port <= 65535:
+    if not _MIN_TCP_PORT <= derived_port <= _MAX_TCP_PORT:
         raise ValueError(f"derived DualPath control port {derived_port} is outside 1..65535")
     if kv_port <= derived_port < kv_port + worker_port_span:
         raise ValueError(
@@ -55,14 +57,6 @@ def derive_decode_control_port(
             f"[{kv_port}, {kv_port + worker_port_span})"
         )
     return derived_port
-
-
-def _require_exact_payload(payload: _JsonValue, expected_keys: frozenset[str]) -> _JsonObject:
-    if not isinstance(payload, dict):
-        raise PathDecisionValidationError("serialized payload must be a dictionary")
-    if set(payload) != expected_keys:
-        raise PathDecisionValidationError(f"serialized payload fields must be exactly {sorted(expected_keys)}")
-    return payload
 
 
 def _require_protocol_version(protocol_version: _JsonValue) -> int:
@@ -79,7 +73,11 @@ class DecodeControlEndpoint:
     def __post_init__(self) -> None:
         if not isinstance(self.host, str) or not self.host:
             raise PathDecisionValidationError("host must be a non-empty string")
-        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 1 <= self.port <= 65535:
+        if (
+            isinstance(self.port, bool)
+            or not isinstance(self.port, int)
+            or not _MIN_TCP_PORT <= self.port <= _MAX_TCP_PORT
+        ):
             raise PathDecisionValidationError("port must be an integer in the range 1..65535 and must not be a boolean")
 
     def to_dict(self) -> _JsonObject:
@@ -118,7 +116,7 @@ class DualPathDecisionMetadata:
             frozenset({"protocol_version", "decision_request", "decode_control_endpoint"}),
         )
         return cls(
-            protocol_version=_require_protocol_version(data["protocol_version"]),
+            protocol_version=data["protocol_version"],
             decision_request=PathDecisionRequest.from_dict(data["decision_request"]),
             decode_control_endpoint=DecodeControlEndpoint.from_dict(data["decode_control_endpoint"]),
         )
@@ -149,7 +147,7 @@ class PathDecision:
         data = _require_exact_payload(payload, frozenset({"protocol_version", "result", "reverse_plan"}))
         reverse_plan_payload = data["reverse_plan"]
         return cls(
-            protocol_version=_require_protocol_version(data["protocol_version"]),
+            protocol_version=data["protocol_version"],
             result=PathDecisionResult.from_dict(data["result"]),
             reverse_plan=None if reverse_plan_payload is None else ReversePlan.from_dict(reverse_plan_payload),
         )
@@ -209,7 +207,7 @@ class _ZmqReqSocket:
 
 
 @contextmanager
-def _zmq_req_opener(endpoint: DecodeControlEndpoint):
+def _zmq_req_opener(endpoint: DecodeControlEndpoint) -> Iterator[_DeliverySocket]:
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.LINGER, 0)
@@ -237,16 +235,13 @@ def _deliver_decision(
     for attempt in range(_MAX_DELIVERY_ATTEMPTS):
         try:
             with opener(endpoint) as socket:
-                try:
-                    socket.set_send_timeout(send_timeout_ms)
-                    socket.send(encoded)
-                    if not socket.poll(poll_timeout_ms):
-                        raise PathDecisionDeliveryError("path decision acknowledgement timed out")
-                    if socket.recv() != _ACK:
-                        raise PathDecisionDeliveryError("path decision acknowledgement was invalid")
-                    return
-                finally:
-                    socket.close()
+                socket.set_send_timeout(send_timeout_ms)
+                socket.send(encoded)
+                if not socket.poll(poll_timeout_ms):
+                    raise PathDecisionDeliveryError("path decision acknowledgement timed out")
+                if socket.recv() != _ACK:
+                    raise PathDecisionDeliveryError("path decision acknowledgement was invalid")
+                return
         except Exception as error:  # noqa: BLE001
             last_error = error
 
@@ -261,7 +256,6 @@ class PathDecisionCoordinator:
     def __init__(self) -> None:
         self._role = ""
         self._closed = False
-        self._running = False
         self._decode_engine_instance_id: str | None = None
         self._decode_control_endpoint: DecodeControlEndpoint | None = None
         self._pending_keys: set[DualPathRequestKey] = set()
@@ -290,14 +284,13 @@ class PathDecisionCoordinator:
     ) -> PathDecisionCoordinator:
         coordinator = cls()
         coordinator._role = "decode"
-        coordinator._running = True
         incarnation = boot_id if boot_id is not None else uuid.uuid4().hex
         coordinator._decode_engine_instance_id = f"{engine_id}:{data_parallel_rank}:{incarnation}"
         coordinator._decode_control_endpoint = control_endpoint
         coordinator._context = zmq.Context()
         ready_event = threading.Event()
         coordinator._receiver_thread = threading.Thread(
-            target=coordinator._receive_results,
+            target=coordinator._receive_decisions,
             args=(ready_event,),
             name=f"path-decision-result-receiver-{data_parallel_rank}",
             daemon=True,
@@ -316,21 +309,21 @@ class PathDecisionCoordinator:
     def for_prefill(
         cls,
         *,
-        _socket_opener: _SocketOpener | None = None,
-        _sleep: _Sleep | None = None,
-        _send_timeout_ms: int = _SEND_TIMEOUT_MS,
-        _poll_timeout_ms: int = _POLL_TIMEOUT_MS,
-        _retry_spacing_s: float = _RETRY_SPACING_S,
+        socket_opener: _SocketOpener | None = None,
+        sleep: _Sleep | None = None,
+        send_timeout_ms: int = _SEND_TIMEOUT_MS,
+        poll_timeout_ms: int = _POLL_TIMEOUT_MS,
+        retry_spacing_s: float = _RETRY_SPACING_S,
     ) -> PathDecisionCoordinator:
         coordinator = cls()
         coordinator._role = "prefill"
-        coordinator._socket_opener = _socket_opener or _zmq_req_opener
-        coordinator._sleep = _sleep or time.sleep
-        coordinator._send_timeout_ms = _send_timeout_ms
-        coordinator._poll_timeout_ms = _poll_timeout_ms
-        coordinator._retry_spacing_s = _retry_spacing_s
+        coordinator._socket_opener = socket_opener or _zmq_req_opener
+        coordinator._sleep = sleep or time.sleep
+        coordinator._send_timeout_ms = send_timeout_ms
+        coordinator._poll_timeout_ms = poll_timeout_ms
+        coordinator._retry_spacing_s = retry_spacing_s
         coordinator._executor = ThreadPoolExecutor(
-            max_workers=PATH_DECISION_SEND_WORKERS,
+            max_workers=_PATH_DECISION_SEND_WORKERS,
             thread_name_prefix="path-decision-sender",
         )
         return coordinator
@@ -346,6 +339,8 @@ class PathDecisionCoordinator:
         return self._decode_control_endpoint
 
     def register_pending(self, key: DualPathRequestKey) -> None:
+        # Unlike unregister, this also takes _lifecycle_lock so close() cannot
+        # clear pending state and then observe a fresh registration.
         with self._lifecycle_lock, self._registry_lock:
             self._pending_keys.add(key)
 
@@ -358,6 +353,8 @@ class PathDecisionCoordinator:
         if self._closed:
             return []
         decisions: list[PathDecision] = []
+        # Draining while holding _registry_lock defers decisions enqueued
+        # mid-drain to the next batch instead of returning them here.
         with self._registry_lock:
             while True:
                 try:
@@ -392,7 +389,6 @@ class PathDecisionCoordinator:
             if self._closed:
                 return
             self._closed = True
-            self._running = False
         if self._role == "decode":
             assert self._context is not None
             assert self._receiver_thread is not None
@@ -406,7 +402,7 @@ class PathDecisionCoordinator:
             assert self._executor is not None
             self._executor.shutdown(wait=True, cancel_futures=True)
 
-    def _receive_results(self, ready_event: threading.Event) -> None:
+    def _receive_decisions(self, ready_event: threading.Event) -> None:
         assert self._context is not None
         assert self._decode_control_endpoint is not None
         socket: zmq.Socket | None = None
@@ -416,13 +412,13 @@ class PathDecisionCoordinator:
             endpoint = self._decode_control_endpoint
             socket.bind(f"tcp://{endpoint.host}:{endpoint.port}")
             ready_event.set()
-            while self._running:
+            while not self._closed:
                 try:
                     frames = socket.recv_multipart()
                 except zmq.ContextTerminated:
                     break
                 except zmq.ZMQError:
-                    if not self._running:
+                    if self._closed:
                         break
                     logger.exception("path decision result receiver socket failure")
                     continue
@@ -432,6 +428,7 @@ class PathDecisionCoordinator:
                     logger.exception("path decision result receiver rejected an unexpected message failure")
         except BaseException as error:  # noqa: BLE001
             self._receiver_error = error
+            logger.exception("path decision result receiver thread terminated")
             ready_event.set()
         finally:
             if socket is not None:
@@ -456,11 +453,11 @@ class PathDecisionCoordinator:
         if key.decode_engine_instance_id != self.decode_engine_instance_id:
             logger.warning("path decision result receiver rejected wrong-incarnation key")
             return
-        if result.path is Path.PE_READ:
+        if result.path is PathKind.PE_READ:
             if decision.reverse_plan is not None:
                 logger.warning("path decision result receiver rejected PE_READ Reverse plan")
                 return
-        elif result.path is Path.DE_READ:
+        elif result.path is PathKind.DE_READ:
             if decision.reverse_plan is None:
                 logger.warning("path decision result receiver rejected DE_READ without Reverse plan")
                 return

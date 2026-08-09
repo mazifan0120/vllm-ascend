@@ -428,7 +428,7 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         keys, _, _ = store.get_calls[0]
         self.assertEqual(len(keys), 1)
 
-    def test_failed_blocks_publish_when_finished_request_is_drained(self):
+    def test_failed_blocks_publish_before_finished_request_is_drained(self):
         invalid_block_ids: set[int] = set()
         thread = KVCacheStoreRecvingThread(
             m_store=FakeStore(),
@@ -451,7 +451,7 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
 
         thread._handle_request(request)
 
-        self.assertEqual(invalid_block_ids, set())
+        self.assertEqual(invalid_block_ids, {10, 11})
         self.assertEqual(thread.get_and_clear_finished_requests(), {"failed-request"})
         self.assertEqual(invalid_block_ids, {10, 11})
 

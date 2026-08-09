@@ -17,8 +17,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionRequest,
+    PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
@@ -37,11 +37,11 @@ _BLOCK_SIZE = 16
 
 
 class FixedPathPolicy:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: PathKind) -> None:
         self.path = path
         self.calls = 0
 
-    def choose(self, request: PathDecisionRequest) -> Path:
+    def choose(self, request: PathDecisionRequest) -> PathKind:
         self.calls += 1
         return self.path
 
@@ -93,7 +93,7 @@ def scheduler_factory():
         coordinator.submit.return_value = _completed_future()
         coordinator_cls.for_prefill.return_value = coordinator
 
-        def make(path: Path = Path.PE_READ, *, need_truncate: bool = False):
+        def make(path: PathKind = PathKind.PE_READ, *, need_truncate: bool = False):
             policy = FixedPathPolicy(path)
             scheduler = connector_module.DualPathConnectorScheduler(
                 _make_vllm_config(),
@@ -225,8 +225,8 @@ def parent_forward_metadata_pair(scheduler_factory):
 @pytest.mark.parametrize(
     ("local_tokens", "path", "expected_policy_calls"),
     [
-        pytest.param(16, Path.DE_READ, 0, id="forced"),
-        pytest.param(0, Path.PE_READ, 1, id="policy"),
+        pytest.param(16, PathKind.DE_READ, 0, id="forced"),
+        pytest.param(0, PathKind.PE_READ, 1, id="policy"),
     ],
 )
 def test_pe_read_returns_zero_false_for_forced_and_policy_paths(
@@ -241,13 +241,13 @@ def test_pe_read_returns_zero_false_for_forced_and_policy_paths(
     result = scheduler.get_num_new_matched_tokens(request, local_tokens)
 
     assert result == (0, False)
-    assert scheduler._pe_path_results[request.request_id].path is Path.PE_READ
+    assert scheduler._pe_path_results[request.request_id].path is PathKind.PE_READ
     assert policy.calls == expected_policy_calls
     coordinator.submit.assert_not_called()
 
 
 def test_de_read_returns_exact_reverse_budget_and_wins_first_positive(scheduler_factory):
-    scheduler, policy, _ = scheduler_factory(Path.DE_READ)
+    scheduler, policy, _ = scheduler_factory(PathKind.DE_READ)
     dual_path = connector_module.DualPathConnector.__new__(connector_module.DualPathConnector)
     dual_path.connector_scheduler = scheduler
     store = MagicMock(name="ascend_store")
@@ -508,7 +508,7 @@ def test_lookup_or_install_alone_invokes_no_worker_p2p(scheduler_factory):
 
 
 def test_partial_de_read_freezes_exact_ranges_with_distinct_tables(scheduler_factory):
-    scheduler, _, _ = scheduler_factory(Path.DE_READ)
+    scheduler, _, _ = scheduler_factory(PathKind.DE_READ)
     request = _make_request(
         target_tokens=48,
         prompt_tokens=49,
@@ -541,7 +541,7 @@ def test_partial_de_read_freezes_exact_ranges_with_distinct_tables(scheduler_fac
 
 
 def test_de_read_installs_binding_plan_and_forward_before_submit(scheduler_factory):
-    scheduler, policy, coordinator = scheduler_factory(Path.DE_READ)
+    scheduler, policy, coordinator = scheduler_factory(PathKind.DE_READ)
     request = _make_request(
         target_tokens=48,
         prompt_tokens=49,
@@ -584,7 +584,7 @@ def test_de_read_installs_binding_plan_and_forward_before_submit(scheduler_facto
 
 
 def test_miss_de_read_freezes_reverse_hbm_range_and_no_store(scheduler_factory):
-    scheduler, _, _ = scheduler_factory(Path.DE_READ)
+    scheduler, _, _ = scheduler_factory(PathKind.DE_READ)
     request = _make_request(
         target_tokens=48,
         prompt_tokens=49,
@@ -610,10 +610,10 @@ def test_miss_de_read_freezes_reverse_hbm_range_and_no_store(scheduler_factory):
 
 @pytest.mark.parametrize(
     "mismatch",
-    ["group-count", "alignment", "coverage", "endpoint", "topology", "key", "wire-id"],
+    ["group-count", "alignment", "coverage", "endpoint", "topology", "wire-id"],
 )
 def test_activation_fact_mismatch_fails_with_local_control_failure(scheduler_factory, mismatch):
-    scheduler, _, coordinator = scheduler_factory(Path.DE_READ)
+    scheduler, _, coordinator = scheduler_factory(PathKind.DE_READ)
     request = _make_request(
         target_tokens=48,
         prompt_tokens=49,
@@ -636,10 +636,6 @@ def test_activation_fact_mismatch_fails_with_local_control_failure(scheduler_fac
         request.kv_transfer_params["remote_host"] = ""
     elif mismatch == "topology":
         request.kv_transfer_params["remote_tp_size"] = 0
-    elif mismatch == "key":
-        request.kv_transfer_params["dual_path"]["decision_request"]["request_key"]["decode_request_id"] = (
-            "conflicting-decode-request"
-        )
     wire_context = (
         patch.object(connector_module, "get_external_request_id", return_value="")
         if mismatch == "wire-id"
@@ -662,11 +658,12 @@ def test_activation_fact_mismatch_fails_with_local_control_failure(scheduler_fac
     first = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
     second = scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
     assert first.control_failures == [expected_failure]
-    assert not isinstance(second, DualPathConnectorMetadata)
+    assert isinstance(second, DualPathConnectorMetadata)
+    assert second.control_failures == []
 
 
 def test_pe_read_local_plan_failure_sends_no_decision(scheduler_factory):
-    scheduler, _, coordinator = scheduler_factory(Path.PE_READ)
+    scheduler, _, coordinator = scheduler_factory(PathKind.PE_READ)
     request = _make_request()
     _decide(scheduler, request)
 
@@ -678,7 +675,7 @@ def test_pe_read_local_plan_failure_sends_no_decision(scheduler_factory):
 
 
 def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
-    scheduler, _, _ = scheduler_factory(Path.DE_READ)
+    scheduler, _, _ = scheduler_factory(PathKind.DE_READ)
     request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
     binding = ReverseReceiveBinding(
         request_key=request_key,
@@ -711,7 +708,10 @@ def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
     assert first.control_failures == [failure]
     assert scheduler._pe_pending_reverse_receive_bindings == {}
     assert scheduler._pe_control_failures == {}
-    assert second is parent_metadata
+    assert isinstance(second, DualPathConnectorMetadata)
+    assert second.requests is parent_metadata.requests
+    assert second.reverse_receive_bindings == []
+    assert second.control_failures == []
 
 
 @pytest.mark.parametrize(

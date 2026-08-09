@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
@@ -15,8 +16,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionResult,
+    PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DUAL_PATH_PROTOCOL_VERSION,
@@ -67,7 +68,7 @@ def _de_read_decision(state, snapshot, **plan_overrides) -> PathDecision:
         plan = dataclasses.replace(plan, **plan_overrides)
     return PathDecision(
         protocol_version=DUAL_PATH_PROTOCOL_VERSION,
-        result=PathDecisionResult(request_key=state.request_key, path=Path.DE_READ),
+        result=PathDecisionResult(request_key=state.request_key, path=PathKind.DE_READ),
         reverse_plan=plan,
     )
 
@@ -106,7 +107,7 @@ def scheduler_factory(monkeypatch):
     monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
     schedulers = []
     with (
-        patch(f"{_CONNECTOR_NS}.KVPoolAdapter"),
+        patch(f"{_CONNECTOR_NS}.KVPoolSchedulerAdapter"),
         patch(f"{_CONNECTOR_NS}.PathDecisionCoordinator") as coordinator_cls,
         patch(f"{_CONNECTOR_NS}.get_ip", return_value="192.0.2.44"),
     ):
@@ -182,7 +183,7 @@ def _make_binding(
 ) -> ForwardReceiveBinding:
     return ForwardReceiveBinding(
         request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, decode_request_id),
-        path=Path.PE_READ,
+        path=PathKind.PE_READ,
         wire_request_id=get_external_request_id(decode_request_id),
         decode_request_id=decode_request_id,
         destination_block_ids=destination_block_ids,
@@ -192,7 +193,7 @@ def _make_binding(
 
 
 def _make_worker():
-    worker = object.__new__(connector_module.DualPathConnectorWorker)
+    worker = init_dual_path_worker_state(object.__new__(connector_module.DualPathConnectorWorker))
     worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
     worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
@@ -201,11 +202,6 @@ def _make_worker():
     worker.virtual_request = set()
     worker._recving_metadata = {}
     worker._invalid_block_ids = set()
-    worker._control_failed_recving = set()
-    worker._forward_receive_bindings = {}
-    worker._pending_forward_done = set()
-    worker._pending_forward_failed = set()
-    worker._consumed_forward_terminals = {}
     worker._kvpool_worker_adapter = MagicMock(name="kvpool_worker_adapter")
     worker.engine = MagicMock(name="transfer_engine")
     worker.block_size = [16]
@@ -224,7 +220,7 @@ def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_t
     # Given
     scheduler, coordinator = scheduler_factory()
     request, snapshot, state = _admit_request(scheduler)
-    result = PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
+    result = PathDecisionResult(request_key=state.request_key, path=PathKind.PE_READ)
     coordinator.take_received_decisions.return_value = [_decision(result)]
     advertised_destination = tuple(
         tuple(group) for group in scheduler.executor.submit.call_args.kwargs["message"]["remote_block_ids"]
@@ -242,7 +238,7 @@ def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_t
     assert metadata.forward_receive_bindings == [
         ForwardReceiveBinding(
             request_key=state.request_key,
-            path=Path.PE_READ,
+            path=PathKind.PE_READ,
             wire_request_id=get_external_request_id(request.request_id),
             decode_request_id=request.request_id,
             destination_block_ids=derived_destination,
@@ -253,7 +249,7 @@ def test_commit_pe_read_emits_exactly_one_control_only_binding_with_advertised_t
     assert request.request_id not in metadata.requests
     assert scheduler._reqs_need_recv == receive_queue_before == {}
     assert metadata.control_failures == []
-    assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_binding_destination_table_includes_hybrid_trimming(scheduler_factory):
@@ -261,7 +257,7 @@ def test_binding_destination_table_includes_hybrid_trimming(scheduler_factory):
     scheduler, coordinator = scheduler_factory(need_truncate=True)
     _, snapshot, state = _admit_request(scheduler)
     coordinator.take_received_decisions.return_value = [
-        _decision(PathDecisionResult(request_key=state.request_key, path=Path.PE_READ))
+        _decision(PathDecisionResult(request_key=state.request_key, path=PathKind.PE_READ))
     ]
     advertised_destination = tuple(
         tuple(group) for group in scheduler.executor.submit.call_args.kwargs["message"]["remote_block_ids"]
@@ -303,7 +299,7 @@ def test_duplicate_pe_read_result_does_not_emit_second_binding(scheduler_factory
     # Given
     scheduler, coordinator = scheduler_factory()
     _, _, state = _admit_request(scheduler)
-    result = PathDecisionResult(request_key=state.request_key, path=Path.PE_READ)
+    result = PathDecisionResult(request_key=state.request_key, path=PathKind.PE_READ)
     coordinator.take_received_decisions.return_value = [_decision(result)]
     first_metadata = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
     coordinator.take_received_decisions.return_value = [_decision(result)]
@@ -314,7 +310,7 @@ def test_duplicate_pe_read_result_does_not_emit_second_binding(scheduler_factory
     # Then
     assert len(first_metadata.forward_receive_bindings) == 1
     assert second_metadata.forward_receive_bindings == []
-    assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_de_read_decision_requires_non_empty_reverse_plan(scheduler_factory):
@@ -322,7 +318,7 @@ def test_de_read_decision_requires_non_empty_reverse_plan(scheduler_factory):
     scheduler, coordinator = scheduler_factory()
     _, _, state = _admit_request(scheduler)
     coordinator.take_received_decisions.return_value = [
-        _decision(PathDecisionResult(request_key=state.request_key, path=Path.DE_READ))
+        _decision(PathDecisionResult(request_key=state.request_key, path=PathKind.DE_READ))
     ]
 
     # When
@@ -332,7 +328,7 @@ def test_de_read_decision_requires_non_empty_reverse_plan(scheduler_factory):
     assert metadata.forward_receive_bindings == []
     assert metadata.reverse_plans == []
     assert len(metadata.control_failures) == 1
-    assert state.status is connector_module.DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
 
 
 def test_wrapper_mismatch_before_commit_fails_without_kvpool_mutation(scheduler_factory):
@@ -344,7 +340,7 @@ def test_wrapper_mismatch_before_commit_fails_without_kvpool_mutation(scheduler_
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert state.status is connector_module.DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
     assert metadata.reverse_plans == []
     assert metadata.forward_receive_bindings == []
@@ -390,7 +386,7 @@ def test_store_miss_commits_nothing_and_enters_skipped(scheduler_factory):
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
     assert metadata.decode_store_metadata is None
     assert metadata.reverse_plans == [decision.reverse_plan]
-    assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_commit_failure_rolls_back_and_emits_one_activation_failure(scheduler_factory):
@@ -402,7 +398,7 @@ def test_commit_failure_rolls_back_and_emits_one_activation_failure(scheduler_fa
     first_metadata = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
     second_metadata = scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
 
-    assert state.status is connector_module.DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
     assert len(first_metadata.control_failures) == 1
     assert second_metadata.control_failures == []
     assert first_metadata.reverse_plans == []
@@ -420,14 +416,16 @@ def test_snapshot_plan_mismatch_uses_activation_failure_not_timeout(scheduler_fa
     with patch.object(connector_module.time, "monotonic", return_value=state.deadline + 1):
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert state.status is connector_module.DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
     assert metadata.control_failures[0].reason is connector_module.DualPathControlFailureReason.ACTIVATION_FAILED
 
 
 def test_activation_failure_invalidates_all_external_destinations(scheduler_factory):
     scheduler, coordinator = scheduler_factory()
     request, snapshot, state = _admit_request(scheduler)
-    coordinator.take_received_decisions.return_value = [_decision(PathDecisionResult(state.request_key, Path.DE_READ))]
+    coordinator.take_received_decisions.return_value = [
+        _decision(PathDecisionResult(state.request_key, PathKind.DE_READ))
+    ]
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
@@ -455,7 +453,7 @@ def test_de_read_activation_emits_plan_binding_store_in_one_lifecycle(scheduler_
     assert metadata.forward_receive_bindings == [
         ForwardReceiveBinding(
             request_key=state.request_key,
-            path=Path.DE_READ,
+            path=PathKind.DE_READ,
             wire_request_id=get_external_request_id(request.request_id),
             decode_request_id=request.request_id,
             destination_block_ids=snapshot.final_block_ids,
@@ -464,7 +462,7 @@ def test_de_read_activation_emits_plan_binding_store_in_one_lifecycle(scheduler_
         )
     ]
     assert metadata.decode_store_metadata is store_metadata
-    assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
+    assert state.status is connector_module._DecodeDecisionStatus.COMMITTED
 
 
 def test_decisions_processed_before_store_metadata_build(scheduler_factory):
@@ -488,7 +486,7 @@ def test_de_read_committed_only_after_all_steps_succeed(scheduler_factory, failu
     _, snapshot, state = _admit_request(scheduler)
     decision = _de_read_decision(state, snapshot)
     if failure_stage == "plan":
-        decision = _decision(PathDecisionResult(state.request_key, Path.DE_READ))
+        decision = _decision(PathDecisionResult(state.request_key, PathKind.DE_READ))
     elif failure_stage == "wrapper":
         snapshot.allocated_blocks.get_block_ids.return_value = ([99, 100, 101, 102],)
     else:
@@ -497,7 +495,7 @@ def test_de_read_committed_only_after_all_steps_succeed(scheduler_factory, failu
 
     scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert state.status is connector_module.DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.status is connector_module._DecodeDecisionStatus.ACTIVATION_FAILED
 
 
 def test_pe_read_never_calls_decode_kvpool_or_store_commit_surfaces(scheduler_factory):
@@ -506,7 +504,7 @@ def test_pe_read_never_calls_decode_kvpool_or_store_commit_surfaces(scheduler_fa
     request, _, state = _admit_request(scheduler)
     scheduler._kvpool_adapter.reset_mock()
     coordinator.take_received_decisions.return_value = [
-        _decision(PathDecisionResult(request_key=state.request_key, path=Path.PE_READ))
+        _decision(PathDecisionResult(request_key=state.request_key, path=PathKind.PE_READ))
     ]
     worker = _make_worker()
 
@@ -591,7 +589,7 @@ def test_done_after_binding_publishes_finished_recving_only():
     assert worker.get_block_ids_with_load_errors() == set()
     assert worker._forward_receive_bindings == {}
     assert worker.request_map == {}
-    assert worker._consumed_forward_terminals == {binding.wire_request_id: binding.decode_request_id}
+    assert worker._consumed_forward_terminal_wire_ids == {binding.wire_request_id: binding.decode_request_id}
 
 
 def test_failed_after_binding_publishes_exact_forward_suffix_and_finished_recving_prefix_preserved():
@@ -628,7 +626,7 @@ def test_done_before_binding_is_retained_and_reconciled_after_install():
 
     # Then
     assert finished == (set(), {binding.decode_request_id})
-    assert worker._pending_forward_done == set()
+    assert worker._pending_forward_done_wire_ids == set()
 
 
 def test_failed_before_binding_is_retained_and_reconciled_after_install():
@@ -648,7 +646,7 @@ def test_failed_before_binding_is_retained_and_reconciled_after_install():
     # Then
     assert finished == (set(), {binding.decode_request_id})
     assert worker.get_block_ids_with_load_errors() == {102, 103, 104}
-    assert worker._pending_forward_failed == set()
+    assert worker._pending_forward_failed_wire_ids == set()
 
 
 def test_conflicting_done_and_failed_resolves_as_failed():
@@ -681,8 +679,8 @@ def test_unknown_wire_ids_are_retained_without_attribution():
 
     # Then
     assert finished == (set(), set())
-    assert worker._pending_forward_done == {"unknown-done"}
-    assert worker._pending_forward_failed == {"unknown-failed"}
+    assert worker._pending_forward_done_wire_ids == {"unknown-done"}
+    assert worker._pending_forward_failed_wire_ids == {"unknown-failed"}
     assert worker.request_map == {"known-wire": "known-request-00000001"}
     assert worker.get_block_ids_with_load_errors() == set()
 
@@ -734,9 +732,9 @@ def test_duplicate_terminals_are_idempotent_and_consumed_record_releases_on_fini
 
     # Then
     assert released == (set(), set())
-    assert worker._consumed_forward_terminals == {}
-    assert worker._pending_forward_done == set()
-    assert worker._pending_forward_failed == set()
+    assert worker._consumed_forward_terminal_wire_ids == {}
+    assert worker._pending_forward_done_wire_ids == set()
+    assert worker._pending_forward_failed_wire_ids == set()
 
 
 def test_shutdown_clears_task05_worker_state_and_active_wire_mapping():
@@ -749,8 +747,8 @@ def test_shutdown_clears_task05_worker_state_and_active_wire_mapping():
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {consumed_binding.wire_request_id}
     assert worker.get_finished(set(), consumed_metadata) == (set(), {consumed_binding.decode_request_id})
     worker.start_load_kv(_binding_metadata(active_binding))
-    worker._pending_forward_done.add("unknown-done")
-    worker._pending_forward_failed.add("unknown-failed")
+    worker._pending_forward_done_wire_ids.add("unknown-done")
+    worker._pending_forward_failed_wire_ids.add("unknown-failed")
 
     # When
     worker.shutdown()
@@ -759,7 +757,7 @@ def test_shutdown_clears_task05_worker_state_and_active_wire_mapping():
     # Then
     assert active_binding.wire_request_id not in worker.request_map
     assert worker._forward_receive_bindings == {}
-    assert worker._pending_forward_done == set()
-    assert worker._pending_forward_failed == set()
-    assert worker._consumed_forward_terminals == {}
-    assert worker._kvpool_worker_adapter.close.call_count == 1
+    assert worker._pending_forward_done_wire_ids == set()
+    assert worker._pending_forward_failed_wire_ids == set()
+    assert worker._consumed_forward_terminal_wire_ids == {}
+    worker._kvpool_worker_adapter.close.assert_not_called()

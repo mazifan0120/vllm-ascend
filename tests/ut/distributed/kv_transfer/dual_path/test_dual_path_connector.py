@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Executable PR-00 contract for DualPath stage 1.
 
-This suite implements DETAILED-SPEC section 11: the foundation config matrix,
+This suite implements DETAILED-SPEC section 11: the connector config matrix,
 call-through construction parity, ten Mooncake Layerwise behavior-parity
 scenarios, section 9 inheritance/drift guards, and connector registration.
 It is deterministic and stubs optional Mooncake/NPU extensions before imports.
@@ -76,6 +76,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # 
     DualPathConnectorScheduler,
     DualPathConnectorWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (  # noqa: E402
+    DualPathConnectorMetadata,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
     DecodeControlEndpoint,
 )
@@ -93,7 +96,10 @@ for _module_name, _module in _saved_modules.items():
 
 import pytest  # noqa: E402
 
-from tests.ut.distributed.kv_transfer.dual_path.conftest import worker_environment  # noqa: E402
+from tests.ut.distributed.kv_transfer.dual_path.conftest import (  # noqa: E402
+    init_dual_path_worker_state,
+    worker_environment,
+)
 
 
 # Task-01: Decode-role DualPath components compose KVPool lookup adapters.
@@ -103,7 +109,7 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import worker_environme
 @pytest.fixture(autouse=True)
 def _patch_task01_adapters():
     with (
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolAdapter"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolSchedulerAdapter"),
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.KVPoolWorkerAdapter"),
         patch(
             "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector.PathDecisionCoordinator"
@@ -165,8 +171,6 @@ class MockVllmConfig:
         self.kv_transfer_config.get_from_extra_config = MagicMock()
         self.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {
             "tls_config": {},
-            "prefill": {"tp_size": 2, "dp_size": 1},
-            "decode": {"tp_size": 2, "dp_size": 1},
         }.get(key, default)
 
 
@@ -292,19 +296,13 @@ class TestDualPathConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"(?=.*other)(?=.*not supported)"):
             DualPathConfig.from_extra_config({"role": "other"}, make_kv_transfer_config("kv_both"))
 
-    def test_role_pe_legacy_alias_rejected(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            r"(?=.*pe)(?=.*legacy alias)(?=.*prefill)(?=.*decode)",
-        ):
-            DualPathConfig.from_extra_config({"role": "pe"}, make_kv_transfer_config("kv_both"))
-
-    def test_role_de_legacy_alias_rejected(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            r"(?=.*de)(?=.*legacy alias)(?=.*prefill)(?=.*decode)",
-        ):
-            DualPathConfig.from_extra_config({"role": "de"}, make_kv_transfer_config("kv_both"))
+    def test_role_legacy_aliases_rejected_as_unsupported(self):
+        for alias in ("pe", "de"):
+            with (
+                self.subTest(alias=alias),
+                self.assertRaisesRegex(ValueError, rf"(?=.*role={alias!r})(?=.*not supported)"),
+            ):
+                DualPathConfig.from_extra_config({"role": alias}, make_kv_transfer_config("kv_both"))
 
     def test_prefill_with_kv_consumer_rejected(self):
         with self.assertRaisesRegex(
@@ -320,13 +318,11 @@ class TestDualPathConfig(unittest.TestCase):
         ):
             DualPathConfig.from_extra_config({"role": "decode"}, make_kv_transfer_config("kv_producer"))
 
-    def test_tls_prefill_decode_keys_are_accepted_without_storage(self):
+    def test_tls_config_key_is_accepted_without_storage(self):
         config = DualPathConfig.from_extra_config(
             {
                 "role": "prefill",
                 "tls_config": {"ssl_enable": False},
-                "prefill": {"tp_size": 2, "dp_size": 1},
-                "decode": {"tp_size": 2, "dp_size": 1},
             },
             make_kv_transfer_config("kv_producer"),
         )
@@ -337,8 +333,6 @@ class TestDualPathConfig(unittest.TestCase):
                 {
                     "role",
                     "tls_config",
-                    "prefill",
-                    "decode",
                     "consumer_is_to_load",
                     "load_async",
                     "backend",
@@ -350,47 +344,17 @@ class TestDualPathConfig(unittest.TestCase):
             ),
         )
 
-    def assert_removed_field_rejected(self, field_name):
-        pattern = (
-            rf"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*{field_name})"
-            r"(?=.*not part of the DualPath foundation configuration)"
-        )
-        with self.assertRaisesRegex(ValueError, pattern):
-            DualPathConfig.from_extra_config(
-                {"role": "prefill", field_name: True},
-                make_kv_transfer_config("kv_producer"),
-            )
-
-    def test_removed_path_strategy_rejected(self):
-        self.assert_removed_field_rejected("path_strategy")
-
-    def test_removed_relay_rejected(self):
-        self.assert_removed_field_rejected("relay")
-
-    def test_removed_path_planner_rejected(self):
-        self.assert_removed_field_rejected("path_planner")
-
-    def test_removed_monitor_rejected(self):
-        self.assert_removed_field_rejected("monitor")
-
-    def test_removed_topology_rejected(self):
-        self.assert_removed_field_rejected("topology")
-
-    def test_removed_enable_value_function_shadow_rejected(self):
-        self.assert_removed_field_rejected("enable_value_function_shadow")
-
-    def test_removed_enable_link_monitor_shadow_rejected(self):
-        self.assert_removed_field_rejected("enable_link_monitor_shadow")
-
     def test_arbitrary_unknown_key_rejected(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            r"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*arbitrary_key)",
-        ):
+        with self.assertRaises(ValueError) as raised:
             DualPathConfig.from_extra_config(
                 {"role": "prefill", "arbitrary_key": 1},
                 make_kv_transfer_config("kv_producer"),
             )
+        message = str(raised.exception)
+        self.assertIn("unsupported kv_connector_extra_config key(s)", message)
+        self.assertIn("arbitrary_key", message)
+        for allowed_key in sorted(ALLOWED_EXTRA_CONFIG_KEYS):
+            self.assertIn(allowed_key, message)
 
     def test_unknown_keys_are_reported_in_sorted_order(self):
         with self.assertRaises(ValueError) as raised:
@@ -640,7 +604,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
         self.assertEqual(parent._is_kv_producer, dual._is_kv_producer)
         self.assertEqual(parent.engine_id, dual.engine_id)
         self.assertIs(type(parent._connector_metadata), MooncakeLayerwiseConnectorMetadata)
-        self.assertIs(type(dual._connector_metadata), MooncakeLayerwiseConnectorMetadata)
+        self.assertIs(type(dual._connector_metadata), DualPathConnectorMetadata)
         self.assertEqual(parent._connector_metadata.requests, dual._connector_metadata.requests)
         self.assertIsInstance(parent._connector_metadata.send_task, SendTask)
         self.assertIsInstance(dual._connector_metadata.send_task, SendTask)
@@ -705,6 +669,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_path_decision_coordinator",
             "_path_decider",
             "_pe_request_keys",
+            "_pe_decision_metadata",
             "_pe_prefill_local_tokens",
             "_pe_path_results",
             "_pe_forward_plans",
@@ -727,19 +692,18 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_registered_layer_order",
                 "_accepting_split_requests",
                 "_split_trackers",
-                "_reverse_plans",
                 "_reverse_terminal_lock",
                 "_pending_local_reverse_terminals",
                 "_control_failed_recving",
                 "_forward_receive_bindings",
-                "_pending_forward_done",
-                "_pending_forward_failed",
-                "_consumed_forward_terminals",
+                "_pending_forward_done_wire_ids",
+                "_pending_forward_failed_wire_ids",
+                "_consumed_forward_terminal_wire_ids",
                 "_reverse_receive_bindings",
                 "_reverse_request_map",
-                "_pending_reverse_done",
-                "_pending_reverse_failed",
-                "_consumed_reverse_terminals",
+                "_pending_reverse_done_wire_ids",
+                "_pending_reverse_failed_wire_ids",
+                "_consumed_reverse_terminal_wire_ids",
             },
         )
 
@@ -1130,7 +1094,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         normal_request_id = "reqA-load-00000001"
         virtual_request_id = "reqB-virt-00000001"
         parent_meta = MooncakeLayerwiseConnectorMetadata()
-        dual_meta = MooncakeLayerwiseConnectorMetadata()
+        dual_meta = DualPathConnectorMetadata()
         parent_meta.add_new_req(normal_request_id, [[7, 8]], dict(params))
         dual_meta.add_new_req(normal_request_id, [[7, 8]], dict(params))
         parent_meta.add_new_req(virtual_request_id, [[9]], {"do_virtual": True})
@@ -1274,7 +1238,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             "remote_te_rpc_port": 9090,
         }
         parent_meta = MooncakeLayerwiseConnectorMetadata()
-        dual_meta = MooncakeLayerwiseConnectorMetadata()
+        dual_meta = DualPathConnectorMetadata()
         parent_meta.add_new_req(normal_request_id, [[7, 8]], dict(normal_params))
         dual_meta.add_new_req(normal_request_id, [[7, 8]], dict(normal_params))
         parent_meta.add_new_req(virtual_request_id, [[9]], {"do_virtual": True})
@@ -1344,7 +1308,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             "remote_te_rpc_port": 9090,
         }
         parent_meta = MooncakeLayerwiseConnectorMetadata()
-        dual_meta = MooncakeLayerwiseConnectorMetadata()
+        dual_meta = DualPathConnectorMetadata()
         parent_meta.add_new_req(request_id, [[7, 8]], dict(params))
         dual_meta.add_new_req(request_id, [[7, 8]], dict(params))
 
@@ -1460,7 +1424,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             "remote_te_rpc_port": 9090,
         }
         parent_meta = MooncakeLayerwiseConnectorMetadata()
-        dual_meta = MooncakeLayerwiseConnectorMetadata()
+        dual_meta = DualPathConnectorMetadata()
         failed_request_id = "reqE-bad-00000001"
         parent_meta.add_new_req(failed_request_id, [[7, 8]], dict(params))
         dual_meta.add_new_req(failed_request_id, [[7, 8]], dict(params))
@@ -1497,7 +1461,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(dual_cleared, parent_cleared)
 
 
-class TestDualPathFoundationGuards(unittest.TestCase):
+class TestDualPathInheritanceGuards(unittest.TestCase):
     LIFECYCLE_METHODS = frozenset(
         {
             "get_num_new_matched_tokens",
@@ -1515,6 +1479,9 @@ class TestDualPathFoundationGuards(unittest.TestCase):
         }
     )
     FACADE_METHOD_EXEMPTIONS = frozenset({"get_finished"})
+    # Extra-config keys the parent MooncakeLayerwiseConnector consumes; each
+    # must be let through by the DualPath allowlist.
+    PARENT_CONSUMED_EXTRA_CONFIG_KEYS = frozenset({"tls_config"})
 
     def test_facade_lifecycle_methods_are_identical_to_parent(self):
         for method_name in self.LIFECYCLE_METHODS - self.FACADE_METHOD_EXEMPTIONS:
@@ -1534,14 +1501,22 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "__init__",
                 "_is_dual_path_decode_admission",
                 "_stage_prefill_activation_failure",
-                "_handle_prefill_decision",
+                "_decide_prefill_path_for_admission",
+                "_log_prefill_decision",
                 "_prepare_forward_plan",
                 "_try_install_forward_plan",
                 "_activate_de_read_path",
-                "_activate_committed_decision",
-                "_build_external_control_failure",
-                "_emit_prefill_control_failure",
+                "_activate_received_decision",
+                "_validate_committed_decision",
+                "_log_decision_activation",
+                "_build_decode_control_failure",
+                "_build_remote_decode_message",
                 "_sweep_pe_delivery",
+                "_update_prefill_state_after_alloc",
+                "_invalidate_prefill_activation",
+                "_bind_decode_admission_after_alloc",
+                "_is_identical_duplicate_admission",
+                "_register_pending_decode_decision",
                 "_release_scheduler_request_state",
                 "get_num_new_matched_tokens",
                 "update_state_after_alloc",
@@ -1564,6 +1539,11 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 "_release_finished_forward_terminals",
                 "_consume_forward_receive_binding",
                 "_consume_store_completions",
+                "_drain_local_reverse_terminals",
+                "_consume_reverse_wire_terminals",
+                "_consume_forward_wire_terminals",
+                "_finish_ordinary_requests",
+                "_log_published_split_terminals",
                 "register_kv_caches",
                 "start_load_kv",
                 "get_finished",
@@ -1586,7 +1566,7 @@ class TestDualPathFoundationGuards(unittest.TestCase):
         # DualPath exempts get_finished from parent identity because the parent
         # facade drops the Core-finished IDs before calling its worker.
         connector = object.__new__(DualPathConnector)
-        worker = object.__new__(DualPathConnectorWorker)
+        worker = init_dual_path_worker_state(object.__new__(DualPathConnectorWorker))
         worker.get_finished = MagicMock(return_value=({"sent"}, {"received"}))
         connector.connector_worker = worker
         connector._connector_metadata = MooncakeLayerwiseConnectorMetadata()
@@ -1630,7 +1610,8 @@ class TestDualPathFoundationGuards(unittest.TestCase):
                 source,
             )
         )
-        self.assertLessEqual(keys, {"tls_config", "prefill", "decode"})
+        self.assertLessEqual(keys, self.PARENT_CONSUMED_EXTRA_CONFIG_KEYS)
+        self.assertLessEqual(self.PARENT_CONSUMED_EXTRA_CONFIG_KEYS, ALLOWED_EXTRA_CONFIG_KEYS)
 
 
 class TestDualPathRegistration(unittest.TestCase):

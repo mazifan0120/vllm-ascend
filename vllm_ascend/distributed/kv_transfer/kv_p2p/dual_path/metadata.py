@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
-from typing import TypeAlias
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionValidationError,
+    PathKind,
+    _JsonObject,
+    _JsonValue,
+    _require_exact_payload,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
@@ -16,21 +20,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     AscendConnectorMetadata,
 )
 
-BlockTable = tuple[tuple[int, ...], ...]
-_JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | dict[str, "_JsonValue"]
-_JsonObject: TypeAlias = dict[str, _JsonValue]
+BlockIdGroups = tuple[tuple[int, ...], ...]
 
 
-def _freeze_block_table(blocks: BlockTable) -> BlockTable:
+def _freeze_block_table(blocks: BlockIdGroups) -> BlockIdGroups:
     return tuple(tuple(group) for group in blocks)
-
-
-def _require_exact_payload(payload: _JsonValue, expected_keys: frozenset[str]) -> _JsonObject:
-    if not isinstance(payload, dict):
-        raise PathDecisionValidationError("serialized payload must be a dictionary")
-    if set(payload) != expected_keys:
-        raise PathDecisionValidationError(f"serialized payload fields must be exactly {sorted(expected_keys)}")
-    return payload
 
 
 def _validate_token_range(token_start: int, token_end: int) -> None:
@@ -41,7 +35,7 @@ def _validate_token_range(token_start: int, token_end: int) -> None:
         raise PathDecisionValidationError("token range must satisfy 0 <= token_start < token_end")
 
 
-def _validate_block_table(blocks: BlockTable, name: str) -> None:
+def _validate_block_table(blocks: BlockIdGroups, name: str) -> None:
     if not blocks:
         raise PathDecisionValidationError(f"{name} must contain at least one group")
     for group in blocks:
@@ -69,51 +63,53 @@ class ForwardPlan:
     request_key: DualPathRequestKey
     token_start: int
     token_end: int
-    source_block_ids: BlockTable
-    destination_block_ids: BlockTable
+    source_block_ids: BlockIdGroups
+    destination_block_ids: BlockIdGroups
 
     def __post_init__(self) -> None:
-        if not isinstance(self.request_key, DualPathRequestKey):
-            raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
-        _validate_token_range(self.token_start, self.token_end)
-        _validate_block_table(self.source_block_ids, "source_block_ids")
-        _validate_block_table(self.destination_block_ids, "destination_block_ids")
         object.__setattr__(self, "source_block_ids", _freeze_block_table(self.source_block_ids))
         object.__setattr__(
             self,
             "destination_block_ids",
             _freeze_block_table(self.destination_block_ids),
         )
+        if not isinstance(self.request_key, DualPathRequestKey):
+            raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
+        _validate_token_range(self.token_start, self.token_end)
+        _validate_block_table(self.source_block_ids, "source_block_ids")
+        _validate_block_table(self.destination_block_ids, "destination_block_ids")
 
 
 @dataclass(frozen=True)
 class ForwardReceiveBinding:
     request_key: DualPathRequestKey
-    path: Path
+    path: PathKind
     wire_request_id: str
     decode_request_id: str
-    destination_block_ids: BlockTable
+    destination_block_ids: BlockIdGroups
     token_start: int
     token_end: int
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "destination_block_ids",
+            _freeze_block_table(self.destination_block_ids),
+        )
         if not isinstance(self.request_key, DualPathRequestKey):
             raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
-        if not isinstance(self.path, Path):
-            raise PathDecisionValidationError("path must be a Path")
+        if not isinstance(self.path, PathKind):
+            raise PathDecisionValidationError("path must be a PathKind")
         _validate_non_empty_strings(
             (
                 ("wire_request_id", self.wire_request_id),
                 ("decode_request_id", self.decode_request_id),
             )
         )
+        if self.decode_request_id != self.request_key.decode_request_id:
+            raise PathDecisionValidationError("decode_request_id must match request_key.decode_request_id")
         _validate_token_range(self.token_start, self.token_end)
         _validate_block_table(self.destination_block_ids, "destination_block_ids")
-        object.__setattr__(
-            self,
-            "destination_block_ids",
-            _freeze_block_table(self.destination_block_ids),
-        )
 
 
 @dataclass(frozen=True)
@@ -122,8 +118,8 @@ class ReversePlan:
     wire_request_id: str
     token_start: int
     token_end: int
-    source_block_ids: BlockTable
-    destination_block_ids: BlockTable
+    source_block_ids: BlockIdGroups
+    destination_block_ids: BlockIdGroups
     remote_engine_id: str
     remote_host: str
     remote_port: int
@@ -158,6 +154,8 @@ class ReversePlan:
                 *((f"remote_block_sizes[{index}]", size) for index, size in enumerate(remote_block_sizes)),
             )
         )
+        if self.remote_port > 65535:
+            raise PathDecisionValidationError("remote_port must be in the range 1..65535")
 
         group_count = len(remote_block_sizes)
         if group_count == 0 or len(source_block_ids) != group_count or len(destination_block_ids) != group_count:
@@ -198,7 +196,7 @@ class ReversePlan:
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> "ReversePlan":
+    def from_dict(cls, payload: _JsonValue) -> ReversePlan:
         data = _require_exact_payload(
             payload,
             frozenset(
@@ -225,12 +223,12 @@ class ReversePlan:
                 wire_request_id=data["wire_request_id"],
                 token_start=data["token_start"],
                 token_end=data["token_end"],
-                source_block_ids=_freeze_block_table(data["source_block_ids"]),
-                destination_block_ids=_freeze_block_table(data["destination_block_ids"]),
+                source_block_ids=data["source_block_ids"],
+                destination_block_ids=data["destination_block_ids"],
                 remote_engine_id=data["remote_engine_id"],
                 remote_host=data["remote_host"],
                 remote_port=data["remote_port"],
-                remote_block_sizes=tuple(data["remote_block_sizes"]),
+                remote_block_sizes=data["remote_block_sizes"],
                 remote_tp_size=data["remote_tp_size"],
                 remote_pcp_size=data["remote_pcp_size"],
                 remote_dcp_size=data["remote_dcp_size"],
@@ -244,7 +242,7 @@ class ReverseReceiveBinding:
     request_key: DualPathRequestKey
     wire_request_id: str
     prefill_request_id: str
-    destination_block_ids: BlockTable
+    destination_block_ids: BlockIdGroups
     token_start: int
     token_end: int
 
@@ -275,9 +273,17 @@ class DualPathControlFailureMetadata:
     reason: DualPathControlFailureReason
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "invalid_block_ids", tuple(self.invalid_block_ids))
+        _validate_non_empty_strings((("request_id", self.request_id),))
+        if not self.invalid_block_ids:
+            raise PathDecisionValidationError("invalid_block_ids must contain at least one block id")
+        for block_id in self.invalid_block_ids:
+            if isinstance(block_id, bool) or not isinstance(block_id, int):
+                raise PathDecisionValidationError(
+                    "invalid_block_ids block ids must be integers and must not be booleans"
+                )
         if not isinstance(self.reason, DualPathControlFailureReason):
             raise PathDecisionValidationError("reason must be a DualPathControlFailureReason")
-        object.__setattr__(self, "invalid_block_ids", tuple(self.invalid_block_ids))
 
 
 class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):
@@ -285,6 +291,7 @@ class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):
     forward_receive_bindings: list[ForwardReceiveBinding]
     reverse_plans: list[ReversePlan]
     reverse_receive_bindings: list[ReverseReceiveBinding]
+    decode_store_metadata: AscendConnectorMetadata | None
 
     def __init__(self) -> None:
         super().__init__()
@@ -292,4 +299,4 @@ class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):
         self.forward_receive_bindings = []
         self.reverse_plans = []
         self.reverse_receive_bindings = []
-        self.decode_store_metadata: AscendConnectorMetadata | None = None
+        self.decode_store_metadata = None

@@ -15,8 +15,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
-    Path,
     PathDecisionValidationError,
+    PathKind,
 )
 
 
@@ -51,7 +51,7 @@ def _make_binding(
 ) -> ForwardReceiveBinding:
     return ForwardReceiveBinding(
         request_key=_key(),
-        path=Path.PE_READ,
+        path=PathKind.PE_READ,
         wire_request_id="wire-request-1",
         decode_request_id="request-1",
         destination_block_ids=destination_block_ids,
@@ -101,7 +101,7 @@ def test_mutating_constructor_inputs_does_not_leak_into_retained_objects():
     binding_destination = [[5, 6, 7]]
     binding = ForwardReceiveBinding(
         request_key=_key(),
-        path=Path.PE_READ,
+        path=PathKind.PE_READ,
         wire_request_id="wire-request-1",
         decode_request_id="request-1",
         destination_block_ids=binding_destination,

@@ -4,7 +4,7 @@
 The worker adapter is a lookup-only composition: a non-layerwise
 ``KVPoolWorker`` plus the existing ``LookupKeyServer`` bound only on the
 owning rank. These tests patch both collaborators at the adapter namespace;
-the lifecycle of a real server is covered by ``test_lookup_key_server_close``.
+the server lifetime follows the owning Worker process.
 """
 
 from unittest.mock import MagicMock, patch
@@ -118,19 +118,3 @@ def test_get_block_ids_with_load_errors_delegates_and_returns_exact_result(colla
     # Then
     assert result is expected
     mock_worker_cls.return_value.get_block_ids_with_load_errors.assert_called_once_with()
-
-
-def test_worker_close_idempotent_and_delegates_to_server_close(collaborators):
-    _, mock_server_cls = collaborators
-    adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=0), MagicMock())
-    adapter.close()
-    adapter.close()
-    mock_server_cls.return_value.close.assert_called_once()
-    assert adapter._lookup_server is None
-
-
-def test_worker_close_without_server_is_noop(collaborators):
-    adapter = KVPoolWorkerAdapter(_make_vllm_config(rank=1), MagicMock())
-    adapter.close()
-    adapter.close()
-    assert adapter._lookup_server is None

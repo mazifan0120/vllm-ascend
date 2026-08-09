@@ -37,6 +37,7 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput  # noqa: E402
 from vllm.v1.request import Request, RequestStatus  # noqa: E402
 from vllm.v1.structured_output import StructuredOutputManager  # noqa: E402
 
+from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state  # noqa: E402
 from tests.ut.distributed.kv_transfer.dual_path.test_de_local_store_full import (  # noqa: E402
     _make_real_store_worker_adapter,
 )
@@ -163,7 +164,7 @@ def _runner_output_for(requests: list[Request]) -> ModelRunnerOutput:
 def _make_bare_worker(
     load_result: list[int] | None,
 ) -> tuple[DualPathConnectorWorker, KVPoolWorkerAdapter, MagicMock]:
-    worker = object.__new__(DualPathConnectorWorker)
+    worker = init_dual_path_worker_state(object.__new__(DualPathConnectorWorker))
     worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
     worker.kv_recv_layer_thread = MagicMock(name="kv_recv_layer_thread")
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
@@ -172,11 +173,6 @@ def _make_bare_worker(
     worker.virtual_request = set()
     worker._recving_metadata = {}
     worker._invalid_block_ids = set()
-    worker._control_failed_recving = set()
-    worker._forward_receive_bindings = {}
-    worker._pending_forward_done = set()
-    worker._pending_forward_failed = set()
-    worker._consumed_forward_terminals = {}
     adapter, backend = _make_real_store_worker_adapter(load_result)
     worker._kvpool_worker_adapter = adapter
     worker.engine = MagicMock(name="transfer_engine")
@@ -675,7 +671,7 @@ class TestDecisionTimeoutIntegration:
             coordinator.register_pending.assert_called_once_with(state.request_key)
             proxy_http.assert_not_called()
             coordinator.submit.assert_not_called()
-            assert state.status is connector_module.DecodeDecisionStatus.PENDING
+            assert state.status is connector_module._DecodeDecisionStatus.PENDING
             assert state.deadline == 101.0
             assert dual._reqs_need_recv == {}
             assert block_pool.free_block_queue.num_free_blocks < baseline_free_blocks
@@ -715,7 +711,7 @@ class TestDecisionTimeoutIntegration:
             scheduler.update_from_output(timeout_scheduler_output, model_runner_output)
 
             # Then
-            assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
+            assert state.status is connector_module._DecodeDecisionStatus.TIMED_OUT
             assert connector_output.finished_recving == {request.request_id}
             assert connector_output.invalid_block_ids == set(external_block_ids)
             assert request.status is RequestStatus.FINISHED_ERROR
