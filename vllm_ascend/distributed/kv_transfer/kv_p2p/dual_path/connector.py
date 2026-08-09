@@ -1015,7 +1015,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         reason: DualPathControlFailureReason,
     ) -> DualPathControlFailureMetadata:
         block_size = self.block_size[0]
-        assert snapshot.local_tokens % block_size == 0
+        if snapshot.local_tokens % block_size != 0:
+            raise RuntimeError(
+                f"DualPath control failure metadata for request {request_id} requires "
+                f"local_tokens ({snapshot.local_tokens}) to be aligned to block_size ({block_size})"
+            )
         invalid_block_ids = snapshot.final_block_ids[0][snapshot.local_tokens // block_size :]
         assert invalid_block_ids
         return DualPathControlFailureMetadata(
@@ -1594,9 +1598,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         plan: ReversePlan,
         decode_request_id: str,
     ) -> MooncakeLayerwiseConnectorMetadata:
-        assert self.pd_head_ratio == 1 and not self.enable_kv_quant and not self.enable_c8_quant, (
-            "DualPath Reverse supports the plain Layerwise send path only"
-        )
+        if not (self.pd_head_ratio == 1 and not self.enable_kv_quant and not self.enable_c8_quant):
+            raise RuntimeError("DualPath Reverse supports the plain Layerwise send path only")
         metadata = MooncakeLayerwiseConnectorMetadata()
         req_meta = ReqMeta(
             local_block_ids=[list(group) for group in plan.source_block_ids],
@@ -1635,7 +1638,8 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 transfer_mappings[(host, port)]["remote_block_ids"][group_idx].extend(block_mapping["remote_block_ids"])
                 transfer_mappings[(host, port)]["trans_count"][group_idx] = block_mapping["trans_count"]
 
-        assert len(transfer_mappings) <= 1, f"Not support add mutil transfer task for req_id:{decode_request_id}"
+        if len(transfer_mappings) > 1:
+            raise RuntimeError(f"Not support add mutil transfer task for req_id:{decode_request_id}")
         for (host, port), block_mapping in transfer_mappings.items():
             update_req_meta = copy.deepcopy(req_meta)
             update_req_meta.remote_host = host
