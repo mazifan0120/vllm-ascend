@@ -32,6 +32,7 @@ import copy
 import math
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
@@ -276,6 +277,29 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         params = request.kv_transfer_params
         return params is not None and params.get("do_remote_prefill") is True
 
+    def _stage_prefill_activation_failure(
+        self,
+        request_id: str,
+        destination_block_ids: Sequence[int],
+        token_start: int,
+        token_end: int,
+    ) -> None:
+        block_size = self.block_size[0]
+        first_block = token_start // block_size
+        last_block = math.ceil(token_end / block_size)
+        failure = DualPathControlFailureMetadata(
+            request_id=request_id,
+            invalid_block_ids=tuple(destination_block_ids[first_block:last_block]),
+            reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+        )
+        existing = self._pe_control_failures.get(request_id)
+        if existing is not None and existing != failure:
+            raise RuntimeError(
+                f"DualPath Prefill request {request_id} got a conflicting local control failure; "
+                "the original failure is preserved"
+            )
+        self._pe_control_failures[request_id] = failure
+
     def _sweep_pe_delivery(self, released_key: DualPathRequestKey | None = None) -> None:
         if self._path_decider is None:
             return
@@ -314,21 +338,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                         continue
                                     destination_block_ids = forward_plan.source_block_ids[0]
                                     token_end = forward_plan.token_start
-                                block_size = self.block_size[0]
-                                first_block = token_start // block_size
-                                last_block = math.ceil(token_end / block_size)
-                                failure = DualPathControlFailureMetadata(
-                                    request_id=request_id,
-                                    invalid_block_ids=tuple(destination_block_ids[first_block:last_block]),
-                                    reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+                                self._stage_prefill_activation_failure(
+                                    request_id,
+                                    destination_block_ids,
+                                    token_start,
+                                    token_end,
                                 )
-                                existing = self._pe_control_failures.get(request_id)
-                                if existing is not None and existing != failure:
-                                    raise RuntimeError(
-                                        f"DualPath Prefill request {request_id} got a conflicting local "
-                                        "control failure; the original failure is preserved"
-                                    )
-                                self._pe_control_failures[request_id] = failure
                                 self._pe_invalid_request_ids.add(request_id)
                                 self._pe_pending_reverse_receive_bindings.pop(request_id, None)
                             case Path.PE_READ:
@@ -684,23 +699,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         token_start: int,
         token_end: int,
     ) -> None:
-        block_size = self.block_size[0]
-        first_block = token_start // block_size
-        last_block = math.ceil(token_end / block_size)
         destination_block_ids = blocks.get_block_ids()[0]
-        invalid_block_ids = tuple(destination_block_ids[first_block:last_block])
-        failure = DualPathControlFailureMetadata(
-            request_id=request.request_id,
-            invalid_block_ids=invalid_block_ids,
-            reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+        self._stage_prefill_activation_failure(
+            request.request_id,
+            destination_block_ids,
+            token_start,
+            token_end,
         )
-        existing = self._pe_control_failures.get(request.request_id)
-        if existing is not None and existing != failure:
-            raise RuntimeError(
-                f"DualPath Prefill request {request.request_id} got a conflicting local control failure; "
-                "the original failure is preserved"
-            )
-        self._pe_control_failures[request.request_id] = failure
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         if not self._is_task01_decode_request(request):
@@ -1031,6 +1036,22 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         params["do_remote_prefill"] = False
 
+    def _build_external_control_failure(
+        self,
+        request_id: str,
+        snapshot: DecodeKVSnapshot,
+        reason: DualPathControlFailureReason,
+    ) -> DualPathControlFailureMetadata:
+        block_size = self.block_size[0]
+        assert snapshot.local_tokens % block_size == 0
+        invalid_block_ids = snapshot.final_block_ids[0][snapshot.local_tokens // block_size :]
+        assert invalid_block_ids
+        return DualPathControlFailureMetadata(
+            request_id=request_id,
+            invalid_block_ids=invalid_block_ids,
+            reason=reason,
+        )
+
     def _activate_committed_decision(
         self,
         decision: PathDecision,
@@ -1150,15 +1171,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             logger.error("DualPath Decode activation failed for request %s: %s", request_id, error)
             state.status = DecodeDecisionStatus.ACTIVATION_FAILED
             self._path_decision_coordinator.unregister(state.request_key)
-            block_size = self.block_size[0]
-            assert snapshot.local_tokens % block_size == 0
-            invalid_block_ids = snapshot.final_block_ids[0][snapshot.local_tokens // block_size :]
-            assert invalid_block_ids
             metadata.control_failures.append(
-                DualPathControlFailureMetadata(
-                    request_id=request_id,
-                    invalid_block_ids=invalid_block_ids,
-                    reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+                self._build_external_control_failure(
+                    request_id,
+                    snapshot,
+                    DualPathControlFailureReason.ACTIVATION_FAILED,
                 )
             )
             return
@@ -1245,16 +1262,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             state.status = DecodeDecisionStatus.TIMED_OUT
             coordinator.unregister(state.request_key)
             snapshot = self._decode_kv_snapshots[request_id]
-            block_size = self.block_size[0]
-            assert snapshot.local_tokens % block_size == 0
-            first_external_block = snapshot.local_tokens // block_size
-            invalid_block_ids = snapshot.final_block_ids[0][first_external_block:]
-            assert invalid_block_ids
             metadata.control_failures.append(
-                DualPathControlFailureMetadata(
-                    request_id=request_id,
-                    invalid_block_ids=invalid_block_ids,
-                    reason=DualPathControlFailureReason.DECISION_TIMEOUT,
+                self._build_external_control_failure(
+                    request_id,
+                    snapshot,
+                    DualPathControlFailureReason.DECISION_TIMEOUT,
                 )
             )
 
@@ -1272,7 +1284,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         return metadata
 
-    def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict | None]:
+    def _release_scheduler_request_state(self, request: Request) -> None:
         request_id = request.request_id
         self._lookup_results.pop(request_id, None)
         self._decode_kv_snapshots.pop(request_id, None)
@@ -1292,30 +1304,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             released_key = self._pe_request_keys.pop(request_id, None)
             self._pe_invalid_request_ids.discard(request_id)
             self._sweep_pe_delivery(released_key)
+
+    def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict | None]:
+        self._release_scheduler_request_state(request)
         return super().request_finished(request, block_ids)
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict | None]:
-        request_id = request.request_id
-        self._lookup_results.pop(request_id, None)
-        self._decode_kv_snapshots.pop(request_id, None)
-        state = self._decode_decision_states.pop(request_id, None)
-        if state is not None:
-            self._path_decision_coordinator.unregister(state.request_key)
-        if self.dual_path_cfg.role == "prefill":
-            self._pe_prefill_local_tokens.pop(request_id, None)
-            self._pe_path_results.pop(request_id, None)
-            self._pe_forward_plans.pop(request_id, None)
-            self._pe_pending_reverse_receive_bindings.pop(request_id, None)
-            self._pe_control_failures.pop(request_id, None)
-            owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
-            send_req_info = self._reqs_need_send_layerwise.get(request_id)
-            if owned_send_req_info is send_req_info and send_req_info is not None and send_req_info.request is request:
-                self._reqs_need_send_layerwise.pop(request_id)
-            released_key = self._pe_request_keys.pop(request_id, None)
-            self._pe_invalid_request_ids.discard(request_id)
-            self._sweep_pe_delivery(released_key)
+        self._release_scheduler_request_state(request)
         return super().request_finished_all_groups(request, block_ids)
 
     def shutdown(self) -> None:
