@@ -308,6 +308,20 @@ def test_pe_read_forward_done_still_completes_immediately() -> None:
     assert worker._split_trackers == {}
 
 
+def test_unconsumed_pe_read_forward_binding_is_released_on_request_finish() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_store=False)
+    binding = replace(metadata.forward_receive_bindings[0], path=Path.PE_READ)
+    metadata.forward_receive_bindings[:] = [binding]
+    worker.start_load_kv(metadata)
+
+    finished = worker.get_finished({DECODE_REQUEST_ID}, metadata)
+
+    assert finished == (set(), set())
+    assert DECODE_REQUEST_ID not in worker._forward_receive_bindings
+    assert WIRE_REQUEST_ID not in worker.request_map
+
+
 def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -> None:
     decode_worker = _make_worker()
     decode_metadata = _make_split_metadata(include_store=False)

@@ -1503,7 +1503,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         reverse_plans = getattr(self, "_reverse_plans", {})
         for request_id in finished_req_ids:
             binding = self._forward_receive_bindings.get(request_id)
-            if binding is not None and binding.path is Path.DE_READ:
+            if binding is not None:
                 if self.request_map.get(binding.wire_request_id) == request_id:
                     self.request_map.pop(binding.wire_request_id)
                 self._forward_receive_bindings.pop(request_id)
