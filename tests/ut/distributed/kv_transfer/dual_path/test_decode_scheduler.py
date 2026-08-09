@@ -398,13 +398,6 @@ class TestDecodeAdmission(unittest.TestCase):
             self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 32)
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
 
-    def test_reprobe_of_admitted_request_raises(self):
-        request = _make_request("req-reprobe", 48, _selected_params())
-        self._admit(request, 16)
-        request.kv_transfer_params["do_remote_prefill"] = True
-        with self.assertRaisesRegex(RuntimeError, "already admitted"):
-            self.scheduler.get_num_new_matched_tokens(request, 16)
-
     def test_selected_request_skips_parent_recv_queue_and_metaserver(self):
         request = _make_request("req-skip", 48, _selected_params())
         self._admit(request, 16)

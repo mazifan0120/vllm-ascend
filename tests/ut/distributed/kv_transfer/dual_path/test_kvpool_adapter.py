@@ -305,65 +305,6 @@ def test_partial_commit_delegates_exact_delta_and_blocks(mock_lookup_client_cls)
     update_state_after_alloc.assert_called_once_with(request, blocks, 16)
 
 
-@pytest.mark.parametrize("kvpool_cached_tokens", [32, 48])
-def test_commit_after_alloc_rejects_duplicate_commit(mock_lookup_client_cls, kvpool_cached_tokens):
-    # Given
-    adapter = _make_commit_adapter()
-    request = _make_request("req-duplicate", 49)
-    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=kvpool_cached_tokens, can_load=False)
-    existing_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=kvpool_cached_tokens, can_load=True)
-    adapter._pool_scheduler.load_specs[request.request_id] = existing_spec
-
-    # When
-    with (
-        patch.object(adapter._pool_scheduler, "update_state_after_alloc") as update_state_after_alloc,
-        pytest.raises(RuntimeError, match="already committed"),
-    ):
-        adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
-
-    # Then
-    assert adapter._pool_scheduler.load_specs[request.request_id] is existing_spec
-    update_state_after_alloc.assert_not_called()
-
-
-def test_commit_after_alloc_rejects_duplicate_after_metadata_consumes_load_spec(mock_lookup_client_cls):
-    # Given
-    adapter = _make_commit_adapter()
-    request = _make_request("req-duplicate-after-metadata", 49)
-    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
-    blocks = _make_blocks([[7, 8, 9]])
-    adapter.commit_after_alloc(request, blocks, detached_spec)
-    scheduler_output = SchedulerOutput.make_empty()
-    scheduler_output.preempted_req_ids = set()
-    adapter.build_connector_meta(scheduler_output)
-    pool = adapter._pool_scheduler
-    assert request.request_id not in pool.load_specs
-    assert request.request_id in pool._unfinished_requests
-    assert request.request_id in pool._unfinished_request_ids
-    assert request.request_id in pool._loading_req_ids
-
-    # When / Then
-    with pytest.raises(RuntimeError, match="already committed"):
-        adapter.commit_after_alloc(request, blocks, detached_spec)
-
-
-def test_commit_after_alloc_rejects_request_tracker_owned_duplicate(mock_lookup_client_cls):
-    adapter = _make_commit_adapter()
-    request = _make_request("req-tracker-duplicate", 49)
-    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
-    existing_tracker = MagicMock(name="existing_tracker")
-    adapter._pool_scheduler._request_trackers[request.request_id] = existing_tracker
-
-    with (
-        patch.object(adapter._pool_scheduler, "update_state_after_alloc") as update_state_after_alloc,
-        pytest.raises(RuntimeError, match="already committed"),
-    ):
-        adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
-
-    assert adapter._pool_scheduler._request_trackers[request.request_id] is existing_tracker
-    update_state_after_alloc.assert_not_called()
-
-
 def test_terminal_metadata_cleanup_releases_commit_ownership(mock_lookup_client_cls):
     # Given
     adapter = _make_commit_adapter()
@@ -389,37 +330,6 @@ def test_terminal_metadata_cleanup_releases_commit_ownership(mock_lookup_client_
     assert request.request_id not in pool._loading_req_ids
     adapter.commit_after_alloc(request, blocks, detached_spec)
     assert request.request_id in pool.load_specs
-
-
-@pytest.mark.parametrize(
-    ("kv_role", "use_layerwise", "num_tokens", "detached_spec"),
-    [
-        ("kv_producer", False, 49, LoadSpec(16, 48, can_load=False)),
-        ("kv_consumer", True, 49, LoadSpec(16, 48, can_load=False)),
-    ],
-)
-def test_commit_after_alloc_rejects_invalid_preconditions_without_state(
-    mock_lookup_client_cls,
-    kv_role,
-    use_layerwise,
-    num_tokens,
-    detached_spec,
-):
-    # Given
-    adapter = _make_commit_adapter()
-    adapter._pool_scheduler.kv_role = kv_role
-    adapter._pool_scheduler.use_layerwise = use_layerwise
-    request = _make_request("req-invalid", num_tokens)
-
-    # When
-    with pytest.raises(RuntimeError):
-        adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
-
-    # Then
-    assert adapter._pool_scheduler.load_specs == {}
-    assert adapter._pool_scheduler._unfinished_requests == {}
-    assert adapter._pool_scheduler._unfinished_request_ids == set()
-    assert adapter._pool_scheduler._loading_req_ids == set()
 
 
 @pytest.mark.parametrize(
@@ -460,35 +370,6 @@ def test_commit_after_alloc_rolls_back_adapter_created_state_on_delegated_failur
     assert request.request_id not in adapter._pool_scheduler._unfinished_request_ids
     assert request.request_id not in adapter._pool_scheduler._loading_req_ids
     assert detached_spec.can_load is False
-
-
-@pytest.mark.parametrize(
-    "detached_spec",
-    [
-        LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=16, can_load=False),
-        LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=49, can_load=False),
-        LoadSpec(vllm_cached_tokens=-1, kvpool_cached_tokens=32, can_load=False),
-    ],
-)
-def test_commit_rejects_out_of_range_partial_preconditions(mock_lookup_client_cls, detached_spec):
-    # Given
-    adapter = _make_commit_adapter()
-    request = _make_request("req-partial-range", 49)
-
-    # When
-    with (
-        patch.object(adapter._pool_scheduler, "update_state_after_alloc") as update_state_after_alloc,
-        pytest.raises(RuntimeError),
-    ):
-        adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
-
-    # Then
-    pool = adapter._pool_scheduler
-    assert pool.load_specs == {}
-    assert pool._unfinished_requests == {}
-    assert pool._unfinished_request_ids == set()
-    assert pool._loading_req_ids == set()
-    update_state_after_alloc.assert_not_called()
 
 
 def test_build_connector_meta_emits_one_async_load_reqmeta_with_ready_boundary(mock_lookup_client_cls):

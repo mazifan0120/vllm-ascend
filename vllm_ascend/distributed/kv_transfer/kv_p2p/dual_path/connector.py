@@ -292,12 +292,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             invalid_block_ids=tuple(destination_block_ids[first_block:last_block]),
             reason=DualPathControlFailureReason.ACTIVATION_FAILED,
         )
-        existing = self._pe_control_failures.get(request_id)
-        if existing is not None and existing != failure:
-            raise RuntimeError(
-                f"DualPath Prefill request {request_id} got a conflicting local control failure; "
-                "the original failure is preserved"
-            )
         self._pe_control_failures[request_id] = failure
 
     def _sweep_pe_delivery(self, released_key: DualPathRequestKey | None = None) -> None:
@@ -425,15 +419,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._pe_invalid_request_ids.add(request_id)
             return parent_result
 
-        retained_result = self._pe_path_results.get(request_id)
-        if retained_result is None:
-            self._pe_path_results[request_id] = result
-        elif retained_result != result:
-            self._pe_invalid_request_ids.add(request_id)
-            raise RuntimeError(
-                f"DualPath Prefill request {request_id} got a conflicting retained path result; "
-                "the original result is preserved"
-            )
+        self._pe_path_results.setdefault(request_id, result)
 
         eligibility = "singleton" if prefill_local_tokens >= decision_request.decode_store_tokens else "policy"
         if result.path is Path.PE_READ:
@@ -710,11 +696,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return parent_result
 
         request_id = request.request_id
-        if request_id in self._decode_kv_snapshots:
-            raise RuntimeError(
-                f"DualPath request {request_id} is already admitted; a new initial lookup is a lifecycle error"
-            )
-
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
         ready_tokens = max(request.num_tokens - 1, 0)
         local_tokens = num_computed_tokens
@@ -728,13 +709,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # HBM-complete: no KVPool lookup, no Task-01 state.
             self._lookup_results.pop(request_id, None)
             return 0, False
-
-        if not 0 <= local_tokens < ready_tokens <= transfer_tokens:
-            raise RuntimeError(
-                f"DualPath request {request_id} Store lookup requires "
-                f"0 <= local_tokens ({local_tokens}) < ready_tokens ({ready_tokens}) "
-                f"<= transfer_tokens ({transfer_tokens})"
-            )
 
         cached = self._lookup_results.get(request_id)
         if cached is not None:

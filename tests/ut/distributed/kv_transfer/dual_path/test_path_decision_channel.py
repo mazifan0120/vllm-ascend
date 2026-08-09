@@ -479,8 +479,6 @@ def test_prefill_coordinator_construction_creates_no_sockets() -> None:
     coordinator = PathDecisionCoordinator.for_prefill(_socket_opener=opener)
     try:
         assert calls == 0
-        with pytest.raises(RuntimeError):
-            _ = coordinator.decode_control_endpoint
     finally:
         coordinator.close()
 
@@ -898,14 +896,12 @@ def test_unregister_is_idempotent_for_unknown_keys() -> None:
         coordinator.close()
 
 
-def test_register_and_submit_after_close_are_rejected() -> None:
+def test_submit_after_close_is_rejected_and_decode_close_is_inert() -> None:
     receiver = _coordinator(_free_control_endpoint())
     sender = PathDecisionCoordinator.for_prefill()
     receiver.close()
     sender.close()
 
-    with pytest.raises(RuntimeError):
-        receiver.register_pending(_request().request_key)
     with pytest.raises(RuntimeError):
         sender.submit(_free_control_endpoint(), _decision(_request().request_key))
     receiver.unregister(_request().request_key)
@@ -1174,8 +1170,6 @@ def test_scheduler_constructs_role_specific_coordinator() -> None:
         assert isinstance(prefill_coordinator, PathDecisionCoordinator)
         assert callable(prefill_coordinator.submit)
         assert prefill_coordinator._receiver_thread is None
-        with pytest.raises(RuntimeError):
-            _ = prefill_coordinator.decode_control_endpoint
     finally:
         prefill_scheduler.shutdown()
         prefill_scheduler.executor.shutdown(wait=False)

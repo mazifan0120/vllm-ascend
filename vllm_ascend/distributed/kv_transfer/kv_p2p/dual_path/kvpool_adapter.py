@@ -104,25 +104,7 @@ class KVPoolAdapter:
     ) -> None:
         pool = self._pool_scheduler
         request_id = request.request_id
-        ready_tokens = max(request.num_tokens - 1, 0)
         store_delta = load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens
-
-        if pool.kv_role not in {"kv_consumer", "kv_both"} or pool.use_layerwise:
-            raise RuntimeError("DualPath KVPool commit requires a non-layerwise Decode-owned scheduler")
-        if not 0 <= load_spec.vllm_cached_tokens < load_spec.kvpool_cached_tokens <= ready_tokens:
-            raise RuntimeError(
-                f"DualPath KVPool commit token range is invalid for request {request_id}: "
-                f"local={load_spec.vllm_cached_tokens}, store={load_spec.kvpool_cached_tokens}, "
-                f"ready={ready_tokens}"
-            )
-        if (
-            request_id in pool.load_specs
-            or request_id in pool._request_trackers
-            or request_id in pool._unfinished_requests
-            or request_id in pool._unfinished_request_ids
-            or request_id in pool._loading_req_ids
-        ):
-            raise RuntimeError(f"DualPath KVPool request {request_id} is already committed")
 
         pool.load_specs[request_id] = dataclasses.replace(load_spec)
         try:

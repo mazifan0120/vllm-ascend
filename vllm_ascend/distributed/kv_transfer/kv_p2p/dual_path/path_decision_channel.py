@@ -337,32 +337,24 @@ class PathDecisionCoordinator:
 
     @property
     def decode_engine_instance_id(self) -> str:
-        self._require_role("decode")
         assert self._decode_engine_instance_id is not None
         return self._decode_engine_instance_id
 
     @property
     def decode_control_endpoint(self) -> DecodeControlEndpoint:
-        self._require_role("decode")
         assert self._decode_control_endpoint is not None
         return self._decode_control_endpoint
 
     def register_pending(self, key: DualPathRequestKey) -> None:
-        self._require_role("decode")
-        with self._lifecycle_lock:
-            if self._closed:
-                raise RuntimeError("path decision coordinator is closed")
-            with self._registry_lock:
-                self._pending_keys.add(key)
+        with self._lifecycle_lock, self._registry_lock:
+            self._pending_keys.add(key)
 
     def unregister(self, key: DualPathRequestKey) -> None:
-        self._require_role("decode")
         with self._registry_lock:
             self._pending_keys.discard(key)
             self._accepted_decisions.pop(key, None)
 
     def take_received_decisions(self) -> list[PathDecision]:
-        self._require_role("decode")
         if self._closed:
             return []
         decisions: list[PathDecision] = []
@@ -378,7 +370,6 @@ class PathDecisionCoordinator:
         endpoint: DecodeControlEndpoint,
         decision: PathDecision,
     ) -> Future[None]:
-        self._require_role("prefill")
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("path decision coordinator is closed")
@@ -414,10 +405,6 @@ class PathDecisionCoordinator:
         elif self._role == "prefill":
             assert self._executor is not None
             self._executor.shutdown(wait=True, cancel_futures=True)
-
-    def _require_role(self, role: str) -> None:
-        if self._role != role:
-            raise RuntimeError(f"path decision coordinator does not support {role} operations")
 
     def _receive_results(self, ready_event: threading.Event) -> None:
         assert self._context is not None
