@@ -162,9 +162,6 @@ class DecodePathDecisionState:
     request: Request
     deadline: float
     status: DecodeDecisionStatus
-    result: PathDecisionResult | None = None
-    proxy_future: Future[None] | None = None
-    timeout_reported: bool = False
 
 
 def build_remote_decode_message(
@@ -354,7 +351,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         params = request.kv_transfer_params
         if (
             not self._accepting_pe_decisions
-            or self.dual_path_cfg.role != "prefill"
             or params is None
             or params.get("do_remote_decode") is not True
             or "dual_path" not in params
@@ -566,15 +562,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         result = self._pe_path_results.get(request_id)
         if result is None:
             return
-        match result.path:
-            case Path.DE_READ:
-                return
-            case Path.PE_READ:
-                token_start = DualPathDecisionMetadata.from_dict(
-                    request.kv_transfer_params["dual_path"]
-                ).decision_request.decode_local_tokens
-            case unreachable:
-                assert_never(unreachable)
+        token_start = DualPathDecisionMetadata.from_dict(
+            request.kv_transfer_params["dual_path"]
+        ).decision_request.decode_local_tokens
 
         try:
             prepared = self._prepare_forward_plan(request, blocks, token_start)
@@ -1027,7 +1017,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     error,
                 )
             else:
-                state.proxy_future = future
 
                 def log_proxy_failure(completed_future: Future[None]) -> None:
                     error = completed_future.exception()
@@ -1177,7 +1166,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if reverse_plan is not None:
             metadata.reverse_plans.append(reverse_plan)
         metadata.forward_receive_bindings.append(binding)
-        state.result = result
         state.status = DecodeDecisionStatus.COMMITTED
         match result.path:
             case Path.PE_READ:
@@ -1269,7 +1257,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     reason=DualPathControlFailureReason.DECISION_TIMEOUT,
                 )
             )
-            state.timeout_reported = True
 
         assert self._kvpool_adapter is not None
         store_metadata = self._kvpool_adapter.build_connector_meta(scheduler_output)
@@ -1291,7 +1278,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_kv_snapshots.pop(request_id, None)
         state = self._decode_decision_states.pop(request_id, None)
         if state is not None:
-            state.proxy_future = None
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
             self._pe_prefill_local_tokens.pop(request_id, None)
@@ -1316,7 +1302,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_kv_snapshots.pop(request_id, None)
         state = self._decode_decision_states.pop(request_id, None)
         if state is not None:
-            state.proxy_future = None
             self._path_decision_coordinator.unregister(state.request_key)
         if self.dual_path_cfg.role == "prefill":
             self._pe_prefill_local_tokens.pop(request_id, None)
@@ -1340,8 +1325,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._path_decision_coordinator.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.metaserver_client.close()
-        for state in self._decode_decision_states.values():
-            state.proxy_future = None
         if self._path_decider is not None:
             retained_keys = set(self._pe_request_keys.values())
             retained_keys.update(self._pe_delivery_futures)

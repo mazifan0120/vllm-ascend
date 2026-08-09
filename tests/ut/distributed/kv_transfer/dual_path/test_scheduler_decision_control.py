@@ -503,7 +503,7 @@ class TestDecodeAdmissionControl:
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         assert state.status is connector_module.DecodeDecisionStatus.PENDING
-        assert state.proxy_future is future
+        decode_scheduler.executor.submit.assert_called_once()
 
     def test_synchronous_executor_failure_remains_pending_without_retry(self, decode_scheduler):
         decode_scheduler.executor.submit.side_effect = RuntimeError("executor closed")
@@ -511,7 +511,6 @@ class TestDecodeAdmissionControl:
             request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         assert state.status is connector_module.DecodeDecisionStatus.PENDING
-        assert state.proxy_future is None
         decode_scheduler.executor.submit.assert_called_once()
         log_error.assert_called_once()
 
@@ -522,7 +521,6 @@ class TestDecodeAdmissionControl:
             request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         assert state.status is connector_module.DecodeDecisionStatus.PENDING
-        assert state.proxy_future is future
         decode_scheduler.executor.submit.assert_called_once()
         log_error.assert_called_once()
 
@@ -537,7 +535,6 @@ class TestDecodeAdmissionControl:
         state = decode_scheduler._decode_decision_states[request.request_id]
         assert state.status is connector_module.DecodeDecisionStatus.PENDING
         assert state.deadline == 90.0
-        assert state.proxy_future is None
         decode_scheduler.executor.submit.assert_not_called()
 
 
@@ -946,7 +943,6 @@ class TestDecodeResultConsumption:
         # Then
         state = decode_scheduler._decode_decision_states[request.request_id]
         assert state.status is connector_module.DecodeDecisionStatus.COMMITTED
-        assert state.result is result
         assert metadata.control_failures == []
         assert request.request_id not in metadata.requests
         assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -990,7 +986,6 @@ class TestDecodeResultConsumption:
 
         # Then
         assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
-        assert state.timeout_reported is True
         assert metadata.requests == {}
         assert metadata.control_failures == [
             connector_module.DualPathControlFailureMetadata(
@@ -1031,7 +1026,6 @@ class TestDecodeResultConsumption:
 
         # Then
         assert state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
-        assert state.result is None
         assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
@@ -1159,7 +1153,6 @@ class TestCleanupAndShutdown:
         assert decode_scheduler._lookup_results == {}
         assert decode_scheduler._decode_kv_snapshots == {}
         assert decode_scheduler._decode_decision_states == {}
-        assert state.proxy_future is None
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
         parent_finish.assert_called_once_with(decode_scheduler, request, block_ids)
 
@@ -1178,7 +1171,6 @@ class TestCleanupAndShutdown:
         # Then
         assert result == (False, None)
         assert request.request_id not in decode_scheduler._decode_decision_states
-        assert state.proxy_future is None
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
     def test_cancellation_after_timeout_unregisters_idempotently(self, decode_scheduler, task04_seams):
@@ -1196,7 +1188,6 @@ class TestCleanupAndShutdown:
         # Then
         assert result == (False, None)
         assert request.request_id not in decode_scheduler._decode_decision_states
-        assert state.proxy_future is None
         assert task04_seams.decode_coordinator.unregister.call_args_list == [
             call(state.request_key),
             call(state.request_key),
@@ -1317,7 +1308,6 @@ class TestCleanupAndShutdown:
         task04_seams.prefill_coordinator.submit.assert_called_once()
         decode_scheduler.executor.submit.assert_called_once()
         assert decode_state.status is connector_module.DecodeDecisionStatus.TIMED_OUT
-        assert decode_state.result is None
         assert metadata.control_failures == [
             connector_module.DualPathControlFailureMetadata(
                 request_id=decode_request.request_id,
@@ -1429,13 +1419,10 @@ class TestCleanupAndShutdown:
         task04_seams,
     ):
         # Given
-        committed_proxy_future = _completed_future()
-        timed_out_proxy_future = _completed_future()
-        cancelled_proxy_future = _completed_future()
         decode_scheduler.executor.submit.side_effect = [
-            committed_proxy_future,
-            timed_out_proxy_future,
-            cancelled_proxy_future,
+            _completed_future(),
+            _completed_future(),
+            _completed_future(),
         ]
         committed_request, _ = _admit_request(
             decode_scheduler,
@@ -1455,9 +1442,6 @@ class TestCleanupAndShutdown:
         committed_state = decode_scheduler._decode_decision_states[committed_request.request_id]
         timed_out_state = decode_scheduler._decode_decision_states[timed_out_request.request_id]
         cancelled_state = decode_scheduler._decode_decision_states[cancelled_request.request_id]
-        assert committed_state.proxy_future is committed_proxy_future
-        assert timed_out_state.proxy_future is timed_out_proxy_future
-        assert cancelled_state.proxy_future is cancelled_proxy_future
 
         completed_delivery_future = _completed_future()
         inflight_delivery_future: Future[None] = Future()
@@ -1510,9 +1494,6 @@ class TestCleanupAndShutdown:
             committed_request.request_id,
             timed_out_request.request_id,
         }
-        assert committed_state.proxy_future is committed_proxy_future
-        assert timed_out_state.proxy_future is timed_out_proxy_future
-        assert cancelled_state.proxy_future is None
         assert timeout_metadata.control_failures == [
             connector_module.DualPathControlFailureMetadata(
                 request_id=timed_out_request.request_id,
@@ -1548,9 +1529,6 @@ class TestCleanupAndShutdown:
         decode_scheduler.request_finished(timed_out_request, [51, 52, 53, 54])
         assert decode_scheduler._decode_decision_states == {}
         assert decode_scheduler._decode_kv_snapshots == {}
-        assert committed_state.proxy_future is None
-        assert timed_out_state.proxy_future is None
-        assert cancelled_state.proxy_future is None
         assert task04_seams.decode_coordinator.unregister.call_args_list == [
             call(cancelled_state.request_key),
             call(timed_out_state.request_key),
@@ -1563,7 +1541,6 @@ class TestCleanupAndShutdown:
         # Given
         decode_scheduler = scheduler_factory(role="decode")
         decode_request, _ = _admit(decode_scheduler)
-        decode_state = decode_scheduler._decode_decision_states[decode_request.request_id]
 
         delivery_future: Future[None] = Future()
         task04_seams.prefill_coordinator.submit.return_value = delivery_future
@@ -1612,7 +1589,6 @@ class TestCleanupAndShutdown:
                     "decode-adapter",
                     task04_seams.decode_coordinator.close.call_count,
                     not decode_scheduler._decode_decision_states,
-                    decode_state.proxy_future is None,
                 )
             )
 
@@ -1638,7 +1614,7 @@ class TestCleanupAndShutdown:
         # Then
         assert events[:4] == [
             ("decode-coordinator", False, False, True),
-            ("decode-adapter", 1, True, True),
+            ("decode-adapter", 1, True),
             ("prefill-coordinator", False, False, True, True),
             ("worker-adapter", True),
         ]
