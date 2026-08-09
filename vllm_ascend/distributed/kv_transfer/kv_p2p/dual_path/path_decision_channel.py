@@ -469,20 +469,19 @@ class PathDecisionCoordinator:
         if key.decode_engine_instance_id != self.decode_engine_instance_id:
             logger.warning("path decision result receiver rejected wrong-incarnation key")
             return
-        match result.path:
-            case Path.PE_READ:
-                if decision.reverse_plan is not None:
-                    logger.warning("path decision result receiver rejected PE_READ Reverse plan")
-                    return
-            case Path.DE_READ:
-                if decision.reverse_plan is None:
-                    logger.warning("path decision result receiver rejected DE_READ without Reverse plan")
-                    return
-                if decision.reverse_plan.request_key != key:
-                    logger.warning("path decision result receiver rejected mismatched Reverse plan key")
-                    return
-            case unreachable:
-                assert_never(unreachable)
+        if result.path is Path.PE_READ:
+            if decision.reverse_plan is not None:
+                logger.warning("path decision result receiver rejected PE_READ Reverse plan")
+                return
+        elif result.path is Path.DE_READ:
+            if decision.reverse_plan is None:
+                logger.warning("path decision result receiver rejected DE_READ without Reverse plan")
+                return
+            if decision.reverse_plan.request_key != key:
+                logger.warning("path decision result receiver rejected mismatched Reverse plan key")
+                return
+        else:
+            assert_never(result.path)
         with self._registry_lock:
             if key not in self._pending_keys:
                 logger.warning("path decision result receiver rejected unknown or stale key")
