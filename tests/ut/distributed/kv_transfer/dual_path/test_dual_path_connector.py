@@ -351,7 +351,10 @@ class TestDualPathConfig(unittest.TestCase):
         )
 
     def assert_removed_field_rejected(self, field_name):
-        pattern = rf"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*{field_name})(?=.*fail fast)"
+        pattern = (
+            rf"(?=.*unsupported kv_connector_extra_config key\(s\))(?=.*{field_name})"
+            r"(?=.*not part of the DualPath foundation configuration)"
+        )
         with self.assertRaisesRegex(ValueError, pattern):
             DualPathConfig.from_extra_config(
                 {"role": "prefill", field_name: True},

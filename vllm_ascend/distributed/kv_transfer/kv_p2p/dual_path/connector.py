@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DualPathConnector — behavior-preserving alias of MooncakeLayerwiseConnector.
+"""Dual-path KV transfer built on ``MooncakeLayerwiseConnector``.
 
-PR-00 foundation scope: this connector inherits ``MooncakeLayerwiseConnector``
-unchanged in behavior, so an ordinary Layerwise workload runs exactly as it
-does today. It exists to create safe Scheduler and Worker subclass seams for
-later PRs; it adds no DualPath decision or data path.
+``DualPathConnector`` preserves ordinary Layerwise behavior while adding
+Decode admission through the local Store, Prefill-owned path selection, and
+production ``PE_READ`` and ``DE_READ`` transfer routes. Store-full requests
+remain local to Decode; non-full requests use the selected forward or split
+Reverse/Forward route.
 
 Why inheritance + a custom ``__init__``:
     ``MooncakeLayerwiseConnector.__init__`` hard-instantiates its own
@@ -142,7 +143,7 @@ class _SplitPhase(str, Enum):
 
 @dataclass(slots=True)
 class _SplitTracker:
-    """Mutable DE-local execution state for one injected split request."""
+    """Mutable DE-local execution state for one split request."""
 
     store_phase: _SplitPhase
     reverse_phase: _SplitPhase
@@ -194,14 +195,12 @@ def build_remote_decode_message(
 class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     """Scheduler side of DualPathConnector.
 
-    Task-01: for a Decode-role request carrying ``do_remote_prefill=True``,
-    owns the admission path from initial HBM lookup through final slot
-    allocation: ``get_num_new_matched_tokens`` returns the route-dependent
-    external delta ``E_DE = T - L_DE`` for remote-required requests (never the
-    Store hit), and ``update_state_after_alloc`` binds the frozen final blocks
-    into a ``DecodeKVSnapshot``. Task-04 adds the Prefill decision hook and
-    suppresses inherited Forward queueing for its ``dual_path`` envelope.
-    Requests outside those contracted shapes delegate to the parent unchanged.
+    Decode admission combines HBM and Store lookup state, freezes final block
+    allocation, receives the Prefill decision, and installs the Store,
+    Reverse, and Forward plans for the selected route. Prefill evaluates the
+    path decision hook from the admitted Decode facts and installs its local
+    send/receive plans after allocation. Requests outside the DualPath
+    admission shapes delegate to the parent unchanged.
     """
 
     def __init__(
@@ -1335,7 +1334,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         return super().request_finished_all_groups(request, block_ids)
 
     def shutdown(self) -> None:
-        """Stop Task-04 work and release all owned records and clients."""
+        """Stop DualPath work and release all owned records and clients."""
         self._accepting_task01 = False
         self._accepting_pe_decisions = False
         self._path_decision_coordinator.close()
@@ -1659,7 +1658,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         decode_request_id: str,
     ) -> MooncakeLayerwiseConnectorMetadata:
         assert self.pd_head_ratio == 1 and not self.enable_kv_quant and not self.enable_c8_quant, (
-            "Task-07 Stage-1 Reverse supports the plain Layerwise send path only"
+            "DualPath Reverse supports the plain Layerwise send path only"
         )
         metadata = MooncakeLayerwiseConnectorMetadata()
         req_meta = ReqMeta(
@@ -2076,12 +2075,12 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
 
 class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
-    """Behavior-preserving alias of ``MooncakeLayerwiseConnector``.
+    """Layerwise connector with DualPath admission and transfer routing.
 
-    A selectable connector name that constructs DualPath Scheduler/Worker
-    subclasses while preserving the parent's accounting, metadata, transfer,
-    completion, invalid-block, cleanup, and failure behavior for ordinary
-    Layerwise workloads.
+    The connector constructs DualPath Scheduler and Worker subclasses while
+    preserving the parent's accounting, metadata, transfer, completion,
+    invalid-block, cleanup, and failure behavior for ordinary Layerwise
+    workloads.
     """
 
     def __init__(
@@ -2122,7 +2121,7 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
         return self.connector_worker.get_finished(finished_req_ids, self._connector_metadata)
 
     def shutdown(self):
-        """Release Task-01-owned state and adapters, then defer to the base."""
+        """Release DualPath-owned state and adapters, then defer to the base."""
         if isinstance(self.connector_scheduler, DualPathConnectorScheduler):
             self.connector_scheduler.shutdown()
         if isinstance(self.connector_worker, DualPathConnectorWorker):

@@ -1,28 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Foundation configuration for ``DualPathConnector`` (PR-00).
+"""Configuration parsing and validation for ``DualPathConnector``.
 
-PR-00 scope: foundation role parsing and fail-fast validation only. The only
-DualPath-owned configuration field is ``role``; every other key the foundation
-accepts (``tls_config``, ``prefill``, ``decode``) is inherited Mooncake
-parallel/runtime configuration consumed by the parent implementation and is
-passed through untouched.
-
-Task-01 addition: the existing lookup-only KVPool settings
-(``consumer_is_to_load``, ``backend``, ``lookup_rpc_port``,
-``mooncake_rpc_port``, ``discard_partial_chunks``) are accepted as validated
-pass-through keys. They are read directly from ``kv_connector_extra_config``
-by the owned KVPool components, so they remain absent from the frozen
-dataclass below.
+``DualPathConfig`` owns the connector role and Decode control port. Inherited
+Mooncake parallel/runtime settings and KVPool lookup/load settings are
+validated here, then consumed directly from ``kv_connector_extra_config`` by
+their owning components rather than stored on the frozen dataclass.
 
 All knobs are read from the connector's own ``kv_connector_extra_config``. No
 environment variables are introduced (see AGENTS.md).
 
-Fields that later PRs will own (path strategy, relay, path planner, monitor,
-topology, shadow toggles) have no producer or consumer in PR-00 and therefore
-fail fast instead of being parsed and silently ignored. If the parent Mooncake
-connector later adds a required extra-config key, the compatibility guard test
-fails until ``ALLOWED_EXTRA_CONFIG_KEYS`` and its parity tests are reviewed
-together.
+Removed draft fields for path strategy, relay, planning, monitoring, topology,
+and shadow toggles fail fast instead of being parsed and silently ignored. If
+the parent Mooncake connector adds a required extra-config key, the
+compatibility guard test fails until ``ALLOWED_EXTRA_CONFIG_KEYS`` and its
+parity tests are reviewed together.
 """
 
 from __future__ import annotations
@@ -33,18 +24,13 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from vllm.config import KVTransferConfig
 
-# Extra-config keys the foundation accepts. ``role`` is the only DualPath-owned
-# key; the rest are inherited Mooncake configuration consumed by the parent.
-# Task-01 admits the existing lookup-only KVPool settings as pass-through keys:
-# they are validated here but consumed directly from
-# ``kv_connector_extra_config`` by the owned ``KVPoolScheduler``/``KVPoolWorker``,
-# so they are NOT stored as ``DualPathConfig`` fields. Task-06 additionally
-# admits ``load_async`` and requires it for a Decode role configured with
-# ``consumer_is_to_load=True`` so synchronous Store I/O never runs in the
-# Scheduler or model thread. ``consumer_is_to_put`` stays rejected: Decode-side
-# put behavior is not part of Stage 1.
-# Task-03 adds ``dual_path_control_port``: required for role="decode", stored
-# on ``DualPathConfig`` and consumed by the Task-03 control endpoint.
+# Accepted connector extra-config keys. ``role`` and
+# ``dual_path_control_port`` are stored on ``DualPathConfig``; inherited
+# Mooncake and KVPool settings are validated here but consumed directly from
+# ``kv_connector_extra_config`` by their owning components. Decode Store loads
+# require ``load_async`` so synchronous Store I/O never runs in the Scheduler
+# or model thread. ``consumer_is_to_put`` remains rejected because Decode-side
+# put is out of scope for DualPath.
 ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "role",
@@ -82,12 +68,12 @@ FOUNDATION_ROLES: tuple[str, str] = ("prefill", "decode")
 
 @dataclass(frozen=True)
 class DualPathConfig:
-    """Parsed and validated PR-00 foundation configuration.
+    """Parsed and validated DualPath connector configuration.
 
-    The frozen dataclass carries no strategy, monitor, relay, planner,
-    topology, Store, timeout, endpoint, or shadow field; those arrive only
-    with the first later PR that has a real producer, consumer, and complete
-    tests.
+    The frozen dataclass carries the connector role and optional Decode control
+    port. Inherited Mooncake and KVPool settings remain in the connector extra
+    configuration for their owning components, while removed draft fields stay
+    unsupported.
     """
 
     role: Literal["prefill", "decode"]
@@ -113,7 +99,7 @@ class DualPathConfig:
             )
             removed = sorted(set(unknown) & REMOVED_FOUNDATION_FIELDS)
             if removed:
-                msg += f" Key(s) {removed} were removed from the foundation scope and fail fast in PR-00."
+                msg += f" Key(s) {removed} are not part of the DualPath foundation configuration."
             raise ValueError(msg)
 
         role = extra.get("role")
