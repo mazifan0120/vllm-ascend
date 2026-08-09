@@ -107,7 +107,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class DecodeKVSnapshot:
-    """Complete Task-01 admission record, created only after real allocation.
+    """Complete admission record, created only after real allocation.
 
     ``local_tokens`` retains the original HBM prefix while ``store_tokens`` is
     derived from the detached ``LoadSpec``. ``final_block_ids`` is mandatory
@@ -270,7 +270,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
 
     def _is_dual_path_decode_admission(self, request: Request) -> bool:
-        """Task-01 admission applies only to Decode-role requests that arrived
+        """Decode admission applies only to Decode-role requests that arrived
         with ``do_remote_prefill is True``; everything else keeps parent behavior."""
         if not self._accepting_decode_admission or self.dual_path_cfg.role != "decode":
             return False
@@ -919,7 +919,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         entry = self._lookup_results.pop(request_id, None)
         if entry is None:
-            raise RuntimeError(f"DualPath request {request_id} has no Task-01 lookup result to bind after allocation")
+            raise RuntimeError(f"DualPath request {request_id} has no admission lookup result to bind after allocation")
         local_tokens, cached_external_tokens, detached_spec = entry
         ready_tokens = max(request.num_tokens - 1, 0)
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)

@@ -394,7 +394,7 @@ class TestDecodeAdmission(unittest.TestCase):
 
     def test_missing_lookup_result_at_bind_raises(self):
         request = _make_request("req-orphan", 48, _selected_params())
-        with self.assertRaisesRegex(RuntimeError, "no Task-01 lookup result"):
+        with self.assertRaisesRegex(RuntimeError, "no admission lookup result"):
             self.scheduler.update_state_after_alloc(request, _make_blocks(((1,),)), 32)
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
 

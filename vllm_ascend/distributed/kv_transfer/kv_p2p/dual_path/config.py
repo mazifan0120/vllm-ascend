@@ -123,7 +123,7 @@ class DualPathConfig:
 
 
 def _validate_kvpool_passthrough(extra: dict[str, Any]) -> None:
-    """Validate the Task-01 lookup-only KVPool pass-through keys.
+    """Validate the lookup-only KVPool pass-through keys.
 
     The values are consumed by the owned KVPool components from
     ``kv_connector_extra_config``; only type/shape validation happens here.
@@ -174,7 +174,7 @@ def _validate_role_capability(role: str, ktc: KVTransferConfig) -> None:
 
 
 def _validate_dual_path_control_port(extra: dict[str, Any], role: str) -> int | None:
-    """Validate and return the Task-03 control port.
+    """Validate and return the dual-path control port.
 
     The port is required for role="decode" and must be an integer (not bool)
     within 1..65535 so the DP-rank-derived endpoint stays in range. For
