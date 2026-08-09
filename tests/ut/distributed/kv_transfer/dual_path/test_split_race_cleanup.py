@@ -424,8 +424,8 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
         prefill_worker.shutdown()
         prefill_worker._install_reverse_receive_binding(reverse_binding)
 
-    assert decode_worker._accepting_task07 is False
-    assert prefill_worker._accepting_task07 is False
+    assert decode_worker._accepting_split_requests is False
+    assert prefill_worker._accepting_split_requests is False
     assert decode_worker._split_trackers == {}
     assert decode_worker._reverse_plans == {}
     assert decode_worker._forward_receive_bindings == {}
@@ -450,7 +450,7 @@ def test_release_prevents_late_reverse_callback_from_recreating_terminal_state()
     worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
     worker._pending_local_reverse_terminals[DECODE_REQUEST_ID] = True
 
-    worker._release_task07_request_state({DECODE_REQUEST_ID})
+    worker._release_split_request_state({DECODE_REQUEST_ID})
     with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
         worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=False)
 
@@ -486,7 +486,7 @@ def test_reverse_callback_and_cleanup_share_one_lock_for_tracker_and_terminal_st
     with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
         worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=False)
     if cleanup == "release":
-        worker._release_task07_request_state({DECODE_REQUEST_ID})
+        worker._release_split_request_state({DECODE_REQUEST_ID})
     else:
         with patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True):
             worker.shutdown()
@@ -556,7 +556,7 @@ def test_production_de_read_result_creates_plan_binding_store_without_scheduler_
 def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
     expected_scheduler_methods = {
         "__init__",
-        "_is_task01_decode_request",
+        "_is_dual_path_decode_admission",
         "_stage_prefill_activation_failure",
         "_handle_prefill_decision",
         "_prepare_forward_plan",

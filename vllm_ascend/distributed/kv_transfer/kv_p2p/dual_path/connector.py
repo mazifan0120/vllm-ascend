@@ -217,7 +217,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_decision_states: dict[str, DecodePathDecisionState] = {}
         self._decision_timeout_seconds: int | None = None
         self._kvpool_adapter: KVPoolAdapter | None = None
-        self._accepting_task01 = True
+        self._accepting_decode_admission = True
         self._accepting_pe_decisions = True
         # PE fields exist on both roles; Decode keeps a None decider and empty
         # maps rather than constructing policy state it never owns.
@@ -269,10 +269,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             dual_path_cfg.role,
         )
 
-    def _is_task01_decode_request(self, request: Request) -> bool:
+    def _is_dual_path_decode_admission(self, request: Request) -> bool:
         """Task-01 admission applies only to Decode-role requests that arrived
         with ``do_remote_prefill is True``; everything else keeps parent behavior."""
-        if not self._accepting_task01 or self.dual_path_cfg.role != "decode":
+        if not self._accepting_decode_admission or self.dual_path_cfg.role != "decode":
             return False
         params = request.kv_transfer_params
         return params is not None and params.get("do_remote_prefill") is True
@@ -708,7 +708,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
-        if not self._is_task01_decode_request(request):
+        if not self._is_dual_path_decode_admission(request):
             parent_result = super().get_num_new_matched_tokens(request, num_computed_tokens)
             if self.dual_path_cfg.role == "prefill" and request.kv_transfer_params is not None:
                 return self._handle_prefill_decision(request, parent_result, num_computed_tokens)
@@ -884,7 +884,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             delivery_future.add_done_callback(log_delivery_failure)
             return
 
-        if not self._is_task01_decode_request(request):
+        if not self._is_dual_path_decode_admission(request):
             # Non-selected requests delegate untouched; in particular a request
             # resumed after a completed async load (its admission flag is already
             # consumed and num_external_tokens == 0) must not re-enter the
@@ -1317,7 +1317,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
     def shutdown(self) -> None:
         """Stop DualPath work and release all owned records and clients."""
-        self._accepting_task01 = False
+        self._accepting_decode_admission = False
         self._accepting_pe_decisions = False
         self._path_decision_coordinator.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -1365,7 +1365,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._kvpool_worker_adapter: KVPoolWorkerAdapter | None = None
         self._registered_kv_caches: dict[str, list[torch.Tensor]] | None = None
         self._registered_layer_order: tuple[tuple[int, str], ...] = ()
-        self._accepting_task07 = True
+        self._accepting_split_requests = True
         self._split_trackers: dict[str, _SplitTracker] = {}
         self._reverse_plans: dict[str, ReversePlan] = {}
         self._reverse_terminal_lock = threading.Lock()
@@ -1403,7 +1403,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._kvpool_worker_adapter.register_kv_caches(kv_caches)
 
     def _install_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
-        if binding.path is Path.DE_READ and not getattr(self, "_accepting_task07", True):
+        if binding.path is Path.DE_READ and not getattr(self, "_accepting_split_requests", True):
             return
         consumed_decode_request_id = self._consumed_forward_terminals.get(binding.wire_request_id)
         if consumed_decode_request_id is not None:
@@ -1445,7 +1445,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return finished_wire_ids
 
     def _install_reverse_receive_binding(self, binding: ReverseReceiveBinding) -> None:
-        if not getattr(self, "_accepting_task07", True):
+        if not getattr(self, "_accepting_split_requests", True):
             return
         existing_binding = self._reverse_receive_bindings.get(binding.prefill_request_id)
         retained_wire_binding = next(
@@ -1492,7 +1492,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._pending_forward_failed.remove(binding.wire_request_id)
             self._pending_reverse_failed.add(binding.wire_request_id)
 
-    def _release_task07_request_state(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+    def _release_split_request_state(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
         finished_reverse_wire_ids = self._release_finished_reverse_terminals(finished_req_ids)
         self._control_failed_recving.difference_update(finished_req_ids)
@@ -1547,7 +1547,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         binding: ForwardReceiveBinding,
         store_metadata: AscendConnectorMetadata | None,
     ) -> None:
-        if not getattr(self, "_accepting_task07", True):
+        if not getattr(self, "_accepting_split_requests", True):
             return
         if binding.decode_request_id in self._split_trackers:
             return
@@ -1590,7 +1590,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         )
 
     def _install_reverse_plan(self, plan: ReversePlan) -> None:
-        if not getattr(self, "_accepting_task07", True):
+        if not getattr(self, "_accepting_split_requests", True):
             return
         decode_request_id = plan.request_key.decode_request_id
         if get_external_request_id(decode_request_id) != plan.wire_request_id:
@@ -1690,7 +1690,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return metadata
 
     def _submit_reverse(self, decode_request_id: str) -> None:
-        if not getattr(self, "_accepting_task07", True):
+        if not getattr(self, "_accepting_split_requests", True):
             return
         tracker = self._split_trackers.get(decode_request_id)
         if (
@@ -1771,7 +1771,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 failure.request_id,
                 failure.reason.value,
             )
-        split_store_accepted = getattr(self, "_accepting_task07", True) or not any(
+        split_store_accepted = getattr(self, "_accepting_split_requests", True) or not any(
             binding.path is Path.DE_READ for binding in getattr(metadata, "forward_receive_bindings", ())
         )
         if store_metadata is not None and split_store_accepted:
@@ -1797,7 +1797,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         finished_req_ids: set[str],
         metadata: MooncakeLayerwiseConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
-        finished_wire_ids, finished_reverse_wire_ids = self._release_task07_request_state(finished_req_ids)
+        finished_wire_ids, finished_reverse_wire_ids = self._release_split_request_state(finished_req_ids)
         split_trackers = getattr(self, "_split_trackers", {})
 
         done_sending: set[str] = set()
@@ -2023,9 +2023,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
     def shutdown(self) -> None:
         """Release local state without promising cancellation of remote DMA."""
-        if not getattr(self, "_accepting_task07", True):
+        if not getattr(self, "_accepting_split_requests", True):
             return
-        self._accepting_task07 = False
+        self._accepting_split_requests = False
         for binding in self._forward_receive_bindings.values():
             if self.request_map.get(binding.wire_request_id) == binding.decode_request_id:
                 self.request_map.pop(binding.wire_request_id)

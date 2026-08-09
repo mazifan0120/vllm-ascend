@@ -1565,7 +1565,7 @@ class TestCleanupAndShutdown:
             events.append(
                 (
                     "decode-coordinator",
-                    decode_scheduler._accepting_task01,
+                    decode_scheduler._accepting_decode_admission,
                     getattr(decode_scheduler, "_accepting_pe_decisions", None),
                     decode_request.request_id in decode_scheduler._decode_decision_states,
                 )
@@ -1575,7 +1575,7 @@ class TestCleanupAndShutdown:
             events.append(
                 (
                     "prefill-coordinator",
-                    prefill_scheduler._accepting_task01,
+                    prefill_scheduler._accepting_decode_admission,
                     getattr(prefill_scheduler, "_accepting_pe_decisions", None),
                     prefill_request.request_id in prefill_scheduler._pe_request_keys,
                     request_key in prefill_scheduler._pe_delivery_futures,
