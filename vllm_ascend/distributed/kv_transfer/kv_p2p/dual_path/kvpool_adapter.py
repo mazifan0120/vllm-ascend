@@ -67,26 +67,25 @@ class KVPoolAdapter:
         request_id = request.request_id
         try:
             store_delta, _ = self._pool_scheduler.get_num_new_matched_tokens(request, local_tokens)
+            spec = self._pool_scheduler.load_specs.pop(request_id, None)
+            if spec is None:
+                return None
+
+            original_delta = spec.kvpool_cached_tokens - spec.vllm_cached_tokens
+            if store_delta != original_delta:
+                raise RuntimeError(
+                    f"DualPath KVPool lookup delta mismatch for request {request_id}: "
+                    f"scheduler returned {store_delta} but detached LoadSpec implies {original_delta}"
+                )
+            if spec.vllm_cached_tokens != local_tokens:
+                raise RuntimeError(
+                    f"DualPath KVPool lookup local-token mismatch for request {request_id}: "
+                    f"expected {local_tokens}, detached LoadSpec has {spec.vllm_cached_tokens}"
+                )
         except Exception:
             self._pool_scheduler.load_specs.pop(request_id, None)
             logger.exception("DualPath KVPool lookup failed for request %s; treating as Store miss", request_id)
             return None
-
-        spec = self._pool_scheduler.load_specs.pop(request_id, None)
-        if spec is None:
-            return None
-
-        original_delta = spec.kvpool_cached_tokens - spec.vllm_cached_tokens
-        if store_delta != original_delta:
-            raise RuntimeError(
-                f"DualPath KVPool lookup delta mismatch for request {request_id}: "
-                f"scheduler returned {store_delta} but detached LoadSpec implies {original_delta}"
-            )
-        if spec.vllm_cached_tokens != local_tokens:
-            raise RuntimeError(
-                f"DualPath KVPool lookup local-token mismatch for request {request_id}: "
-                f"expected {local_tokens}, detached LoadSpec has {spec.vllm_cached_tokens}"
-            )
 
         target_tokens = max(request.num_tokens - 1, 0)
         usable_store_tokens = min(spec.kvpool_cached_tokens, target_tokens)

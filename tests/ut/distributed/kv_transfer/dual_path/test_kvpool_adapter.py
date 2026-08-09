@@ -197,23 +197,47 @@ def _stub_scheduler_lookup(adapter, spec: LoadSpec | None, delta: int):
     )
 
 
-def test_lookup_store_delta_mismatch_raises_and_detaches(mock_lookup_client_cls):
+@pytest.mark.parametrize(
+    ("request_id", "local_tokens", "spec", "delta"),
+    [
+        pytest.param(
+            "req-delta",
+            0,
+            LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=False),
+            10,
+            id="lookup-delta-mismatch",
+        ),
+        pytest.param(
+            "req-local",
+            16,
+            LoadSpec(vllm_cached_tokens=8, kvpool_cached_tokens=32, can_load=False),
+            24,
+            id="local-token-mismatch",
+        ),
+    ],
+)
+def test_lookup_accounting_divergence_degrades_to_store_miss(
+    mock_lookup_client_cls,
+    request_id,
+    local_tokens,
+    spec,
+    delta,
+):
+    # Given
     adapter = _make_adapter()
-    bad_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=False)
-    with _stub_scheduler_lookup(adapter, bad_spec, delta=10), pytest.raises(RuntimeError, match="delta mismatch"):
-        adapter.lookup(_make_request("req-delta", 48), 0)
-    assert "req-delta" not in adapter._pool_scheduler.load_specs
+    request = _make_request(request_id, 48)
 
-
-def test_lookup_vllm_cached_mismatch_raises_and_detaches(mock_lookup_client_cls):
-    adapter = _make_adapter()
-    bad_spec = LoadSpec(vllm_cached_tokens=8, kvpool_cached_tokens=32, can_load=False)
+    # When
     with (
-        _stub_scheduler_lookup(adapter, bad_spec, delta=24),
-        pytest.raises(RuntimeError, match="local-token mismatch"),
+        _stub_scheduler_lookup(adapter, spec, delta),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter.logger.exception") as log_exception,
     ):
-        adapter.lookup(_make_request("req-local", 48), 16)
-    assert "req-local" not in adapter._pool_scheduler.load_specs
+        result = adapter.lookup(request, local_tokens)
+
+    # Then
+    assert result is None
+    assert request_id not in adapter._pool_scheduler.load_specs
+    log_exception.assert_called_once()
 
 
 def test_lookup_exception_returns_none_and_detaches(mock_lookup_client_cls):
