@@ -330,17 +330,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if request_id in self._pe_invalid_request_ids:
             return parent_result
 
-        try:
-            metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
-        except PathDecisionValidationError as error:
-            logger.error(
-                "DualPath Prefill decision metadata is invalid for request %s: %s",
-                request_id,
-                error,
-            )
-            self._pe_invalid_request_ids.add(request_id)
-            return parent_result
-
+        metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
         decision_request = metadata.decision_request
         effective_prefill_tokens = _expected_prefill_token_end(decision_request, self.need_truncate)
         if not 0 <= prefill_local_tokens <= effective_prefill_tokens:
@@ -352,22 +342,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
             return parent_result
 
+        assert self._path_decider is not None
+        result = self._path_decider.decide(decision_request, prefill_local_tokens)
+
         request_key = decision_request.request_key
         self._pe_request_keys[request_id] = request_key
         self._pe_decision_metadata[request_id] = metadata
         self._pe_prefill_local_tokens.setdefault(request_id, prefill_local_tokens)
-        assert self._path_decider is not None
-        try:
-            result = self._path_decider.decide(decision_request, prefill_local_tokens)
-        except Exception as error:  # noqa: BLE001
-            logger.error(
-                "DualPath Prefill decision failed locally for request %s: %s",
-                request_id,
-                error,
-            )
-            self._pe_invalid_request_ids.add(request_id)
-            return parent_result
-
         self._pe_path_results.setdefault(request_id, result)
 
         self._log_prefill_decision(

@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     PathDecisionRequest,
     PathDecisionResult,
+    PathDecisionValidationError,
     PathKind,
     RoundRobinPathPolicy,
 )
@@ -610,15 +611,6 @@ class TestPrefillDecisionHook:
         task04_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._pe_prefill_local_tokens == {request.request_id: 32}
 
-    def test_parent_accounting_runs_exactly_once_for_malformed_dual_path(self, scheduler_factory):
-        scheduler = scheduler_factory(role="prefill")
-        request = _make_prefill_request(
-            "prefill-malformed",
-            _remote_decode_params(dual_path={"malformed": True}),
-        )
-
-        self._assert_parent_accounting_once(scheduler, request)
-
     def test_parent_accounting_runs_exactly_once_for_ordinary_request(self, scheduler_factory, task04_seams):
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request(
@@ -674,21 +666,6 @@ class TestPrefillDecisionHook:
         assert scheduler._pe_request_keys == {}
         assert scheduler._pe_delivery_futures == {}
 
-    def test_forged_full_payload_is_invalidated_without_decide_or_submit(self, scheduler_factory, task04_seams):
-        policy = MagicMock(name="path_policy")
-        scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        payload = _prefill_decision_payload(decode_store_tokens=48)
-        request = _make_prefill_request("prefill-full", _remote_decode_params(dual_path=payload))
-
-        result = scheduler.get_num_new_matched_tokens(request, 0)
-
-        assert result == (0, False)
-        policy.choose.assert_not_called()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_invalid_request_ids == {request.request_id}
-        assert scheduler._pe_request_keys == {}
-        assert scheduler._pe_delivery_futures == {}
-
     def test_seeded_non_full_requests_invoke_policy_once_and_alternate(self, scheduler_factory, task04_seams):
         policy = MagicMock(spec=RoundRobinPathPolicy, wraps=RoundRobinPathPolicy(random.Random(1)))
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -727,7 +704,7 @@ class TestPrefillDecisionHook:
         assert list(scheduler._pe_forward_plans) == [request.request_id]
         assert list(scheduler._pe_delivery_futures) == [scheduler._pe_request_keys[request.request_id]]
 
-    def test_conflicting_facts_fail_locally_without_second_policy_invocation(self, scheduler_factory, task04_seams):
+    def test_conflicting_facts_propagate_without_second_policy_invocation(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -740,24 +717,22 @@ class TestPrefillDecisionHook:
             _remote_decode_params(dual_path=_prefill_decision_payload(decode_store_tokens=32)),
         )
 
-        with patch.object(scheduler_module.logger, "error") as log_error:
-            scheduler.get_num_new_matched_tokens(original, 0)
-            result = scheduler.get_num_new_matched_tokens(conflicting, 0)
-            _bind_prefill(scheduler, conflicting)
+        scheduler.get_num_new_matched_tokens(original, 0)
+        with pytest.raises(
+            PathDecisionValidationError,
+            match="request key is already associated with different token facts",
+        ):
+            scheduler.get_num_new_matched_tokens(conflicting, 0)
 
-        assert result == (0, False)
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        log_error.assert_called_once()
-        assert scheduler._pe_invalid_request_ids == {original.request_id}
+        assert scheduler._pe_invalid_request_ids == set()
         assert scheduler._pe_forward_plans == {}
         assert scheduler._pe_pending_reverse_receive_bindings == {}
         assert scheduler._reqs_need_send_layerwise == {}
-        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
-        assert scheduler._path_decider is not None
-        assert scheduler._path_decider._decision_records[request_key].request.decode_store_tokens == 24
+        assert scheduler._pe_decision_metadata[original.request_id].decision_request.decode_store_tokens == 24
 
-    def test_conflicting_frozen_prefill_prefix_fails_locally_before_allocation_activation(
+    def test_conflicting_frozen_prefill_prefix_propagates_before_allocation_activation(
         self,
         scheduler_factory,
         task04_seams,
@@ -767,100 +742,29 @@ class TestPrefillDecisionHook:
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-prefix-conflict", _remote_decode_params())
 
-        with (
-            patch.object(
-                MooncakeLayerwiseConnectorScheduler,
-                "get_num_new_matched_tokens",
-                autospec=True,
-                return_value=(0, False),
-            ),
-            patch.object(scheduler_module.logger, "error") as log_error,
+        with patch.object(
+            MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            return_value=(0, False),
         ):
             scheduler.get_num_new_matched_tokens(request, 0)
-            result = scheduler.get_num_new_matched_tokens(request, 16)
-            _bind_prefill(scheduler, request)
+            with pytest.raises(
+                PathDecisionValidationError,
+                match="request key is already associated with different token facts",
+            ):
+                scheduler.get_num_new_matched_tokens(request, 16)
 
-        assert result == (0, False)
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        log_error.assert_called_once()
-        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        assert scheduler._pe_invalid_request_ids == set()
         assert scheduler._pe_forward_plans == {}
         assert scheduler._pe_pending_reverse_receive_bindings == {}
-        assert scheduler._reqs_need_send_layerwise == {}
-        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
-        assert scheduler._path_decider is not None
-        assert scheduler._path_decider._decision_records[request_key].prefill_local_tokens == 0
-
-    def test_malformed_nested_metadata_marks_invalid_and_sends_nothing(self, scheduler_factory, task04_seams):
-        policy = MagicMock(name="path_policy")
-        scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        request = _make_prefill_request(
-            "prefill-malformed",
-            _remote_decode_params(dual_path={"malformed": True}),
-        )
-
-        scheduler.get_num_new_matched_tokens(request, 0)
-        scheduler.get_num_new_matched_tokens(request, 0)
-
-        assert scheduler._pe_invalid_request_ids == {request.request_id}
-        policy.choose.assert_not_called()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-
-    @pytest.mark.parametrize("failure", ["exception", "invalid-return"])
-    def test_policy_exception_or_invalid_return_records_failure_sends_nothing(
-        self,
-        failure,
-        scheduler_factory,
-        task04_seams,
-    ):
-        policy = MagicMock(name="path_policy")
-        if failure == "exception":
-            policy.choose.side_effect = RuntimeError("policy failed")
-        else:
-            policy.choose.return_value = "PE_READ"
-        scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        request = _make_prefill_request(f"prefill-policy-{failure}", _remote_decode_params())
-
-        scheduler.get_num_new_matched_tokens(request, 0)
-        scheduler.get_num_new_matched_tokens(request, 0)
-
-        policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-
-        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
-        assert scheduler._path_decider is not None
-        assert scheduler._path_decider._decision_records[request_key].result is None
-
-    def test_local_failures_never_enter_parent_forward_queue(self, scheduler_factory):
-        policy = MagicMock(name="path_policy")
-        policy.choose.side_effect = RuntimeError("policy failed")
-        scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        request = _make_prefill_request("prefill-local-failure", _remote_decode_params())
-        blocks = MagicMock(name="blocks")
-        blocks.get_block_ids.return_value = ([7, 8, 9],)
-
-        scheduler.get_num_new_matched_tokens(request, 0)
-        scheduler.update_state_after_alloc(request, blocks, 0)
-
         assert scheduler._reqs_need_send_layerwise == {}
 
     def test_update_state_after_alloc_suppresses_send_queue_for_dual_path(self, scheduler_factory):
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request("prefill-valid", _remote_decode_params())
-        blocks = MagicMock(name="blocks")
-
-        scheduler.update_state_after_alloc(request, blocks, 0)
-
-        assert scheduler._reqs_need_send_layerwise == {}
-        blocks.get_block_ids.assert_not_called()
-
-    def test_update_state_after_alloc_suppresses_send_queue_for_malformed_dual_path(self, scheduler_factory):
-        scheduler = scheduler_factory(role="prefill")
-        request = _make_prefill_request(
-            "prefill-malformed",
-            _remote_decode_params(dual_path={"malformed": True}),
-        )
         blocks = MagicMock(name="blocks")
 
         scheduler.update_state_after_alloc(request, blocks, 0)
@@ -1240,9 +1144,9 @@ class TestCleanupAndShutdown:
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request(
             "prefill-invalid-cleanup",
-            _remote_decode_params(dual_path={"malformed": True}),
+            _remote_decode_params(),
         )
-        scheduler.get_num_new_matched_tokens(request, 0)
+        scheduler._pe_invalid_request_ids.add(request.request_id)
         assert scheduler._pe_invalid_request_ids == {request.request_id}
 
         # When
@@ -1536,9 +1440,9 @@ class TestCleanupAndShutdown:
         _bind_prefill(prefill_scheduler, prefill_request)
         invalid_request = _make_prefill_request(
             "prefill-invalid-shutdown",
-            _remote_decode_params(dual_path={"malformed": True}),
+            _remote_decode_params(),
         )
-        prefill_scheduler.get_num_new_matched_tokens(invalid_request, 0)
+        prefill_scheduler._pe_invalid_request_ids.add(invalid_request.request_id)
         request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
 
         worker = _control_only_worker()
