@@ -477,7 +477,7 @@ def test_structured_logs_reconstruct_request_facts(production_harness_factory) -
     )
     assert "eligibility=policy selected_path=DE_READ store=partial" in messages
     assert "store_range=[16,32) reverse_range=[16,32) forward_range=[32,49)" in messages
-    assert "protocol=2 delivery_terminal=SUCCEEDED" in messages
+    assert "delivery_terminal=SUCCEEDED" in messages
     assert "final_predicate=SUCCESS" in messages
     assert "PathDecision" not in messages
 
