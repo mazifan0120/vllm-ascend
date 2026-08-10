@@ -674,6 +674,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_pe_path_results",
             "_pe_forward_plans",
             "_pe_forward_send_infos",
+            "_pe_reverse_plans",
             "_pe_pending_reverse_receive_bindings",
             "_pe_control_failures",
             "_pe_delivery_futures",

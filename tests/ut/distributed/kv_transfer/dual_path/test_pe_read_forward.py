@@ -583,6 +583,42 @@ def test_de_read_installs_binding_plan_and_forward_before_submit(scheduler_facto
     coordinator.submit.assert_called_once()
 
 
+def test_de_read_delivers_with_admission_table_and_defers_forward_plan(scheduler_factory):
+    """Real vLLM admission allocates only the external-token blocks (the
+    Reverse destination) and parks the request in WAITING_FOR_REMOTE_KVS, so
+    the T-covering table only appears on the post-Reverse allocation. The
+    Decision must be delivered from the admission table; the Forward plan
+    installs on the later allocation without a second delivery."""
+    scheduler, _, coordinator = scheduler_factory(PathKind.DE_READ)
+    request = _make_request(
+        target_tokens=48,
+        prompt_tokens=49,
+        local_tokens=16,
+        store_tokens=32,
+        destination_block_ids=[[20, 21, 22, 23]],
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+
+    # Admission allocation covers only the Reverse destination [L_PE, K_DE).
+    scheduler.update_state_after_alloc(request, _blocks(([70, 71],)), 16)
+
+    assert coordinator.submit.call_count == 1
+    decision = coordinator.submit.call_args.args[1]
+    assert decision.reverse_plan is not None
+    assert (decision.reverse_plan.token_start, decision.reverse_plan.token_end) == (16, 32)
+    assert decision.reverse_plan.destination_block_ids == ((70, 71),)
+    assert request.request_id in scheduler._pe_pending_reverse_receive_bindings
+    assert request.request_id not in scheduler._pe_forward_plans
+
+    # Post-Reverse allocation covers T: Forward plan installs, no re-delivery.
+    scheduler.update_state_after_alloc(request, _blocks(([70, 71, 72, 73],)), 0)
+
+    assert coordinator.submit.call_count == 1
+    plan = scheduler._pe_forward_plans[request.request_id]
+    assert (plan.token_start, plan.token_end) == (32, 49)
+    assert scheduler._reqs_need_send_layerwise[request.request_id].local_block_ids == [[70, 71, 72, 73]]
+
+
 def test_miss_de_read_freezes_reverse_hbm_range_and_no_store(scheduler_factory):
     scheduler, _, _ = scheduler_factory(PathKind.DE_READ)
     request = _make_request(

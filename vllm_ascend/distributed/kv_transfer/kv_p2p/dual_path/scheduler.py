@@ -191,6 +191,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._pe_path_results: dict[str, PathDecisionResult] = {}
         self._pe_forward_plans: dict[str, ForwardPlan] = {}
         self._pe_forward_send_infos: dict[str, SendReqInfo] = {}
+        self._pe_reverse_plans: dict[str, ReversePlan] = {}
         self._pe_pending_reverse_receive_bindings: dict[str, ReverseReceiveBinding] = {}
         self._pe_control_failures: dict[str, DualPathControlFailureMetadata] = {}
         self._pe_delivery_futures: dict[DualPathRequestKey, Future[None]] = {}
@@ -550,60 +551,81 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             raise PathDecisionValidationError("Decode local tokens must not exceed the DE_READ split")
 
         prepared = self._prepare_forward_plan(request, blocks, token_split)
-        if prepared is None:
-            return None
-        forward_plan, send_req_info = prepared
-        wire_request_id = get_external_request_id(request_id)
-        binding = ReverseReceiveBinding(
-            request_key=result.request_key,
-            wire_request_id=wire_request_id,
-            prefill_request_id=request_id,
-            destination_block_ids=forward_plan.source_block_ids,
-            token_start=token_start,
-            token_end=token_split,
-        )
-        parallel_config = self.vllm_config.parallel_config
-        reverse_plan = ReversePlan(
-            request_key=result.request_key,
-            wire_request_id=wire_request_id,
-            token_start=token_start,
-            token_end=token_split,
-            source_block_ids=forward_plan.destination_block_ids,
-            destination_block_ids=forward_plan.source_block_ids,
-            remote_engine_id=self.engine_id,
-            remote_host=self.side_channel_host,
-            remote_port=self.side_channel_port,
-            remote_block_sizes=tuple(self.block_size),
-            remote_tp_size=parallel_config.tensor_parallel_size,
-            remote_pcp_size=parallel_config.prefill_context_parallel_size,
-            remote_dcp_size=parallel_config.decode_context_parallel_size,
-        )
+        # vLLM admission allocates only the external-token blocks (the Reverse
+        # destination [L_PE, K_DE)) and then parks the request in
+        # WAITING_FOR_REMOTE_KVS, so a T-covering Forward table can only appear
+        # on the post-Reverse allocation. Install the Reverse artifacts from
+        # the admission table and deliver immediately; the Forward plan
+        # installs on that later allocation without a second delivery.
+        pe_block_table = tuple(tuple(group) for group in blocks.get_block_ids())
+        de_block_table = tuple(tuple(group) for group in params["remote_block_ids"])
+        if any(
+            len(group) * block_size < token_split
+            for group, block_size in zip(pe_block_table, tuple(self.block_size), strict=True)
+        ):
+            raise PathDecisionValidationError("DE_READ Reverse destination block table does not cover the split point")
 
+        wire_request_id = get_external_request_id(request_id)
+        retained_reverse_plan = self._pe_reverse_plans.get(request_id)
+        if retained_reverse_plan is None:
+            binding = ReverseReceiveBinding(
+                request_key=result.request_key,
+                wire_request_id=wire_request_id,
+                prefill_request_id=request_id,
+                destination_block_ids=pe_block_table,
+                token_start=token_start,
+                token_end=token_split,
+            )
+            parallel_config = self.vllm_config.parallel_config
+            reverse_plan = ReversePlan(
+                request_key=result.request_key,
+                wire_request_id=wire_request_id,
+                token_start=token_start,
+                token_end=token_split,
+                source_block_ids=de_block_table,
+                destination_block_ids=pe_block_table,
+                remote_engine_id=self.engine_id,
+                remote_host=self.side_channel_host,
+                remote_port=self.side_channel_port,
+                remote_block_sizes=tuple(self.block_size),
+                remote_tp_size=parallel_config.tensor_parallel_size,
+                remote_pcp_size=parallel_config.prefill_context_parallel_size,
+                remote_dcp_size=parallel_config.decode_context_parallel_size,
+            )
+            existing_binding = self._pe_pending_reverse_receive_bindings.get(request_id)
+            conflicting_binding = any(
+                retained != binding
+                and (retained.request_key == binding.request_key or retained.wire_request_id == binding.wire_request_id)
+                for retained in self._pe_pending_reverse_receive_bindings.values()
+            )
+            if (existing_binding is not None and existing_binding != binding) or conflicting_binding:
+                raise RuntimeError(
+                    f"DualPath Prefill request {request_id} got a conflicting duplicate Reverse receive binding; "
+                    "the original binding is preserved"
+                )
+            self._pe_pending_reverse_receive_bindings[request_id] = binding
+            self._pe_reverse_plans[request_id] = reverse_plan
+            retained_reverse_plan = reverse_plan
+
+        if prepared is None:
+            # Forward table does not cover T yet; it installs on the
+            # post-Reverse allocation without touching the delivered Reverse.
+            return self._pe_reverse_plans[request_id]
+        forward_plan, send_req_info = prepared
+        if forward_plan.source_block_ids != pe_block_table or forward_plan.destination_block_ids != de_block_table:
+            raise PathDecisionValidationError("block tables changed during DE_READ activation")
         existing_plan = self._pe_forward_plans.get(request_id)
-        if existing_plan is not None and existing_plan != forward_plan:
+        if existing_plan is not None:
+            if existing_plan == forward_plan:
+                return self._pe_reverse_plans[request_id]
             raise RuntimeError(
                 f"DualPath Prefill request {request_id} got a conflicting duplicate Forward plan; "
                 "the original plan is preserved"
             )
-        existing_binding = self._pe_pending_reverse_receive_bindings.get(request_id)
-        conflicting_binding = any(
-            retained != binding
-            and (retained.request_key == binding.request_key or retained.wire_request_id == binding.wire_request_id)
-            for retained in self._pe_pending_reverse_receive_bindings.values()
-        )
-        if (existing_binding is not None and existing_binding != binding) or conflicting_binding:
-            raise RuntimeError(
-                f"DualPath Prefill request {request_id} got a conflicting duplicate Reverse receive binding; "
-                "the original binding is preserved"
-            )
-        if existing_plan is not None and result.request_key in self._pe_delivery_futures:
-            return reverse_plan
-
-        self._pe_pending_reverse_receive_bindings[request_id] = binding
         self._pe_forward_plans[request_id] = forward_plan
         self._pe_forward_send_infos[request_id] = send_req_info
         self._reqs_need_send_layerwise[request_id] = send_req_info
-        return reverse_plan
+        return self._pe_reverse_plans[request_id]
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         if not self._is_dual_path_decode_admission(request):
@@ -685,10 +707,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if result is None:
             return
 
-        reverse_plan: ReversePlan | None = None
         try:
             if result.path is PathKind.DE_READ:
-                reverse_plan = self._activate_de_read_path(request, blocks, result)
+                self._activate_de_read_path(request, blocks, result)
             elif result.path is PathKind.PE_READ:
                 self._try_install_forward_plan(request, blocks)
             else:
@@ -703,12 +724,24 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
 
         result = self._pe_path_results.get(request_id)
-        if result is None or request_id not in self._pe_forward_plans:
+        if result is None:
             return
-
         request_key = result.request_key
         if request_key in self._pe_delivery_futures:
             return
+        reverse_plan: ReversePlan | None = None
+        if result.path is PathKind.PE_READ:
+            # PE_READ delivers once the Forward plan is installed.
+            if request_id not in self._pe_forward_plans:
+                return
+        elif result.path is PathKind.DE_READ:
+            # DE_READ delivers once the Reverse artifacts are installed; its
+            # Forward plan may still be deferred to the post-Reverse allocation.
+            reverse_plan = self._pe_reverse_plans.get(request_id)
+            if reverse_plan is None:
+                return
+        else:
+            assert_never(result.path)
         metadata = self._pe_decision_metadata[request_id]
         decision = PathDecision(
             result=result,
@@ -740,8 +773,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             error = completed_future.exception()
             if error is not None:
                 logger.error(
-                    "dual_path delivery key=%s/%s delivery_terminal=FAILED "
-                    "failure_source=DELIVERY error=%s",
+                    "dual_path delivery key=%s/%s delivery_terminal=FAILED failure_source=DELIVERY error=%s",
                     request_key.decode_engine_instance_id,
                     request_key.decode_request_id,
                     error,
@@ -780,6 +812,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._pe_path_results.pop(request_id, None)
         if not discard_installed_plans:
             return
+        self._pe_reverse_plans.pop(request_id, None)
         self._pe_pending_reverse_receive_bindings.pop(request_id, None)
         self._pe_forward_plans.pop(request_id, None)
         owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
@@ -1196,7 +1229,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def _release_scheduler_request_state(self, request: Request) -> None:
         request_id = request.request_id
         self._lookup_results.pop(request_id, None)
-        self._decode_kv_snapshots.pop(request_id, None)
+        self._decode_kv_snapshots.pop(request_id, None) 
         state = self._decode_decision_states.pop(request_id, None)
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)
@@ -1205,6 +1238,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._pe_prefill_local_tokens.pop(request_id, None)
             self._pe_path_results.pop(request_id, None)
             self._pe_forward_plans.pop(request_id, None)
+            self._pe_reverse_plans.pop(request_id, None)
             self._pe_pending_reverse_receive_bindings.pop(request_id, None)
             self._pe_control_failures.pop(request_id, None)
             owned_send_req_info = self._pe_forward_send_infos.pop(request_id, None)
@@ -1249,6 +1283,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._reqs_need_send_layerwise.pop(request_id)
         self._pe_forward_send_infos.clear()
         self._pe_forward_plans.clear()
+        self._pe_reverse_plans.clear()
         self._pe_pending_reverse_receive_bindings.clear()
         self._pe_control_failures.clear()
         self._pe_delivery_futures.clear()
