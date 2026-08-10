@@ -52,16 +52,6 @@ class SpyPolicy:
         return self._path
 
 
-class InvalidResultPolicy:
-    def __init__(self, result: str | None) -> None:
-        self._result = result
-        self.choose_count = 0
-
-    def choose(self, request: PathDecisionRequest) -> str | None:
-        self.choose_count += 1
-        return self._result
-
-
 class AlwaysPePolicy:
     def choose(self, request: PathDecisionRequest) -> PathKind:
         return PathKind.PE_READ
@@ -70,15 +60,6 @@ class AlwaysPePolicy:
 class AlwaysDePolicy:
     def choose(self, request: PathDecisionRequest) -> PathKind:
         return PathKind.DE_READ
-
-
-class ExplodingPolicy:
-    def __init__(self) -> None:
-        self.choose_count = 0
-
-    def choose(self, request: PathDecisionRequest) -> PathKind:
-        self.choose_count += 1
-        raise RuntimeError("policy failed")
 
 
 def test_request_key_equality_and_hash() -> None:
@@ -311,40 +292,6 @@ def test_decide_with_invalid_protocol_input_without_key_raises_validation_error(
     assert policy.choose_count == 0
 
 
-@pytest.mark.parametrize("invalid_result", ["PE_READ", None])
-def test_policy_result_not_a_path_raises_and_retains_failure(invalid_result: str | None) -> None:
-    request = _make_request()
-    policy = InvalidResultPolicy(invalid_result)
-    decider = PathDecisionDecider(policy)
-
-    with pytest.raises(PathDecisionValidationError):
-        decider.decide(request, 0)
-    retained = decider._decision_records[request.request_key]
-    with pytest.raises(PathDecisionValidationError):
-        decider.decide(_make_request(), 0)
-
-    assert retained.request == request
-    assert retained.prefill_local_tokens == 0
-    assert retained.result is None
-    assert policy.choose_count == 1
-
-
-def test_policy_exception_is_chained_retained_and_invoked_once() -> None:
-    request = _make_request()
-    policy = ExplodingPolicy()
-    decider = PathDecisionDecider(policy)
-
-    with pytest.raises(PathDecisionValidationError) as raised:
-        decider.decide(request, 0)
-    with pytest.raises(PathDecisionValidationError):
-        decider.decide(_make_request(), 0)
-
-    assert isinstance(raised.value.__cause__, RuntimeError)
-    assert str(raised.value.__cause__) == "policy failed"
-    assert decider._decision_records[request.request_key].result is None
-    assert policy.choose_count == 1
-
-
 def test_discard_removes_retained_result_record() -> None:
     request = _make_request()
     policy = SpyPolicy(PathKind.PE_READ)
@@ -353,20 +300,6 @@ def test_discard_removes_retained_result_record() -> None:
 
     decider.discard(request.request_key)
     decider.decide(request, 0)
-
-    assert policy.choose_count == 2
-
-
-def test_discard_removes_failure_record() -> None:
-    request = _make_request()
-    policy = InvalidResultPolicy("PE_READ")
-    decider = PathDecisionDecider(policy)
-    with pytest.raises(PathDecisionValidationError):
-        decider.decide(request, 0)
-
-    decider.discard(request.request_key)
-    with pytest.raises(PathDecisionValidationError):
-        decider.decide(request, 0)
 
     assert policy.choose_count == 2
 
@@ -381,19 +314,6 @@ def test_discard_is_idempotent_and_does_not_rewind_policy() -> None:
     decider.discard(first.request_key)
 
     assert decider.decide(second, 0).path is PathKind.DE_READ
-
-
-def test_retained_failure_replay_raises_without_policy() -> None:
-    request = _make_request()
-    policy = InvalidResultPolicy(None)
-    decider = PathDecisionDecider(policy)
-    with pytest.raises(PathDecisionValidationError):
-        decider.decide(request, 0)
-
-    with pytest.raises(PathDecisionValidationError):
-        decider.decide(_make_request(), 0)
-
-    assert policy.choose_count == 1
 
 
 def test_second_policy_satisfies_path_policy_without_caller_change() -> None:

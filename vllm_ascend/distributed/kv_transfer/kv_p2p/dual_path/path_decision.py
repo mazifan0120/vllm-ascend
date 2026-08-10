@@ -165,7 +165,7 @@ class RoundRobinPathPolicy:
 class _DecisionRecord:
     request: PathDecisionRequest
     prefill_local_tokens: int
-    result: PathDecisionResult | None
+    result: PathDecisionResult
 
 
 class PathDecisionDecider:
@@ -183,21 +183,13 @@ class PathDecisionDecider:
                 raise PathDecisionValidationError(
                     "request key is already associated with different token facts or prefill_local_tokens"
                 )
-            if existing.result is None:
-                raise PathDecisionValidationError("decision previously failed locally")
             return existing.result
 
-        if prefill_local_tokens >= request.decode_store_tokens:
-            path = PathKind.PE_READ
-        else:
-            try:
-                path = self._policy.choose(request)
-            except Exception as error:  # noqa: BLE001
-                self._record_failure(request, prefill_local_tokens)
-                raise PathDecisionValidationError("path policy raised an exception") from error
-            if not isinstance(path, PathKind):
-                self._record_failure(request, prefill_local_tokens)
-                raise PathDecisionValidationError(f"policy returned an invalid path: {path!r}")
+        path = (
+            PathKind.PE_READ
+            if prefill_local_tokens >= request.decode_store_tokens
+            else self._policy.choose(request)
+        )
 
         result = PathDecisionResult(request_key=request.request_key, path=path)
         self._decision_records[request.request_key] = _DecisionRecord(
@@ -206,15 +198,6 @@ class PathDecisionDecider:
             result=result,
         )
         return result
-
-    def _record_failure(self, request: PathDecisionRequest, prefill_local_tokens: int) -> None:
-        # Recording the failure pins the request facts so a retry with
-        # different facts is still rejected as conflicting.
-        self._decision_records[request.request_key] = _DecisionRecord(
-            request=request,
-            prefill_local_tokens=prefill_local_tokens,
-            result=None,
-        )
 
     def discard(self, request_key: DualPathRequestKey) -> None:
         self._decision_records.pop(request_key, None)
