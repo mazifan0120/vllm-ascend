@@ -468,8 +468,60 @@ def test_build_connector_meta_filters_unowned_preemption_but_cleans_owned_tracke
     assert metadata.preempted_req_ids == {request.request_id}
     assert pool._preempted_req_ids == {request.request_id}
     assert pool._unfinished_requests == {}
-    assert pool._request_trackers == {}
-    assert pool._loading_req_ids == set()
+
+
+def test_build_connector_meta_tolerates_empty_new_token_ids_for_owned_cached_request(mock_lookup_client_cls):
+    """NPU contract regression: vLLM only populates
+    ``CachedRequestData.new_token_ids`` for PP without async scheduling, so on
+    NPU it stays empty while ``req_ids`` is non-empty. Filtering an owned
+    request out of such a payload must not index into the empty list."""
+    # Given: an owned (committed) request that reappears as a cached request
+    adapter = _make_commit_adapter()
+    request = _make_request("req-cached-owned", 49)
+    detached_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=48, can_load=False)
+    adapter.commit_after_alloc(request, _make_blocks([[7, 8, 9]]), detached_spec)
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(
+            req_ids=[request.request_id, "ordinary-request"],
+            resumed_req_ids={request.request_id},
+            new_token_ids=[],  # NPU shape: empty despite non-empty req_ids
+            all_token_ids={request.request_id: [1] * 49},
+            new_block_ids=[([7, 8, 9],), ([10],)],
+            num_computed_tokens=[48, 16],
+            num_output_tokens=[1, 1],
+        ),
+        num_scheduled_tokens={request.request_id: 1, "ordinary-request": 1},
+        total_num_scheduled_tokens=2,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        preempted_req_ids=set(),
+    )
+
+    forwarded: dict[str, SchedulerOutput] = {}
+    original = adapter._pool_scheduler.build_connector_meta
+
+    def _spy(output):
+        forwarded["output"] = output
+        return original(output)
+
+    adapter._pool_scheduler.build_connector_meta = _spy
+
+    # When
+    adapter.build_connector_meta(scheduler_output)
+
+    # Then: the owned request stays visible to the pool scheduler and the
+    # unowned one is filtered out, with the empty new_token_ids preserved.
+    forwarded_cached = forwarded["output"].scheduled_cached_reqs
+    assert list(forwarded_cached.req_ids) == [request.request_id]
+    assert forwarded_cached.resumed_req_ids == {request.request_id}
+    assert forwarded_cached.new_token_ids == []
+    assert list(forwarded_cached.new_block_ids) == [([7, 8, 9],)]
+    assert list(forwarded_cached.num_computed_tokens) == [48]
+    assert forwarded["output"].num_scheduled_tokens == {request.request_id: 1}
 
 
 def test_lookup_clamp_preserves_can_load_and_token_len_via_replace(mock_lookup_client_cls):

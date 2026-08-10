@@ -136,11 +136,18 @@ class KVPoolSchedulerAdapter:
         owned_cached_indices = [
             index for index, request_id in enumerate(cached_reqs.req_ids) if request_id in owned_request_ids
         ]
+        # vLLM only populates ``new_token_ids`` for PP without async scheduling;
+        # on NPU it stays empty while ``req_ids`` is non-empty, so it can only
+        # be indexed when populated.
+        if cached_reqs.new_token_ids:
+            filtered_new_token_ids = [cached_reqs.new_token_ids[index] for index in owned_cached_indices]
+        else:
+            filtered_new_token_ids = cached_reqs.new_token_ids
         filtered_cached_reqs = dataclasses.replace(
             cached_reqs,
             req_ids=[cached_reqs.req_ids[index] for index in owned_cached_indices],
             resumed_req_ids=cached_reqs.resumed_req_ids.intersection(owned_request_ids),
-            new_token_ids=[cached_reqs.new_token_ids[index] for index in owned_cached_indices],
+            new_token_ids=filtered_new_token_ids,
             all_token_ids={
                 request_id: token_ids
                 for request_id, token_ids in cached_reqs.all_token_ids.items()
