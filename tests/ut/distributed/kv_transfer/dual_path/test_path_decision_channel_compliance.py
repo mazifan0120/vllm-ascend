@@ -11,7 +11,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     PathDecision,
     PathDecisionCoordinator,
@@ -68,7 +67,6 @@ def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None
     coordinator = PathDecisionCoordinator()
     coordinator._role = "decode"
     initial_decision = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(
             request_key=DualPathRequestKey("decode-engine:0:boot", "request-initial"),
             path=PathKind.PE_READ,
@@ -76,7 +74,6 @@ def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None
         reverse_plan=None,
     )
     late_decision = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(
             request_key=DualPathRequestKey("decode-engine:0:boot", "request-late"),
             path=PathKind.DE_READ,

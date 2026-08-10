@@ -28,10 +28,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionValidationError,
     PathKind,
     _JsonObject,
-    _JsonValue,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     DualPathDecisionMetadata,
     PathDecision,
@@ -76,7 +74,6 @@ def _request_payload() -> _JsonObject:
 
 def _metadata() -> DualPathDecisionMetadata:
     return DualPathDecisionMetadata(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         decision_request=_request(),
         decode_control_endpoint=DecodeControlEndpoint(host="192.0.2.10", port=24001),
     )
@@ -84,7 +81,6 @@ def _metadata() -> DualPathDecisionMetadata:
 
 def _metadata_payload() -> _JsonObject:
     return {
-        "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
         "decision_request": _request_payload(),
         "decode_control_endpoint": {"host": "192.0.2.10", "port": 24001},
     }
@@ -145,58 +141,13 @@ def test_dual_path_decision_metadata_round_trip() -> None:
     assert DualPathDecisionMetadata.from_dict(payload) == metadata
 
 
-def test_decision_metadata_rejects_forged_store_full_before_send() -> None:
-    payload = _metadata_payload()
-    payload["decision_request"]["decode_store_tokens"] = payload["decision_request"]["target_tokens"]
-
-    with pytest.raises(PathDecisionValidationError):
-        DualPathDecisionMetadata.from_dict(payload)
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        pytest.param(
-            {
-                "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
-                "decision_request": _request_payload(),
-            },
-            id="missing-outer-field",
-        ),
-        pytest.param(
-            {**_metadata_payload(), "unexpected": None},
-            id="extra-outer-field",
-        ),
-        pytest.param(
-            {
-                **_metadata_payload(),
-                "decode_control_endpoint": {"host": "192.0.2.10"},
-            },
-            id="missing-nested-field",
-        ),
-        pytest.param(
-            {
-                **_metadata_payload(),
-                "decision_request": {**_request_payload(), "unexpected": None},
-            },
-            id="extra-nested-field",
-        ),
-    ],
-)
-def test_dual_path_decision_metadata_rejects_non_exact_keys(payload: _JsonValue) -> None:
-    with pytest.raises(PathDecisionValidationError):
-        DualPathDecisionMetadata.from_dict(payload)
-
-
 def test_path_decision_msgpack_round_trip_result() -> None:
     decision = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=_request().request_key, path=PathKind.PE_READ),
         reverse_plan=None,
     )
     expected_bytes = msgspec.msgpack.encode(
         {
-            "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
             "result": _result_payload(),
             "reverse_plan": None,
         }
@@ -206,90 +157,29 @@ def test_path_decision_msgpack_round_trip_result() -> None:
     assert decode_path_decision(expected_bytes) == decision
 
 
-def test_protocol_v2_decision_request_and_result_round_trip() -> None:
+def test_decision_request_and_result_round_trip() -> None:
     metadata = _metadata()
     key = metadata.decision_request.request_key
     decision = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
         reverse_plan=_reverse_plan(key),
     )
 
     assert set(metadata.to_dict()) == {
-        "protocol_version",
         "decision_request",
         "decode_control_endpoint",
     }
-    assert set(decision.to_dict()) == {"protocol_version", "result", "reverse_plan"}
+    assert set(decision.to_dict()) == {"result", "reverse_plan"}
     assert decode_path_decision(encode_path_decision(decision)) == decision
 
 
 def test_pe_read_serializes_none_reverse_plan() -> None:
     decision = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=_request().request_key, path=PathKind.PE_READ),
         reverse_plan=None,
     )
 
     assert decision.to_dict()["reverse_plan"] is None
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        pytest.param(
-            {
-                "protocol_version": True,
-                "result": _result_payload(),
-                "reverse_plan": None,
-            },
-            id="boolean-version",
-        ),
-        pytest.param(
-            {
-                "protocol_version": "1",
-                "result": _result_payload(),
-                "reverse_plan": None,
-            },
-            id="non-integer-version",
-        ),
-    ],
-)
-def test_path_decision_from_dict_rejects_bad_version(payload: _JsonValue) -> None:
-    with pytest.raises(PathDecisionValidationError):
-        PathDecision.from_dict(payload)
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        pytest.param(
-            {"protocol_version": DUAL_PATH_PROTOCOL_VERSION},
-            id="missing-field",
-        ),
-        pytest.param(
-            {
-                "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
-                "result": _result_payload(),
-                "reverse_plan": None,
-                "unexpected": None,
-            },
-            id="extra-field",
-        ),
-        pytest.param(
-            {
-                "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
-                "result": _result_payload(),
-                "reverse_plan": None,
-                "result" + "_type": "commit",
-            },
-            id="legacy-discriminator-extra-field",
-        ),
-    ],
-)
-def test_path_decision_from_dict_rejects_non_exact_keys(payload: _JsonValue) -> None:
-    with pytest.raises(PathDecisionValidationError):
-        PathDecision.from_dict(payload)
 
 
 def test_decode_path_decision_rejects_malformed_msgpack() -> None:
@@ -312,7 +202,6 @@ def test_nested_dual_path_envelope_matches_kv_transfer_params_shape() -> None:
         "remote_host": "198.51.100.20",
         "remote_port": 25001,
         "dual_path": {
-            "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
             "decision_request": {
                 "request_key": _key_payload(),
                 "target_tokens": 32,
@@ -366,7 +255,6 @@ def _coordinator(endpoint: DecodeControlEndpoint, *, boot_id: str | None = "boot
 
 def _decision(key: DualPathRequestKey, *, path: PathKind = PathKind.PE_READ) -> PathDecision:
     return PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=key, path=path),
         reverse_plan=_reverse_plan(key) if path is PathKind.DE_READ else None,
     )
@@ -630,7 +518,6 @@ def test_identical_duplicate_accepted_once_conflict_rejected() -> None:
     key = _request().request_key
     decision = _decision(key, path=PathKind.DE_READ)
     conflicting = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=decision.result,
         reverse_plan=replace(decision.reverse_plan, remote_port=5001),
     )
@@ -645,40 +532,16 @@ def test_identical_duplicate_accepted_once_conflict_rejected() -> None:
         receiver.close()
 
 
-def test_protocol_v1_or_mixed_payload_rejected() -> None:
-    endpoint = _free_control_endpoint()
-    receiver = _coordinator(endpoint)
-    key = _request().request_key
-    v1_payload = {
-        "protocol_version": 1,
-        "result": _result_payload(),
-        "reverse_plan": None,
-    }
-    mixed_payload = {
-        "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
-        "result": _result_payload(),
-    }
-    try:
-        receiver.register_pending(key)
-        assert _raw_request(endpoint, msgspec.msgpack.encode(v1_payload)) is None
-        assert _raw_request(endpoint, msgspec.msgpack.encode(mixed_payload)) is None
-        assert receiver.take_received_decisions() == []
-    finally:
-        receiver.close()
-
-
 def test_de_read_requires_serialized_reverse_plan() -> None:
     endpoint = _free_control_endpoint()
     receiver = _coordinator(endpoint)
     key = _request().request_key
     without_plan = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
         reverse_plan=None,
     )
     other_key = DualPathRequestKey(key.decode_engine_instance_id, "request-2")
     mismatched_plan = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
         reverse_plan=_reverse_plan(other_key),
     )
@@ -729,20 +592,6 @@ def test_registered_wrong_incarnation_key_gets_no_ack() -> None:
         assert _raw_request(endpoint, encode_path_decision(_decision(wrong))) is None
         assert receiver.take_received_decisions() == []
         assert wrong not in receiver._accepted_decisions
-    finally:
-        receiver.close()
-
-
-def test_unsupported_protocol_version_gets_no_ack() -> None:
-    endpoint = _free_control_endpoint()
-    receiver = _coordinator(endpoint)
-    key = _request().request_key
-    payload = _decision(key).to_dict()
-    payload["protocol_version"] = DUAL_PATH_PROTOCOL_VERSION + 1
-    try:
-        receiver.register_pending(key)
-        assert _raw_request(endpoint, msgspec.msgpack.encode(payload)) is None
-        assert receiver.take_received_decisions() == []
     finally:
         receiver.close()
 

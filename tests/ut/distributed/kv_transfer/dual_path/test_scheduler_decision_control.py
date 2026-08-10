@@ -31,7 +31,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     RoundRobinPathPolicy,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     PathDecision,
     PathDecisionDeliveryError,
@@ -205,7 +204,6 @@ def _result(request_id: str = "request-local-7") -> PathDecisionResult:
 def _decision(result: PathDecisionResult | None = None) -> PathDecision:
     retained_result = result or _result()
     return PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=retained_result,
         reverse_plan=ReversePlan(
             request_key=retained_result.request_key,
@@ -243,7 +241,6 @@ def _control_only_worker():
 
 def _expected_dual_path_payload() -> dict:
     return {
-        "protocol_version": DUAL_PATH_PROTOCOL_VERSION,
         "decision_request": {
             "request_key": {
                 "decode_engine_instance_id": _DECODE_INSTANCE_ID,
@@ -263,10 +260,8 @@ def _prefill_decision_payload(
     target_tokens: int = 48,
     decode_local_tokens: int = 16,
     decode_store_tokens: int = 32,
-    protocol_version: int = DUAL_PATH_PROTOCOL_VERSION,
 ) -> dict:
     return {
-        "protocol_version": protocol_version,
         "decision_request": {
             "request_key": {
                 "decode_engine_instance_id": _DECODE_INSTANCE_ID,
@@ -812,18 +807,6 @@ class TestPrefillDecisionHook:
         policy.choose.assert_not_called()
         task04_seams.prefill_coordinator.submit.assert_not_called()
 
-    def test_version_mismatch_fails_locally_and_sends_nothing(self, scheduler_factory, task04_seams):
-        policy = MagicMock(name="path_policy")
-        scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        payload = _prefill_decision_payload(protocol_version=DUAL_PATH_PROTOCOL_VERSION + 1)
-        request = _make_prefill_request("prefill-version", _remote_decode_params(dual_path=payload))
-
-        scheduler.get_num_new_matched_tokens(request, 0)
-
-        assert scheduler._pe_invalid_request_ids == {request.request_id}
-        policy.choose.assert_not_called()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-
     @pytest.mark.parametrize("failure", ["exception", "invalid-return"])
     def test_policy_exception_or_invalid_return_records_failure_sends_nothing(
         self,
@@ -1035,7 +1018,6 @@ class TestDecodeResultConsumption:
         request, snapshot = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         invalid_decision = PathDecision(
-            protocol_version=DUAL_PATH_PROTOCOL_VERSION,
             result=_result(),
             reverse_plan=None,
         )

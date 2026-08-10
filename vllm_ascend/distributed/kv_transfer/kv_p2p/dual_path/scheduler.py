@@ -41,7 +41,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     RoundRobinPathPolicy,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     DualPathDecisionMetadata,
     PathDecision,
@@ -338,16 +337,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 "DualPath Prefill decision metadata is invalid for request %s: %s",
                 request_id,
                 error,
-            )
-            self._pe_invalid_request_ids.add(request_id)
-            return parent_result
-
-        if metadata.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-            logger.error(
-                "DualPath Prefill decision protocol version mismatch for request %s: expected %s, got %s",
-                request_id,
-                DUAL_PATH_PROTOCOL_VERSION,
-                metadata.protocol_version,
             )
             self._pe_invalid_request_ids.add(request_id)
             return parent_result
@@ -741,7 +730,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
         metadata = self._pe_decision_metadata[request_id]
         decision = PathDecision(
-            protocol_version=DUAL_PATH_PROTOCOL_VERSION,
             result=result,
             reverse_plan=reverse_plan,
         )
@@ -763,28 +751,25 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         def log_delivery_failure(completed_future: Future[None]) -> None:
             if completed_future.cancelled():
                 logger.warning(
-                    "dual_path delivery key=%s/%s protocol=%s delivery_terminal=CANCELLED",
+                    "dual_path delivery key=%s/%s delivery_terminal=CANCELLED",
                     request_key.decode_engine_instance_id,
                     request_key.decode_request_id,
-                    DUAL_PATH_PROTOCOL_VERSION,
                 )
                 return
             error = completed_future.exception()
             if error is not None:
                 logger.error(
-                    "dual_path delivery key=%s/%s protocol=%s delivery_terminal=FAILED "
+                    "dual_path delivery key=%s/%s delivery_terminal=FAILED "
                     "failure_source=DELIVERY error=%s",
                     request_key.decode_engine_instance_id,
                     request_key.decode_request_id,
-                    DUAL_PATH_PROTOCOL_VERSION,
                     error,
                 )
                 return
             logger.info(
-                "dual_path delivery key=%s/%s protocol=%s delivery_terminal=SUCCEEDED",
+                "dual_path delivery key=%s/%s delivery_terminal=SUCCEEDED",
                 request_key.decode_engine_instance_id,
                 request_key.decode_request_id,
-                DUAL_PATH_PROTOCOL_VERSION,
             )
 
         delivery_future.add_done_callback(log_delivery_failure)
@@ -958,7 +943,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             decode_store_tokens=snapshot.store_tokens,
         )
         decision_metadata = DualPathDecisionMetadata(
-            protocol_version=DUAL_PATH_PROTOCOL_VERSION,
             decision_request=decision_request,
             decode_control_endpoint=coordinator.decode_control_endpoint,
         )
@@ -1161,11 +1145,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         else:
             assert_never(result.path)
         logger.info(
-            "dual_path activation key=%s/%s protocol=%s selected_path=%s store=%s "
+            "dual_path activation key=%s/%s selected_path=%s store=%s "
             "store_range=[%s,%s) reverse_range=[%s,%s) forward_range=[%s,%s)",
             state.request_key.decode_engine_instance_id,
             state.request_key.decode_request_id,
-            decision.protocol_version,
             result.path.value,
             store_coverage,
             snapshot.local_tokens,

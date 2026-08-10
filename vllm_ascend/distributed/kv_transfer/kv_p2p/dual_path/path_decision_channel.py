@@ -28,7 +28,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     _require_exact_payload,
 )
 
-DUAL_PATH_PROTOCOL_VERSION: Final[int] = 2
 _PATH_DECISION_SEND_WORKERS: Final[int] = 32
 
 _MIN_TCP_PORT: Final[int] = 1
@@ -59,12 +58,6 @@ def derive_decode_control_port(
     return derived_port
 
 
-def _require_protocol_version(protocol_version: _JsonValue) -> int:
-    if isinstance(protocol_version, bool) or not isinstance(protocol_version, int):
-        raise PathDecisionValidationError("protocol_version must be an integer and must not be a boolean")
-    return protocol_version
-
-
 @dataclass(frozen=True)
 class DecodeControlEndpoint:
     host: str
@@ -91,12 +84,10 @@ class DecodeControlEndpoint:
 
 @dataclass(frozen=True)
 class DualPathDecisionMetadata:
-    protocol_version: int
     decision_request: PathDecisionRequest
     decode_control_endpoint: DecodeControlEndpoint
 
     def __post_init__(self) -> None:
-        _require_protocol_version(self.protocol_version)
         if not isinstance(self.decision_request, PathDecisionRequest):
             raise PathDecisionValidationError("decision_request must be a PathDecisionRequest")
         if not isinstance(self.decode_control_endpoint, DecodeControlEndpoint):
@@ -104,7 +95,6 @@ class DualPathDecisionMetadata:
 
     def to_dict(self) -> _JsonObject:
         return {
-            "protocol_version": self.protocol_version,
             "decision_request": self.decision_request.to_dict(),
             "decode_control_endpoint": self.decode_control_endpoint.to_dict(),
         }
@@ -113,10 +103,9 @@ class DualPathDecisionMetadata:
     def from_dict(cls, payload: _JsonValue) -> DualPathDecisionMetadata:
         data = _require_exact_payload(
             payload,
-            frozenset({"protocol_version", "decision_request", "decode_control_endpoint"}),
+            frozenset({"decision_request", "decode_control_endpoint"}),
         )
         return cls(
-            protocol_version=data["protocol_version"],
             decision_request=PathDecisionRequest.from_dict(data["decision_request"]),
             decode_control_endpoint=DecodeControlEndpoint.from_dict(data["decode_control_endpoint"]),
         )
@@ -124,12 +113,10 @@ class DualPathDecisionMetadata:
 
 @dataclass(frozen=True)
 class PathDecision:
-    protocol_version: int
     result: PathDecisionResult
     reverse_plan: ReversePlan | None
 
     def __post_init__(self) -> None:
-        _require_protocol_version(self.protocol_version)
         if not isinstance(self.result, PathDecisionResult):
             raise PathDecisionValidationError("result must be a PathDecisionResult")
         if self.reverse_plan is not None and not isinstance(self.reverse_plan, ReversePlan):
@@ -137,17 +124,15 @@ class PathDecision:
 
     def to_dict(self) -> _JsonObject:
         return {
-            "protocol_version": self.protocol_version,
             "result": self.result.to_dict(),
             "reverse_plan": None if self.reverse_plan is None else self.reverse_plan.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: _JsonValue) -> PathDecision:
-        data = _require_exact_payload(payload, frozenset({"protocol_version", "result", "reverse_plan"}))
+        data = _require_exact_payload(payload, frozenset({"result", "reverse_plan"}))
         reverse_plan_payload = data["reverse_plan"]
         return cls(
-            protocol_version=data["protocol_version"],
             result=PathDecisionResult.from_dict(data["result"]),
             reverse_plan=None if reverse_plan_payload is None else ReversePlan.from_dict(reverse_plan_payload),
         )
@@ -444,10 +429,6 @@ class PathDecisionCoordinator:
         except PathDecisionValidationError:
             logger.warning("path decision result receiver rejected malformed payload")
             return
-        if decision.protocol_version != DUAL_PATH_PROTOCOL_VERSION:
-            logger.warning("path decision result receiver rejected unsupported protocol version")
-            return
-
         result = decision.result
         key = result.request_key
         if key.decode_engine_instance_id != self.decode_engine_instance_id:

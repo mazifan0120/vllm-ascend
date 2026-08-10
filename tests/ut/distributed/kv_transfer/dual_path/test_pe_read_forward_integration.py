@@ -35,7 +35,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     PathDecision,
 )
@@ -270,7 +269,6 @@ def _build_lifecycle(
     assert pe_scheduler._pe_forward_plans == {pe_request.request_id: forward_plan}
 
     pe_decision = PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=pe_result,
         reverse_plan=None,
     )

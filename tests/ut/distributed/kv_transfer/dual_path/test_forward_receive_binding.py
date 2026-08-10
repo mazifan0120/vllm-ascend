@@ -23,7 +23,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     PathDecision,
 )
@@ -43,7 +42,6 @@ _CONTROL_ENDPOINT = DecodeControlEndpoint(host="192.0.2.44", port=24001)
 
 def _decision(result: PathDecisionResult) -> PathDecision:
     return PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=result,
         reverse_plan=None,
     )
@@ -71,7 +69,6 @@ def _de_read_decision(state, snapshot, **plan_overrides) -> PathDecision:
     if plan_overrides:
         plan = dataclasses.replace(plan, **plan_overrides)
     return PathDecision(
-        protocol_version=DUAL_PATH_PROTOCOL_VERSION,
         result=PathDecisionResult(request_key=state.request_key, path=PathKind.DE_READ),
         reverse_plan=plan,
     )

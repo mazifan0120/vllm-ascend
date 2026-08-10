@@ -37,7 +37,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    DUAL_PATH_PROTOCOL_VERSION,
     DecodeControlEndpoint,
     PathDecision,
 )
@@ -834,7 +833,6 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
         order.append("results")
         return [
             PathDecision(
-                protocol_version=DUAL_PATH_PROTOCOL_VERSION,
                 result=result,
                 reverse_plan=None,
             )
