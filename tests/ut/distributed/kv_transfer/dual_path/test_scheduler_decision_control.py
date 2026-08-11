@@ -27,7 +27,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     PathDecisionRequest,
     PathDecisionResult,
-    PathDecisionValidationError,
     PathKind,
     RoundRobinPathPolicy,
 )
@@ -704,9 +703,11 @@ class TestPrefillDecisionHook:
         assert list(scheduler._pe_forward_plans) == [request.request_id]
         assert list(scheduler._pe_delivery_futures) == [scheduler._pe_request_keys[request.request_id]]
 
-    def test_conflicting_facts_propagate_without_second_policy_invocation(self, scheduler_factory, task04_seams):
+    def test_undelivered_conflicting_facts_discard_and_redecide(self, scheduler_factory, task04_seams):
+        # An admission retry carrying changed facts before any delivery discards
+        # the uncommitted decision and decides fresh from the new facts.
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = PathKind.PE_READ
+        policy.choose.side_effect = [PathKind.PE_READ, PathKind.DE_READ]
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         original = _make_prefill_request(
             "prefill-conflict",
@@ -717,28 +718,31 @@ class TestPrefillDecisionHook:
             _remote_decode_params(dual_path=_prefill_decision_payload(decode_store_tokens=32)),
         )
 
-        scheduler.get_num_new_matched_tokens(original, 0)
-        with pytest.raises(
-            PathDecisionValidationError,
-            match="request key is already associated with different token facts",
-        ):
-            scheduler.get_num_new_matched_tokens(conflicting, 0)
+        first = scheduler.get_num_new_matched_tokens(original, 0)
+        second = scheduler.get_num_new_matched_tokens(conflicting, 0)
 
-        policy.choose.assert_called_once()
+        assert first == (0, False)
+        assert second == (32, True)
+        assert policy.choose.call_count == 2
         task04_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._pe_invalid_request_ids == set()
         assert scheduler._pe_forward_plans == {}
         assert scheduler._pe_pending_reverse_receive_bindings == {}
         assert scheduler._reqs_need_send_layerwise == {}
-        assert scheduler._pe_decision_metadata[original.request_id].decision_request.decode_store_tokens == 24
+        retained = scheduler._pe_decision_metadata[original.request_id].decision_request
+        assert retained.decode_store_tokens == 32
+        assert scheduler._pe_path_results[original.request_id].path is PathKind.DE_READ
 
-    def test_conflicting_frozen_prefill_prefix_propagates_before_allocation_activation(
+    def test_undelivered_prefill_prefix_change_discards_and_redecides(
         self,
         scheduler_factory,
         task04_seams,
     ):
+        # The same request re-admitted with a different local prefix (e.g. an
+        # allocation-failure retry re-probing a grown prefix cache) re-decides
+        # from the new prefix instead of raising.
         policy = MagicMock(name="path_policy")
-        policy.choose.return_value = PathKind.PE_READ
+        policy.choose.side_effect = [PathKind.PE_READ, PathKind.DE_READ]
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-prefix-conflict", _remote_decode_params())
 
@@ -748,19 +752,70 @@ class TestPrefillDecisionHook:
             autospec=True,
             return_value=(0, False),
         ):
-            scheduler.get_num_new_matched_tokens(request, 0)
-            with pytest.raises(
-                PathDecisionValidationError,
-                match="request key is already associated with different token facts",
-            ):
-                scheduler.get_num_new_matched_tokens(request, 16)
+            first = scheduler.get_num_new_matched_tokens(request, 0)
+            second = scheduler.get_num_new_matched_tokens(request, 16)
 
-        policy.choose.assert_called_once()
+        assert first == (0, False)
+        assert second == (16, True)
+        assert policy.choose.call_count == 2
         task04_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._pe_invalid_request_ids == set()
         assert scheduler._pe_forward_plans == {}
         assert scheduler._pe_pending_reverse_receive_bindings == {}
         assert scheduler._reqs_need_send_layerwise == {}
+        assert scheduler._pe_prefill_local_tokens[request.request_id] == 16
+        assert scheduler._pe_path_results[request.request_id].path is PathKind.DE_READ
+
+    def test_delivered_conflicting_facts_converge_without_redecide(self, scheduler_factory, task04_seams):
+        # Once the decision has been delivered, re-deciding would fork the
+        # protocol (e.g. preemption resume after delivery): converge locally by
+        # marking the request invalid and deferring to the parent result.
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = PathKind.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-delivered-conflict", _remote_decode_params())
+
+        parent_result = (7, True)
+        with patch.object(
+            MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            return_value=parent_result,
+        ):
+            first = scheduler.get_num_new_matched_tokens(request, 0)
+            _bind_prefill(scheduler, request)
+            second = scheduler.get_num_new_matched_tokens(request, 16)
+
+        assert first == (0, False)
+        assert second == parent_result
+        policy.choose.assert_called_once()
+        task04_seams.prefill_coordinator.submit.assert_called_once()
+        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        assert scheduler._pe_path_results[request.request_id].path is PathKind.PE_READ
+        assert list(scheduler._pe_forward_plans) == [request.request_id]
+
+    def test_malformed_decision_envelope_converges_to_parent_result(self, scheduler_factory, task04_seams):
+        policy = MagicMock(name="path_policy")
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request(
+            "prefill-malformed",
+            _remote_decode_params(dual_path={"unexpected": "shape"}),
+        )
+
+        parent_result = (7, True)
+        with patch.object(
+            MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            return_value=parent_result,
+        ):
+            first = scheduler.get_num_new_matched_tokens(request, 0)
+            second = scheduler.get_num_new_matched_tokens(request, 0)
+
+        assert first == second == parent_result
+        policy.choose.assert_not_called()
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+        assert scheduler._pe_invalid_request_ids == {request.request_id}
 
     def test_update_state_after_alloc_suppresses_send_queue_for_dual_path(self, scheduler_factory):
         scheduler = scheduler_factory(role="prefill")

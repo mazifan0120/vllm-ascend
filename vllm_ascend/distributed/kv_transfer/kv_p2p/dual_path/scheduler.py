@@ -331,7 +331,16 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if request_id in self._pe_invalid_request_ids:
             return parent_result
 
-        metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
+        try:
+            metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
+        except PathDecisionValidationError as error:
+            logger.error(
+                "DualPath Prefill decision metadata is invalid for request %s: %s",
+                request_id,
+                error,
+            )
+            self._pe_invalid_request_ids.add(request_id)
+            return parent_result
         decision_request = metadata.decision_request
         effective_prefill_tokens = _expected_prefill_token_end(decision_request, self.need_truncate)
         if not 0 <= prefill_local_tokens <= effective_prefill_tokens:
@@ -344,9 +353,45 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return parent_result
 
         assert self._path_decider is not None
-        result = self._path_decider.decide(decision_request, prefill_local_tokens)
-
         request_key = decision_request.request_key
+        try:
+            result = self._path_decider.decide(decision_request, prefill_local_tokens)
+        except PathDecisionValidationError as error:
+            if request_key in self._pe_delivery_futures or request_id not in self._pe_path_results:
+                # A delivered decision cannot be re-decided without forking the
+                # protocol (e.g. preemption resume after delivery), and a
+                # first-contact failure has nothing to discard: converge locally
+                # instead of escaping into the vLLM scheduling loop. No Result is
+                # sent and Decode converges through its decision deadline.
+                logger.error(
+                    "DualPath Prefill decision failed for request %s: %s",
+                    request_id,
+                    error,
+                )
+                self._pe_invalid_request_ids.add(request_id)
+                return parent_result
+            # The retained decision was never delivered, so the conflicting facts
+            # come from an admission retry (allocation-failure retry or preemption
+            # resume re-probing a changed prefix cache). Discard the uncommitted
+            # decision state wholesale and decide fresh from the new facts.
+            logger.warning(
+                "DualPath Prefill admission facts changed for request %s before decision "
+                "delivery; discarding the undelivered decision and re-deciding: %s",
+                request_id,
+                error,
+            )
+            self._discard_undelivered_pe_decision(request_id, request_key)
+            try:
+                result = self._path_decider.decide(decision_request, prefill_local_tokens)
+            except PathDecisionValidationError as fresh_error:
+                logger.error(
+                    "DualPath Prefill fresh decision failed for request %s: %s",
+                    request_id,
+                    fresh_error,
+                )
+                self._pe_invalid_request_ids.add(request_id)
+                return parent_result
+
         self._pe_request_keys[request_id] = request_key
         self._pe_decision_metadata[request_id] = metadata
         self._pe_prefill_local_tokens.setdefault(request_id, prefill_local_tokens)
@@ -368,6 +413,20 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return reverse_tokens, True
         else:
             assert_never(result.path)
+
+    def _discard_undelivered_pe_decision(self, request_id: str, request_key: DualPathRequestKey) -> None:
+        # Drop every record latched by the first admission of this request. The
+        # decision was never delivered (no delivery future exists), and
+        # Forward/Reverse artifacts are only installed during
+        # update_state_after_alloc, so none can exist here; only the
+        # admission-time maps and the decider record need clearing for the
+        # retry to decide as a fresh request.
+        self._pe_request_keys.pop(request_id, None)
+        self._pe_decision_metadata.pop(request_id, None)
+        self._pe_prefill_local_tokens.pop(request_id, None)
+        self._pe_path_results.pop(request_id, None)
+        assert self._path_decider is not None
+        self._path_decider.discard(request_key)
 
     def _log_prefill_decision(
         self,
@@ -1229,7 +1288,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def _release_scheduler_request_state(self, request: Request) -> None:
         request_id = request.request_id
         self._lookup_results.pop(request_id, None)
-        self._decode_kv_snapshots.pop(request_id, None) 
+        self._decode_kv_snapshots.pop(request_id, None)
         state = self._decode_decision_states.pop(request_id, None)
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)

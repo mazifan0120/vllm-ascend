@@ -185,11 +185,7 @@ class PathDecisionDecider:
                 )
             return existing.result
 
-        path = (
-            PathKind.PE_READ
-            if prefill_local_tokens >= request.decode_store_tokens
-            else self._policy.choose(request)
-        )
+        path = PathKind.PE_READ if prefill_local_tokens >= request.decode_store_tokens else self._policy.choose(request)
 
         result = PathDecisionResult(request_key=request.request_key, path=path)
         self._decision_records[request.request_key] = _DecisionRecord(

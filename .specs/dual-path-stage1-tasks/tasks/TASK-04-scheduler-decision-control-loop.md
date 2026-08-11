@@ -369,10 +369,17 @@ same key + identical facts during the active lifecycle
     -> do not invoke policy
     -> do not submit another delivery Future
 
-same key + different facts, invalid metadata, or invalid policy result
+same key + different facts before the Decision is delivered
+    (Scheduler admission retry, e.g. an allocation-failure retry or a
+    preemption resume re-probing a changed prefix cache)
+    -> discard the undelivered retained state for the request/key
+    -> decide once more from the new facts
+
+same key + different facts after the Decision was delivered, invalid
+metadata, or a locally failed fresh decision
     -> log local failure
     -> send no Result
-    -> mark the active local request/key as processed
+    -> mark the active local request/key as processed (invalid)
     -> do not invoke policy again on Scheduler replay
 ```
 

@@ -550,6 +550,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_is_dual_path_decode_admission",
         "_stage_prefill_activation_failure",
         "_decide_prefill_path_for_admission",
+        "_discard_undelivered_pe_decision",
         "_log_prefill_decision",
         "_prepare_forward_plan",
         "_try_install_forward_plan",
