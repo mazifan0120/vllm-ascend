@@ -43,8 +43,8 @@ SUPPORTED_ROLES: tuple[str, str] = ("prefill", "decode")
 # Rendered once so every role-related error message lists the same choices.
 _ROLE_CHOICES: str = " | ".join(repr(role) for role in SUPPORTED_ROLES)
 
-_MIN_TCP_PORT: int = 1
-_MAX_TCP_PORT: int = 65535
+MIN_TCP_PORT: int = 1
+MAX_TCP_PORT: int = 65535
 
 
 @dataclass(frozen=True)
@@ -145,9 +145,8 @@ def _validate_dual_path_control_port(extra: dict[str, Any], role: str) -> int | 
     """Validate and return the dual-path control port.
 
     The port is required for role="decode" and validated here only as an
-    integer (not bool) within 1..65535. For role="prefill" it is optional,
-    type/range-checked when present, and stored but not consumed by the
-    prefill side.
+    integer (not bool) within 1..65535. It is rejected for role="prefill",
+    which never consumes it.
     """
     port = extra.get("dual_path_control_port")
     if role == "decode" and port is None:
@@ -155,9 +154,14 @@ def _validate_dual_path_control_port(extra: dict[str, Any], role: str) -> int | 
             "DualPathConnector role='decode' requires 'dual_path_control_port' "
             "in kv_connector_extra_config (an integer between 1 and 65535)."
         )
+    if role != "decode" and port is not None:
+        raise ValueError(
+            "DualPathConnector 'dual_path_control_port' is only consumed by role='decode'; "
+            "remove it from the prefill-side configuration."
+        )
     if port is None:
         return None
-    if isinstance(port, bool) or not isinstance(port, int) or not _MIN_TCP_PORT <= port <= _MAX_TCP_PORT:
+    if isinstance(port, bool) or not isinstance(port, int) or not MIN_TCP_PORT <= port <= MAX_TCP_PORT:
         raise ValueError(
             f"DualPathConnector 'dual_path_control_port' must be an integer between 1 and 65535; got {port!r}."
         )

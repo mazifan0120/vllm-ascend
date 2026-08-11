@@ -10,29 +10,28 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Final, Protocol, TypeAlias
+from typing import Final, Literal, Protocol, TypeAlias
 
 import msgspec
 import zmq
 from typing_extensions import assert_never
 from vllm.logger import logger
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import MAX_TCP_PORT, MIN_TCP_PORT
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    JsonObject,
+    JsonValue,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
     PathKind,
-    _JsonObject,
-    _JsonValue,
-    _require_exact_payload,
+    require_exact_payload,
 )
 
 _PATH_DECISION_SEND_WORKERS: Final[int] = 32
 
-_MIN_TCP_PORT: Final[int] = 1
-_MAX_TCP_PORT: Final[int] = 65535
 _MAX_DELIVERY_ATTEMPTS: Final[int] = 3
 _SEND_TIMEOUT_MS: Final[int] = 1000
 _POLL_TIMEOUT_MS: Final[int] = 1000
@@ -49,7 +48,7 @@ def derive_decode_control_port(
     worker_port_span: int,
 ) -> int:
     derived_port = dual_path_control_port + data_parallel_rank
-    if not _MIN_TCP_PORT <= derived_port <= _MAX_TCP_PORT:
+    if not MIN_TCP_PORT <= derived_port <= MAX_TCP_PORT:
         raise ValueError(f"derived DualPath control port {derived_port} is outside 1..65535")
     if kv_port <= derived_port < kv_port + worker_port_span:
         raise ValueError(
@@ -70,16 +69,16 @@ class DecodeControlEndpoint:
         if (
             isinstance(self.port, bool)
             or not isinstance(self.port, int)
-            or not _MIN_TCP_PORT <= self.port <= _MAX_TCP_PORT
+            or not MIN_TCP_PORT <= self.port <= MAX_TCP_PORT
         ):
             raise PathDecisionValidationError("port must be an integer in the range 1..65535 and must not be a boolean")
 
-    def to_dict(self) -> _JsonObject:
+    def to_dict(self) -> JsonObject:
         return {"host": self.host, "port": self.port}
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> DecodeControlEndpoint:
-        data = _require_exact_payload(payload, frozenset({"host", "port"}))
+    def from_dict(cls, payload: JsonValue) -> DecodeControlEndpoint:
+        data = require_exact_payload(payload, frozenset({"host", "port"}))
         return cls(host=data["host"], port=data["port"])
 
 
@@ -94,15 +93,15 @@ class DualPathDecisionMetadata:
         if not isinstance(self.decode_control_endpoint, DecodeControlEndpoint):
             raise PathDecisionValidationError("decode_control_endpoint must be a DecodeControlEndpoint")
 
-    def to_dict(self) -> _JsonObject:
+    def to_dict(self) -> JsonObject:
         return {
             "decision_request": self.decision_request.to_dict(),
             "decode_control_endpoint": self.decode_control_endpoint.to_dict(),
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> DualPathDecisionMetadata:
-        data = _require_exact_payload(
+    def from_dict(cls, payload: JsonValue) -> DualPathDecisionMetadata:
+        data = require_exact_payload(
             payload,
             frozenset({"decision_request", "decode_control_endpoint"}),
         )
@@ -123,15 +122,15 @@ class PathDecision:
         if self.reverse_plan is not None and not isinstance(self.reverse_plan, ReversePlan):
             raise PathDecisionValidationError("reverse_plan must be a ReversePlan or None")
 
-    def to_dict(self) -> _JsonObject:
+    def to_dict(self) -> JsonObject:
         return {
             "result": self.result.to_dict(),
             "reverse_plan": None if self.reverse_plan is None else self.reverse_plan.to_dict(),
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> PathDecision:
-        data = _require_exact_payload(payload, frozenset({"result", "reverse_plan"}))
+    def from_dict(cls, payload: JsonValue) -> PathDecision:
+        data = require_exact_payload(payload, frozenset({"result", "reverse_plan"}))
         reverse_plan_payload = data["reverse_plan"]
         return cls(
             result=PathDecisionResult.from_dict(data["result"]),
@@ -240,7 +239,7 @@ def _deliver_decision(
 
 class PathDecisionCoordinator:
     def __init__(self) -> None:
-        self._role = ""
+        self._role: Literal["prefill", "decode"] | None = None
         self._closed = False
         self._decode_engine_instance_id: str | None = None
         self._decode_control_endpoint: DecodeControlEndpoint | None = None

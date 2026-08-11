@@ -7,15 +7,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, TypeAlias
 
-_JsonValue: TypeAlias = str | int | float | bool | None | list["_JsonValue"] | dict[str, "_JsonValue"]
-_JsonObject: TypeAlias = dict[str, _JsonValue]
+JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+JsonObject: TypeAlias = dict[str, JsonValue]
 
 
 class PathDecisionValidationError(ValueError):
     pass
 
 
-def _require_exact_payload(payload: _JsonValue, expected_keys: frozenset[str]) -> _JsonObject:
+def require_exact_payload(payload: JsonValue, expected_keys: frozenset[str]) -> JsonObject:
     if not isinstance(payload, dict):
         raise PathDecisionValidationError("serialized payload must be a dictionary")
     if set(payload) != expected_keys:
@@ -24,6 +24,10 @@ def _require_exact_payload(payload: _JsonValue, expected_keys: frozenset[str]) -
 
 
 class PathKind(str, Enum):
+    """Transfer route chosen by the Prefill-owned policy: ``PE_READ`` serves
+    the request from the Prefill engine (PE); ``DE_READ`` serves it on the
+    Decode engine (DE) from Store plus a Forward suffix."""
+
     PE_READ = "PE_READ"
     DE_READ = "DE_READ"
 
@@ -39,15 +43,15 @@ class DualPathRequestKey:
         if not isinstance(self.decode_request_id, str) or not self.decode_request_id:
             raise PathDecisionValidationError("decode_request_id must be a non-empty string")
 
-    def to_dict(self) -> _JsonObject:
+    def to_dict(self) -> JsonObject:
         return {
             "decode_engine_instance_id": self.decode_engine_instance_id,
             "decode_request_id": self.decode_request_id,
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> DualPathRequestKey:
-        data = _require_exact_payload(
+    def from_dict(cls, payload: JsonValue) -> DualPathRequestKey:
+        data = require_exact_payload(
             payload,
             frozenset({"decode_engine_instance_id", "decode_request_id"}),
         )
@@ -81,7 +85,7 @@ class PathDecisionRequest:
                 "token counts must satisfy 0 <= decode_local_tokens <= decode_store_tokens < target_tokens"
             )
 
-    def to_dict(self) -> _JsonObject:
+    def to_dict(self) -> JsonObject:
         return {
             "request_key": self.request_key.to_dict(),
             "target_tokens": self.target_tokens,
@@ -90,8 +94,8 @@ class PathDecisionRequest:
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> PathDecisionRequest:
-        data = _require_exact_payload(
+    def from_dict(cls, payload: JsonValue) -> PathDecisionRequest:
+        data = require_exact_payload(
             payload,
             frozenset(
                 {
@@ -121,15 +125,15 @@ class PathDecisionResult:
         if not isinstance(self.path, PathKind):
             raise PathDecisionValidationError("path must be a PathKind")
 
-    def to_dict(self) -> _JsonObject:
+    def to_dict(self) -> JsonObject:
         return {
             "request_key": self.request_key.to_dict(),
             "path": self.path.value,
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> PathDecisionResult:
-        data = _require_exact_payload(
+    def from_dict(cls, payload: JsonValue) -> PathDecisionResult:
+        data = require_exact_payload(
             payload,
             frozenset({"request_key", "path"}),
         )
@@ -153,11 +157,11 @@ class RoundRobinPathPolicy:
     not advance the rotation phase."""
 
     def __init__(self, rng: random.Random | None = None) -> None:
-        self._next = (rng or random.Random()).choice((PathKind.PE_READ, PathKind.DE_READ))
+        self._next_path = (rng or random.Random()).choice((PathKind.PE_READ, PathKind.DE_READ))
 
     def choose(self, request: PathDecisionRequest) -> PathKind:
-        selected = self._next
-        self._next = PathKind.DE_READ if selected is PathKind.PE_READ else PathKind.PE_READ
+        selected = self._next_path
+        self._next_path = PathKind.DE_READ if selected is PathKind.PE_READ else PathKind.PE_READ
         return selected
 
 

@@ -7,7 +7,8 @@ explicit post-allocation commit authorizes the existing async load lifecycle
 using a copy so the detached admission fact remains unchanged.
 
 ``KVPoolWorkerAdapter`` delegates that load lifecycle to one private
-``KVPoolWorker`` and retains ownership of the existing ``LookupKeyServer``.
+``KVPoolWorker``; the existing ``LookupKeyServer`` lifetime follows the
+worker process.
 """
 
 from __future__ import annotations
@@ -87,14 +88,6 @@ class KVPoolSchedulerAdapter:
             logger.exception("DualPath KVPool lookup failed for request %s; treating as Store miss", request_id)
             return None
 
-        # Defensive clamp: a worker-reported hit may exceed the decode-ready
-        # boundary; the pool scheduler only clamps the exactly-full case.
-        target_tokens = max(request.num_tokens - 1, 0)
-        usable_store_tokens = min(spec.kvpool_cached_tokens, target_tokens)
-        if usable_store_tokens != spec.kvpool_cached_tokens:
-            spec = dataclasses.replace(spec, kvpool_cached_tokens=usable_store_tokens)
-        if usable_store_tokens <= local_tokens:
-            return None
         return spec
 
     def commit_after_alloc(

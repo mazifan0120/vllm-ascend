@@ -348,14 +348,14 @@ PE retains one request/result pair and at most one delivery Future per
 `DualPathRequestKey`:
 
 ```python
-_pe_request_keys: dict[str, DualPathRequestKey]
-_pe_delivery_futures: dict[DualPathRequestKey, Future[None]]
-_pe_invalid_request_ids: set[str]
+_prefill_request_keys: dict[str, DualPathRequestKey]
+_prefill_delivery_futures: dict[DualPathRequestKey, Future[None]]
+_prefill_invalid_request_ids: set[str]
 ```
 
 The `PathDecisionDecider` owns the retained decision record described in
 Task-02, including a `result=None` record for a policy attempt that failed
-locally. `_pe_invalid_request_ids` covers malformed nested metadata from which
+locally. `_prefill_invalid_request_ids` covers malformed nested metadata from which
 no valid request key can be recovered.
 
 ```text

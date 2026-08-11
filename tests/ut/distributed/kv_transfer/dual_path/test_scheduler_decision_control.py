@@ -562,7 +562,7 @@ class TestPrefillDecisionHook:
         self._assert_parent_accounting_once(scheduler, request, (32, True))
 
         policy.choose.assert_called_once()
-        assert scheduler._pe_prefill_local_tokens == {request.request_id: 0}
+        assert scheduler._prefill_local_tokens == {request.request_id: 0}
 
     def test_prefill_local_tokens_validate_against_effective_target_before_decide(
         self,
@@ -584,7 +584,7 @@ class TestPrefillDecisionHook:
         assert result == (0, False)
         policy.choose.assert_not_called()
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_prefill_local_tokens == {}
+        assert scheduler._prefill_local_tokens == {}
 
     def test_prefill_hook_passes_incoming_l_pe_to_forced_eligibility(
         self,
@@ -606,9 +606,9 @@ class TestPrefillDecisionHook:
 
         assert result == (0, False)
         policy.choose.assert_not_called()
-        assert scheduler._pe_path_results[request.request_id].path is PathKind.PE_READ
+        assert scheduler._prefill_path_results[request.request_id].path is PathKind.PE_READ
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_prefill_local_tokens == {request.request_id: 32}
+        assert scheduler._prefill_local_tokens == {request.request_id: 32}
 
     def test_parent_accounting_runs_exactly_once_for_ordinary_request(self, scheduler_factory, task04_seams):
         scheduler = scheduler_factory(role="prefill")
@@ -662,8 +662,8 @@ class TestPrefillDecisionHook:
         assert result == parent_result
         policy.choose.assert_not_called()
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_request_keys == {}
-        assert scheduler._pe_delivery_futures == {}
+        assert scheduler._prefill_request_keys == {}
+        assert scheduler._prefill_delivery_futures == {}
 
     def test_seeded_non_full_requests_invoke_policy_once_and_alternate(self, scheduler_factory, task04_seams):
         policy = MagicMock(spec=RoundRobinPathPolicy, wraps=RoundRobinPathPolicy(random.Random(1)))
@@ -680,7 +680,7 @@ class TestPrefillDecisionHook:
 
         assert results == [(0, False), (32, True)]
         assert policy.choose.call_count == 2
-        assert [scheduler._pe_path_results[request.request_id].path for request in requests] == [
+        assert [scheduler._prefill_path_results[request.request_id].path for request in requests] == [
             PathKind.PE_READ,
             PathKind.DE_READ,
         ]
@@ -700,8 +700,8 @@ class TestPrefillDecisionHook:
         assert first == second == (0, False)
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
-        assert list(scheduler._pe_forward_plans) == [request.request_id]
-        assert list(scheduler._pe_delivery_futures) == [scheduler._pe_request_keys[request.request_id]]
+        assert list(scheduler._prefill_forward_plans) == [request.request_id]
+        assert list(scheduler._prefill_delivery_futures) == [request.request_id]
 
     def test_undelivered_conflicting_facts_discard_and_redecide(self, scheduler_factory, task04_seams):
         # An admission retry carrying changed facts before any delivery discards
@@ -725,13 +725,13 @@ class TestPrefillDecisionHook:
         assert second == (32, True)
         assert policy.choose.call_count == 2
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_invalid_request_ids == set()
-        assert scheduler._pe_forward_plans == {}
-        assert scheduler._pe_pending_reverse_receive_bindings == {}
+        assert scheduler._prefill_invalid_request_ids == set()
+        assert scheduler._prefill_forward_plans == {}
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._reqs_need_send_layerwise == {}
-        retained = scheduler._pe_decision_metadata[original.request_id].decision_request
+        retained = scheduler._prefill_decision_metadata[original.request_id].decision_request
         assert retained.decode_store_tokens == 32
-        assert scheduler._pe_path_results[original.request_id].path is PathKind.DE_READ
+        assert scheduler._prefill_path_results[original.request_id].path is PathKind.DE_READ
 
     def test_undelivered_prefill_prefix_change_discards_and_redecides(
         self,
@@ -759,12 +759,12 @@ class TestPrefillDecisionHook:
         assert second == (16, True)
         assert policy.choose.call_count == 2
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_invalid_request_ids == set()
-        assert scheduler._pe_forward_plans == {}
-        assert scheduler._pe_pending_reverse_receive_bindings == {}
+        assert scheduler._prefill_invalid_request_ids == set()
+        assert scheduler._prefill_forward_plans == {}
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._reqs_need_send_layerwise == {}
-        assert scheduler._pe_prefill_local_tokens[request.request_id] == 16
-        assert scheduler._pe_path_results[request.request_id].path is PathKind.DE_READ
+        assert scheduler._prefill_local_tokens[request.request_id] == 16
+        assert scheduler._prefill_path_results[request.request_id].path is PathKind.DE_READ
 
     def test_delivered_conflicting_facts_converge_without_redecide(self, scheduler_factory, task04_seams):
         # Once the decision has been delivered, re-deciding would fork the
@@ -790,9 +790,9 @@ class TestPrefillDecisionHook:
         assert second == parent_result
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
-        assert scheduler._pe_invalid_request_ids == {request.request_id}
-        assert scheduler._pe_path_results[request.request_id].path is PathKind.PE_READ
-        assert list(scheduler._pe_forward_plans) == [request.request_id]
+        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_path_results[request.request_id].path is PathKind.PE_READ
+        assert list(scheduler._prefill_forward_plans) == [request.request_id]
 
     def test_malformed_decision_envelope_converges_to_parent_result(self, scheduler_factory, task04_seams):
         policy = MagicMock(name="path_policy")
@@ -815,7 +815,7 @@ class TestPrefillDecisionHook:
         assert first == second == parent_result
         policy.choose.assert_not_called()
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_invalid_request_ids == {request.request_id}
 
     def test_update_state_after_alloc_suppresses_send_queue_for_dual_path(self, scheduler_factory):
         scheduler = scheduler_factory(role="prefill")
@@ -929,7 +929,7 @@ class TestDecodeResultConsumption:
             metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
         # Then
-        assert state.status is scheduler_module._DecodeDecisionStatus.TIMED_OUT
+        assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
         assert metadata.requests == {}
         assert metadata.control_failures == [
             DualPathControlFailureMetadata(
@@ -969,7 +969,7 @@ class TestDecodeResultConsumption:
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_result_scheduler_output"))
 
         # Then
-        assert state.status is scheduler_module._DecodeDecisionStatus.TIMED_OUT
+        assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
         assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
@@ -1123,7 +1123,7 @@ class TestCleanupAndShutdown:
         task04_seams.decode_coordinator.take_received_decisions.return_value = []
         with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline):
             decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert state.status is scheduler_module._DecodeDecisionStatus.TIMED_OUT
+        assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
 
         # When
         result = decode_scheduler.request_finished(request, [41, 42, 43, 44])
@@ -1169,17 +1169,17 @@ class TestCleanupAndShutdown:
             wraps=scheduler._path_decider.discard,
         ) as discard:
             getattr(scheduler, method_name)(request, block_ids)
-            assert request.request_id not in scheduler._pe_request_keys
-            assert request.request_id not in scheduler._pe_prefill_local_tokens
-            assert scheduler._pe_delivery_futures == {request_key: delivery_future}
-            discard.assert_not_called()
+            assert request.request_id not in scheduler._prefill_request_keys
+            assert request.request_id not in scheduler._prefill_local_tokens
+            assert scheduler._prefill_delivery_futures == {request.request_id: delivery_future}
+            discard.assert_called_once_with(request_key)
 
             delivery_future.set_result(None)
             scheduler.build_connector_meta(MagicMock(name="idle_scheduler_output"))
 
         # Then
         discard.assert_called_once_with(request_key)
-        assert scheduler._pe_delivery_futures == {}
+        assert scheduler._prefill_delivery_futures == {}
         assert request_key not in scheduler._path_decider._decision_records
 
     @pytest.mark.parametrize(
@@ -1201,15 +1201,15 @@ class TestCleanupAndShutdown:
             "prefill-invalid-cleanup",
             _remote_decode_params(),
         )
-        scheduler._pe_invalid_request_ids.add(request.request_id)
-        assert scheduler._pe_invalid_request_ids == {request.request_id}
+        scheduler._prefill_invalid_request_ids.add(request.request_id)
+        assert scheduler._prefill_invalid_request_ids == {request.request_id}
 
         # When
         result = getattr(scheduler, method_name)(request, block_ids)
 
         # Then
         assert result == (False, None)
-        assert scheduler._pe_invalid_request_ids == set()
+        assert scheduler._prefill_invalid_request_ids == set()
 
     def test_delivery_exhaustion_converges_to_de_timeout_without_redecision(
         self,
@@ -1250,7 +1250,7 @@ class TestCleanupAndShutdown:
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
         decode_scheduler.executor.submit.assert_called_once()
-        assert decode_state.status is scheduler_module._DecodeDecisionStatus.TIMED_OUT
+        assert decode_state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
         assert metadata.control_failures == [
             DualPathControlFailureMetadata(
                 request_id=decode_request.request_id,
@@ -1298,7 +1298,7 @@ class TestCleanupAndShutdown:
         )
         assert metadata.reverse_receive_bindings == []
         assert metadata.control_failures == [expected_failure]
-        assert scheduler._pe_control_failures == {}
+        assert scheduler._prefill_control_failures == {}
 
         worker = _make_prefill_worker()
         worker.start_load_kv(binding_metadata)
@@ -1313,9 +1313,9 @@ class TestCleanupAndShutdown:
         assert worker.get_finished({request.request_id}, metadata) == (set(), set())
         assert worker._control_failed_recving == set()
         assert worker._reverse_receive_bindings == {}
-        assert scheduler._pe_delivery_futures == {}
-        assert scheduler._pe_pending_reverse_receive_bindings == {}
-        assert scheduler._pe_control_failures == {}
+        assert scheduler._prefill_delivery_futures == {}
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
+        assert scheduler._prefill_control_failures == {}
 
     def test_de_read_delivery_failure_before_first_build_emits_control_only(
         self,
@@ -1334,7 +1334,7 @@ class TestCleanupAndShutdown:
         )
         scheduler.get_num_new_matched_tokens(request, 0)
         _bind_prefill(scheduler, request)
-        assert request.request_id in scheduler._pe_pending_reverse_receive_bindings
+        assert request.request_id in scheduler._prefill_pending_reverse_receive_bindings
         delivery_future.set_exception(PathDecisionDeliveryError("delivery exhausted"))
 
         # When
@@ -1427,7 +1427,7 @@ class TestCleanupAndShutdown:
 
         # Then
         assert committed_state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
-        assert timed_out_state.status is scheduler_module._DecodeDecisionStatus.TIMED_OUT
+        assert timed_out_state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
         assert cancelled_request.request_id not in decode_scheduler._decode_decision_states
         assert set(decode_scheduler._decode_decision_states) == {
             committed_request.request_id,
@@ -1457,11 +1457,11 @@ class TestCleanupAndShutdown:
             submitted.args[1].result.request_key for submitted in task04_seams.prefill_coordinator.submit.call_args_list
         ] == [committed_state.request_key, timed_out_state.request_key]
         assert completed_delivery_future is not inflight_delivery_future
-        assert prefill_scheduler._pe_request_keys == {
+        assert prefill_scheduler._prefill_request_keys == {
             inflight_prefill_request.request_id: timed_out_state.request_key,
         }
-        assert prefill_scheduler._pe_delivery_futures == {
-            timed_out_state.request_key: inflight_delivery_future,
+        assert prefill_scheduler._prefill_delivery_futures == {
+            inflight_prefill_request.request_id: inflight_delivery_future,
         }
         assert not inflight_delivery_future.done()
         assert prefill_scheduler._path_decider is not None
@@ -1497,9 +1497,7 @@ class TestCleanupAndShutdown:
             "prefill-invalid-shutdown",
             _remote_decode_params(),
         )
-        prefill_scheduler._pe_invalid_request_ids.add(invalid_request.request_id)
-        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
-
+        prefill_scheduler._prefill_invalid_request_ids.add(invalid_request.request_id)
         worker = _control_only_worker()
         worker._control_failed_recving.add("request-control-failure")
         events = []
@@ -1509,7 +1507,7 @@ class TestCleanupAndShutdown:
                 (
                     "decode-coordinator",
                     decode_scheduler._accepting_decode_admission,
-                    getattr(decode_scheduler, "_accepting_pe_decisions", None),
+                    getattr(decode_scheduler, "_accepting_prefill_decisions", None),
                     decode_request.request_id in decode_scheduler._decode_decision_states,
                 )
             )
@@ -1519,9 +1517,9 @@ class TestCleanupAndShutdown:
                 (
                     "prefill-coordinator",
                     prefill_scheduler._accepting_decode_admission,
-                    getattr(prefill_scheduler, "_accepting_pe_decisions", None),
-                    prefill_request.request_id in prefill_scheduler._pe_request_keys,
-                    request_key in prefill_scheduler._pe_delivery_futures,
+                    getattr(prefill_scheduler, "_accepting_prefill_decisions", None),
+                    prefill_request.request_id in prefill_scheduler._prefill_request_keys,
+                    prefill_request.request_id in prefill_scheduler._prefill_delivery_futures,
                 )
             )
             delivery_future.cancel()
@@ -1563,10 +1561,10 @@ class TestCleanupAndShutdown:
         assert decode_scheduler._lookup_results == {}
         assert decode_scheduler._decode_kv_snapshots == {}
         assert decode_scheduler._decode_decision_states == {}
-        assert prefill_scheduler._pe_request_keys == {}
-        assert prefill_scheduler._pe_prefill_local_tokens == {}
-        assert prefill_scheduler._pe_delivery_futures == {}
-        assert prefill_scheduler._pe_invalid_request_ids == set()
+        assert prefill_scheduler._prefill_request_keys == {}
+        assert prefill_scheduler._prefill_local_tokens == {}
+        assert prefill_scheduler._prefill_delivery_futures == {}
+        assert prefill_scheduler._prefill_invalid_request_ids == set()
         assert prefill_scheduler._path_decider is not None
         assert prefill_scheduler._path_decider._decision_records == {}
         assert worker._control_failed_recving == set()

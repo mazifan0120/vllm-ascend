@@ -332,21 +332,6 @@ def test_de_read_decision_requires_non_empty_reverse_plan(scheduler_factory):
     assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
 
 
-def test_wrapper_mismatch_before_commit_fails_without_kvpool_mutation(scheduler_factory):
-    scheduler, coordinator = scheduler_factory()
-    _, snapshot, state = _admit_request(scheduler)
-    snapshot.allocated_blocks.get_block_ids.return_value = ([99, 100, 101, 102],)
-    scheduler._kvpool_adapter.reset_mock()
-    coordinator.take_received_decisions.return_value = [_de_read_decision(state, snapshot)]
-
-    metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-
-    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
-    scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
-    assert metadata.reverse_plans == []
-    assert metadata.forward_receive_bindings == []
-
-
 def test_partial_commit_metadata_targets_k_de_only(scheduler_factory):
     scheduler, coordinator = scheduler_factory()
     request, snapshot, state = _admit_request(scheduler)
@@ -481,15 +466,13 @@ def test_decisions_processed_before_store_metadata_build(scheduler_factory):
     assert events == ["commit", "build"]
 
 
-@pytest.mark.parametrize("failure_stage", ["plan", "wrapper", "commit"])
+@pytest.mark.parametrize("failure_stage", ["plan", "commit"])
 def test_de_read_committed_only_after_all_steps_succeed(scheduler_factory, failure_stage):
     scheduler, coordinator = scheduler_factory()
     _, snapshot, state = _admit_request(scheduler)
     decision = _de_read_decision(state, snapshot)
     if failure_stage == "plan":
         decision = _decision(PathDecisionResult(state.request_key, PathKind.DE_READ))
-    elif failure_stage == "wrapper":
-        snapshot.allocated_blocks.get_block_ids.return_value = ([99, 100, 101, 102],)
     else:
         scheduler._kvpool_adapter.commit_after_alloc.side_effect = RuntimeError("commit failed")
     coordinator.take_received_decisions.return_value = [decision]

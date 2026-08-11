@@ -90,7 +90,7 @@ def test_identical_duplicate_plans_are_idempotent_and_conflicts_preserve_first()
         worker._install_reverse_plan(replace(plan, remote_port=plan.remote_port + 1))
 
     tracker = worker._split_trackers[DECODE_REQUEST_ID]
-    assert tracker.plan is plan
+    assert tracker.reverse_plan is plan
     assert tracker.reverse_phase.value == "PENDING"
 
 
@@ -104,7 +104,7 @@ def test_reverse_plan_install_rejects_wire_and_split_boundary_mismatch() -> None
     with pytest.raises(RuntimeError, match="split boundary"):
         worker._install_reverse_plan(replace(plan, token_end=48))
 
-    assert worker._split_trackers[DECODE_REQUEST_ID].plan is None
+    assert worker._split_trackers[DECODE_REQUEST_ID].reverse_plan is None
 
 
 def test_decode_send_callback_records_failed_wins_and_always_delegates_parent_signal() -> None:
@@ -370,7 +370,7 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     assert WIRE_REQUEST_ID not in decode_worker._pending_forward_done_wire_ids
     assert WIRE_REQUEST_ID not in decode_worker._consumed_forward_terminal_wire_ids
     assert unrelated_decode_id in decode_worker._split_trackers
-    assert decode_worker._split_trackers[unrelated_decode_id].plan is plan
+    assert decode_worker._split_trackers[unrelated_decode_id].reverse_plan is plan
     assert unrelated_decode_id in decode_worker._forward_receive_bindings
     assert decode_worker.request_map[unrelated_wire_id] == unrelated_decode_id
 
@@ -383,7 +383,7 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
 
     decode_state = (
         dict(decode_worker._split_trackers),
-        {request_id: tracker.plan for request_id, tracker in decode_worker._split_trackers.items()},
+        {request_id: tracker.reverse_plan for request_id, tracker in decode_worker._split_trackers.items()},
         dict(decode_worker._forward_receive_bindings),
         dict(decode_worker.request_map),
     )
@@ -398,7 +398,7 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     )
     assert decode_state == (
         decode_worker._split_trackers,
-        {request_id: tracker.plan for request_id, tracker in decode_worker._split_trackers.items()},
+        {request_id: tracker.reverse_plan for request_id, tracker in decode_worker._split_trackers.items()},
         decode_worker._forward_receive_bindings,
         decode_worker.request_map,
     )
@@ -499,7 +499,7 @@ def test_shutdown_makes_public_split_start_load_inert_but_preserves_pre_shutdown
 
     worker._kvpool_worker_adapter.start_load_kv.assert_called_once_with(store_metadata)
     assert DECODE_REQUEST_ID in worker._split_trackers
-    assert worker._split_trackers[DECODE_REQUEST_ID].plan is not None
+    assert worker._split_trackers[DECODE_REQUEST_ID].reverse_plan is not None
 
     with (
         patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True),
@@ -550,7 +550,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_is_dual_path_decode_admission",
         "_stage_prefill_activation_failure",
         "_decide_prefill_path_for_admission",
-        "_discard_undelivered_pe_decision",
+        "_discard_undelivered_prefill_decision",
         "_log_prefill_decision",
         "_prepare_forward_plan",
         "_try_install_forward_plan",
@@ -560,7 +560,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_log_decision_activation",
         "_build_decode_control_failure",
         "_build_remote_decode_message",
-        "_sweep_pe_delivery",
+        "_reconcile_prefill_deliveries",
         "_update_prefill_state_after_alloc",
         "_invalidate_prefill_activation",
         "_bind_decode_admission_after_alloc",

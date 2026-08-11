@@ -305,7 +305,7 @@ def test_store_miss_submits_reverse_after_mapping_install(production_harness_fac
 
     assert harness.de_worker.request_map[harness.wire_request_id] == DECODE_REQUEST_ID
     assert tracker.store_phase.value == "SKIPPED"
-    assert tracker.plan is harness.de_metadata.reverse_plans[0]
+    assert tracker.reverse_plan is harness.de_metadata.reverse_plans[0]
     assert tracker.reverse_submitted is True
 
 
@@ -405,7 +405,7 @@ def test_production_metadata_failed_wins_over_late_done(production_harness_facto
 def test_request_finish_releases_all_task08_state_idempotently(production_harness_factory) -> None:
     harness = production_harness_factory()
     unrelated_key = DualPathRequestKey("decode-instance", "unrelated")
-    harness.prefill_scheduler._pe_prefill_local_tokens["unrelated"] = 7
+    harness.prefill_scheduler._prefill_local_tokens["unrelated"] = 7
     harness.prefill_scheduler._path_decider._decision_records[unrelated_key] = MagicMock()
 
     with patch.object(
@@ -423,10 +423,10 @@ def test_request_finish_releases_all_task08_state_idempotently(production_harnes
     assert harness.pe_worker.get_finished({PREFILL_REQUEST_ID}, harness.pe_metadata) == (set(), set())
     assert harness.pe_worker.get_finished({PREFILL_REQUEST_ID}, harness.pe_metadata) == (set(), set())
 
-    assert harness.prefill_scheduler._pe_prefill_local_tokens == {"unrelated": 7}
-    assert harness.prefill_scheduler._pe_pending_reverse_receive_bindings == {}
-    assert harness.prefill_scheduler._pe_control_failures == {}
-    assert harness.prefill_scheduler._pe_delivery_futures == {}
+    assert harness.prefill_scheduler._prefill_local_tokens == {"unrelated": 7}
+    assert harness.prefill_scheduler._prefill_pending_reverse_receive_bindings == {}
+    assert harness.prefill_scheduler._prefill_control_failures == {}
+    assert harness.prefill_scheduler._prefill_delivery_futures == {}
     assert set(harness.prefill_scheduler._path_decider._decision_records) == {unrelated_key}
     assert harness.decode_scheduler._decode_kv_snapshots == {}
     assert harness.decode_scheduler._decode_decision_states == {}
@@ -444,10 +444,10 @@ def test_shutdown_leaves_no_task08_residue(production_harness_factory) -> None:
     harness.pe_worker.shutdown()
     harness.de_worker.shutdown()
 
-    assert harness.prefill_scheduler._pe_prefill_local_tokens == {}
-    assert harness.prefill_scheduler._pe_pending_reverse_receive_bindings == {}
-    assert harness.prefill_scheduler._pe_control_failures == {}
-    assert harness.prefill_scheduler._pe_delivery_futures == {}
+    assert harness.prefill_scheduler._prefill_local_tokens == {}
+    assert harness.prefill_scheduler._prefill_pending_reverse_receive_bindings == {}
+    assert harness.prefill_scheduler._prefill_control_failures == {}
+    assert harness.prefill_scheduler._prefill_delivery_futures == {}
     assert harness.prefill_scheduler._path_decider._decision_records == {}
     assert harness.decode_scheduler._decode_kv_snapshots == {}
     assert harness.decode_scheduler._decode_decision_states == {}

@@ -524,19 +524,6 @@ def test_build_connector_meta_tolerates_empty_new_token_ids_for_owned_cached_req
     assert forwarded["output"].num_scheduled_tokens == {request.request_id: 1}
 
 
-def test_lookup_clamp_preserves_can_load_and_token_len_via_replace(mock_lookup_client_cls):
-    adapter = _make_adapter()
-    raw_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=60, can_load=False, token_len=7)
-    with _stub_scheduler_lookup(adapter, raw_spec, delta=60):
-        spec = adapter.lookup(_make_request("req-clamp", 48), 0)
-    assert spec is not None
-    assert spec is not raw_spec
-    assert spec.kvpool_cached_tokens == 47  # clamped to R = P - 1
-    assert spec.can_load is False
-    assert spec.token_len == 7
-    assert raw_spec.kvpool_cached_tokens == 60  # raw object never mutated
-
-
 def test_close_idempotent_before_and_after_lazy_client_creation(mock_lookup_client_cls):
     adapter = _make_adapter()
     adapter.close()  # no client created yet

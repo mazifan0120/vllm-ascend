@@ -526,11 +526,10 @@ def test_store_full_success_completes_locally_and_recomputes_last_token(
     worker.kv_recv_layer_thread.get_and_clear_failed_requests.assert_called_once_with()
     assert worker.engine.method_calls == []
     assert worker._forward_receive_bindings == {}
-    assert dual._pe_request_keys == {}
-    assert dual._pe_path_results == {}
-    assert dual._pe_forward_plans == {}
-    assert dual._pe_forward_send_infos == {}
-    assert dual._pe_delivery_futures == {}
+    assert dual._prefill_request_keys == {}
+    assert dual._prefill_path_results == {}
+    assert dual._prefill_forward_plans == {}
+    assert dual._prefill_delivery_futures == {}
     assert dual._reqs_need_recv == {}
 
 
@@ -628,11 +627,10 @@ def test_store_full_failure_fails_closed_and_releases_delayed_blocks(
     assert worker.engine.method_calls == []
     assert worker._forward_receive_bindings == {}
     assert dual._decode_decision_states == {}
-    assert dual._pe_request_keys == {}
-    assert dual._pe_path_results == {}
-    assert dual._pe_forward_plans == {}
-    assert dual._pe_forward_send_infos == {}
-    assert dual._pe_delivery_futures == {}
+    assert dual._prefill_request_keys == {}
+    assert dual._prefill_path_results == {}
+    assert dual._prefill_forward_plans == {}
+    assert dual._prefill_delivery_futures == {}
     assert dual._reqs_need_recv == {}
 
 
@@ -711,7 +709,7 @@ class TestDecisionTimeoutIntegration:
             scheduler.update_from_output(timeout_scheduler_output, model_runner_output)
 
             # Then
-            assert state.status is scheduler_module._DecodeDecisionStatus.TIMED_OUT
+            assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
             assert connector_output.finished_recving == {request.request_id}
             assert connector_output.invalid_block_ids == set(external_block_ids)
             assert request.status is RequestStatus.FINISHED_ERROR

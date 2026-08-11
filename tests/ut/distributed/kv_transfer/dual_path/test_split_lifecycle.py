@@ -174,7 +174,7 @@ def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
         tracker.forward_phase,
         tracker.store_destination_slice,
         tracker.forward_destination_slice,
-        tracker.plan,
+        tracker.reverse_plan,
         tracker.reverse_submitted,
         tracker.terminal_published,
     )
@@ -185,7 +185,7 @@ def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
     assert tracker.forward_phase.value == "PENDING"
     assert tracker.store_destination_slice == (20, 21)
     assert tracker.forward_destination_slice == (30, 31, 40, 41)
-    assert tracker.plan is None
+    assert tracker.reverse_plan is None
     assert tracker.reverse_submitted is False
     assert tracker.terminal_published is False
     assert finished == (set(), set())
@@ -195,7 +195,7 @@ def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
         tracker.forward_phase,
         tracker.store_destination_slice,
         tracker.forward_destination_slice,
-        tracker.plan,
+        tracker.reverse_plan,
         tracker.reverse_submitted,
         tracker.terminal_published,
     ) == before_poll
@@ -426,7 +426,7 @@ def test_empty_store_submits_reverse_immediately_after_installation() -> None:
     assert enqueue.call_count == 2
     assert tracker.store_phase.value == "SKIPPED"
     assert tracker.reverse_phase.value == "PENDING"
-    assert tracker.plan is metadata.reverse_plans[0]
+    assert tracker.reverse_plan is metadata.reverse_plans[0]
     assert tracker.reverse_submitted is True
 
 

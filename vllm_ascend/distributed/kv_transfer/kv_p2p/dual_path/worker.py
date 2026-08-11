@@ -62,10 +62,21 @@ class _SplitTracker:
     forward_phase: _SplitPhase
     store_destination_slice: tuple[int, ...]
     forward_destination_slice: tuple[int, ...]
-    plan: ReversePlan | None
+    reverse_plan: ReversePlan | None
     reverse_submitted: bool
     store_load_failed: bool
     terminal_published: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ForwardTerminalSets:
+    """Wire terminals classified into pending, ordinary, and split-Forward buckets."""
+
+    pending_done: set[str]
+    pending_failed: set[str]
+    ordinary_done: set[str]
+    ordinary_failed: set[str]
+    forward_finished: set[str]
 
 
 class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
@@ -137,7 +148,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 return
             raise RuntimeError(
                 f"DualPath wire request {binding.wire_request_id} already belongs to a consumed Forward terminal; "
-                "the original binding is preserved"
+                "this is a bug and the engine cannot continue safely"
             )
 
         existing_binding = self._forward_receive_bindings.get(binding.decode_request_id)
@@ -154,7 +165,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         ):
             raise RuntimeError(
                 f"DualPath Decode request {binding.decode_request_id} got a conflicting duplicate "
-                "Forward receive binding; the original binding is preserved"
+                "Forward receive binding; this is a bug and the engine cannot continue safely"
             )
 
         self.request_map[binding.wire_request_id] = binding.decode_request_id
@@ -193,7 +204,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 return
             raise RuntimeError(
                 f"DualPath wire request {binding.wire_request_id} already belongs to a consumed Reverse terminal; "
-                "the original binding is preserved"
+                "this is a bug and the engine cannot continue safely"
             )
         existing_prefill_request_id = self._reverse_request_map.get(binding.wire_request_id)
         existing_parent_request_id = self.request_map.get(binding.wire_request_id)
@@ -211,7 +222,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         ):
             raise RuntimeError(
                 f"DualPath Prefill request {binding.prefill_request_id} got a conflicting duplicate "
-                "Reverse receive binding; the original binding is preserved"
+                "Reverse receive binding; this is a bug and the engine cannot continue safely"
             )
 
         self._reverse_request_map[binding.wire_request_id] = binding.prefill_request_id
@@ -304,7 +315,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             forward_phase=_SplitPhase.PENDING,
             store_destination_slice=store_destination_slice,
             forward_destination_slice=forward_destination_slice,
-            plan=None,
+            reverse_plan=None,
             reverse_submitted=False,
             store_load_failed=False,
             terminal_published=False,
@@ -335,22 +346,22 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 f"DualPath Decode request {decode_request_id} got a Reverse plan with a conflicting split boundary"
             )
 
-        existing_plan = tracker.plan
+        existing_plan = tracker.reverse_plan
         conflicts_with_retained_plan = any(
             retained != plan
             and (retained.request_key == plan.request_key or retained.wire_request_id == plan.wire_request_id)
-            for retained in (split_tracker.plan for split_tracker in self._split_trackers.values())
+            for retained in (split_tracker.reverse_plan for split_tracker in self._split_trackers.values())
             if retained is not None
         )
         if (existing_plan is not None and existing_plan != plan) or conflicts_with_retained_plan:
             raise RuntimeError(
                 f"DualPath Decode request {decode_request_id} got a conflicting duplicate Reverse plan; "
-                "the original plan is preserved"
+                "this is a bug and the engine cannot continue safely"
             )
         if existing_plan is not None:
             return
 
-        tracker.plan = plan
+        tracker.reverse_plan = plan
         tracker.reverse_phase = _SplitPhase.PENDING
 
     def _build_reverse_send_metadata(
@@ -399,7 +410,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 transfer_mappings[(host, port)]["trans_count"][group_idx] = block_mapping["trans_count"]
 
         if len(transfer_mappings) > 1:
-            raise RuntimeError(f"Not support add mutil transfer task for req_id:{decode_request_id}")
+            raise RuntimeError(
+                f"DualPath Reverse does not support multiple transfer tasks for req_id: {decode_request_id}"
+            )
         for (host, port), block_mapping in transfer_mappings.items():
             update_req_meta = copy.deepcopy(req_meta)
             update_req_meta.remote_host = host
@@ -417,12 +430,12 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         if (
             tracker is None
             or tracker.store_phase not in {_SplitPhase.DONE, _SplitPhase.SKIPPED}
-            or tracker.plan is None
+            or tracker.reverse_plan is None
             or tracker.reverse_submitted
         ):
             return
 
-        metadata = self._build_reverse_send_metadata(tracker.plan, decode_request_id)
+        metadata = self._build_reverse_send_metadata(tracker.reverse_plan, decode_request_id)
         if self._registered_kv_caches is None:
             raise RuntimeError("DualPath Reverse submission requires registered KV caches")
         ready_event = torch.npu.Event()
@@ -558,14 +571,14 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         reverse_finished = self._consume_reverse_wire_terminals(
             raw_done, raw_failed, finished_wire_ids, finished_reverse_wire_ids
         )
-        pending_done, pending_failed, ordinary_done, ordinary_failed, forward_finished = (
-            self._consume_forward_wire_terminals(raw_done, raw_failed)
-        )
-        self._finish_ordinary_requests(ordinary_done, ordinary_failed)
+        terminals = self._consume_forward_wire_terminals(raw_done, raw_failed)
+        self._finish_ordinary_requests(terminals.ordinary_done, terminals.ordinary_failed)
 
-        self._pending_forward_done_wire_ids = pending_done
-        self._pending_forward_failed_wire_ids = pending_failed
-        done_recving.update(ordinary_done.union(forward_finished, reverse_finished, self.virtual_request))
+        self._pending_forward_done_wire_ids = terminals.pending_done
+        self._pending_forward_failed_wire_ids = terminals.pending_failed
+        done_recving.update(
+            terminals.ordinary_done.union(terminals.forward_finished, reverse_finished, self.virtual_request)
+        )
         self.virtual_request = set()
         self._log_published_split_terminals(done_recving)
         done_recving.update(self._control_failed_recving)
@@ -663,10 +676,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self,
         raw_done: set[str],
         raw_failed: set[str],
-    ) -> tuple[set[str], set[str], set[str], set[str], set[str]]:
+    ) -> _ForwardTerminalSets:
         """Classify the remaining wire terminals into pending, ordinary, and
-        split-Forward buckets. Returns ``(pending_done, pending_failed,
-        ordinary_done, ordinary_failed, forward_finished)``."""
+        split-Forward buckets."""
         done_wire_ids = raw_done.union(self._pending_forward_done_wire_ids)
         failed_wire_ids = raw_failed.union(self._pending_forward_failed_wire_ids)
         failed_wins_wire_ids: set[str] = set()
@@ -740,7 +752,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             else:
                 assert_never(binding.path)
             self._consume_forward_receive_binding(binding)
-        return pending_done, pending_failed, ordinary_done, ordinary_failed, forward_finished
+        return _ForwardTerminalSets(pending_done, pending_failed, ordinary_done, ordinary_failed, forward_finished)
 
     def _finish_ordinary_requests(self, ordinary_done: set[str], ordinary_failed: set[str]) -> None:
         """Release ordinary (non-DualPath) recv bookkeeping for finished requests."""

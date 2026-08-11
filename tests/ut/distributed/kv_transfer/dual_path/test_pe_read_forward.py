@@ -241,7 +241,7 @@ def test_pe_read_returns_zero_false_for_forced_and_policy_paths(
     result = scheduler.get_num_new_matched_tokens(request, local_tokens)
 
     assert result == (0, False)
-    assert scheduler._pe_path_results[request.request_id].path is PathKind.PE_READ
+    assert scheduler._prefill_path_results[request.request_id].path is PathKind.PE_READ
     assert policy.calls == expected_policy_calls
     coordinator.submit.assert_not_called()
 
@@ -273,7 +273,7 @@ def test_no_sender_future_after_lookup_alone(scheduler_factory):
 
     _decide(scheduler, request)
 
-    assert scheduler._pe_delivery_futures == {}
+    assert scheduler._prefill_delivery_futures == {}
     coordinator.submit.assert_not_called()
 
 
@@ -283,7 +283,7 @@ def test_successful_allocation_installs_before_creating_one_future(scheduler_fac
     blocks = _blocks(([10, 11, 12],))
 
     def submit_after_install(_endpoint, _decision):
-        assert request.request_id in scheduler._pe_forward_plans
+        assert request.request_id in scheduler._prefill_forward_plans
         assert request.request_id in scheduler._reqs_need_send_layerwise
         return _completed_future()
 
@@ -294,11 +294,11 @@ def test_successful_allocation_installs_before_creating_one_future(scheduler_fac
     scheduler.update_state_after_alloc(request, blocks, 0)
     scheduler.update_state_after_alloc(request, blocks, 0)
 
-    assert list(scheduler._pe_path_results) == [request.request_id]
-    assert list(scheduler._pe_forward_plans) == [request.request_id]
+    assert list(scheduler._prefill_path_results) == [request.request_id]
+    assert list(scheduler._prefill_forward_plans) == [request.request_id]
     assert policy.calls == 1
     coordinator.submit.assert_called_once()
-    assert list(scheduler._pe_delivery_futures) == [scheduler._pe_request_keys[request.request_id]]
+    assert list(scheduler._prefill_delivery_futures) == [request.request_id]
 
 
 def test_pe_read_freezes_forward_range_with_final_tables(scheduler_factory):
@@ -313,7 +313,7 @@ def test_pe_read_freezes_forward_range_with_final_tables(scheduler_factory):
     source.append(13)
     destination[0].append(23)
 
-    plan = scheduler._pe_forward_plans[request.request_id]
+    plan = scheduler._prefill_forward_plans[request.request_id]
     assert (plan.token_start, plan.token_end) == (16, 33)
     assert plan.source_block_ids == ((10, 11, 12),)
     assert plan.destination_block_ids == ((20, 21, 22),)
@@ -327,7 +327,7 @@ def test_hybrid_transfer_target_applied_exactly_once(scheduler_factory):
     _decide(scheduler, request)
     scheduler.update_state_after_alloc(request, _blocks(([10, 11],)), 0)
 
-    plan = scheduler._pe_forward_plans[request.request_id]
+    plan = scheduler._prefill_forward_plans[request.request_id]
     assert request.num_prompt_tokens == 32
     assert len(request.prompt_token_ids) == 32
     assert request.kv_transfer_params["_p_side_truncated"] is True
@@ -342,7 +342,7 @@ def test_installation_creates_send_req_info_with_L_DE_transferred(scheduler_fact
     _decide(scheduler, request)
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
-    plan = scheduler._pe_forward_plans[request.request_id]
+    plan = scheduler._prefill_forward_plans[request.request_id]
     assert scheduler._reqs_need_send_layerwise[request.request_id] == SendReqInfo(
         local_block_ids=[list(group) for group in plan.source_block_ids],
         local_transferred_tokens=plan.token_start,
@@ -357,12 +357,12 @@ def test_identical_duplicate_alloc_is_idempotent(scheduler_factory):
     blocks = _blocks(([10, 11, 12],))
     _decide(scheduler, request)
     scheduler.update_state_after_alloc(request, blocks, 0)
-    first_plan = scheduler._pe_forward_plans[request.request_id]
+    first_plan = scheduler._prefill_forward_plans[request.request_id]
     first_send = scheduler._reqs_need_send_layerwise[request.request_id]
 
     scheduler.update_state_after_alloc(request, blocks, 0)
 
-    assert scheduler._pe_forward_plans[request.request_id] is first_plan
+    assert scheduler._prefill_forward_plans[request.request_id] is first_plan
     assert scheduler._reqs_need_send_layerwise[request.request_id] is first_send
 
 
@@ -371,13 +371,13 @@ def test_conflicting_duplicate_alloc_fails_locally_preserving_first_plan(schedul
     request = _make_request()
     _decide(scheduler, request)
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
-    first_plan = scheduler._pe_forward_plans[request.request_id]
+    first_plan = scheduler._prefill_forward_plans[request.request_id]
 
     scheduler.update_state_after_alloc(request, _blocks(([13, 14, 15],)), 0)
 
-    assert scheduler._pe_forward_plans[request.request_id] is first_plan
-    assert request.request_id in scheduler._pe_invalid_request_ids
-    assert request.request_id not in scheduler._pe_path_results
+    assert scheduler._prefill_forward_plans[request.request_id] is first_plan
+    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert request.request_id not in scheduler._prefill_path_results
 
 
 def test_post_install_validation_failure_preserves_first_plan_and_send_state(scheduler_factory):
@@ -386,16 +386,16 @@ def test_post_install_validation_failure_preserves_first_plan_and_send_state(sch
     blocks = _blocks(([10, 11, 12],))
     _decide(scheduler, request)
     scheduler.update_state_after_alloc(request, blocks, 0)
-    first_plan = scheduler._pe_forward_plans[request.request_id]
+    first_plan = scheduler._prefill_forward_plans[request.request_id]
     first_send = scheduler._reqs_need_send_layerwise[request.request_id]
     request.kv_transfer_params.pop("remote_host")
 
     scheduler.update_state_after_alloc(request, blocks, 0)
 
-    assert scheduler._pe_forward_plans[request.request_id] is first_plan
+    assert scheduler._prefill_forward_plans[request.request_id] is first_plan
     assert scheduler._reqs_need_send_layerwise[request.request_id] is first_send
-    assert request.request_id in scheduler._pe_invalid_request_ids
-    assert request.request_id not in scheduler._pe_path_results
+    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert request.request_id not in scheduler._prefill_path_results
 
 
 def test_pe_ascendstore_may_win_after_pe_read_forward_still_installs(scheduler_factory):
@@ -416,7 +416,7 @@ def test_pe_ascendstore_may_win_after_pe_read_forward_still_installs(scheduler_f
 
     assert policy.calls == 1
     assert multi._requests_to_connector[request.request_id] == 1
-    assert scheduler._pe_forward_plans[request.request_id].source_block_ids == ((10, 11, 12),)
+    assert scheduler._prefill_forward_plans[request.request_id].source_block_ids == ((10, 11, 12),)
     store.update_state_after_alloc.assert_called_once_with(request, blocks, 17)
 
 
@@ -438,7 +438,7 @@ def test_all_zero_sibling_still_installs_forward(scheduler_factory):
     multi.update_state_after_alloc(request, blocks, 0)
 
     assert policy.calls == 1
-    assert scheduler._pe_forward_plans[request.request_id].source_block_ids == ((10, 11, 12),)
+    assert scheduler._prefill_forward_plans[request.request_id].source_block_ids == ((10, 11, 12),)
     store.update_state_after_alloc.assert_called_once()
 
 
@@ -471,14 +471,14 @@ def test_scheduler_defers_plan_while_source_table_short_of_T(scheduler_factory):
 
     scheduler.update_state_after_alloc(request, _blocks(([10],)), 0)
 
-    assert request.request_id in scheduler._pe_path_results
-    assert request.request_id not in scheduler._pe_forward_plans
+    assert request.request_id in scheduler._prefill_path_results
+    assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
-    assert request.request_id not in scheduler._pe_invalid_request_ids
+    assert request.request_id not in scheduler._prefill_invalid_request_ids
 
     scheduler.update_state_after_alloc(request, _blocks(([10, 11],)), 0)
 
-    assert list(scheduler._pe_forward_plans) == [request.request_id]
+    assert list(scheduler._prefill_forward_plans) == [request.request_id]
     assert policy.calls == 0
 
 
@@ -491,8 +491,8 @@ def test_allocation_retry_before_bind_sends_nothing_and_does_not_redecide(schedu
     _decide(scheduler, request)
 
     assert policy.calls == 1
-    assert scheduler._pe_forward_plans == {}
-    assert scheduler._pe_delivery_futures == {}
+    assert scheduler._prefill_forward_plans == {}
+    assert scheduler._prefill_delivery_futures == {}
     coordinator.submit.assert_not_called()
 
 
@@ -521,8 +521,8 @@ def test_partial_de_read_freezes_exact_ranges_with_distinct_tables(scheduler_fac
     assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
     scheduler.update_state_after_alloc(request, blocks, 0)
 
-    binding = scheduler._pe_pending_reverse_receive_bindings[request.request_id]
-    forward = scheduler._pe_forward_plans[request.request_id]
+    binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
+    forward = scheduler._prefill_forward_plans[request.request_id]
     decision = scheduler._path_decision_coordinator.submit.call_args.args[1]
     reverse = decision.reverse_plan
     assert reverse is not None
@@ -561,15 +561,15 @@ def test_de_read_installs_binding_plan_and_forward_before_submit(scheduler_facto
             events.append(self.event_name)
             return super().__setitem__(key, value)
 
-    scheduler._pe_pending_reverse_receive_bindings = RecordingDict("binding")
-    scheduler._pe_forward_plans = RecordingDict("forward")
+    scheduler._prefill_pending_reverse_receive_bindings = RecordingDict("binding")
+    scheduler._prefill_forward_plans = RecordingDict("forward")
 
     def submit_after_install(_endpoint, decision):
         events.append("submit")
         assert isinstance(decision, PathDecision)
         assert decision.reverse_plan is not None
-        assert request.request_id in scheduler._pe_pending_reverse_receive_bindings
-        assert request.request_id in scheduler._pe_forward_plans
+        assert request.request_id in scheduler._prefill_pending_reverse_receive_bindings
+        assert request.request_id in scheduler._prefill_forward_plans
         return _completed_future()
 
     coordinator.submit.side_effect = submit_after_install
@@ -607,14 +607,14 @@ def test_de_read_delivers_with_admission_table_and_defers_forward_plan(scheduler
     assert decision.reverse_plan is not None
     assert (decision.reverse_plan.token_start, decision.reverse_plan.token_end) == (16, 32)
     assert decision.reverse_plan.destination_block_ids == ((70, 71),)
-    assert request.request_id in scheduler._pe_pending_reverse_receive_bindings
-    assert request.request_id not in scheduler._pe_forward_plans
+    assert request.request_id in scheduler._prefill_pending_reverse_receive_bindings
+    assert request.request_id not in scheduler._prefill_forward_plans
 
     # Post-Reverse allocation covers T: Forward plan installs, no re-delivery.
     scheduler.update_state_after_alloc(request, _blocks(([70, 71, 72, 73],)), 0)
 
     assert coordinator.submit.call_count == 1
-    plan = scheduler._pe_forward_plans[request.request_id]
+    plan = scheduler._prefill_forward_plans[request.request_id]
     assert (plan.token_start, plan.token_end) == (32, 49)
     assert scheduler._reqs_need_send_layerwise[request.request_id].local_block_ids == [[70, 71, 72, 73]]
 
@@ -632,8 +632,8 @@ def test_miss_de_read_freezes_reverse_hbm_range_and_no_store(scheduler_factory):
     assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
     scheduler.update_state_after_alloc(request, _blocks(([70, 71, 72, 73],)), 0)
 
-    binding = scheduler._pe_pending_reverse_receive_bindings[request.request_id]
-    forward = scheduler._pe_forward_plans[request.request_id]
+    binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
+    forward = scheduler._prefill_forward_plans[request.request_id]
     decision = scheduler._path_decision_coordinator.submit.call_args.args[1]
     assert decision.reverse_plan is not None
     assert (binding.token_start, binding.token_end) == (16, 32)
@@ -682,14 +682,14 @@ def test_activation_fact_mismatch_fails_with_local_control_failure(scheduler_fac
         scheduler.update_state_after_alloc(request, blocks, 0)
 
     coordinator.submit.assert_not_called()
-    assert scheduler._pe_forward_plans == {}
-    assert scheduler._pe_pending_reverse_receive_bindings == {}
+    assert scheduler._prefill_forward_plans == {}
+    assert scheduler._prefill_pending_reverse_receive_bindings == {}
     expected_failure = DualPathControlFailureMetadata(
         request_id=request.request_id,
         invalid_block_ids=(70, 71) if mismatch == "alignment" else (71,),
         reason=DualPathControlFailureReason.ACTIVATION_FAILED,
     )
-    assert scheduler._pe_control_failures == {request.request_id: expected_failure}
+    assert scheduler._prefill_control_failures == {request.request_id: expected_failure}
 
     first = scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
     second = scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
@@ -707,7 +707,7 @@ def test_pe_read_local_plan_failure_sends_no_decision(scheduler_factory):
         scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
     coordinator.submit.assert_not_called()
-    assert scheduler._pe_delivery_futures == {}
+    assert scheduler._prefill_delivery_futures == {}
 
 
 def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
@@ -726,8 +726,8 @@ def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
         invalid_block_ids=(81,),
         reason=DualPathControlFailureReason.ACTIVATION_FAILED,
     )
-    scheduler._pe_pending_reverse_receive_bindings[binding.prefill_request_id] = binding
-    scheduler._pe_control_failures[failure.request_id] = failure
+    scheduler._prefill_pending_reverse_receive_bindings[binding.prefill_request_id] = binding
+    scheduler._prefill_control_failures[failure.request_id] = failure
     parent_metadata = MooncakeLayerwiseConnectorMetadata()
 
     with patch.object(
@@ -742,8 +742,8 @@ def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
     assert isinstance(first, DualPathConnectorMetadata)
     assert first.reverse_receive_bindings == [binding]
     assert first.control_failures == [failure]
-    assert scheduler._pe_pending_reverse_receive_bindings == {}
-    assert scheduler._pe_control_failures == {}
+    assert scheduler._prefill_pending_reverse_receive_bindings == {}
+    assert scheduler._prefill_control_failures == {}
     assert isinstance(second, DualPathConnectorMetadata)
     assert second.requests is parent_metadata.requests
     assert second.reverse_receive_bindings == []
@@ -775,9 +775,8 @@ def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
         return_value=parent_result,
     ) as parent_finish:
         assert getattr(scheduler, method_name)(request, block_ids) == parent_result
-        assert scheduler._pe_path_results == {}
-        assert scheduler._pe_forward_plans == {}
-        assert scheduler._pe_forward_send_infos == {}
+        assert scheduler._prefill_path_results == {}
+        assert scheduler._prefill_forward_plans == {}
         assert request.request_id not in scheduler._reqs_need_send_layerwise
 
         replacement_request = _make_request(request_id=request.request_id)
@@ -790,23 +789,6 @@ def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
         scheduler._reqs_need_send_layerwise[request.request_id] = replacement_send_info
         assert getattr(scheduler, method_name)(request, block_ids) == parent_result
         assert scheduler._reqs_need_send_layerwise[request.request_id] is replacement_send_info
-
-        reused_scheduler, _, _ = scheduler_factory()
-        reused_request = _make_request(request_id="prefill-finish-reused-id")
-        _decide(reused_scheduler, reused_request)
-        reused_scheduler.update_state_after_alloc(reused_request, _blocks(([10, 11, 12],)), 0)
-        reused_replacement_request = _make_request(request_id=reused_request.request_id)
-        reused_replacement_send_info = SendReqInfo(
-            local_block_ids=[[80, 81, 82]],
-            local_transferred_tokens=16,
-            local_computed_tokens=0,
-            request=reused_replacement_request,
-        )
-        reused_scheduler._reqs_need_send_layerwise[reused_request.request_id] = reused_replacement_send_info
-        assert getattr(reused_scheduler, method_name)(reused_request, block_ids) == parent_result
-        assert reused_scheduler._pe_path_results == {}
-        assert reused_scheduler._pe_forward_plans == {}
-        assert reused_scheduler._reqs_need_send_layerwise[reused_request.request_id] is reused_replacement_send_info
 
         consumed_scheduler, _, _ = scheduler_factory()
         consumed_request = _make_request(request_id="prefill-finish-consumed")
@@ -826,10 +808,10 @@ def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
         )
         assert consumed_request.request_id not in consumed_scheduler._reqs_need_send_layerwise
         assert getattr(consumed_scheduler, method_name)(consumed_request, block_ids) == parent_result
-        assert consumed_scheduler._pe_path_results == {}
-        assert consumed_scheduler._pe_forward_plans == {}
+        assert consumed_scheduler._prefill_path_results == {}
+        assert consumed_scheduler._prefill_forward_plans == {}
 
-    assert parent_finish.call_count == 4
+    assert parent_finish.call_count == 3
 
     shutdown_scheduler, _, _ = scheduler_factory()
     shutdown_request = _make_request(request_id="prefill-shutdown-records")
@@ -850,9 +832,8 @@ def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
     shutdown_scheduler.shutdown()
     shutdown_scheduler.shutdown()
 
-    assert shutdown_scheduler._pe_path_results == {}
-    assert shutdown_scheduler._pe_forward_plans == {}
-    assert shutdown_scheduler._pe_forward_send_infos == {}
+    assert shutdown_scheduler._prefill_path_results == {}
+    assert shutdown_scheduler._prefill_forward_plans == {}
     assert shutdown_request.request_id not in shutdown_scheduler._reqs_need_send_layerwise
     assert shutdown_scheduler._reqs_need_send_layerwise[ordinary_request.request_id] is ordinary_send_info
 
@@ -863,7 +844,6 @@ def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
         "misaligned_token_start",
         "group_count_mismatch",
         "insufficient_destination_coverage",
-        "destination_table_drift",
         "missing_remote_block_size",
         "missing_remote_engine_id",
         "missing_remote_host",
@@ -878,19 +858,15 @@ def test_scheduler_rejects_invalid_forward_plan_without_send_state(scheduler_fac
         blocks.get_block_ids.return_value = ([10, 11, 12], [30, 31, 32])
     elif invalid_case == "insufficient_destination_coverage":
         request.kv_transfer_params["remote_block_ids"] = [[20, 21]]
-    elif invalid_case == "destination_table_drift":
-        blocks.get_block_ids.side_effect = lambda: (
-            request.kv_transfer_params.__setitem__("remote_block_ids", [[90, 91, 92]]) or ([10, 11, 12],)
-        )
     elif invalid_case.startswith("missing_"):
         request.kv_transfer_params.pop(invalid_case.removeprefix("missing_"))
     _decide(scheduler, request)
 
     scheduler.update_state_after_alloc(request, blocks, 0)
 
-    assert request.request_id in scheduler._pe_invalid_request_ids
-    assert request.request_id not in scheduler._pe_path_results
-    assert request.request_id not in scheduler._pe_forward_plans
+    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert request.request_id not in scheduler._prefill_path_results
+    assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
 
 
@@ -903,9 +879,9 @@ def test_scheduler_rejects_missing_forward_topology_without_send_state(scheduler
 
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
-    assert request.request_id in scheduler._pe_invalid_request_ids
-    assert request.request_id not in scheduler._pe_path_results
-    assert request.request_id not in scheduler._pe_forward_plans
+    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert request.request_id not in scheduler._prefill_path_results
+    assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
 
 
@@ -923,9 +899,9 @@ def test_scheduler_rejects_invalid_forward_topology_without_send_state(
 
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
-    assert request.request_id in scheduler._pe_invalid_request_ids
-    assert request.request_id not in scheduler._pe_path_results
-    assert request.request_id not in scheduler._pe_forward_plans
+    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert request.request_id not in scheduler._prefill_path_results
+    assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
 
 

@@ -18,7 +18,6 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
-    SupportsHMA,
 )
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
@@ -50,7 +49,7 @@ __all__ = [
 ]
 
 
-class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
+class DualPathConnector(MooncakeLayerwiseConnector):
     """Layerwise connector with DualPath admission and transfer routing.
 
     The connector constructs DualPath Scheduler and Worker subclasses while
@@ -88,8 +87,6 @@ class DualPathConnector(MooncakeLayerwiseConnector, SupportsHMA):
             self.connector_worker = DualPathConnectorWorker(
                 vllm_config, kv_cache_config, str(self.engine_id), dual_path_cfg
             )
-        else:
-            raise ValueError(f"Unsupported KVConnectorRole: {role!r}")
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # Deliberately bypasses super().get_finished(): the parent facade drops Core-finished ids.

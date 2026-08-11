@@ -7,11 +7,11 @@ from enum import Enum
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    JsonObject,
+    JsonValue,
     PathDecisionValidationError,
     PathKind,
-    _JsonObject,
-    _JsonValue,
-    _require_exact_payload,
+    require_exact_payload,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
@@ -183,7 +183,7 @@ class ReversePlan:
         object.__setattr__(self, "destination_block_ids", destination_block_ids)
         object.__setattr__(self, "remote_block_sizes", remote_block_sizes)
 
-    def to_dict(self) -> _JsonObject:
+    def to_dict(self) -> JsonObject:
         return {
             "request_key": self.request_key.to_dict(),
             "wire_request_id": self.wire_request_id,
@@ -201,8 +201,8 @@ class ReversePlan:
         }
 
     @classmethod
-    def from_dict(cls, payload: _JsonValue) -> ReversePlan:
-        data = _require_exact_payload(
+    def from_dict(cls, payload: JsonValue) -> ReversePlan:
+        data = require_exact_payload(
             payload,
             frozenset(
                 {

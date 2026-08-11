@@ -394,8 +394,8 @@ Task-04 already computes the PE-owned Result in
 PE-local request ID so the later allocation callback can authorize a plan:
 
 ```python
-_pe_path_results: dict[str, PathDecisionResult]
-_pe_forward_plans: dict[str, ForwardPlan]
+_prefill_path_results: dict[str, PathDecisionResult]
+_prefill_forward_plans: dict[str, ForwardPlan]
 ```
 
 Only a successfully validated Result is retained. The existing Decider remains

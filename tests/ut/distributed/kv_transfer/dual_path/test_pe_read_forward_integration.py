@@ -183,7 +183,7 @@ def _send_parent_metadata_through_connector(
     worker.kv_send_layer_thread.send_queue.put.assert_called_once()
     sent_task = worker.kv_send_layer_thread.send_queue.put.call_args.args[0]
     sent_request_metadata = sent_task.send_request[request.request_id]
-    plan = scheduler._pe_forward_plans[request.request_id]
+    plan = scheduler._prefill_forward_plans[request.request_id]
     assert sent_task.layer_name == "layer.0"
     assert sent_task.layer_idx == 0
     assert sent_task.wait_event is attn_metadata.reshape_cache_event
@@ -253,7 +253,7 @@ def _build_lifecycle(
     pe_scheduler, pe_policy = _make_pe_scheduler()
     pe_request = _make_pe_request(captured_messages[0])
     assert pe_scheduler.get_num_new_matched_tokens(pe_request, 0) == (0, False)
-    pe_result = pe_scheduler._pe_path_results[pe_request.request_id]
+    pe_result = pe_scheduler._prefill_path_results[pe_request.request_id]
     full_blocks = forward_harness._blocks(_SOURCE_BLOCK_IDS)
     if defer_first_allocation:
         pe_scheduler.update_state_after_alloc(
@@ -261,12 +261,12 @@ def _build_lifecycle(
             forward_harness._blocks((_SOURCE_BLOCK_IDS[0][:-1],)),
             0,
         )
-        assert pe_scheduler._pe_forward_plans == {}
+        assert pe_scheduler._prefill_forward_plans == {}
         assert pe_scheduler._reqs_need_send_layerwise == {}
     pe_scheduler.update_state_after_alloc(pe_request, full_blocks, 0)
-    forward_plan = pe_scheduler._pe_forward_plans[pe_request.request_id]
+    forward_plan = pe_scheduler._prefill_forward_plans[pe_request.request_id]
     pe_scheduler.update_state_after_alloc(pe_request, full_blocks, 0)
-    assert pe_scheduler._pe_forward_plans == {pe_request.request_id: forward_plan}
+    assert pe_scheduler._prefill_forward_plans == {pe_request.request_id: forward_plan}
 
     pe_decision = PathDecision(
         result=pe_result,
@@ -449,6 +449,6 @@ def test_pe_read_deferred_plan_completes_after_second_allocation(lifecycle_facto
     _feed_worker_output(harness, connector_output)
 
     assert connector_output.finished_recving == {harness.decode_request.request_id}
-    assert list(harness.pe_scheduler._pe_forward_plans) == [harness.pe_request.request_id]
+    assert list(harness.pe_scheduler._prefill_forward_plans) == [harness.pe_request.request_id]
     assert harness.pe_policy.calls == 1
     _assert_next_schedule_recomputes_last_token(harness)

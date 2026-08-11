@@ -23,11 +23,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    JsonObject,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
     PathKind,
-    _JsonObject,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DecodeControlEndpoint,
@@ -56,14 +56,14 @@ def _request() -> PathDecisionRequest:
     )
 
 
-def _key_payload() -> _JsonObject:
+def _key_payload() -> JsonObject:
     return {
         "decode_engine_instance_id": "decode-engine-1:0:boot-1",
         "decode_request_id": "request-1",
     }
 
 
-def _request_payload() -> _JsonObject:
+def _request_payload() -> JsonObject:
     return {
         "request_key": _key_payload(),
         "target_tokens": 32,
@@ -79,14 +79,14 @@ def _metadata() -> DualPathDecisionMetadata:
     )
 
 
-def _metadata_payload() -> _JsonObject:
+def _metadata_payload() -> JsonObject:
     return {
         "decision_request": _request_payload(),
         "decode_control_endpoint": {"host": "192.0.2.10", "port": 24001},
     }
 
 
-def _result_payload() -> _JsonObject:
+def _result_payload() -> JsonObject:
     return {"request_key": _key_payload(), "path": "PE_READ"}
 
 
@@ -214,7 +214,7 @@ def test_nested_dual_path_envelope_matches_kv_transfer_params_shape() -> None:
 
 
 def test_fake_proxy_forwards_dual_path_envelope_transparently() -> None:
-    kv_transfer_params: _JsonObject = {
+    kv_transfer_params: JsonObject = {
         "do_remote_decode": True,
         "remote_block_ids": [11, 12],
         "remote_host": "198.51.100.20",
@@ -222,7 +222,7 @@ def test_fake_proxy_forwards_dual_path_envelope_transparently() -> None:
         "dual_path": _metadata().to_dict(),
     }
 
-    def fake_proxy(params: _JsonObject) -> _JsonObject:
+    def fake_proxy(params: JsonObject) -> JsonObject:
         forwarded_params = deepcopy(params)
         envelope = forwarded_params["dual_path"]
         assert DualPathDecisionMetadata.from_dict(envelope).to_dict() == envelope

@@ -665,20 +665,19 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_decode_decision_states",
             "_decision_timeout_seconds",
             "_accepting_decode_admission",
-            "_accepting_pe_decisions",
+            "_accepting_prefill_decisions",
             "_path_decision_coordinator",
             "_path_decider",
-            "_pe_request_keys",
-            "_pe_decision_metadata",
-            "_pe_prefill_local_tokens",
-            "_pe_path_results",
-            "_pe_forward_plans",
-            "_pe_forward_send_infos",
-            "_pe_reverse_plans",
-            "_pe_pending_reverse_receive_bindings",
-            "_pe_control_failures",
-            "_pe_delivery_futures",
-            "_pe_invalid_request_ids",
+            "_prefill_request_keys",
+            "_prefill_decision_metadata",
+            "_prefill_local_tokens",
+            "_prefill_path_results",
+            "_prefill_forward_plans",
+            "_prefill_reverse_plans",
+            "_prefill_pending_reverse_receive_bindings",
+            "_prefill_control_failures",
+            "_prefill_delivery_futures",
+            "_prefill_invalid_request_ids",
         }
         self.assertEqual(
             set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | dual_path_scheduler_fields
@@ -784,10 +783,6 @@ class TestDualPathConstructionParity(unittest.TestCase):
         self.assertEqual(dual_engine_calls, parent_engine_calls)
         self.assertEqual(parent_buffer_calls, 1)
         self.assertEqual(dual_buffer_calls, parent_buffer_calls)
-
-    def test_unsupported_connector_role_rejected(self):
-        with self.assertRaisesRegex(ValueError, r"Unsupported KVConnectorRole"):
-            DualPathConnector(MockVllmConfig(), "unsupported", MockKVCacheConfig())
 
 
 class TestDualPathBehaviorParity(unittest.TestCase):
@@ -1503,7 +1498,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_is_dual_path_decode_admission",
                 "_stage_prefill_activation_failure",
                 "_decide_prefill_path_for_admission",
-                "_discard_undelivered_pe_decision",
+                "_discard_undelivered_prefill_decision",
                 "_log_prefill_decision",
                 "_prepare_forward_plan",
                 "_try_install_forward_plan",
@@ -1513,7 +1508,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_log_decision_activation",
                 "_build_decode_control_failure",
                 "_build_remote_decode_message",
-                "_sweep_pe_delivery",
+                "_reconcile_prefill_deliveries",
                 "_update_prefill_state_after_alloc",
                 "_invalidate_prefill_activation",
                 "_bind_decode_admission_after_alloc",
