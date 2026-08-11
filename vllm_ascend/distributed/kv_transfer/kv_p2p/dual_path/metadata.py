@@ -164,6 +164,11 @@ class ReversePlan:
             )
         if any(self.token_start % block_size != 0 for block_size in remote_block_sizes):
             raise PathDecisionValidationError("token_start must align with every remote block size")
+        if any(self.token_end % block_size != 0 for block_size in remote_block_sizes):
+            # The Reverse terminal signal only fires when the transferred range
+            # covers whole blocks; an unaligned token_end would hang the pull
+            # silently, so reject it at the contract boundary.
+            raise PathDecisionValidationError("token_end must align with every remote block size")
         for name, block_table in (
             ("source_block_ids", source_block_ids),
             ("destination_block_ids", destination_block_ids),

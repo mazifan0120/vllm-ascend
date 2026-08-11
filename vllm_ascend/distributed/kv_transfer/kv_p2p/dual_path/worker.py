@@ -8,9 +8,10 @@ import math
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, assert_never
+from typing import TYPE_CHECKING, Any
 
 import torch
+from typing_extensions import assert_never
 from vllm.config import VllmConfig
 from vllm.logger import logger
 

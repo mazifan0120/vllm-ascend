@@ -73,6 +73,17 @@ The following requirements apply to every Task:
 - Ordinary Layerwise requests remain behavior-compatible throughout the
   series.
 
+### Known limitations (Stage 1)
+
+- **Prefill-side preemption after decision delivery is unsafe.** vLLM
+  preemption frees the request's blocks without notifying the connector
+  (`request_finished` is not called), so a Decode reverse pull advertised
+  through an already-delivered Decision may read freed or reallocated blocks.
+  Stage 1 therefore requires Prefill deployments that never preempt DualPath
+  requests (provision KV blocks so allocation never fails for running
+  requests). A fail-closed abort driven off `preempted_req_ids` is the
+  planned Stage 2 remedy.
+
 ## 4. Task dependency graph
 
 ```mermaid

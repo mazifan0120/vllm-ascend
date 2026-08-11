@@ -10,10 +10,11 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Final, Protocol, TypeAlias, assert_never
+from typing import Final, Protocol, TypeAlias
 
 import msgspec
 import zmq
+from typing_extensions import assert_never
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan

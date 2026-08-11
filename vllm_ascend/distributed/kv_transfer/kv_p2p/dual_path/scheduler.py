@@ -9,8 +9,9 @@ from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, NamedTuple, assert_never
+from typing import TYPE_CHECKING, Any, NamedTuple
 
+from typing_extensions import assert_never
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip

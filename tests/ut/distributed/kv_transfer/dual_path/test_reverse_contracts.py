@@ -219,6 +219,7 @@ def test_reverse_plan_rejects_invalid_token_range_and_boolean_integers() -> None
         replace(valid, token_start=True),
         replace(valid, token_end=False),
         replace(valid, token_start=17),
+        replace(valid, token_end=47),
         replace(valid, source_block_ids=((10, True, 12, 13),)),
     )
 
