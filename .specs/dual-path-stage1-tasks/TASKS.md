@@ -77,12 +77,15 @@ The following requirements apply to every Task:
 
 - **Prefill-side preemption after decision delivery is unsafe.** vLLM
   preemption frees the request's blocks without notifying the connector
-  (`request_finished` is not called), so a Decode reverse pull advertised
-  through an already-delivered Decision may read freed or reallocated blocks.
-  Stage 1 therefore requires Prefill deployments that never preempt DualPath
-  requests (provision KV blocks so allocation never fails for running
-  requests). A fail-closed abort driven off `preempted_req_ids` is the
-  planned Stage 2 remedy.
+  (`request_finished` is not called), so an in-flight Forward send can read
+  freed or reallocated blocks, a re-admitted request can park forever, and a
+  late Reverse terminal can crash the engine core
+  (`scheduler.py:2243`). Stage 1 therefore requires Prefill deployments that
+  never preempt DualPath requests (provision KV blocks so allocation never
+  fails for running requests). The Stage 2 remedy — block pinning plus a
+  fail-closed abort driven off `preempted_req_ids`, followed by epoch-based
+  re-execution — is designed in
+  `.specs/dual-path-stage2-preemption/2026-08-11-dual-path-stage2-preemption-safety-design.md`.
 
 ## 4. Task dependency graph
 
