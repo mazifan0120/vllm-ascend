@@ -56,7 +56,7 @@ class TestRemoteTopologyValidation:
         assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
         scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
-    def test_remote_tp_mismatch_rejected_before_decision_and_holds(self, pe_scheduler_factory):
+    def test_remote_tp_mismatch_rejected_before_decision_and_plan_install(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, coordinator = pe_scheduler_factory(PathKind.PE_READ, pool=pool)
         request = _make_request()

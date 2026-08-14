@@ -1543,6 +1543,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_release_scheduler_request_state",
                 "_may_install_forward_plan",
                 "_delay_free_for_connector",
+                "_has_open_reverse_send_job",
                 "_resume_delivered_prefill_decision",
                 "_deliver_prefill_decision",
                 "_request_for_failed_job",

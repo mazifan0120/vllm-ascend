@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -152,6 +153,9 @@ class TestJobRecordReclamation:
     def test_failed_completion_job_record_is_reclaimed_with_the_request(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
         job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == job_id
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._job_ledger.record_failure(job_id) is True
 
         scheduler._release_scheduler_request_state(request)
@@ -161,10 +165,41 @@ class TestJobRecordReclamation:
     def test_open_completion_job_record_survives_request_cleanup(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
         job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == job_id
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
         scheduler._release_scheduler_request_state(request)
 
         assert scheduler._job_ledger.get(job_id) is not None
+
+    def test_request_cleanup_reclaims_every_closed_completion_job_after_binding_delivery(self, pe_scheduler_factory):
+        scheduler, request = self._admit_de_read(pe_scheduler_factory)
+        binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
+        successful_job_id = binding.reverse_completion_job_id
+        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == successful_job_id
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
+
+        ledgers = _ledgers()
+        failed_job = scheduler._job_ledger.create_job(
+            ledgers.JobKind.REVERSE_COMPLETION,
+            expected_worker_count=1,
+            reverse_attempt_key=ReverseAttemptKey(binding.request_key, 1),
+        )
+        open_job = scheduler._job_ledger.create_job(
+            ledgers.JobKind.REVERSE_COMPLETION,
+            expected_worker_count=1,
+            reverse_attempt_key=ReverseAttemptKey(binding.request_key, 2),
+        )
+        assert scheduler._job_ledger.record_reports(successful_job_id, 1) is True
+        assert scheduler._job_ledger.record_failure(failed_job.job_id) is True
+
+        scheduler._release_scheduler_request_state(request)
+
+        assert scheduler._job_ledger.get(successful_job_id) is None
+        assert scheduler._job_ledger.get(failed_job.job_id) is None
+        assert scheduler._job_ledger.get(open_job.job_id) is open_job
 
     @pytest.mark.parametrize("latest_closed", [False, True], ids=["latest-open", "latest-closed"])
     def test_request_cleanup_reclaims_closed_superseded_send_jobs_and_preserves_latest_state(

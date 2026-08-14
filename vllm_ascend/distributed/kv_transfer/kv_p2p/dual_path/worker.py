@@ -613,31 +613,34 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         super().start_load_kv(metadata)
 
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
-        tracker = None
         submitted_attempt = None
+        reverse_send_job_id = None
         if self.dual_path_cfg.role == "decode":
             with self._reverse_terminal_lock:
                 tracker = self._split_trackers.get(req_id)
                 if tracker is not None and tracker.reverse_submitted_attempt is not None:
                     submitted_attempt = tracker.reverse_submitted_attempt
-                    self._pending_local_reverse_terminals[submitted_attempt] = (
-                        self._pending_local_reverse_terminals.get(submitted_attempt, True) and trans_flag
-                    )
+                    if tracker.reverse_plan is not None:
+                        reverse_send_job_id = tracker.reverse_plan.reverse_send_job_id
         # The parent's return value is the single outcome source: True only
         # after a successful terminal ACK.
         ack_succeeded = super().send_done_send_signal(req_id, req_meta, group_idx, trans_flag)
+        terminal_succeeded = trans_flag and ack_succeeded
         # Only the Reverse direction reports to the local scheduler; a Forward
         # send reaches its peer over the control channel like the parent's.
         if self.dual_path_cfg.role != "decode":
             return
-        if submitted_attempt is None or tracker is None or tracker.reverse_plan is None:
+        if submitted_attempt is None:
             return
-        reverse_send_job_id = tracker.reverse_plan.reverse_send_job_id
+        with self._reverse_terminal_lock:
+            self._pending_local_reverse_terminals[submitted_attempt] = (
+                self._pending_local_reverse_terminals.get(submitted_attempt, True) and terminal_succeeded
+            )
         if reverse_send_job_id is None:
             return
         # The reverse-send proof is recorded only after the final synchronous
         # write AND a successful terminal ACK.
-        self._record_sender_job(reverse_send_job_id, succeeded=trans_flag and ack_succeeded)
+        self._record_sender_job(reverse_send_job_id, succeeded=terminal_succeeded)
 
     def get_finished(
         self,

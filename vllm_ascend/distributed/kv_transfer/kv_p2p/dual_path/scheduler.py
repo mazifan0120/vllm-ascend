@@ -1593,11 +1593,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     self._reverse_send_job_ids.pop(attempt_key, None)
                 if send_job is not None and send_job.closed:
                     self._job_ledger.discard(send_job.job_id)
-            latest_attempt = self._latest_reverse_attempt_ids.get(request_id)
-            if latest_attempt is not None:
-                latest_key = ReverseAttemptKey(state.request_key, latest_attempt)
-                if latest_key not in self._reverse_send_job_ids:
-                    self._latest_reverse_attempt_ids.pop(request_id, None)
+            if not self._has_open_reverse_send_job(state.request_key):
+                self._latest_reverse_attempt_ids.pop(request_id, None)
         if self.dual_path_cfg.role == "prefill":
             self._prefill_decision_metadata.pop(request_id, None)
             self._prefill_local_tokens.pop(request_id, None)
@@ -1605,16 +1602,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             forward_plan = self._prefill_forward_plans.pop(request_id, None)
             self._prefill_forward_plan_epochs.pop(request_id, None)
             self._prefill_reverse_plans.pop(request_id, None)
-            released_binding = self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
-            if released_binding is not None:
-                # A closed record can no longer receive worker reports; an open
-                # one still can, and discard() refuses it.
-                self._job_ledger.discard(released_binding.reverse_completion_job_id)
+            self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
             self._prefill_control_failures.pop(request_id, None)
             if forward_plan is not None:
                 self._reqs_need_send_layerwise.pop(request_id, None)
             released_key = self._prefill_request_keys.pop(request_id, None)
             if released_key is not None:
+                self._job_ledger.discard_closed_jobs(JobKind.REVERSE_COMPLETION, released_key)
                 assert self._path_decider is not None
                 self._path_decider.discard(released_key)
             self._prefill_invalid_request_ids.discard(request_id)
@@ -1648,20 +1642,23 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         # until the send job reports.
         request_id = request.request_id
         if self.dual_path_cfg.role == "decode":
-            # A final Decode request with an open reverse-send job must keep
+            # A final Decode request with any open reverse-send attempt must keep
             # the engine stepping: the delayed free retains it upstream so
             # zero-token steps keep harvesting the job report.
-            latest_attempt = self._latest_reverse_attempt_ids.get(request_id)
             state = self._decode_decision_states.get(request_id)
-            if latest_attempt is None or state is None:
-                return False
-            send_job = self._job_ledger.get(
-                self._reverse_send_job_ids.get(ReverseAttemptKey(state.request_key, latest_attempt), -1)
-            )
-            if send_job is None or send_job.closed:
+            if state is None or not self._has_open_reverse_send_job(state.request_key):
                 return False
             self._pending_finished_sending.add(request_id)
             return True
+        return False
+
+    def _has_open_reverse_send_job(self, request_key: DualPathRequestKey) -> bool:
+        for attempt_key, job_id in self._reverse_send_job_ids.items():
+            if attempt_key.request_key != request_key:
+                continue
+            job = self._job_ledger.get(job_id)
+            if job is not None and not job.closed:
+                return True
         return False
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -1720,14 +1717,22 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             attempt_key = job.reverse_attempt_key
             if attempt_key is None:
                 return set(), set()
-            request_id = attempt_key.request_key.decode_request_id
+            request_key = attempt_key.request_key
+            request_id = request_key.decode_request_id
+            # Each attempt owns exactly one mapping and record. Closing one
+            # attempt retires only those attempt-scoped facts.
+            self._reverse_send_job_ids.pop(attempt_key, None)
+            self._job_ledger.discard(job.job_id)
+            if self._has_open_reverse_send_job(request_key):
+                return set(), set()
+
+            # Request-level release is authorized only after every send attempt
+            # for this exact request key has closed or disappeared.
             self._de_progress_deadlines.pop(request_id, None)
+            self._latest_reverse_attempt_ids.pop(request_id, None)
             finished_sending: set[str] = set()
             if request_id in self._pending_finished_sending:
                 self._pending_finished_sending.discard(request_id)
-                self._reverse_send_job_ids.pop(attempt_key, None)
-                self._latest_reverse_attempt_ids.pop(request_id, None)
-                self._job_ledger.discard(job.job_id)
                 finished_sending.add(request_id)
             return finished_sending, set()
         return set(), set()
@@ -1746,6 +1751,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             None,
         )
         if request_id is None:
+            self._job_ledger.discard(job.job_id)
             return set()
         del self._waiting_reverse_attempt_ids[request_id]
         self._recovery_deadlines.pop(request_id, None)

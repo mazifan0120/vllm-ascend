@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import (
@@ -62,6 +64,9 @@ def test_stale_attempt_job_absorbed_never_reaches_finished_recving(pe_scheduler_
     request = _admit_de_read_request(scheduler)
     binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
     completion_job_id = binding.reverse_completion_job_id
+    metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+    assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_job_id
+    assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
     # The logical request has re-parked at a newer attempt: the old attempt's
     # job report is stale and must be absorbed.
@@ -71,6 +76,7 @@ def test_stale_attempt_job_absorbed_never_reaches_finished_recving(pe_scheduler_
 
     assert output.finished_recving is None
     assert output.finished_sending is None
+    assert scheduler._job_ledger.get(completion_job_id) is None
 
 
 def test_current_attempt_job_inserts_req_id_only_while_waiting(pe_scheduler_factory):
@@ -84,8 +90,7 @@ def test_current_attempt_job_inserts_req_id_only_while_waiting(pe_scheduler_fact
     output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_job_id: 1}))
     scheduler.update_connector_output(output)
 
-    # I4 gate passes: the request id enters the mutable finished_recving and
-    # the Reverse destination hold is released.
+    # I4 gate passes: the request id enters the mutable finished_recving.
     assert output.finished_recving == {request.request_id}
     assert pool.blocks[71].ref_cnt == 0
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids

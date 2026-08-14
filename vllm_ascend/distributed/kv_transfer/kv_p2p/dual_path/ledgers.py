@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
+    DualPathRequestKey,
     ReverseAttemptKey,
 )
 
@@ -89,6 +90,18 @@ class JobLedger:
             return False
         del self._records[job_id]
         return True
+
+    def discard_closed_jobs(self, job_kind: JobKind, request_key: DualPathRequestKey) -> None:
+        """Retire every closed job of ``job_kind`` owned by ``request_key``."""
+        for job_id, record in list(self._records.items()):
+            attempt_key = record.reverse_attempt_key
+            if (
+                record.job_kind is job_kind
+                and attempt_key is not None
+                and attempt_key.request_key == request_key
+                and record.closed
+            ):
+                del self._records[job_id]
 
     def open_count(self) -> int:
         return sum(1 for record in self._records.values() if not record.closed)
