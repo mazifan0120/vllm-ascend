@@ -504,7 +504,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         ret,
                     )
-                    self.failed_reqs.add(req_id)
+                    self.failed_reqs.update(transfer_meta.req_ids)
                 else:
                     req_end_time = time.perf_counter()
                     total_transfer_size = sum(transfer_meta.length) / 1024
@@ -1951,7 +1951,7 @@ class MooncakeLayerwiseConnectorWorker:
         req_meta.remote_layer_metadata = self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port]
         return req_meta
 
-    def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
+    def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True) -> bool:
         external_req_id = get_external_request_id(req_id)
         send_msg_type = DONE_SENDING_MSG if trans_flag else FAILED_SENDING_MSG
         logger.info(
@@ -1981,7 +1981,7 @@ class MooncakeLayerwiseConnectorWorker:
                         ack = sock.recv()
                         if ack != b"ACK":
                             raise ValueError(f"Unexpected ACK response: {ack}")
-                        return
+                        return True
                 except Exception as e:
                     if attempt < max_retries:
                         logger.warning(
@@ -2006,6 +2006,7 @@ class MooncakeLayerwiseConnectorWorker:
                 req_meta.remote_port,
                 e,
             )
+            return False
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

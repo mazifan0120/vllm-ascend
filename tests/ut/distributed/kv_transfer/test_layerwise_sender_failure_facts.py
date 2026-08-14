@@ -2,8 +2,7 @@
 """Unit tests for Layerwise sender failure facts.
 
 Covers the failed-session wrong-attribution fix, the guarantee that a failed
-request never gets a success callback, and terminal-ACK failure surfacing as a
-worker-visible fact.
+request never gets a success callback, and terminal-ACK failure reporting.
 """
 
 import importlib.util
@@ -188,7 +187,7 @@ class TestLayerwiseSenderFailureFacts(unittest.TestCase):
         self.assertEqual(success_calls_for_r2, [])
         self.assertNotIn("r2", thread.failed_reqs)
 
-    def test_terminal_ack_failure_is_drained_once(self):
+    def test_terminal_ack_failure_returns_false(self):
         thread = _make_sending_thread()
         worker = object.__new__(MooncakeLayerwiseConnectorWorker)
         worker.kv_send_layer_thread = thread
@@ -199,17 +198,9 @@ class TestLayerwiseSenderFailureFacts(unittest.TestCase):
         req_id = "req_terminal_ack_failure_000000000"
         req_meta = _make_req_meta()
         with patch.object(layerwise_module, "zmq_ctx", side_effect=RuntimeError("no route to host")):
-            worker.send_done_send_signal(req_id, req_meta, 0, trans_flag=True)
+            result = worker.send_done_send_signal(req_id, req_meta, 0, trans_flag=True)
 
-        self.assertIn(req_id, thread.terminal_ack_failed)
-
-        self.assertEqual(worker.drain_terminal_ack_failures(), {req_id})
-        # A second drain returns nothing; the set was popped.
-        self.assertEqual(worker.drain_terminal_ack_failures(), set())
-
-        idle_worker = object.__new__(MooncakeLayerwiseConnectorWorker)
-        idle_worker.kv_send_layer_thread = None
-        self.assertEqual(idle_worker.drain_terminal_ack_failures(), set())
+        self.assertIs(result, False)
 
 
 if __name__ == "__main__":

@@ -562,7 +562,6 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return published_store_terminals
 
     def build_connector_worker_meta(self) -> DualPathWorkerMetadata | None:
-        self.drain_terminal_ack_failures()
         completed_jobs: dict[int, int] = {}
         failed_jobs: dict[int, int] = {}
         with self._sender_job_facts_lock:
