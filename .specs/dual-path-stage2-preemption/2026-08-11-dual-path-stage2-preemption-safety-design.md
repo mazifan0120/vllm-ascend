@@ -1,4 +1,4 @@
-# DualPath Stage-2: Preemption Safety (Pin + Fence + Stable Forward Replay + DE_READ Reverse Attempts)
+# DualPath Stage-2: Runtime Contract and DE_READ Reverse Attempts
 
 Status: design — single-stage delivery (approved direction: route-specific
 recovery; no 2a/2b split)
@@ -7,7 +7,9 @@ Updated: 2026-08-14
 Revision note: 2026-08-14 implementation sync retires the
 `CloseReverseAttempt` protocol and Reverse destination hold while retaining the
 Decision epoch, `STALE_CLOSED`, I4 gate, and `JobLedger`. Earlier review history
-is preserved below. Round 5:
+is preserved below. A later source-alignment correction also records that the
+Forward hold/fence/completion-job proposal was never implemented: Prefill
+Forward uses the ordinary Layerwise push and releases immediately. Round 5:
 retained-proof lookup precedence in the close matrix and cleanup wording.
 Round 4: durable safe-close proofs (persisted before every SAFE reply, retained
 until PE acknowledgment or verified teardown), request_finished contract
@@ -96,8 +98,8 @@ unsafe if the vLLM scheduler later preempts it:
 
 F2-F6 require a Reverse direction and therefore apply only to `DE_READ`.
 `PE_READ` has no DE-to-PE write, no PE-side remote-KV wait, and no Reverse
-attempt. Both paths nevertheless share F1 and the same stable Forward-binding
-replay semantics.
+attempt. Both paths nevertheless share F1; the current runtime does not add a
+Forward hold or fence to remove that risk.
 
 ### Why existing request-finish mechanisms do not cover this
 
@@ -121,9 +123,10 @@ replay semantics.
 
 Goals:
 
-- Prevent hangs and incorrect resume under normal PE preemption (F1-F5), while
-  documenting rather than masking the accepted exceptional-termination risk
-  in F6.
+- Preserve route and Reverse-attempt correctness under normal PE recovery
+  (F2-F5), while documenting that current Forward preemption (F1) and
+  exceptional Reverse termination (F6) retain the parent/main immediate-free
+  risk.
 - Preserve the original `PathKind`. PE prefix loss is normal and never causes a
   policy re-run or a route switch.
 - Keep one stable logical Forward binding on DE for both paths. Recovery only
@@ -146,38 +149,21 @@ Non-goals (Stage-2):
   incarnation boundary; verified old-process/transport teardown is the final
   safety proof when the old control endpoint cannot answer.
 - Post-commit fallback or path switching during recovery.
-- Cancelling an in-flight synchronous Mooncake transfer. Stage-2 fences work
-  already accepted by the relevant sender and prevents new old-attempt work.
+- Cancelling or fencing an in-flight synchronous Mooncake Forward transfer.
+  Prefill finish, abort, and preemption add no connector hold or gating job.
 
 ## 3. Reused engine and Connector primitives
 
-Stage-2 reuses four existing mechanisms rather than creating another
+Stage-2 reuses three existing mechanisms rather than creating another
 completion framework:
 
-1. **Forward source block pinning.** `KVConnector.bind_gpu_block_pool(block_pool)`
-   (`vllm/distributed/kv_transfer/kv_connector/v1/base.py:443-451`), bound once
-   by the scheduler at `scheduler.py:247-248`; `BlockPool.touch(blocks)`
-   (`vllm/v1/core/block_pool.py:402-417`) and `BlockPool.free_blocks(blocks)`
-   (`:419-441`) are refcount-balanced. In-tree precedents are upstream
-   `simple_kv_offload` (`vllm/v1/simple_kv_offload/manager.py:223-226` bind,
-   `:640-642` touch, `:703-726` release) and AscendStore. The AscendStore
-   touch/job/release precedent is exact only for its **mamba** path
-   (`kv_pool/ascend_store/pool_scheduler.py:970-1010`); its non-mamba path uses
-   delayed free plus generic `finished_sending` (`pool_scheduler.py:1012-1068`)
-   and is not a pinning precedent. Reverse destination pinning is the retired
-   exception documented in L0 below.
-2. **Preemption delivery.** `SchedulerOutput.preempted_req_ids` is populated in
-   the preempting schedule pass (`scheduler.py:940`) and is visible to
-   `build_connector_meta` in the same pass (`scheduler.py:954-956`).
-   Worker-side `handle_preemptions` (base no-op at `base.py:285-290`) receives
-   the resulting connector metadata before the model forward of every step
-   (upstream `vllm/v1/worker/gpu/kv_connector.py:61-68`,
-   `vllm/v1/worker/gpu_model_runner.py:4036-4039`; Ascend
-   `vllm_ascend/worker/model_runner_v1.py:1967-1969`). This is the existing
-   worker-side synchronization point used by the upstream Offloading connector,
-   which blocks in `handle_preemptions` on the exact jobs the scheduler flagged
-   (`offloading/worker.py:232-239`).
-3. **Worker completion metadata.** `KVConnectorWorkerMetadata.aggregate()`
+1. **Parent ownership/lifecycle.** Prefill Forward is the ordinary Layerwise
+   push: DualPath does not call `BlockPool.touch`, create a Forward gating job,
+   or delay free on normal finish, abort, or preemption. A WAITING Reverse
+   abort likewise follows the parent/main immediate-free lifecycle. Only a
+   Decode request with an open `REVERSE_SEND` job delays free so zero-token
+   steps can harvest worker reports.
+2. **Worker completion metadata.** `KVConnectorWorkerMetadata.aggregate()`
    (`base.py:150-168`) is invoked while vLLM combines every executor worker's
    `KVConnectorOutput` (`distributed/kv_transfer/kv_connector/utils.py:130-139`;
    that fold performs no type check, so each concrete `aggregate` must assert
@@ -186,20 +172,18 @@ completion framework:
    `{event_idx: 1}` / `{event_id: 1}`. The Scheduler maps the opaque id back to
    semantic state and completes at an expected worker count sourced from
    `parallel_config.world_size`.
-4. **Layerwise topology mapping.** MooncakeLayerwise already maps TP/PCP/DCP
-   ranks and physical ranges. Stage-2 adds direction-appropriate fencing around
-   the existing per-rank work instead of duplicating that math.
+3. **Layerwise topology mapping.** MooncakeLayerwise already maps TP/PCP/DCP
+   ranks and physical ranges. DualPath uses that ordinary Forward data path and
+   does not add a preemption fence around it.
 
-The pin-connector precedent shape is: completion is reported through
+Reverse completion is reported through
 `kv_connector_worker_meta`, not `finished_sending`; scheduler-side
 `update_connector_output` (invoked at `scheduler.py:2233`, before the generic
 finished-set processing at `:2236-2248`) waits for all participating workers
-and then releases the extra Forward source references. `request_finished`
-returns `(False, None)` on the normal path when no connector work remains;
-Stage-2 returns `True` when a finished RUNNING Forward source or Decode
-reverse-send job must retain ordinary ownership and scheduler visibility while
-connector jobs remain pending (see "Engine progress while connector jobs are
-pending"). The separate WAITING Reverse-abort path does not delay free.
+and then applies I4 or the Decode reverse-send completion action. Prefill
+`request_finished` returns `False` for both directions; only Decode returns
+`True` while its open reverse-send job must retain scheduler visibility (see
+"Engine progress while connector jobs are pending").
 
 ## 4. Safety model and identities
 
@@ -211,10 +195,9 @@ pending"). The separate WAITING Reverse-abort path does not delay free.
 - **Stable Forward binding:** both `PE_READ` and `DE_READ` keep one logical DE
   `ForwardReceiveBinding`, one stable Forward wire id, the frozen DE destination
   table, and one fixed Forward range for the lifetime of the request.
-- **PE-local Forward source attempt:** PE block allocation and the source table
-  may change after preemption. The source plan, holds, and opaque completion
-  jobs are local attempt state under the logical request; they are not part of
-  the PE-to-DE decision identity.
+- **PE-local Forward source plan:** PE block allocation and the source table may
+  change after preemption. This local plan has no hold, completion job, or
+  barrier association and is not part of the PE-to-DE decision identity.
 - **DE_READ Reverse attempt:** only `DE_READ` carries a non-negative
   `reverse_attempt_id`, sourced from PE `request.num_preemptions`, plus the
   attempt-local `prefill_local_tokens = L_PE(attempt)`. Scheduler/Worker code
@@ -226,10 +209,9 @@ pending"). The separate WAITING Reverse-abort path does not delay free.
   from its complete attempt key. Code looks it up explicitly and never recovers
   identity by slicing a string suffix.
 - **Completion job id:** a Scheduler-assigned opaque integer. Worker code does
-  not interpret route or attempt. PE Scheduler maps it to a Forward source
-  completion/fence or a Reverse completion; DE Scheduler maps it to a
-  Reverse-send completion. `JobLedger` remains the sole all-worker counting
-  authority.
+  not interpret route or attempt. PE Scheduler maps it to a Reverse completion;
+  DE Scheduler maps it to a Reverse-send completion. `JobLedger` remains the
+  sole all-worker counting authority.
 
 `PathDecisionRequest` and DE pending admission remain keyed only by
 `DualPathRequestKey`. The serialized `PE_READ` result remains exactly
@@ -240,27 +222,22 @@ field validation rejects an attempt-bearing `PE_READ` or a `DE_READ` missing
 its attempt fields.
 
 `ForwardPlan` remains a logical-keyed value containing range and block tables.
-Both paths retain the current source plan under their logical request and may
-replace it only after the prior source attempt is fenced (I6).
+Both paths retain the current source plan under their logical request; current
+runtime replacement is not gated by a DualPath hold, job, or fence.
 
 ### 4.2 Required invariants
 
-- **I1 — no Forward-source reuse before proof.** A held Forward source block is
-  not reusable until every transport that can read it is proven unable to
-  touch it. A parked `DE_READ` request keeps ordinary destination ownership
-  until I4 publishes normal Reverse completion; WAITING Reverse abort/watchdog
-  termination is the documented immediate-release exception.
+- **I1 — current ownership boundary.** DualPath owns no extra Forward source or
+  Reverse destination reference. A parked `DE_READ` request keeps ordinary
+  destination ownership until I4 publishes normal Reverse completion; Prefill
+  normal finish, abort, and preemption otherwise follow parent/main release.
 - **I2 — identity follows the changing address.** Admission and Forward receive
   state use `DualPathRequestKey`; only DE_READ Reverse plans, bindings, wire
   map, terminals, latches, and cleanup lookups use `ReverseAttemptKey`. An
   admission lookup is never replaced by attempt-key membership.
-- **I3 — stable Forward completion and idempotent overwrite.** A successful
-  terminal means one complete valid write of the stable logical Forward range.
-  Partial work publishes no terminal; a later source attempt deterministically
-  overwrites the same stable destination range, so duplicate complete writes
-  are safe. A normal-completion report that arrives after its source attempt
-  was fenced and released is dropped: the replay overwrite makes it harmless,
-  and it must not mutate any later source attempt.
+- **I3 — stable Forward identity.** Both paths retain the same logical Forward
+  binding and fixed destination range. DualPath does not publish a Forward
+  completion job or claim that preemption fences queued Layerwise work.
 - **I4 — current Reverse-attempt gate.** PE Workers report Reverse completion
   only as an opaque `{reverse_completion_job_id: 1}` in
   `DualPathWorkerMetadata`. Only the PE Scheduler, inside
@@ -271,12 +248,11 @@ replace it only after the prior source attempt is fenced (I6).
   request is still waiting for remote KV, and only then inserts the request id
   into the mutable `KVConnectorOutput.finished_recving`. Jobs from stale
   attempts are absorbed and never reach the generic finished sets.
-- **I5 — all-worker proof.** A job or generic terminal is complete only after
-  every expected participating worker has reported it exactly once.
-- **I6 — fence before Forward source replacement.** No new Forward source plan
-  or enqueue may become visible to any PE worker until every PE worker has
-  consumed the FIFO barrier item for the old source attempt and the Scheduler
-  has observed the all-worker barrier-job completion.
+- **I5 — all-worker Reverse proof.** A Reverse completion or Reverse-send job
+  is complete only after every expected participating worker reports once.
+- **I6 — no Forward gating contract.** Prefill Forward creates no hold,
+  completion job, barrier job, or delayed-free state. Preemption may replace
+  local Forward state without a connector safety proof.
 - **I7 — route-preserving recovery.** PE_READ rebuilds only its local Forward
   source attempt. DE_READ rebuilds that source attempt plus a new Reverse
   attempt from current `L_PE`. Neither path calls `PathPolicy` again.
@@ -288,42 +264,35 @@ replace it only after the prior source attempt is fenced (I6).
 
 ## 5. Design
 
-The active design separates three concerns: Forward source holds plus completion
-jobs; one common synchronous-fence Forward replay mechanism; and DE_READ
-Reverse-attempt renewal. The former Reverse destination hold and exceptional
-close protocol are retained below only as rejected design history.
+The active design separates three concerns: Reverse-job completion aggregation;
+ordinary Forward Layerwise push and local plan refresh; and DE_READ
+Reverse-attempt renewal. Forward/Reverse holds, Forward completion/barrier jobs,
+and the exceptional close protocol are retained below only as rejected design
+history.
 
-### L0 — Forward source holds and completion-job ledger
+### L0 — Reverse `JobLedger`; no DualPath block holds
 
-Owner: `DualPathConnectorScheduler`. The PE role maintains Forward source
-holds plus the job ledger; the DE role maintains the same job ledger for its
-Reverse-send completion proofs. The active records are:
+Owner: `DualPathConnectorScheduler`. Both roles maintain one `JobLedger`: PE
+uses it for Reverse completion and I4; DE uses it for Reverse-send completion.
+The live record is:
 
 ```text
-hold_id -> { block_ids, hold_kind=FORWARD_SOURCE, released }
-ForwardSourceAttempt -> { request_key, hold_id, normal_completion_job_id,
-                          pending_barrier_job_id | None, source_block_ids }
-job_id -> { job_kind, affected_hold_ids, reverse_attempt_key | None,
+job_id -> { job_kind, reverse_attempt_key | None,
             expected_worker_count, completed_worker_count, failed, closed }
 ```
 
-Ledger rules:
+Active ledger rules:
 
-- There is exactly one record per Forward source held reference.
-  `BlockPool.touch`/`free_blocks` maintain the physical refcounts, and every
-  acquisition/release flows through that record.
 - Each worker contributes at most one report per job; the Scheduler accumulates
   `completed_worker_count` across steps.
 - When `completed_worker_count` reaches `expected_worker_count`, the
   kind-specific action runs exactly once and the job becomes `closed`. Reports
   arriving for a `closed` job are ignored, so duplicate or late reports cannot
-  double-release a Forward hold or mutate a later attempt.
-- A barrier job references every old Forward source hold fenced in that pass;
-  a normal Forward completion job maps to one Forward source hold; a Reverse
-  completion job and DE reverse-send job each map to one `ReverseAttemptKey`.
+  mutate a later attempt.
+- A Reverse completion job and a DE reverse-send job each map to exactly one
+  `ReverseAttemptKey`.
 - A failure report closes the job as `failed`; the owning request is failed
-  through the existing control-failure/watchdog path. Forward source holds are
-  not released unless the failure itself proves no transport can read them.
+  through the existing control-failure/watchdog path.
 - The job ledger is the sole authority for reverse-send counting:
   `completed_worker_count`, `failed`, and `closed` for a `reverse_send_job_id`
   live only here. No second structure keeps a completion counter.
@@ -331,41 +300,25 @@ Ledger rules:
   superseded reverse-send jobs. Open records remain reportable because
   `JobLedger.discard()` refuses them.
 
-#### Hold acquisition
+#### Retired hold and Forward-gating proposal
 
-- **Forward source holds are acquired in `update_state_after_alloc`** before a
-  request can become `RUNNING` and preemptible. Each hold covers the path's
-  stable Forward-range source blocks.
-- The former Reverse destination hold pinned `[L_PE, K_DE)` before Decision
-  delivery. It is retired: normal parked `DE_READ` already owns its allocation
-  until I4 completes, while exceptional abort/watchdog termination now accepts
-  parent/main immediate release.
+The earlier design added `HoldKind`, `HoldRecord`, `HoldLedger`,
+`ForwardSourceAttempt`, normal Forward completion jobs, barrier jobs,
+`affected_hold_ids`, and `_reverse_destination_holds`. None is implemented.
+Current Prefill Forward is the ordinary Layerwise push: it calls no
+`BlockPool.touch`, creates no gating job, and does not delay free on normal
+finish, RUNNING abort, or preemption. The retired Reverse destination hold
+would have pinned `[L_PE, K_DE)` before Decision delivery.
 
-The retired Reverse hold required `HoldKind.REVERSE_DESTINATION`,
-`_reverse_destination_holds`, the close protocol, durable safety proofs, and
-two pressure limits. Those Reverse-specific pieces and
-`VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS` /
-`VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS` are removed. Forward source holds,
-`ForwardSourceAttempt`, and their completion/barrier jobs remain part of this
-design. The hold ledger remains for `FORWARD_SOURCE` records only; it contains
-no Reverse destination entry or Reverse-specific release path.
+The Reverse hold was redundant on the normal parked path and required the
+retired close protocol for exceptional termination. Both hold kinds and the
+pressure limits were dropped; consequently `ledgers.py` contains `JobLedger`
+only, and `VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS` plus
+`VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS` are removed.
 
-#### Forward source attempts and the normal completion job
+#### Worker-to-Scheduler Reverse completion
 
-The `normal_completion_job_id` is carried unchanged with the source metadata
-to every PE worker. A worker records success only after its final synchronous
-write and successful terminal ACK; a DMA or terminal-ACK failure records the
-job as failed. Each worker emits `{normal_completion_job_id: 1}` exactly once.
-PE Scheduler `update_connector_output` aggregates to `expected_worker_count`,
-resolves the job to its Forward source hold, and releases that hold on success.
-
-`pending_barrier_job_id` associates an attempt with the barrier job that fences
-it. On preemption or RUNNING abort, the barrier job records every fenced
-`ForwardSourceAttempt`; a late normal-completion report for an already-fenced
-attempt is ignored and cannot affect a replacement. A new source plan becomes
-visible only after the old attempt's all-worker fence completes.
-
-Worker-to-Scheduler completion follows the upstream offloading shape:
+Worker-to-Scheduler completion follows the upstream aggregation shape:
 
 ```python
 @dataclass
@@ -390,34 +343,27 @@ Worker build_connector_worker_meta()
   -> ModelRunner KVConnectorOutput.kv_connector_worker_meta
   -> vLLM aggregate() across executor workers
   -> Scheduler update_connector_output()
-  -> Forward hold / JobLedger transition
+  -> Reverse JobLedger transition
 ```
 
-`get_finished()` keeps the base meanings of its generic sets. PE-side Forward
-completion/fence and Reverse completion use completed jobs; a validated
+`get_finished()` keeps the base meanings of its generic sets. A validated
 current-attempt Reverse completion becomes `finished_recving` only through I4.
-A finished request with an open Forward or reverse-send job remains delayed
-until the corresponding completion transition injects `finished_sending`.
+A Decode request that finished with an open reverse-send job stays delayed
+until JobLedger closes that job and injects `finished_sending`. Prefill has no
+corresponding Forward completion or delayed-free job.
 
-#### Hold release predicates
+### L1 — retired Forward hold/fence/replay proposal
 
-| Hold/ownership class and exit | Required proof | Release owner |
-|---|---|---|
-| Forward source, normal | Every PE worker reports final Forward completion after its last synchronous write and terminal ACK | PE Scheduler `update_connector_output` |
-| Forward source, preempt/RUNNING abort | Every PE worker reports the barrier job after consuming its FIFO barrier item | PE Scheduler `update_connector_output` |
-| Reverse destination, normal DE_READ ordinary ownership | Every PE worker reports the current-attempt Reverse completion job; I4 validation passes | Upstream normal completion path |
-| Reverse destination, WAITING abort/watchdog | No proof is awaited; immediate parent/main release is the accepted risk | Upstream termination path |
+> **Not implemented.** The following subsection records the rejected stronger
+> design. Current DualPath creates no Forward hold, completion job, barrier job,
+> or `handle_preemptions` fence. Prefill finish, abort, and preemption release
+> immediately through the parent lifecycle.
 
-The former `SAFE`/`NOT_SAFE` close matrix and retained Reverse destination hold
-are historical only. They do not change the active Forward source hold
-predicates above.
+#### Historical sender prerequisites
 
-### L1 — common stable Forward replay via synchronous fencing
-
-#### Sender prerequisites (Stage-2 blockers)
-
-The existing MooncakeLayerwise sender invalidates naive barrier use; three
-fixes land before the fence protocol:
+The rejected fence design depended on three sender facts. The barrier-specific
+primitive was never implemented because the fence was abandoned; the other
+two defects were fixed independently as correctness repairs:
 
 1. **Barrier items are processed outside `_transfer_kv_cache`.** The sender run
    loop (`mooncake_layerwise_connector.py:266-273`) dispatches barrier items on
@@ -426,17 +372,17 @@ fixes land before the fence protocol:
    exception can never strand a blocked model thread. Today `_handle_request`
    catches and swallows all transfer exceptions (`:275-283`); a barrier routed
    through that path could disappear without reporting its job.
-2. **Fix the failed-request wrong-attribution bug.** On transfer failure the
-   sender marks `self.failed_reqs.add(req_id)` using the stale loop variable
-   from the outer request loop (`:507`). It must mark **every** member of
-   `transfer_meta.req_ids` for the failed session; otherwise the final-layer
-   callback (`:519-527`) can publish success for the actually failed request.
-3. **Terminal-ACK failure becomes a worker failure fact.** A failed
-   `send_done_send_signal` is currently only logged; it must surface as a
-   failure fact for the affected request/job so the Scheduler terminates
-   recovery instead of waiting forever.
+2. **Failed-request attribution is session-wide.** On transfer failure the
+   sender now updates `failed_reqs` with every member of
+   `transfer_meta.req_ids`; the former stale-loop-variable attribution bug
+   could otherwise let the final-layer callback publish success for a failed
+   request.
+3. **Terminal-ACK failure is a worker failure fact.** The parent
+   `send_done_send_signal` now returns one boolean outcome, `True` only after a
+   successful ACK. The DualPath Reverse sender records a failed job when that
+   outcome is false; there is no separate terminal-failure drain queue.
 
-#### Fence protocol
+#### Rejected fence protocol
 
 The Layerwise sender is a single thread consuming one FIFO queue, and
 `batch_transfer_sync_write` returns synchronously. Model execution is serial
@@ -472,14 +418,13 @@ a bounded engine-level timeout. Blocking the model thread inside
 reaches the barrier item, sets the event, and the model thread unblocks. No
 circular wait exists.
 
-The current queue has no `task_done()/join()` or barrier item; Stage-2 adds
-this explicit primitive. Observing an empty queue is racy and is not a barrier.
-The fence is required even when every layer callback for the last chunk has
-already enqueued before preemption, as can happen with async scheduling.
+The current DualPath path has no `task_done()/join()` or barrier item. The
+proposal would have added this explicit primitive; it was not implemented.
 
-#### After the fence: always release and replay
+#### Historical post-fence release and replay
 
-After a preemption fence completes, PE **always** releases the old Forward
+In that rejected proposal, after a preemption fence completed, PE would always
+release the old Forward
 source holds and replays the stable Forward range from the new allocation on
 re-admission. There is no SATISFIED-versus-DRAINING arbitration:
 
@@ -496,12 +441,13 @@ PE may compute admission facts for the replacement while the fence is pending,
 but such computation is provisional only: it must not mutate plans, holds,
 `_reqs_need_send_layerwise`, or control state, must not expose the new source
 plan, and must not enqueue new Forward work until every participating PE worker
-has reported the barrier job (I6). The resume-admission entry point defers
+has reported the barrier job (the historical fence predicate). The proposed
+resume-admission entry point defers
 instead of returning partial results (§L2 "Resume admission").
 
-For PE_READ, the post-fence replacement can immediately rebuild and replay its
-Forward source. For DE_READ, the source attempt is rebuilt but cannot run until
-the new Reverse attempt described below completes.
+In the proposal, PE_READ post-fence replacement would rebuild and replay its
+Forward source. DE_READ would rebuild the source attempt but wait for the new
+Reverse attempt described below.
 
 ```mermaid
 sequenceDiagram
@@ -540,7 +486,7 @@ Recovery recomputes ranges without calling `PathPolicy`:
 | Fixed path | Recovery identity | Reverse | PE recompute | Stable Forward |
 |---|---|---|---|---|
 | `DE_READ` | logical request + new `reverse_attempt_id` | `[L_PE(new), K_DE)`; empty when `L_PE(new) >= K_DE` | `[max(L_PE(new), K_DE), T)` | `[K_DE, T)` |
-| `PE_READ` | logical request + new local source jobs | none | `[L_PE(new), T)` | `[L_DE, T)` |
+| `PE_READ` | logical request + local source plan | none | `[L_PE(new), T)` | `[L_DE, T)` |
 
 For DE_READ, a smaller PE prefix asks DE to resend a larger Reverse range from
 the same stable Decode table. DE already has, or its logical Store load
@@ -551,10 +497,8 @@ For PE_READ, PE prefix loss only changes how PE produces `[L_DE,T)`. Its
 Decision contains no PE block address or PE-derived boundary, so PE sends no
 replacement Decision and DE does not reactivate anything.
 
-For both paths, the stable Forward binding lets DE combine a valid completed
-rank terminal with later duplicate overwrites. DE retains the binding while
-completion is pending and retains its consumed-terminal tombstone through final
-request cleanup so a late duplicate cannot be attributed to another request.
+For both paths, the Forward binding remains logical and stable. Current runtime
+does not create a Forward completion job or fence source-plan replacement.
 
 #### Resume admission (replaces the invalid-set convergence)
 
@@ -566,16 +510,9 @@ request cleanup so a late duplicate cannot be attributed to another request.
    instead treats the changed prefix as invalid and converges into
    `_prefill_invalid_request_ids` (dual_path `scheduler.py:321-322`,
    `:350-362`), which this branch replaces for delivered decisions.
-2. **Barrier gate.** If the logical request's Forward barrier job is still
-   pending (all-worker completion not yet observed in
-   `update_connector_output`), return `(None, False)`. Upstream permits a
-   connector to return `None` from `get_num_new_matched_tokens`
-   (`vllm/distributed/kv_transfer/kv_connector/v1/base.py:453-477`); the
-   scheduler then moves the request to `skipped_waiting` and retries it in a
-   later pass (`vllm/v1/core/sched/scheduler.py:615-629`). Only after
-   `update_connector_output` observes all-worker barrier completion may resume
-   compute `L_PE(new)`, return route-specific results, allocate replacement
-   blocks, or deliver a replacement Decision.
+2. **No Forward barrier gate.** Resume computes current `L_PE`, returns the
+   route-specific result, and updates the local source plan without waiting for
+   a Forward job. The connector creates no `barrier_jobs` metadata.
 3. Reuse the frozen `PathKind`; never re-run eligibility or `PathPolicy`.
 4. `DE_READ`: return `(max(K_DE - L_PE(new), 0), True)` — the Reverse token
    count as external tokens, parking the request in `WAITING_FOR_REMOTE_KVS`.
@@ -583,8 +520,7 @@ request cleanup so a late duplicate cannot be attributed to another request.
    machinery entirely: return `(0, False)`; no
    `reverse_completion_job_id` is allocated, no
    `waiting_reverse_attempt_id` is installed, the request never enters
-   `WAITING_FOR_REMOTE_KVS`, and Forward replay proceeds once the barrier gate
-   is open.
+   `WAITING_FOR_REMOTE_KVS`, and the ordinary Forward push proceeds.
 5. `PE_READ`: return `(0, False)`; recovery rebuilds only the local Forward
    source plan.
 
@@ -599,10 +535,9 @@ Normal scheduler preemption starts from a completed Reverse attempt:
 ReverseAttempt(N): DONE
   -> PE RUNNING / Forward in flight
   -> preemption
-  -> fence (all-worker barrier) -> old source work drained
   -> re-admission (resume branch)
   -> ReverseAttempt(N+1): submitted -> DONE      # skipped when vacuous
-  -> Forward replay -> complete
+  -> ordinary Forward Layerwise push
 ```
 
 No close message exists on this path. The all-worker Reverse completion that
@@ -610,10 +545,9 @@ promoted the request from `WAITING_FOR_REMOTE_KVS` is already the I4 terminal
 for attempt N; normal request ownership remains valid through that transition.
 
 PE creates a greater `reverse_attempt_id`, captures current `L_PE` and the new
-PE block table, and delivers a new DE_READ Decision only after the old local
-Forward fence completes (I6). The
-already-preempted PE scheduler request still follows normal vLLM
-re-admission/completion bookkeeping.
+PE block table, and delivers a new DE_READ Decision during normal re-admission;
+there is no old-Forward fence gate. The already-preempted PE scheduler request
+still follows normal vLLM re-admission/completion bookkeeping.
 
 DE validates that the logical admission still owns the same path, `K_DE`, `T`,
 Decode allocation, and source coverage. It then installs a fresh Reverse plan
@@ -632,9 +566,7 @@ sequenceDiagram
     PS->>PS: I4 gate: attempt == waiting, still waiting -> finished_recving
     PS->>PS: request RUNNING with normal ownership
     PS->>PW: compute and enqueue stable Forward range
-    PS->>PS: preemption; create barrier job in metadata
-    PW-->>PS: all-worker barrier job completion
-    PS->>PS: old Forward source work drained
+    PS->>PS: preemption; ordinary ownership releases immediately
     PS->>PS: resume admission; recompute current L_PE; keep PathKind=DE_READ
     PS->>DC: Decision(request_key, attempt M, current L_PE, new PE blocks)
     DC->>DC: validate stable admission; install fresh Reverse plan/latch
@@ -643,7 +575,7 @@ sequenceDiagram
     DW-->>PW: write [L_PE(M), K_DE) into new PE blocks
     PW-->>PS: {reverse_completion_job_M: 1} from every worker
     PS->>PS: I4 gate passes; resume request
-    PS->>PW: compute remainder + replay stable Forward range
+    PS->>PW: compute remainder + ordinary Forward Layerwise push
 ```
 
 This normal sequence uses Decision messages only: N completed before the
@@ -940,8 +872,8 @@ ordinary parent/main release:
 
 1. PE `request_finished` adds no close request, WAITING-abort release
    injection, or Reverse hold. This WAITING Reverse-abort branch returns
-   `False`; the separate RUNNING Forward-abort branch below may still return
-   `True` while its Forward source fence/hold remains open.
+   `False`. RUNNING Forward abort, normal Prefill finish, and preemption use the
+   same immediate-release ownership contract.
 2. The aborted request and its ordinary destination ownership are released by
    the parent lifecycle immediately; recovery-watchdog expiry follows the same
    terminal path.
@@ -954,57 +886,25 @@ ordinary parent/main release:
 make this release safe; they only prevent delayed control messages from
 reopening a lower execution epoch.
 
-### RUNNING-request abort fence
+### Prefill finish, abort, and preemption release
 
-This is a distinct lifecycle from the WAITING Reverse abort above. WAITING
-Reverse abort immediately releases without `finished_recving` injection;
-RUNNING Forward abort must delay ordinary free until the Forward source fence
-proves queued reads have drained.
-
-Upstream abort of a delivered **RUNNING** dual_path request never populates
-`preempted_req_ids`: `finish_requests` (`scheduler.py:1825-1886`) removes the
-request from the running queue (`:1859-1860`, `:1867-1868`), marks it finished,
-and calls `_free_request` (`:1888-1905`) → `_connector_finished` → the
-connector's `request_finished`. The preemption fence path therefore never
-fires for it, and without a fence its queued Forward work could read blocks
-whose ordinary ownership is being freed. Stage-2 adds the abort fence:
-
-1. PE `request_finished` detects an unreleased `ForwardSourceAttempt` for the
-   request and returns `True` (connector-owned delayed free), so upstream
-   retains ordinary ownership (`scheduler.py:1901-1903` skips `_free_blocks`).
-2. The PE Scheduler creates an abort-fence barrier job associated with the
-   attempt (recorded on the job and as the attempt's
-   `pending_barrier_job_id`), carried to workers in the next connector
-   metadata. Delivery is guaranteed even with no runnable request: the
-   no-forward output step still runs (`vllm/v1/worker/gpu/model_runner.py:1098-1101`
-   → `vllm/v1/worker/gpu/kv_connector.py:98-105`); see "Engine progress" below.
-3. Every worker's `handle_preemptions` enqueues one FIFO barrier item and
-   blocks on its local event until the sender consumes it — the same mechanism
-   as the preemption fence.
-4. All-worker aggregation in `update_connector_output` releases the Forward
-   source hold.
-5. The Scheduler then injects the finished request id into
-   `finished_sending`. This is the legal channel for a `request_finished=True`
-   request: `_free_request` already supplied the id through `finished_req_ids`
-   (`scheduler.py:1897`, carried into `SchedulerOutput` at `:945`), satisfying
-   the `get_finished` contract (`base.py:357-373`), and the upstream
-   `finished_sending` branch unconditionally frees the delayed blocks
-   (`scheduler.py:2245-2248`). `finished_recving` would also pass the status
-   assertion for a finished request (`:2242-2244`), but `finished_sending` is
-   the canonical delayed-free completion channel and is used here. The retired
-   WAITING Reverse-abort `finished_recving` injection is not used.
+`_delay_free_for_connector` returns `False` for the Prefill role regardless of
+path or request status. Forward is an ordinary Layerwise push: RUNNING abort,
+normal finish, and preemption create no hold, gating job, barrier metadata, or
+pending `finished_sending` injection. WAITING Reverse abort also releases
+immediately without `finished_recving` injection. These paths deliberately do
+not prove that queued transport work has drained before ordinary blocks become
+reusable.
 
 ### Engine progress while connector jobs are pending
 
-Connector jobs (PE normal Forward completion, PE barrier, DE reverse-send) may
-outlive the last ordinary request; if no further model steps occurred, no
-connector outputs would be produced and the jobs would never aggregate. The
-rule that prevents this:
+An open DE reverse-send job may outlive the last ordinary Decode request; if no
+further model steps occurred, no connector outputs would be produced and the
+job would never aggregate. The rule that prevents this:
 
-- While the connector owns an open Forward completion/barrier job or DE
-  reverse-send job for a finished request, that request returns `True` from
-  `request_finished` (delayed
-  free). Such a request remains in the scheduler's `self.requests` after
+- While the Decode connector owns an open reverse-send job for a finished
+  request, that request returns `True` from `request_finished` (delayed free).
+  Such a request remains in the scheduler's `self.requests` after
   leaving the scheduling queues, so `has_finished_requests()`
   (`scheduler.py:1931-1941`) returns `True`, `has_requests()`
   (`v1/core/sched/interface.py:185-188`) stays `True`, and `EngineCore.step()`
@@ -1015,9 +915,9 @@ rule that prevents this:
   `post_forward` still calls `get_finished` and `build_connector_worker_meta`
   (`v1/worker/gpu/kv_connector.py:98-105`), producing a `KVConnectorOutput`.
   The scheduler's `update_from_output` then invokes
-  `update_connector_output` (`scheduler.py:2233`), so job aggregation, Forward
-  hold release, and `finished_sending` injection keep making
-  progress with no ordinary request running.
+  `update_connector_output` (`scheduler.py:2233`), so reverse-send aggregation
+  and `finished_sending` injection keep making progress with no ordinary
+  request running.
 - A finished request with no pending connector work must return
   `(False, None)` from `request_finished` so the engine can go idle.
 - The bounded-watchdog fallback fails the request. On PE it does not synthesize
@@ -1063,8 +963,8 @@ combinations and does not validate PE/DE TP equality (the parent Decode
 scheduler rejects PCP, which is not the full matrix). Stage-2 adds:
 
 - local checks during connector construction for the local-side restrictions;
-- remote checks from bootstrap/plan metadata before Decision commit and before
-  acquiring DualPath holds. The existing bootstrap/meta exchange already
+- remote checks from bootstrap/plan metadata before Decision commit. The
+  existing bootstrap/meta exchange already
   carries the incarnation-qualified identity `decode_engine_instance_id =
   f"{engine_id}:{data_parallel_rank}:{incarnation}"`
   (`path_decision_channel.py:272-273`); Stage-2 extends that bootstrap metadata
@@ -1075,9 +975,9 @@ scheduler rejects PCP, which is not the full matrix). Stage-2 adds:
 Every violation raises an explicit configuration/control error; no request
 enters the partial protocol.
 
-### 6.2 Reused TP barrier
+### 6.2 Reused TP Reverse-job aggregation
 
-Every Scheduler-created completion/barrier job is sent unchanged to every
+Every Scheduler-created Reverse completion/send job is sent unchanged to every
 participating local executor worker. Each worker reports `{job_id: 1}` exactly
 once only after all rank-local subtransfers represented by that job complete.
 The Scheduler accumulates counts across steps and completes at the recorded
@@ -1086,12 +986,9 @@ The Scheduler accumulates counts across steps and completes at the recorded
 `expected_worker_count` is sourced directly from
 `vllm_config.parallel_config.world_size`, which equals TP under the supported
 `PP == PCP == DP == 1` topology (`vllm/config/parallel.py:774-784`). A
-rank-local terminal can never release a process-wide hold. A missing or failed
-rank leaves the job incomplete and takes the watchdog/fail-closed path.
-
-One barrier job per preempting pass is preferred over per-request barrier jobs:
-the single FIFO barrier item on each worker's sender queue already fences every
-old source attempt enqueued before it.
+rank-local terminal can never publish process-wide Reverse completion. A
+missing or failed rank leaves the job incomplete and takes the watchdog/failure
+path.
 
 ### 6.3 PCP/DCP reuse boundary
 
@@ -1103,7 +1000,7 @@ protocol and job aggregation:
 - PCP ranks naturally add participating Workers;
 - DCP contributes rank-local subtransfers that finish before that Worker
   reports its one job completion; and
-- the barrier counts participating Workers, never raw direction terminals.
+- the job ledger counts participating Workers, never raw direction terminals.
 
 That reuse is not sufficient evidence to enable PCP/DCP in Stage-2. Stage-1
 excludes them and the Decode Layerwise scheduler currently rejects PCP.
@@ -1115,7 +1012,7 @@ acceptance matrix, not a change to the route-specific recovery model.
 
 | Failure | Ownership / fence | Identity / plan handling | Completion / publication |
 |---|---|---|---|
-| F1 Forward read-after-free | Forward source hold plus all-worker synchronous sender fence (I6), on preemption or on RUNNING-request abort | replace only PE-local source attempt | all-PE-worker completion/barrier jobs |
+| F1 Forward read-after-free | no DualPath hold or fence; ordinary ownership releases immediately | replace PE-local source plan without a gate | accepted parent/main risk; no Forward job publication |
 | F2 DE_READ re-admission parks forever | ordinary request ownership while parked | resume-admission branch reuses frozen PathKind; create new `reverse_attempt_id` and plan | only the current attempt resumes PE (I4) |
 | F3 exhausted Reverse latch | no old-plan reuse | fresh per-attempt tracker and latch keyed by `ReverseAttemptKey` | old DONE attempt retired on normal replacement |
 | F4 stale Reverse terminal | ordinary ownership remains until current completion | Worker reports an opaque completion job; PE Scheduler maps job_id to `ReverseAttemptKey` | I4 job-based gate absorbs stale-attempt jobs; only PE Scheduler publishes `finished_recving` |
@@ -1124,51 +1021,40 @@ acceptance matrix, not a change to the route-specific recovery model.
 
 ## 8. Connector facade requirements
 
-`DualPathConnector` explicitly delegates every safety hook to its Scheduler or
-Worker implementation. Relying on base-class no-ops would silently disable the
-design. Required forwarding includes:
+`DualPathConnector` delegates its active completion and lifecycle hooks to the
+Scheduler or Worker implementation. Required forwarding includes:
 
-- `bind_gpu_block_pool`;
-- `handle_preemptions`;
 - `build_connector_worker_meta`;
 - `update_connector_output`;
 - existing `get_finished`, `request_finished`, and `shutdown` behavior.
 
 The same metadata remains composable under `MultiConnector`; aggregation must
 preserve the concrete `DualPathWorkerMetadata` type (its `aggregate` performs
-the `isinstance` assertion the upstream fold omits), and `MultiConnector`'s
-`bind_gpu_block_pool` / `handle_preemptions` forwarding must reach the DualPath
-sub-connector.
+the `isinstance` assertion the upstream fold omits).
 
 ## 9. Test strategy for implementation
 
 No test execution is part of this design-only update. Tests land alongside
 each implementation step of §10. Coverage must include:
 
-**Step 1 — sender fixes and barrier primitive:**
+**Step 1 — sender failure facts; no Forward barrier wiring:**
 
-- Barrier items are processed outside `_transfer_kv_cache`; an injected
-  exception on the barrier path still sets the local event and records the job
-  (no stranded model thread).
 - Multi-request/session failure attribution: a failed session marks every
   member of `transfer_meta.req_ids` failed (regression for
   `mooncake_layerwise_connector.py:507`), and the final-layer callback never
   publishes success for a failed request.
 - Terminal-ACK failure produces a worker failure fact, not only a log.
-- Barrier metadata handoff: scheduler-created barrier job reaches
-  `handle_preemptions`; enqueue precedes the next forward; FIFO ordering of old
-  work before the barrier item; duplicate barrier item consumption is
-  idempotent.
+- A preempting Prefill pass has no `barrier_jobs` metadata and leaves no
+  connector job behind.
 
 **Step 2 — JobLedger and retired hold lifecycle:**
 
-- Forward source hold accounting covers every acquisition and exit, including
-  overlapping physical sets and retries. Holds are acquired in
-  `update_state_after_alloc` before the request can become preemptible.
-- A no-preemption run releases every Forward source hold through the normal
-  completion job, only after the final synchronous write and terminal ACK.
-- The Reverse-specific no-pinning regression asserts unchanged destination
-  refcounts and absence of the retired Reverse hold symbols.
+- Forward and Reverse no-pinning regressions assert unchanged block refcounts,
+  no `_hold_ledger`, and no Forward gating job after allocation.
+- RUNNING Forward abort and normal Prefill finish return `(False, None)` and
+  leave no `_pending_finished_sending`; preemption creates no fence work.
+- WAITING Reverse abort also releases immediately without a connector-owned
+  destination reference or `finished_recving` injection.
 - Job aggregation across steps and matching `TP>1`; no completion before every
   expected worker reports exactly once; `expected_worker_count` equals
   `parallel_config.world_size`.
@@ -1176,19 +1062,6 @@ each implementation step of §10. Coverage must include:
 - Duplicate-report and late-report oracles: a second report from the same
   worker never counts twice, and a report for a `closed` job is ignored without
   mutating later attempts.
-- RUNNING-request abort fence: (1) abort while RUNNING with queued Forward
-  work — `request_finished` returns `True`, the abort fence is created, and the
-  source hold is released only after all-worker barrier completion; (2) abort
-  before the final layer; (3) abort after the DMA but before the terminal ACK;
-  (4) sole-request RUNNING abort — the no-forward output step still delivers
-  the barrier metadata, and `finished_sending` injection frees the delayed
-  ordinary ownership; (5) TP=2 with a late worker barrier — the hold is
-  released only after both workers report.
-- Engine progress, PE: a sole normally finished PE request with a pending
-  normal Forward completion job — `request_finished` delays the free, and
-  zero-token steps harvest the all-worker result, release the source hold,
-  inject `finished_sending`, free ordinary ownership, and let the engine go
-  idle.
 - Engine progress, DE: a sole DE request with an open reverse-send job and no
   runnable request remaining — zero-token steps harvest all worker reports,
   inject `finished_sending`, and reclaim the closed JobLedger record.
@@ -1226,10 +1099,7 @@ each implementation step of §10. Coverage must include:
   returns `(0, False)` and completes immediately.
 - PE_READ resume returns `(0, False)` and rebuilds only the local source plan.
 - The old invalid-set convergence no longer fires for delivered decisions.
-- Barrier-gated defer: multiple `schedule()` passes before the barrier output
-  returns must all defer with `(None, False)` and perform no replacement
-  allocation, plan mutation, or Decision delivery; the first pass after
-  all-worker barrier completion resumes normally.
+- Resume has no Forward barrier defer and creates no `barrier_jobs` metadata.
 
 **Step 5 — Decision-only receiver schema and registry:**
 
@@ -1243,23 +1113,20 @@ each implementation step of §10. Coverage must include:
 - Decision response encoding round-trip and at-least-once retry idempotence;
   overlapping attempt deliveries still reject lower epochs as `STALE_CLOSED`.
 
-**Step 6 — replay wiring:**
+**Step 6 — ordinary Forward plan wiring:**
 
-- Common Forward replay: no DE binding replacement; source plan changes only
-  after the all-worker fence; coincidentally equal block ids still replay;
-  duplicate complete writes are idempotent (I3).
-- A normal-completion report arriving after the fence for the released source
-  attempt is dropped: it releases nothing and mutates no later attempt.
+- No DE binding replacement; local source plan changes have no hold,
+  completion job, or barrier gate.
 - Exact ranges: DE_READ Reverse expands, shrinks, or is vacuous while Forward
   remains `[K_DE,T)`; PE_READ Forward remains `[L_DE,T)`.
 - Normal DE_READ preemption starts from Reverse `DONE`, uses no close or
-  Reverse hold, and creates N+1 only after the fence.
+  Reverse hold, and creates N+1 during re-admission without a Forward fence.
 
 **Step 7 — close/hold retirement and abort semantics:**
 
 - No PE close-driver fields or methods, close retry backoff, close message/reply
-  schema, close registry, `ClosedReverseAttemptRecord`, Reverse destination hold
-  map, or Reverse hold-pressure limit remains. Forward source holds remain.
+  schema, close registry, `ClosedReverseAttemptRecord`, `HoldLedger`, Forward or
+  Reverse hold map, or hold-pressure limit remains.
 - The Decision envelope accepts `Decision` only. A literal legacy
   `CloseReverseAttempt` message produces one warning and no reply; this pins the
   unsupported mixed-version behavior.
@@ -1285,39 +1152,35 @@ each implementation step of §10. Coverage must include:
 - Explicit rejection for PP>1, DP>1, PCP>1, DCP>1, and PE/DE TP mismatch via
   the new bootstrap fields; matching TP=2 follows the same semantics as TP=1.
 
-**Step 9 — NPU E2E:** force PE preemption during compute/Forward, including the
-final-layer queued race, and verify no crash, hang, reuse corruption, or output
-mismatch; include matching TP>1. Exercise abort-while-waiting separately and
-record the accepted immediate-free/late-DMA risk instead of claiming the
-retired hold guarantee.
+**Step 9 — NPU E2E:** exercise PE preemption during compute/Forward, including
+the final-layer queued race, and record the accepted immediate-free risk rather
+than claim a nonexistent fence guarantee; include matching TP>1. Exercise
+abort-while-waiting separately and record the accepted late-DMA risk.
 
 ## 10. Implementation order and delivery
 
 Single deliverable; the order below is a local build sequence, not a release
 split. Each step lands with its §9 tests.
 
-1. **Sender failure fixes + barrier primitive.** Exception-safe barrier
-   dispatch outside `_transfer_kv_cache`; `failed_reqs` attribution fix; the
-   terminal-ACK failure fact; the FIFO barrier item and worker-local event.
-2. **Forward hold and JobLedger lifecycle.** Forward source hold acquisition in
-   `update_state_after_alloc`, `ForwardSourceAttempt` normal completion and
-   barrier association, RUNNING-abort delayed free plus `finished_sending`, and
-   Scheduler-side all-worker aggregation with `expected_worker_count` from
-   `parallel_config.world_size`. Reverse destination pinning is not included.
+1. **Sender failure facts.** `failed_reqs` attribution and terminal-ACK failure
+   reporting; no DualPath Forward barrier is wired.
+2. **Reverse JobLedger and no-hold lifecycle.** Scheduler-side all-worker
+   aggregation with `expected_worker_count` from `parallel_config.world_size`;
+   no Forward/Reverse pin, Forward gating job, or Prefill delayed-free state.
 3. **Attempt identity + I4 terminal gate.** `ReverseAttemptKey`, attempt-unique
    Reverse wire ids, attempt-keyed worker state, job-based Reverse completion
    reporting, the DE `reverse_send_job_id` aggregation, and removal of the
    worker-side direct req-id conversion for dual_path reverse terminals.
 4. **Resume admission.** The delivered-state resume branch in
-   `_decide_prefill_path_for_admission`, including the barrier-gated
-   `(None, False)` defer, replacing the invalid-set convergence for delivered
-   decisions.
+   `_decide_prefill_path_for_admission`, replacing the invalid-set convergence
+   for delivered decisions without a Forward barrier defer.
 5. **Decision-only receiver schema and registry.** Message-kind field,
    attempt-aware `_accepted_decisions` semantics, response encoding,
    at-least-once retry behavior, and stale-epoch rejection.
-6. **Replay wiring.** Common fence-and-replay for PE_READ first (no new
+6. **Forward plan wiring.** Ordinary Layerwise push for PE_READ (no new
    Decision, no DE reactivation), then DE_READ (new Reverse attempt from
-   current `L_PE`, fresh tracker/latch, stable Forward binding unchanged).
+   current `L_PE`, fresh tracker/latch, stable Forward binding unchanged),
+   without hold/fence gating.
 7. **Retire close and Reverse hold.** Remove the PE close driver, Decode close
    protocol/registry, Reverse destination hold and budgets; preserve Decision
    epoch monotonicity, `STALE_CLOSED`, I4, and JobLedger.
