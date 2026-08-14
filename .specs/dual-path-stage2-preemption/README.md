@@ -1,10 +1,10 @@
 # DualPath Stage-2: Preemption Safety
 
 Design for making delivered Prefill-side dual_path requests safe under vLLM
-preemption: a synchronous worker-side sender fence, one stable logical Forward
-binding, local source replay on both paths, and attempt-keyed Reverse
-completion. `DE_READ` renews only its Reverse attempt for the current PE
-allocation. Delivered as a single unit, no 2a/2b split.
+preemption: Forward source block holds plus a synchronous worker-side sender
+fence, one stable logical Forward binding, local source replay on both paths,
+and attempt-keyed Reverse completion. `DE_READ` renews only its Reverse attempt
+for the current PE allocation. Delivered as a single unit, no 2a/2b split.
 
 > **2026-08-14 revision:** The cross-process `CloseReverseAttempt` protocol and
 > the Reverse destination hold are retired. An aborted or recovery-watchdog-
@@ -15,8 +15,8 @@ allocation. Delivered as a single unit, no 2a/2b split.
 
 - [2026-08-11-dual-path-stage2-preemption-safety-design.md](2026-08-11-dual-path-stage2-preemption-safety-design.md) —
   problem/failure-mode analysis, logical Forward versus DE_READ Reverse-attempt
-  identity, upstream worker-metadata reuse, `JobLedger` TP all-worker
-  aggregation, synchronous fence-and-replay for the stable Forward range,
+  identity, upstream worker-metadata reuse, Forward source hold lifecycle,
+  `JobLedger` TP all-worker aggregation, synchronous fence-and-replay,
   job-based current-Reverse-attempt gate, the immediate-free abort semantics,
   the retired close/hold design and its rationale, explicit unsupported-
   topology rejection, and test strategy.

@@ -1,4 +1,4 @@
-# DualPath Stage-2: Preemption Safety (Fence + Stable Forward Replay + DE_READ Reverse Attempts)
+# DualPath Stage-2: Preemption Safety (Pin + Fence + Stable Forward Replay + DE_READ Reverse Attempts)
 
 Status: design — single-stage delivery (approved direction: route-specific
 recovery; no 2a/2b split)
@@ -154,11 +154,18 @@ Non-goals (Stage-2):
 Stage-2 reuses four existing mechanisms rather than creating another
 completion framework:
 
-1. **Parent ownership/lifecycle.** The implemented DualPath scheduler does not
-   add a `HoldLedger` or call `BlockPool.touch` for Reverse destinations.
-   Normal parked `DE_READ` requests keep their ordinary vLLM allocation until
-   I4 publishes completion. Exceptional abort/watchdog expiry follows the
-   parent connector's immediate-free semantics.
+1. **Forward source block pinning.** `KVConnector.bind_gpu_block_pool(block_pool)`
+   (`vllm/distributed/kv_transfer/kv_connector/v1/base.py:443-451`), bound once
+   by the scheduler at `scheduler.py:247-248`; `BlockPool.touch(blocks)`
+   (`vllm/v1/core/block_pool.py:402-417`) and `BlockPool.free_blocks(blocks)`
+   (`:419-441`) are refcount-balanced. In-tree precedents are upstream
+   `simple_kv_offload` (`vllm/v1/simple_kv_offload/manager.py:223-226` bind,
+   `:640-642` touch, `:703-726` release) and AscendStore. The AscendStore
+   touch/job/release precedent is exact only for its **mamba** path
+   (`kv_pool/ascend_store/pool_scheduler.py:970-1010`); its non-mamba path uses
+   delayed free plus generic `finished_sending` (`pool_scheduler.py:1012-1068`)
+   and is not a pinning precedent. Reverse destination pinning is the retired
+   exception documented in L0 below.
 2. **Preemption delivery.** `SchedulerOutput.preempted_req_ids` is populated in
    the preempting schedule pass (`scheduler.py:940`) and is visible to
    `build_connector_meta` in the same pass (`scheduler.py:954-956`).
@@ -183,13 +190,16 @@ completion framework:
    ranks and physical ranges. Stage-2 adds direction-appropriate fencing around
    the existing per-rank work instead of duplicating that math.
 
-The active completion shape is: Reverse completion is reported through
+The pin-connector precedent shape is: completion is reported through
 `kv_connector_worker_meta`, not `finished_sending`; scheduler-side
 `update_connector_output` (invoked at `scheduler.py:2233`, before the generic
 finished-set processing at `:2236-2248`) waits for all participating workers
-and then applies the I4 or reverse-send job-completion action. `request_finished`
-returns `True` only on Decode when an open reverse-send job must keep the
-engine stepping; PE abort does not add a delayed-free path.
+and then releases the extra Forward source references. `request_finished`
+returns `(False, None)` on the normal path when no connector work remains;
+Stage-2 returns `True` when a finished RUNNING Forward source or Decode
+reverse-send job must retain ordinary ownership and scheduler visibility while
+connector jobs remain pending (see "Engine progress while connector jobs are
+pending"). The separate WAITING Reverse-abort path does not delay free.
 
 ## 4. Safety model and identities
 
@@ -202,8 +212,9 @@ engine stepping; PE abort does not add a delayed-free path.
   `ForwardReceiveBinding`, one stable Forward wire id, the frozen DE destination
   table, and one fixed Forward range for the lifetime of the request.
 - **PE-local Forward source attempt:** PE block allocation and the source table
-  may change after preemption. The source plan is local attempt state under the
-  logical request; it is not part of the PE-to-DE decision identity.
+  may change after preemption. The source plan, holds, and opaque completion
+  jobs are local attempt state under the logical request; they are not part of
+  the PE-to-DE decision identity.
 - **DE_READ Reverse attempt:** only `DE_READ` carries a non-negative
   `reverse_attempt_id`, sourced from PE `request.num_preemptions`, plus the
   attempt-local `prefill_local_tokens = L_PE(attempt)`. Scheduler/Worker code
@@ -215,9 +226,10 @@ engine stepping; PE abort does not add a delayed-free path.
   from its complete attempt key. Code looks it up explicitly and never recovers
   identity by slicing a string suffix.
 - **Completion job id:** a Scheduler-assigned opaque integer. Worker code does
-  not interpret route or attempt. PE Scheduler maps it to a Reverse completion;
-  DE Scheduler maps it to a Reverse-send completion. `JobLedger` remains the
-  sole all-worker counting authority.
+  not interpret route or attempt. PE Scheduler maps it to a Forward source
+  completion/fence or a Reverse completion; DE Scheduler maps it to a
+  Reverse-send completion. `JobLedger` remains the sole all-worker counting
+  authority.
 
 `PathDecisionRequest` and DE pending admission remain keyed only by
 `DualPathRequestKey`. The serialized `PE_READ` result remains exactly
@@ -233,10 +245,11 @@ replace it only after the prior source attempt is fenced (I6).
 
 ### 4.2 Required invariants
 
-- **I1 — normal-path ownership.** While a `DE_READ` request is parked normally,
-  its ordinary vLLM allocation remains owned until I4 publishes the current
-  Reverse completion. The 2026-08-14 abort/watchdog exception deliberately does
-  not extend this invariant beyond request termination.
+- **I1 — no Forward-source reuse before proof.** A held Forward source block is
+  not reusable until every transport that can read it is proven unable to
+  touch it. A parked `DE_READ` request keeps ordinary destination ownership
+  until I4 publishes normal Reverse completion; WAITING Reverse abort/watchdog
+  termination is the documented immediate-release exception.
 - **I2 — identity follows the changing address.** Admission and Forward receive
   state use `DualPathRequestKey`; only DE_READ Reverse plans, bindings, wire
   map, terminals, latches, and cleanup lookups use `ReverseAttemptKey`. An
@@ -275,33 +288,42 @@ replace it only after the prior source attempt is fenced (I6).
 
 ## 5. Design
 
-The active design separates three concerns: `JobLedger` completion aggregation;
-Forward replay; and DE_READ Reverse-attempt renewal. The former hold ledger and
-exceptional close protocol are retained below only as rejected design history.
+The active design separates three concerns: Forward source holds plus completion
+jobs; one common synchronous-fence Forward replay mechanism; and DE_READ
+Reverse-attempt renewal. The former Reverse destination hold and exceptional
+close protocol are retained below only as rejected design history.
 
-### L0 — `JobLedger` and the retired hold ledger
+### L0 — Forward source holds and completion-job ledger
 
-Owner: `DualPathConnectorScheduler`. Both roles maintain one `JobLedger`: PE
-uses it for Reverse completion and I4; DE uses it for Reverse-send completion.
-The live record is:
+Owner: `DualPathConnectorScheduler`. The PE role maintains Forward source
+holds plus the job ledger; the DE role maintains the same job ledger for its
+Reverse-send completion proofs. The active records are:
 
 ```text
-job_id -> { job_kind, reverse_attempt_key | None,
+hold_id -> { block_ids, hold_kind=FORWARD_SOURCE, released }
+ForwardSourceAttempt -> { request_key, hold_id, normal_completion_job_id,
+                          pending_barrier_job_id | None, source_block_ids }
+job_id -> { job_kind, affected_hold_ids, reverse_attempt_key | None,
             expected_worker_count, completed_worker_count, failed, closed }
 ```
 
-Active ledger rules:
+Ledger rules:
 
+- There is exactly one record per Forward source held reference.
+  `BlockPool.touch`/`free_blocks` maintain the physical refcounts, and every
+  acquisition/release flows through that record.
 - Each worker contributes at most one report per job; the Scheduler accumulates
   `completed_worker_count` across steps.
 - When `completed_worker_count` reaches `expected_worker_count`, the
   kind-specific action runs exactly once and the job becomes `closed`. Reports
   arriving for a `closed` job are ignored, so duplicate or late reports cannot
-  mutate a later attempt.
-- A Reverse completion job and a DE reverse-send job each map to exactly one
-  `ReverseAttemptKey`.
+  double-release a Forward hold or mutate a later attempt.
+- A barrier job references every old Forward source hold fenced in that pass;
+  a normal Forward completion job maps to one Forward source hold; a Reverse
+  completion job and DE reverse-send job each map to one `ReverseAttemptKey`.
 - A failure report closes the job as `failed`; the owning request is failed
-  through the existing control-failure/watchdog path.
+  through the existing control-failure/watchdog path. Forward source holds are
+  not released unless the failure itself proves no transport can read them.
 - The job ledger is the sole authority for reverse-send counting:
   `completed_worker_count`, `failed`, and `closed` for a `reverse_send_job_id`
   live only here. No second structure keeps a completion counter.
@@ -309,26 +331,41 @@ Active ledger rules:
   superseded reverse-send jobs. Open records remain reportable because
   `JobLedger.discard()` refuses them.
 
-#### Retired hold acquisition
+#### Hold acquisition
 
-The earlier design added `HoldKind`, `HoldRecord`, `HoldLedger`,
-`affected_hold_ids`, and `_reverse_destination_holds`, pinning the PE slice
-`[L_PE, K_DE)` before Decision delivery. It was retired for two reasons:
+- **Forward source holds are acquired in `update_state_after_alloc`** before a
+  request can become `RUNNING` and preemptible. Each hold covers the path's
+  stable Forward-range source blocks.
+- The former Reverse destination hold pinned `[L_PE, K_DE)` before Decision
+  delivery. It is retired: normal parked `DE_READ` already owns its allocation
+  until I4 completes, while exceptional abort/watchdog termination now accepts
+  parent/main immediate release.
 
-1. On the normal path, a parked `DE_READ` request already owns its destination
-   allocation until I4 publishes Reverse completion; the extra reference was
-   redundant.
-2. Its only additional protection was exceptional termination. Retaining that
-   protection also required the close protocol, durable safety proofs,
-   potentially unbounded failed holds, and two hold-pressure limits. The
-   2026-08-14 decision instead accepts the parent/main immediate-free behavior.
+The retired Reverse hold required `HoldKind.REVERSE_DESTINATION`,
+`_reverse_destination_holds`, the close protocol, durable safety proofs, and
+two pressure limits. Those Reverse-specific pieces and
+`VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS` /
+`VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS` are removed. Forward source holds,
+`ForwardSourceAttempt`, and their completion/barrier jobs remain part of this
+design. The hold ledger remains for `FORWARD_SOURCE` records only; it contains
+no Reverse destination entry or Reverse-specific release path.
 
-Consequently `ledgers.py` contains `JobLedger` only, no KV block is pinned by
-DualPath, and `VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS` plus
-`VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS` are removed. Setting either legacy
-environment variable has no effect.
+#### Forward source attempts and the normal completion job
 
-#### Worker-to-Scheduler completion
+The `normal_completion_job_id` is carried unchanged with the source metadata
+to every PE worker. A worker records success only after its final synchronous
+write and successful terminal ACK; a DMA or terminal-ACK failure records the
+job as failed. Each worker emits `{normal_completion_job_id: 1}` exactly once.
+PE Scheduler `update_connector_output` aggregates to `expected_worker_count`,
+resolves the job to its Forward source hold, and releases that hold on success.
+
+`pending_barrier_job_id` associates an attempt with the barrier job that fences
+it. On preemption or RUNNING abort, the barrier job records every fenced
+`ForwardSourceAttempt`; a late normal-completion report for an already-fenced
+attempt is ignored and cannot affect a replacement. A new source plan becomes
+visible only after the old attempt's all-worker fence completes.
+
+Worker-to-Scheduler completion follows the upstream offloading shape:
 
 ```python
 @dataclass
@@ -353,30 +390,27 @@ Worker build_connector_worker_meta()
   -> ModelRunner KVConnectorOutput.kv_connector_worker_meta
   -> vLLM aggregate() across executor workers
   -> Scheduler update_connector_output()
-  -> JobLedger transition
+  -> Forward hold / JobLedger transition
 ```
 
-`get_finished()` keeps the base meanings of its generic sets. A validated
-current-attempt Reverse completion becomes `finished_recving` only through the
-I4 gate. A Decode request that finished with an open reverse-send job stays
-delayed until JobLedger closes that job and injects `finished_sending`.
+`get_finished()` keeps the base meanings of its generic sets. PE-side Forward
+completion/fence and Reverse completion use completed jobs; a validated
+current-attempt Reverse completion becomes `finished_recving` only through I4.
+A finished request with an open Forward or reverse-send job remains delayed
+until the corresponding completion transition injects `finished_sending`.
 
-#### Retired hold release predicates
+#### Hold release predicates
 
-The table below records the rejected stronger design; none of these rows is a
-live `HoldLedger` contract after 2026-08-14.
-
-| Hold class and exit | Former required proof | Former release owner |
+| Hold/ownership class and exit | Required proof | Release owner |
 |---|---|---|
-| Reverse destination, normal DE_READ | Every PE worker reports the current-attempt Reverse completion job; I4 validation passes | PE Scheduler `update_connector_output` |
-| Reverse destination, uncertain Decision/abort | DE returns `SAFE` for `CloseReverseAttempt` | PE Scheduler |
-| Decision never left PE | No remote writer was authorized | PE Scheduler immediately |
-| Old DE process/transport teardown | Verified old transport can no longer issue DMA | Connector teardown cleanup |
+| Forward source, normal | Every PE worker reports final Forward completion after its last synchronous write and terminal ACK | PE Scheduler `update_connector_output` |
+| Forward source, preempt/RUNNING abort | Every PE worker reports the barrier job after consuming its FIFO barrier item | PE Scheduler `update_connector_output` |
+| Reverse destination, normal DE_READ ordinary ownership | Every PE worker reports the current-attempt Reverse completion job; I4 validation passes | Upstream normal completion path |
+| Reverse destination, WAITING abort/watchdog | No proof is awaited; immediate parent/main release is the accepted risk | Upstream termination path |
 
-The original design treated a Decision receipt, replacement receipt, watchdog
-expiry, or `NOT_SAFE` reply as insufficient. The active implementation has no
-hold to release: normal I4 completion still gates request resume, while abort
-and watchdog expiry release ordinary ownership immediately.
+The former `SAFE`/`NOT_SAFE` close matrix and retained Reverse destination hold
+are historical only. They do not change the active Forward source hold
+predicates above.
 
 ### L1 — common stable Forward replay via synchronous fencing
 
@@ -774,7 +808,7 @@ reply:
 Under the retired registry lock,
 `CloseReverseAttempt(request_key, reverse_attempt_id)` would have replied by
 this exact matrix. **Every** successful close transition would atomically
-persists a minimal safe-close proof (a `ClosedReverseAttemptRecord`, below)
+persist a minimal safe-close proof (a `ClosedReverseAttemptRecord`, below)
 **before** the response is sent, so a lost `SAFE` response followed by an
 identical retry still returns `SAFE`:
 
@@ -904,9 +938,10 @@ The former dual-release distinguished ordinary vLLM ownership from a
 connector-owned Reverse destination hold. After 2026-08-14 there is only the
 ordinary parent/main release:
 
-1. PE `request_finished` adds no close request, pending-release injection, or
-   Reverse hold. `_delay_free_for_connector` returns `False` on the Prefill
-   side.
+1. PE `request_finished` adds no close request, WAITING-abort release
+   injection, or Reverse hold. This WAITING Reverse-abort branch returns
+   `False`; the separate RUNNING Forward-abort branch below may still return
+   `True` while its Forward source fence/hold remains open.
 2. The aborted request and its ordinary destination ownership are released by
    the parent lifecycle immediately; recovery-watchdog expiry follows the same
    terminal path.
@@ -920,6 +955,11 @@ make this release safe; they only prevent delayed control messages from
 reopening a lower execution epoch.
 
 ### RUNNING-request abort fence
+
+This is a distinct lifecycle from the WAITING Reverse abort above. WAITING
+Reverse abort immediately releases without `finished_recving` injection;
+RUNNING Forward abort must delay ordinary free until the Forward source fence
+proves queued reads have drained.
 
 Upstream abort of a delivered **RUNNING** dual_path request never populates
 `preempted_req_ids`: `finish_requests` (`scheduler.py:1825-1886`) removes the
@@ -951,18 +991,19 @@ whose ordinary ownership is being freed. Stage-2 adds the abort fence:
    `finished_sending` branch unconditionally frees the delayed blocks
    (`scheduler.py:2245-2248`). `finished_recving` would also pass the status
    assertion for a finished request (`:2242-2244`), but `finished_sending` is
-   the canonical delayed-free completion channel and is used here; the
-   `finished_recving` injection remains reserved for the abort-while-waiting
-   path above, whose requests never returned `True` from `request_finished`.
+   the canonical delayed-free completion channel and is used here. The retired
+   WAITING Reverse-abort `finished_recving` injection is not used.
 
 ### Engine progress while connector jobs are pending
 
-An open DE reverse-send job may outlive the last ordinary Decode request; if no
-further model steps occurred, no connector outputs would be produced and the
-job would never aggregate. The rule that prevents this:
+Connector jobs (PE normal Forward completion, PE barrier, DE reverse-send) may
+outlive the last ordinary request; if no further model steps occurred, no
+connector outputs would be produced and the jobs would never aggregate. The
+rule that prevents this:
 
-- While the connector owns an open reverse-send job for a finished Decode
-  request, that request returns `True` from `request_finished` (delayed
+- While the connector owns an open Forward completion/barrier job or DE
+  reverse-send job for a finished request, that request returns `True` from
+  `request_finished` (delayed
   free). Such a request remains in the scheduler's `self.requests` after
   leaving the scheduling queues, so `has_finished_requests()`
   (`scheduler.py:1931-1941`) returns `True`, `has_requests()`
@@ -974,8 +1015,8 @@ job would never aggregate. The rule that prevents this:
   `post_forward` still calls `get_finished` and `build_connector_worker_meta`
   (`v1/worker/gpu/kv_connector.py:98-105`), producing a `KVConnectorOutput`.
   The scheduler's `update_from_output` then invokes
-  `update_connector_output` (`scheduler.py:2233`), so job aggregation and
-  `finished_sending` injection keep making
+  `update_connector_output` (`scheduler.py:2233`), so job aggregation, Forward
+  hold release, and `finished_sending` injection keep making
   progress with no ordinary request running.
 - A finished request with no pending connector work must return
   `(False, None)` from `request_finished` so the engine can go idle.
@@ -1121,9 +1162,13 @@ each implementation step of §10. Coverage must include:
 
 **Step 2 — JobLedger and retired hold lifecycle:**
 
-- Retired coverage recorded the former HoldLedger acquisition/exit contract;
-  the active no-pinning regression instead asserts that Reverse destination
-  refcounts are unchanged and hold symbols are absent.
+- Forward source hold accounting covers every acquisition and exit, including
+  overlapping physical sets and retries. Holds are acquired in
+  `update_state_after_alloc` before the request can become preemptible.
+- A no-preemption run releases every Forward source hold through the normal
+  completion job, only after the final synchronous write and terminal ACK.
+- The Reverse-specific no-pinning regression asserts unchanged destination
+  refcounts and absence of the retired Reverse hold symbols.
 - Job aggregation across steps and matching `TP>1`; no completion before every
   expected worker reports exactly once; `expected_worker_count` equals
   `parallel_config.world_size`.
@@ -1213,8 +1258,8 @@ each implementation step of §10. Coverage must include:
 **Step 7 — close/hold retirement and abort semantics:**
 
 - No PE close-driver fields or methods, close retry backoff, close message/reply
-  schema, close registry, `ClosedReverseAttemptRecord`, HoldLedger type, hold
-  map, or hold-pressure limit remains.
+  schema, close registry, `ClosedReverseAttemptRecord`, Reverse destination hold
+  map, or Reverse hold-pressure limit remains. Forward source holds remain.
 - The Decision envelope accepts `Decision` only. A literal legacy
   `CloseReverseAttempt` message produces one warning and no reply; this pins the
   unsupported mixed-version behavior.
@@ -1254,10 +1299,11 @@ split. Each step lands with its §9 tests.
 1. **Sender failure fixes + barrier primitive.** Exception-safe barrier
    dispatch outside `_transfer_kv_cache`; `failed_reqs` attribution fix; the
    terminal-ACK failure fact; the FIFO barrier item and worker-local event.
-2. **JobLedger lifecycle.** Scheduler-side `update_connector_output`
-   all-worker aggregation with `expected_worker_count` from
-   `parallel_config.world_size`, duplicate/failure handling, and closed-record
-   reclamation. No HoldLedger or KV block pinning remains.
+2. **Forward hold and JobLedger lifecycle.** Forward source hold acquisition in
+   `update_state_after_alloc`, `ForwardSourceAttempt` normal completion and
+   barrier association, RUNNING-abort delayed free plus `finished_sending`, and
+   Scheduler-side all-worker aggregation with `expected_worker_count` from
+   `parallel_config.world_size`. Reverse destination pinning is not included.
 3. **Attempt identity + I4 terminal gate.** `ReverseAttemptKey`, attempt-unique
    Reverse wire ids, attempt-keyed worker state, job-based Reverse completion
    reporting, the DE `reverse_send_job_id` aggregation, and removal of the
