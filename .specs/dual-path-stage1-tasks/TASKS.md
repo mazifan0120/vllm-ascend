@@ -75,15 +75,19 @@ The following requirements apply to every Task:
 
 ### Known limitations (Stage 1)
 
-- ~~**Prefill-side preemption after decision delivery is unsafe.**~~ Resolved
-  by Stage 2: block holds plus a synchronous worker-side sender fence, a
-  fail-closed abort driven off `preempted_req_ids`, and attempt-based
-  re-execution are designed in
+- **Prefill-side preemption after decision delivery retains a late-DMA
+  risk.** Stage 2 preserves attempt-based Reverse re-execution, the
+  `reverse_attempt_id` epoch, the I4 current-attempt completion gate, and the
+  normal recovery path designed in
   `.specs/dual-path-stage2-preemption/2026-08-11-dual-path-stage2-preemption-safety-design.md`
-  and implemented in `vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/`
-  (ledgers, fence, resume admission, attempt-keyed channel registry,
-  `CloseReverseAttempt`, watchdogs, and topology guards), with unit coverage
-  under `tests/ut/distributed/kv_transfer/dual_path/`.
+  and implemented in `vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/`.
+  The Forward block hold and sender fence were not retained, and the Reverse
+  destination hold plus `CloseReverseAttempt` protocol have been retired.
+  Forward preemption and exceptional Reverse termination therefore follow the
+  parent connector's immediate-free semantics: blocks may be reused before a
+  late DMA has stopped. This accepted risk has unit coverage for the retained
+  epoch, I4, recovery, watchdog, and topology behavior under
+  `tests/ut/distributed/kv_transfer/dual_path/`.
 
 ## 4. Task dependency graph
 

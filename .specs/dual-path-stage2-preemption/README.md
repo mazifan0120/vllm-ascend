@@ -33,5 +33,6 @@ lives in `tests/ut/distributed/kv_transfer/` (Layerwise sender machinery) and
 `tests/ut/distributed/kv_transfer/dual_path/` (all Stage-2 machinery). The §9
 step-9 NPU end-to-end scenarios remain outstanding.
 
-Stage-1 context: the known-limitation note this supersedes was removed from
-`../dual-path-stage1-tasks/TASKS.md` §3.
+Stage-1 context: the [known-limitation note](../dual-path-stage1-tasks/TASKS.md#known-limitations-stage-1)
+now records the retained epoch/I4 recovery behavior, the retired hold/fence/
+close design, and the accepted late-DMA risk of immediate-free semantics.
