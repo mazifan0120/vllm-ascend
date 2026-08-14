@@ -1586,15 +1586,20 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)
         self._de_progress_deadlines.pop(request_id, None)
-        latest_attempt = self._latest_reverse_attempt_ids.get(request_id)
-        if state is not None and latest_attempt is not None:
-            attempt_key = ReverseAttemptKey(state.request_key, latest_attempt)
-            send_job = self._job_ledger.get(self._reverse_send_job_ids.get(attempt_key, -1))
-            if send_job is None or send_job.closed:
-                self._latest_reverse_attempt_ids.pop(request_id, None)
-                self._reverse_send_job_ids.pop(attempt_key, None)
-            if send_job is not None and send_job.closed:
-                self._job_ledger.discard(send_job.job_id)
+        if state is not None:
+            for attempt_key in [
+                key for key in self._reverse_send_job_ids if key.request_key == state.request_key
+            ]:
+                send_job = self._job_ledger.get(self._reverse_send_job_ids[attempt_key])
+                if send_job is None or send_job.closed:
+                    self._reverse_send_job_ids.pop(attempt_key, None)
+                if send_job is not None and send_job.closed:
+                    self._job_ledger.discard(send_job.job_id)
+            latest_attempt = self._latest_reverse_attempt_ids.get(request_id)
+            if latest_attempt is not None:
+                latest_key = ReverseAttemptKey(state.request_key, latest_attempt)
+                if latest_key not in self._reverse_send_job_ids:
+                    self._latest_reverse_attempt_ids.pop(request_id, None)
         if self.dual_path_cfg.role == "prefill":
             self._prefill_decision_metadata.pop(request_id, None)
             self._prefill_local_tokens.pop(request_id, None)
@@ -1602,7 +1607,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             forward_plan = self._prefill_forward_plans.pop(request_id, None)
             self._prefill_forward_plan_epochs.pop(request_id, None)
             self._prefill_reverse_plans.pop(request_id, None)
-            self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
+            released_binding = self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
+            if released_binding is not None:
+                # A closed record can no longer receive worker reports; an open
+                # one still can, and discard() refuses it.
+                self._job_ledger.discard(released_binding.reverse_completion_job_id)
             self._prefill_control_failures.pop(request_id, None)
             if forward_plan is not None:
                 self._reqs_need_send_layerwise.pop(request_id, None)

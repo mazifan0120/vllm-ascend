@@ -123,3 +123,41 @@ class TestReverseDestinationNotPinned:
         merged = metadata.aggregate(make_worker_metadata(completed_jobs={1: 1, 2: 1}, failed_jobs={3: 1}))
         assert merged.completed_jobs == {1: 2, 2: 1}
         assert merged.failed_jobs == {3: 1}
+
+
+class TestJobRecordReclamation:
+    @staticmethod
+    def _admit_de_read(pe_scheduler_factory):
+        pool = make_block_pool()
+        scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
+        request = _make_request(
+            target_tokens=48,
+            prompt_tokens=49,
+            local_tokens=16,
+            store_tokens=32,
+            destination_block_ids=[[20, 21, 22, 23]],
+        )
+        assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+        scheduler.update_state_after_alloc(request, _blocks(([70, 71],)), 16)
+        return scheduler, request
+
+    def test_failed_completion_job_record_is_reclaimed_with_the_request(self, pe_scheduler_factory):
+        scheduler, request = self._admit_de_read(pe_scheduler_factory)
+        job_id = scheduler._prefill_pending_reverse_receive_bindings[
+            request.request_id
+        ].reverse_completion_job_id
+        assert scheduler._job_ledger.record_failure(job_id) is True
+
+        scheduler._release_scheduler_request_state(request)
+
+        assert scheduler._job_ledger.get(job_id) is None
+
+    def test_open_completion_job_record_survives_request_cleanup(self, pe_scheduler_factory):
+        scheduler, request = self._admit_de_read(pe_scheduler_factory)
+        job_id = scheduler._prefill_pending_reverse_receive_bindings[
+            request.request_id
+        ].reverse_completion_job_id
+
+        scheduler._release_scheduler_request_state(request)
+
+        assert scheduler._job_ledger.get(job_id) is not None
