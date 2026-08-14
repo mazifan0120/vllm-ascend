@@ -11,14 +11,14 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_block_pool,
     make_worker_metadata,
 )
-from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
-    _blocks,
-    _make_request,
-)
 from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
     _activate_decision,
     _admit_decode_request,
     _de_read_decision,
+)
+from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
+    _blocks,
+    _make_request,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
@@ -151,9 +151,7 @@ class TestJobRecordReclamation:
 
     def test_failed_completion_job_record_is_reclaimed_with_the_request(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
-        job_id = scheduler._prefill_pending_reverse_receive_bindings[
-            request.request_id
-        ].reverse_completion_job_id
+        job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
         assert scheduler._job_ledger.record_failure(job_id) is True
 
         scheduler._release_scheduler_request_state(request)
@@ -162,9 +160,7 @@ class TestJobRecordReclamation:
 
     def test_open_completion_job_record_survives_request_cleanup(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
-        job_id = scheduler._prefill_pending_reverse_receive_bindings[
-            request.request_id
-        ].reverse_completion_job_id
+        job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
 
         scheduler._release_scheduler_request_state(request)
 
