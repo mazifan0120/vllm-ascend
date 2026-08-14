@@ -1587,9 +1587,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._path_decision_coordinator.unregister(state.request_key)
         self._de_progress_deadlines.pop(request_id, None)
         if state is not None:
-            for attempt_key in [
-                key for key in self._reverse_send_job_ids if key.request_key == state.request_key
-            ]:
+            for attempt_key in [key for key in self._reverse_send_job_ids if key.request_key == state.request_key]:
                 send_job = self._job_ledger.get(self._reverse_send_job_ids[attempt_key])
                 if send_job is None or send_job.closed:
                     self._reverse_send_job_ids.pop(attempt_key, None)
@@ -1753,15 +1751,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._recovery_deadlines.pop(request_id, None)
         self._job_ledger.discard(job.job_id)
         return {request_id}
-
-    def _is_reverse_send_complete(self, attempt_key: ReverseAttemptKey) -> bool:
-        """``sender_complete``: the attempt's reverse-send job is closed and
-        not failed, read only from the job ledger (the sole counting authority)."""
-        job_id = self._reverse_send_job_ids.get(attempt_key)
-        if job_id is None:
-            return False
-        job = self._job_ledger.get(job_id)
-        return job is not None and job.closed and not job.failed
 
     def shutdown(self) -> None:
         """Stop DualPath work and release all owned records and clients."""

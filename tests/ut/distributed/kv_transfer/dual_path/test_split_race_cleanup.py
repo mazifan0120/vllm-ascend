@@ -595,7 +595,6 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_aggregate_worker_job_facts",
         "_run_job_close_action",
         "_close_reverse_completion_job",
-        "_is_reverse_send_complete",
         "bind_gpu_block_pool",
         "update_connector_output",
         "get_num_new_matched_tokens",

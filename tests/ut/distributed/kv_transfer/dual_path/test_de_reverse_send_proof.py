@@ -130,7 +130,8 @@ def test_reverse_send_job_allocated_at_attempt_creation_and_carried_on_plan(
     assert job.reverse_attempt_key == attempt_key
     assert job.expected_worker_count == 1
     assert scheduler._reverse_send_job_ids[attempt_key] == job.job_id
-    assert scheduler._is_reverse_send_complete(attempt_key) is False
+    send_job = scheduler._job_ledger.get(scheduler._reverse_send_job_ids[attempt_key])
+    assert not (send_job.closed and not send_job.failed)
 
 
 def test_partial_tp_completion_never_sender_complete(decode_scheduler_factory, decode_task04_seams):
@@ -146,7 +147,8 @@ def test_partial_tp_completion_never_sender_complete(decode_scheduler_factory, d
     job = scheduler._job_ledger.get(job_id)
     assert job.completed_worker_count == 1
     assert job.closed is False
-    assert scheduler._is_reverse_send_complete(attempt_key) is False
+    send_job = scheduler._job_ledger.get(scheduler._reverse_send_job_ids[attempt_key])
+    assert not (send_job.closed and not send_job.failed)
 
 
 def test_terminal_ack_failure_marks_job_failed_never_success(decode_scheduler_factory, decode_task04_seams):
@@ -171,7 +173,8 @@ def test_terminal_ack_failure_marks_job_failed_never_success(decode_scheduler_fa
     job = scheduler._job_ledger.get(job_id)
     assert job.closed is True
     assert job.failed is True
-    assert scheduler._is_reverse_send_complete(attempt_key) is False
+    send_job = scheduler._job_ledger.get(scheduler._reverse_send_job_ids[attempt_key])
+    assert not (send_job.closed and not send_job.failed)
 
 
 def test_abort_before_final_layer_leaves_job_incomplete(decode_scheduler_factory, decode_task04_seams):
@@ -190,10 +193,11 @@ def test_abort_before_final_layer_leaves_job_incomplete(decode_scheduler_factory
 
     job = scheduler._job_ledger.get(job_id)
     assert job.closed is False
-    assert scheduler._is_reverse_send_complete(attempt_key) is False
+    send_job = scheduler._job_ledger.get(scheduler._reverse_send_job_ids[attempt_key])
+    assert not (send_job.closed and not send_job.failed)
 
 
-def test_job_close_makes_sender_complete_true(decode_scheduler_factory, decode_task04_seams):
+def test_job_close_marks_the_send_job_closed_and_not_failed(decode_scheduler_factory, decode_task04_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
@@ -215,4 +219,5 @@ def test_job_close_makes_sender_complete_true(decode_scheduler_factory, decode_t
     job = scheduler._job_ledger.get(job_id)
     assert job.closed is True
     assert job.failed is False
-    assert scheduler._is_reverse_send_complete(attempt_key) is True
+    send_job = scheduler._job_ledger.get(scheduler._reverse_send_job_ids[attempt_key])
+    assert send_job.closed and not send_job.failed

@@ -271,7 +271,7 @@ class TestReverseSendJobRetirement:
         assert output.finished_sending == {request.request_id}
         assert scheduler._job_ledger.get(job_id) is None
 
-    def test_normal_reverse_send_close_retires_at_release_and_predicate_reads_ledger(
+    def test_normal_reverse_send_close_retires_at_release_and_ledger_records_success(
         self, decode_scheduler_factory, decode_task04_seams
     ):
         scheduler = decode_scheduler_factory()
@@ -289,8 +289,9 @@ class TestReverseSendJobRetirement:
         output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={job_id: 1}))
         scheduler.update_connector_output(output)
 
-        # Between close and release the predicate still reads the ledger.
-        assert scheduler._is_reverse_send_complete(attempt_key) is True
+        # Between close and release the job ledger records a successful close.
+        send_job = scheduler._job_ledger.get(scheduler._reverse_send_job_ids[attempt_key])
+        assert send_job.closed and not send_job.failed
         assert scheduler._job_ledger.get(job_id) is not None
 
         request.status = RequestStatus.FINISHED_STOPPED
