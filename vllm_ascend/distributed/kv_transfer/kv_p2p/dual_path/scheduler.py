@@ -15,7 +15,6 @@ from typing_extensions import assert_never
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
-from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
@@ -53,8 +52,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     reverse_wire_id,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
-    CloseReplyStatus,
-    CloseReverseAttempt,
     DecodeControlEndpoint,
     DualPathDecisionMetadata,
     PathDecision,
@@ -238,7 +235,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._job_ledger = JobLedger()
         self._expected_worker_count: int = vllm_config.parallel_config.world_size
         self._reverse_destination_holds: dict[str, int] = {}
-        self._pending_ordinary_release: set[str] = set()
         self._pending_finished_sending: set[str] = set()
         self._waiting_reverse_attempt_ids: dict[str, ReverseAttemptKey] = {}
         self._reverse_send_job_ids: dict[ReverseAttemptKey, int] = {}
@@ -246,20 +242,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_deferred_deliveries: set[str] = set()
         self._prefill_vacuous_reverse_request_ids: set[str] = set()
         self._latest_reverse_attempt_ids: dict[str, int] = {}
-        self._pending_close_futures: dict[str, Future[CloseReplyStatus]] = {}
-        self._pending_close_requests: dict[str, tuple[CloseReverseAttempt, DecodeControlEndpoint]] = {}
-        self._close_retry_deadlines: dict[str, float] = {}
         self._recovery_deadlines: dict[str, float] = {}
         self._de_progress_deadlines: dict[str, float] = {}
         self._recovery_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S
         self._de_progress_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S
-        self._close_retry_backoff_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S
         self._max_held_recovery_blocks: int = ascend_envs.VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS
         self._max_recovery_records: int = ascend_envs.VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS
         for env_name, env_value in (
             ("VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S", self._recovery_watchdog_s),
             ("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", self._de_progress_watchdog_s),
-            ("VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S", self._close_retry_backoff_s),
         ):
             if env_value <= 0:
                 raise ValueError(f"{env_name} must be an integer greater than zero")
@@ -521,61 +512,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._prefill_vacuous_reverse_request_ids.add(request_id)
             return (reverse_tokens, True) if reverse_tokens > 0 else (0, False)
         assert_never(result.path)
-
-    def _initiate_reverse_attempt_close(self, request_id: str) -> None:
-        attempt_key = self._waiting_reverse_attempt_ids.get(request_id)
-        metadata = self._prefill_decision_metadata.get(request_id)
-        if attempt_key is None or metadata is None or request_id in self._pending_close_requests:
-            return
-        close = CloseReverseAttempt(
-            request_key=attempt_key.request_key,
-            reverse_attempt_id=attempt_key.reverse_attempt_id,
-        )
-        self._pending_close_requests[request_id] = (close, metadata.decode_control_endpoint)
-        self._recovery_deadlines[request_id] = time.monotonic() + self._recovery_watchdog_s
-        self._submit_reverse_attempt_close(request_id)
-
-    def _submit_reverse_attempt_close(self, request_id: str) -> None:
-        close, endpoint = self._pending_close_requests[request_id]
-        try:
-            close_future = self._path_decision_coordinator.submit_close(endpoint, close)
-        except RuntimeError as error:
-            logger.error(
-                "DualPath Prefill close submission failed for request %s: %s; the Reverse destination hold is retained",
-                request_id,
-                error,
-            )
-            return
-        self._pending_close_futures[request_id] = close_future
-
-    def _reconcile_reverse_attempt_closes(self) -> None:
-        # The destination hold is released only on SAFE; NOT_SAFE re-arms the
-        # identical retry after the close backoff, and an in-flight close or a
-        # failed delivery retains the hold. The recovery watchdog bounds the
-        # whole sequence.
-        now = time.monotonic()
-        for request_id, close_future in list(self._pending_close_futures.items()):
-            if not close_future.done():
-                continue
-            self._pending_close_futures.pop(request_id)
-            status: CloseReplyStatus | None = None
-            if not close_future.cancelled() and close_future.exception() is None:
-                status = close_future.result()
-            if status is CloseReplyStatus.SAFE:
-                self._recovery_deadlines.pop(request_id, None)
-                self._close_retry_deadlines.pop(request_id, None)
-                self._pending_close_requests.pop(request_id, None)
-                hold_id = self._reverse_destination_holds.pop(request_id, None)
-                if hold_id is not None and self._block_pool is not None:
-                    self._hold_ledger.release(self._block_pool, hold_id)
-            elif status is CloseReplyStatus.NOT_SAFE:
-                self._close_retry_deadlines[request_id] = now + self._close_retry_backoff_s
-        for request_id, retry_deadline in list(self._close_retry_deadlines.items()):
-            if retry_deadline > now or request_id in self._pending_close_futures:
-                continue
-            self._close_retry_deadlines.pop(request_id)
-            if request_id in self._pending_close_requests:
-                self._submit_reverse_attempt_close(request_id)
 
     def _discard_undelivered_prefill_decision(self, request_id: str, request_key: DualPathRequestKey) -> None:
         # Drop every record latched by the first admission of this request. The
@@ -1618,9 +1554,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if deadline > now:
                 continue
             self._recovery_deadlines.pop(request_id)
-            self._close_retry_deadlines.pop(request_id, None)
-            self._pending_close_futures.pop(request_id, None)
-            self._pending_close_requests.pop(request_id, None)
             self._prefill_invalid_request_ids.add(request_id)
             invalid_block_ids = self._recovery_invalid_block_ids(request_id)
             if invalid_block_ids:
@@ -1683,7 +1616,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         metadata.send_task = parent_metadata.send_task
         if self.dual_path_cfg.role != "decode":
             self._reconcile_prefill_deliveries()
-            self._reconcile_reverse_attempt_closes()
             for deferred_request_id in list(self._prefill_deferred_deliveries):
                 self._deliver_prefill_decision(deferred_request_id)
             self._sweep_prefill_recovery_watchdogs(metadata)
@@ -1786,10 +1718,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         return delay_free or parent_delay_free, params
 
     def _delay_free_for_connector(self, request: Request) -> bool:
-        # The Forward direction never delays the free: it is the ordinary
-        # Layerwise push and follows the parent's immediate-free semantics.
-        # Only the Reverse direction, whose blocks are written by the peer,
-        # holds a request back.
+        # Neither direction delays the free on the Prefill side: Forward is the
+        # ordinary Layerwise push, and an aborted Reverse destination follows
+        # the parent's immediate-free semantics. Only a Decode request with an
+        # open reverse-send job is held back, so the engine keeps stepping
+        # until the send job reports.
         request_id = request.request_id
         if self.dual_path_cfg.role == "decode":
             # A final Decode request with an open reverse-send job must keep
@@ -1806,19 +1739,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 return False
             self._pending_finished_sending.add(request_id)
             return True
-        if (
-            getattr(request, "status", None) is RequestStatus.FINISHED_ABORTED
-            and request_id in self._waiting_reverse_attempt_ids
-        ):
-            # Abort while waiting for the Reverse: ordinary ownership is freed
-            # through the finished_recving injection, but the Reverse
-            # destination hold is retained until the close proves SAFE (I8).
-            self._pending_ordinary_release.add(request_id)
-            self._initiate_reverse_attempt_close(request_id)
         return False
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
-        self._reconcile_reverse_attempt_closes()
         finished_sending_injection: set[str] = set()
         finished_recving_injection: set[str] = set()
         worker_metadata = connector_output.kv_connector_worker_meta
@@ -1835,11 +1758,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if connector_output.finished_recving is None:
                 connector_output.finished_recving = set()
             connector_output.finished_recving.update(finished_recving_injection)
-        if self._pending_ordinary_release:
-            if connector_output.finished_recving is None:
-                connector_output.finished_recving = set()
-            connector_output.finished_recving.update(self._pending_ordinary_release)
-            self._pending_ordinary_release.clear()
 
     def _aggregate_worker_job_facts(self, worker_metadata: DualPathWorkerMetadata) -> tuple[set[str], set[str]]:
         finished_sending_injection: set[str] = set()

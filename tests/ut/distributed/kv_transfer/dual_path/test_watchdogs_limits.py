@@ -9,14 +9,6 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_block_pool,
     make_empty_scheduler_output,
 )
-from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import (
-    _make_receiver,
-)
-from tests.ut.distributed.kv_transfer.dual_path.test_close_reverse_attempt import (
-    _KEY,
-    _close,
-    _receive_decision,
-)
 from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
     _admit_decode_request,
     _de_read_decision,
@@ -25,7 +17,6 @@ from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
     _blocks,
     _make_request,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel as channel
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathControlFailureReason,
@@ -39,7 +30,6 @@ def test_env_vars_registered_with_defaults(monkeypatch):
     for name in (
         "VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S",
         "VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S",
-        "VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S",
         "VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS",
         "VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS",
     ):
@@ -166,15 +156,3 @@ class TestCleanupRetention:
         assert scheduler._prefill_request_keys == {}
         assert scheduler._reqs_need_send_layerwise == {}
         assert pool.blocks[11].ref_cnt == 0
-
-    def test_late_close_for_removed_admission_safe_with_proof_not_safe_otherwise(self):
-        receiver = _make_receiver()
-        receiver.register_pending(_KEY)
-        _receive_decision(receiver, 0)
-        assert _close(receiver, 0) is channel.CloseReplyStatus.SAFE
-        receiver.unregister(_KEY)
-
-        # Retained proof: the removed admission still answers SAFE.
-        assert _close(receiver, 0) is channel.CloseReplyStatus.SAFE
-        # No proof for a different attempt: fail closed after teardown.
-        assert _close(receiver, 4) is channel.CloseReplyStatus.NOT_SAFE

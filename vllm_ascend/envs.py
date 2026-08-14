@@ -113,11 +113,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # DualPath Decode decision timeout in integer seconds. The default is 60,
     # the valid range is greater than zero, and this value is not sensitive.
     "VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT": lambda: int(os.getenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", "60")),
-    # DualPath PE Forward-recovery and Reverse-attempt close watchdog in
-    # integer seconds: bounds how long a fenced recovery or an unresolved
-    # close may make no progress before the request is failed. Default 30;
-    # valid range is greater than zero; not sensitive. Tunable per spec
-    # section 11 — the default requires NPU workload measurement.
+    # DualPath PE Reverse-completion watchdog in integer seconds: bounds how
+    # long a parked DE_READ request may wait for its Reverse completion before
+    # the request is failed. Default 30; valid range is greater than zero; not
+    # sensitive. Tunable per spec section 11 — the default requires NPU
+    # workload measurement.
     "VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S": lambda: int(
         os.getenv("VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S", "30")
     ),
@@ -127,12 +127,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Tunable per spec section 11 — the default requires NPU measurement.
     "VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S": lambda: int(
         os.getenv("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", "60")
-    ),
-    # Backoff in integer seconds between identical CloseReverseAttempt retries
-    # after a NOT_SAFE reply. Default 1; valid range is greater than zero; not
-    # sensitive. Tunable per spec section 11.
-    "VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S": lambda: int(
-        os.getenv("VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S", "1")
     ),
     # Maximum DualPath recovery blocks held concurrently across all requests;
     # new uncommitted admissions are rejected before pinning when the budget

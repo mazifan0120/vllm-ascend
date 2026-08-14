@@ -10,16 +10,15 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import (
+    DECODE_TEST_INSTANCE_ID,
     make_block_pool,
     make_empty_scheduler_output,
     make_worker_metadata,
 )
-from tests.ut.distributed.kv_transfer.dual_path.test_close_reverse_attempt import (
-    _admit_decode_request,
-    _de_read_decision,
-)
 from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
     _activate_decision,
+    _admit_decode_request,
+    _de_read_decision,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_i4_gate import (
     _admit_de_read_request,
@@ -30,6 +29,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
 from tests.ut.distributed.kv_transfer.dual_path.test_resume_admission import (
     _admit_de_read,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel as channel
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.close_registry import (
     ReverseAttemptRegistryState,
 )
@@ -47,6 +47,26 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
     ReverseAttemptKey,
 )
+
+_KEY = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, "decode-request-9")
+
+
+def _close(receiver, attempt_id: int, key: DualPathRequestKey = _KEY) -> channel.CloseReplyStatus:
+    from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _deliver_frames
+
+    close = channel.CloseReverseAttempt(request_key=key, reverse_attempt_id=attempt_id)
+    reply = _deliver_frames(
+        receiver,
+        channel.encode_control_message(channel.ControlMessageKind.CLOSE_REVERSE_ATTEMPT, close.to_dict()),
+    )
+    assert reply is not None
+    return channel.decode_close_reply(reply)
+
+
+def _receive_decision(receiver, attempt_id: int = 0) -> None:
+    from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _decision, _deliver_frames
+
+    _deliver_frames(receiver, channel.encode_path_decision(_decision(attempt_id)))
 
 
 class TestDecodeEngineProgress:
@@ -240,12 +260,6 @@ class TestLedgerRetirementWiring:
         from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import (
             _make_receiver,
         )
-        from tests.ut.distributed.kv_transfer.dual_path.test_close_reverse_attempt import (
-            _KEY,
-            _close,
-            _receive_decision,
-        )
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel as channel
 
         receiver = _make_receiver()
         receiver.register_pending(_KEY)
@@ -267,12 +281,6 @@ class TestLedgerRetirementWiring:
         from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import (
             _make_receiver,
         )
-        from tests.ut.distributed.kv_transfer.dual_path.test_close_reverse_attempt import (
-            _KEY,
-            _close,
-            _receive_decision,
-        )
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel as channel
 
         receiver = _make_receiver()
         receiver.register_pending(_KEY)
@@ -312,7 +320,6 @@ class TestLifecycleRetirement:
 
     def test_coordinator_attempt_states_retire_after_safe_proof(self):
         from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _make_receiver
-        from tests.ut.distributed.kv_transfer.dual_path.test_close_reverse_attempt import _KEY, _close
 
         receiver = _make_receiver()
         receiver.register_pending(_KEY)
@@ -334,7 +341,6 @@ class TestStage2EnvValidation:
         [
             "VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S",
             "VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S",
-            "VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S",
         ],
     )
     def test_non_positive_timeouts_rejected(self, monkeypatch, pe_scheduler_factory, name):
@@ -369,8 +375,6 @@ class TestReverseSendJobRetirement:
             DECODE_TEST_INSTANCE_ID,
         )
         from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _make_receiver
-        from tests.ut.distributed.kv_transfer.dual_path.test_close_reverse_attempt import _close
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel as channel
 
         scheduler = decode_scheduler_factory()
         receiver = _make_receiver()
