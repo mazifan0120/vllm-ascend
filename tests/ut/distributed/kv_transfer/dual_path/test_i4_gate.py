@@ -71,7 +71,6 @@ def test_stale_attempt_job_absorbed_never_reaches_finished_recving(pe_scheduler_
 
     assert output.finished_recving is None
     assert output.finished_sending is None
-    assert pool.blocks[71].ref_cnt == 1
 
 
 def test_current_attempt_job_inserts_req_id_only_while_waiting(pe_scheduler_factory):
@@ -114,4 +113,3 @@ def test_current_attempt_job_for_running_request_does_not_insert(pe_scheduler_fa
     scheduler.update_connector_output(output)
 
     assert output.finished_recving is None
-    assert pool.blocks[71].ref_cnt == 1

@@ -132,36 +132,6 @@ def test_normal_path_never_sends_close_reverse_attempt(pe_scheduler_factory):
     assert second_decision.result.reverse_attempt_id == 1
 
 
-def test_old_reverse_destination_hold_released_before_running(pe_scheduler_factory):
-    pool = make_block_pool()
-    scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
-    request = _admit_de_read(scheduler)
-    # The attempt-0 Reverse destination hold covers [16, 48) -> blocks 71, 72.
-    assert pool.blocks[71].ref_cnt == 1
-    assert pool.blocks[72].ref_cnt == 1
-    _complete_reverse_attempt_zero(scheduler, request)
-    # The attempt-0 destination hold is released when the I4 gate passes,
-    # before the request can become RUNNING again.
-    assert pool.blocks[71].ref_cnt == 0
-    assert pool.blocks[72].ref_cnt == 0
-
-    refcnt_at_delivery: list[tuple[int, int]] = []
-
-    def record_submit(_endpoint, _decision):
-        refcnt_at_delivery.append((pool.blocks[82].ref_cnt, pool.blocks[83].ref_cnt))
-        future = MagicMock(name="delivery_future")
-        future.done.return_value = False
-        return future
-
-    coordinator.submit.side_effect = record_submit
-    _resume(scheduler, request, 32, _RESUME_BLOCKS)
-
-    # The new Reverse destination hold over [32, 48) covers block 82 and exists
-    # before delivery; block 83 carries the Forward source, which is never
-    # pinned.
-    assert refcnt_at_delivery == [(1, 0)]
-
-
 def test_attempt_n_plus_1_created_on_resume_allocation(pe_scheduler_factory):
     pool = make_block_pool()
     scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)

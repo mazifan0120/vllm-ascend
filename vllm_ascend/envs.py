@@ -128,18 +128,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S": lambda: int(
         os.getenv("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", "60")
     ),
-    # Maximum DualPath recovery blocks held concurrently across all requests;
-    # new uncommitted admissions are rejected before pinning when the budget
-    # would be exceeded. Committed holds are never evicted. Default 1024;
-    # valid range is greater than zero; not sensitive.
-    "VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS": lambda: int(
-        os.getenv("VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS", "1024")
-    ),
-    # Maximum concurrent DualPath recovery records (unreleased holds plus open
-    # jobs). Default 256; valid range is greater than zero; not sensitive.
-    "VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS": lambda: int(
-        os.getenv("VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS", "256")
-    ),
 }
 
 # end-env-vars-definition

@@ -28,12 +28,6 @@ from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
 from tests.ut.distributed.kv_transfer.dual_path.test_resume_admission import (
     _admit_de_read,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.ledgers import (
-    HoldKind,
-    HoldLedger,
-    JobKind,
-    JobLedger,
-)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathControlFailureReason,
 )
@@ -80,7 +74,7 @@ class TestDecodeEngineProgress:
 
 
 class TestBoundedCompletionJobs:
-    def test_failed_reverse_completion_job_surfaces_control_failure_without_release(self, pe_scheduler_factory):
+    def test_failed_reverse_completion_job_surfaces_control_failure(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
         request = _admit_de_read_request(scheduler)
@@ -96,7 +90,6 @@ class TestBoundedCompletionJobs:
         failure = metadata.control_failures[0]
         assert failure.request_id == request.request_id
         assert failure.reason is DualPathControlFailureReason.RECOVERY_TIMEOUT
-        assert pool.blocks[71].ref_cnt == 1
 
     def test_missing_reverse_completion_deadline_expiry_surfaces_control_failure(self, pe_scheduler_factory):
         pool = make_block_pool()
@@ -112,7 +105,6 @@ class TestBoundedCompletionJobs:
 
         assert len(metadata.control_failures) == 1
         assert metadata.control_failures[0].request_id == request.request_id
-        assert pool.blocks[71].ref_cnt == 1
 
 
 class TestSingleUnresolvedDeliveryFuture:
@@ -198,13 +190,12 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         assert len(metadata.control_failures) == 1
 
 
-class TestLedgerRetirementWiring:
-    def test_reverse_completion_close_retires_job_and_hold_records(self, pe_scheduler_factory):
+class TestJobLedgerRetirementWiring:
+    def test_reverse_completion_close_retires_job_record(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
         request = _admit_de_read_request(scheduler)
         binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
-        hold_id = scheduler._reverse_destination_holds[request.request_id]
 
         output = KVConnectorOutput(
             kv_connector_worker_meta=make_worker_metadata(completed_jobs={binding.reverse_completion_job_id: 1})
@@ -213,14 +204,12 @@ class TestLedgerRetirementWiring:
 
         assert output.finished_recving == {request.request_id}
         assert scheduler._job_ledger.get(binding.reverse_completion_job_id) is None
-        assert scheduler._hold_ledger.get(hold_id) is None
 
-    def test_failed_job_and_held_records_are_never_retired_early(self, pe_scheduler_factory):
+    def test_failed_job_record_is_retained(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
         request = _admit_de_read_request(scheduler)
         binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
-        hold_id = scheduler._reverse_destination_holds[request.request_id]
 
         output = KVConnectorOutput(
             kv_connector_worker_meta=make_worker_metadata(failed_jobs={binding.reverse_completion_job_id: 1})
@@ -228,29 +217,6 @@ class TestLedgerRetirementWiring:
         scheduler.update_connector_output(output)
 
         assert scheduler._job_ledger.get(binding.reverse_completion_job_id).failed is True
-        assert scheduler._hold_ledger.get(hold_id).released is False
-        assert pool.blocks[71].ref_cnt == 1
-
-
-class TestLifecycleRetirement:
-    def test_ledgers_retire_only_closed_and_released_records(self):
-        pool = make_block_pool(num_blocks=8)
-        hold_ledger = HoldLedger()
-        job_ledger = JobLedger()
-        released = hold_ledger.acquire(pool, (1,), HoldKind.REVERSE_DESTINATION)
-        retained = hold_ledger.acquire(pool, (2,), HoldKind.REVERSE_DESTINATION)
-        hold_ledger.release(pool, released.hold_id)
-
-        closed_job = job_ledger.create_job(JobKind.REVERSE_COMPLETION, expected_worker_count=1)
-        open_job = job_ledger.create_job(JobKind.REVERSE_COMPLETION, expected_worker_count=1)
-        job_ledger.record_reports(closed_job.job_id, 1)
-
-        assert not job_ledger.discard(open_job.job_id)
-        assert job_ledger.discard(closed_job.job_id)
-        assert job_ledger.get(closed_job.job_id) is None
-        assert not hold_ledger.discard(retained.hold_id)
-        assert hold_ledger.discard(released.hold_id)
-        assert hold_ledger.get(released.hold_id) is None
 
 
 class TestStage2EnvValidation:
@@ -263,18 +229,6 @@ class TestStage2EnvValidation:
     )
     def test_non_positive_timeouts_rejected(self, monkeypatch, pe_scheduler_factory, name):
         monkeypatch.setenv(name, "0")
-        with pytest.raises(ValueError, match=name):
-            pe_scheduler_factory(PathKind.PE_READ)
-
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS",
-            "VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS",
-        ],
-    )
-    def test_negative_budgets_rejected(self, monkeypatch, pe_scheduler_factory, name):
-        monkeypatch.setenv(name, "-1")
         with pytest.raises(ValueError, match=name):
             pe_scheduler_factory(PathKind.PE_READ)
 

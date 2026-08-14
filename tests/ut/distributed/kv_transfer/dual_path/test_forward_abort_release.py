@@ -28,7 +28,7 @@ def _admit_pe_read(scheduler):
 
 
 def _assert_nothing_retained(scheduler, pool):
-    assert scheduler._hold_ledger.unreleased_count() == 0
+    assert not hasattr(scheduler, "_hold_ledger")
     assert scheduler._job_ledger.open_count() == 0
     assert scheduler._pending_finished_sending == set()
     # The PE_READ Forward range [16, 33) covers source blocks 11 and 12.

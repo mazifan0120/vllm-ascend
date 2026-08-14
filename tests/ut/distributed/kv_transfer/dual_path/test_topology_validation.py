@@ -67,7 +67,6 @@ class TestRemoteTopologyValidation:
 
         assert request.request_id in scheduler._prefill_invalid_request_ids
         assert coordinator.submit.call_count == 0
-        assert scheduler._hold_ledger._records == {}
         assert scheduler._prefill_forward_plans == {}
 
     @pytest.mark.parametrize("field", ["remote_pcp_size", "remote_dcp_size", "remote_pp_size", "remote_dp_size"])
@@ -81,7 +80,6 @@ class TestRemoteTopologyValidation:
 
         assert request.request_id in scheduler._prefill_invalid_request_ids
         assert coordinator.submit.call_count == 0
-        assert scheduler._hold_ledger._records == {}
 
     def test_bootstrap_message_missing_topology_fields_rejected(self, pe_scheduler_factory):
         pool = make_block_pool()

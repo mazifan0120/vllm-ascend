@@ -92,16 +92,14 @@ def test_de_read_vacuous_reverse_returns_zero_false_and_skips_reverse_machinery(
     pool = make_block_pool()
     scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     request = _admit_de_read(scheduler)
-    hold_records_before = len(scheduler._hold_ledger._records)
     job_records_before = len(scheduler._job_ledger._records)
 
     request.num_preemptions += 1
     assert scheduler.get_num_new_matched_tokens(request, 40) == (0, False)
 
     # A vacuous Reverse bypasses the Reverse machinery entirely: no new
-    # destination hold, no new completion job, and no waiting-attempt entry
-    # (the request goes straight back to RUNNING, never parks).
-    assert len(scheduler._hold_ledger._records) == hold_records_before
+    # completion job and no waiting-attempt entry (the request goes straight
+    # back to RUNNING, never parks).
     assert len(scheduler._job_ledger._records) == job_records_before
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids
 
@@ -128,12 +126,12 @@ def test_pe_read_resume_returns_zero_false_rebuilds_local_source_only(pe_schedul
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
     plan_before = scheduler._prefill_forward_plans[request.request_id]
-    holds_before = len(scheduler._hold_ledger._records)
+    job_records_before = len(scheduler._job_ledger._records)
 
     assert scheduler.get_num_new_matched_tokens(request, 8) == (0, False)
-    # No plan/hold mutation and no re-delivery on the resume admission itself.
+    # No plan/job mutation and no re-delivery on the resume admission itself.
     assert scheduler._prefill_forward_plans[request.request_id] is plan_before
-    assert len(scheduler._hold_ledger._records) == holds_before
+    assert len(scheduler._job_ledger._records) == job_records_before
     assert scheduler._reqs_need_send_layerwise[request.request_id].local_block_ids == [[10, 11, 12]]
 
 

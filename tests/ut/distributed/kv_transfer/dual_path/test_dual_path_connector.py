@@ -681,10 +681,8 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_prefill_delivery_futures",
             "_prefill_invalid_request_ids",
             "_block_pool",
-            "_hold_ledger",
             "_job_ledger",
             "_expected_worker_count",
-            "_reverse_destination_holds",
             "_pending_finished_sending",
             "_waiting_reverse_attempt_ids",
             "_reverse_send_job_ids",
@@ -696,8 +694,6 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_de_progress_deadlines",
             "_recovery_watchdog_s",
             "_de_progress_watchdog_s",
-            "_max_held_recovery_blocks",
-            "_max_recovery_records",
         }
         self.assertEqual(
             set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | dual_path_scheduler_fields
@@ -1546,10 +1542,8 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_register_pending_decode_decision",
                 "_release_scheduler_request_state",
                 "_may_install_forward_plan",
-                "_ensure_reverse_destination_hold",
                 "_delay_free_for_connector",
                 "_resume_delivered_prefill_decision",
-                "_check_hold_budget",
                 "_deliver_prefill_decision",
                 "_request_for_failed_job",
                 "_sweep_prefill_recovery_watchdogs",

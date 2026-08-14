@@ -22,8 +22,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import 
     KVPoolSchedulerAdapter,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.ledgers import (
-    HoldKind,
-    HoldLedger,
     JobKind,
     JobLedger,
     JobRecord,
@@ -180,10 +178,6 @@ def _validate_local_topology(vllm_config: VllmConfig) -> None:
             raise ValueError(f"DualPath requires {name} == 1, got {value}")
 
 
-class DualPathHoldBudgetExceededError(RuntimeError):
-    """A new uncommitted admission would exceed the hold-pressure budget."""
-
-
 class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     """Scheduler side of DualPathConnector.
 
@@ -231,10 +225,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_delivery_futures: dict[str, Future[None]] = {}
         self._prefill_invalid_request_ids: set[str] = set()
         self._block_pool: BlockPool | None = None
-        self._hold_ledger = HoldLedger()
         self._job_ledger = JobLedger()
         self._expected_worker_count: int = vllm_config.parallel_config.world_size
-        self._reverse_destination_holds: dict[str, int] = {}
         self._pending_finished_sending: set[str] = set()
         self._waiting_reverse_attempt_ids: dict[str, ReverseAttemptKey] = {}
         self._reverse_send_job_ids: dict[ReverseAttemptKey, int] = {}
@@ -246,20 +238,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._de_progress_deadlines: dict[str, float] = {}
         self._recovery_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S
         self._de_progress_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S
-        self._max_held_recovery_blocks: int = ascend_envs.VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS
-        self._max_recovery_records: int = ascend_envs.VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS
         for env_name, env_value in (
             ("VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S", self._recovery_watchdog_s),
             ("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", self._de_progress_watchdog_s),
         ):
             if env_value <= 0:
                 raise ValueError(f"{env_name} must be an integer greater than zero")
-        for env_name, env_value in (
-            ("VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS", self._max_held_recovery_blocks),
-            ("VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS", self._max_recovery_records),
-        ):
-            if env_value < 0:
-                raise ValueError(f"{env_name} must be a non-negative integer")
         _validate_local_topology(vllm_config)
         if dual_path_cfg.role == "decode":
             if len(kv_cache_config.kv_cache_groups) != 1:
@@ -937,16 +921,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         result = self._prefill_path_results.get(request_id)
         if result is None:
             return
-        try:
-            self._ensure_reverse_destination_hold(request_id, result)
-        except DualPathHoldBudgetExceededError as error:
-            logger.error(
-                "DualPath Prefill admission rejected by the hold-pressure limit for request %s: %s",
-                request_id,
-                error,
-            )
-            self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
-            return
         if (
             result.path is PathKind.DE_READ
             and request_id in self._prefill_reverse_plans
@@ -1059,46 +1033,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
 
         delivery_future.add_done_callback(log_delivery_failure)
-
-    def _check_hold_budget(self, new_block_count: int, new_record_count: int) -> None:
-        """Reject a new uncommitted admission before pinning when the budget
-        would be exceeded; committed holds are never evicted."""
-        held_blocks = self._hold_ledger.held_block_count()
-        if held_blocks + new_block_count > self._max_held_recovery_blocks:
-            raise DualPathHoldBudgetExceededError(
-                f"held recovery blocks {held_blocks} + {new_block_count} would exceed "
-                f"the limit {self._max_held_recovery_blocks}"
-            )
-        open_records = self._hold_ledger.unreleased_count() + self._job_ledger.open_count()
-        if open_records + new_record_count > self._max_recovery_records:
-            raise DualPathHoldBudgetExceededError(
-                f"open recovery records {open_records} + {new_record_count} would exceed "
-                f"the limit {self._max_recovery_records}"
-            )
-
-    def _ensure_reverse_destination_hold(self, request_id: str, result: PathDecisionResult) -> None:
-        # Before a DE_READ Decision is delivered, pin the PE-local Reverse
-        # destination slice [L_PE, K_DE); a vacuous Reverse acquires no hold.
-        if self._block_pool is None or result.path is not PathKind.DE_READ:
-            return
-        existing_hold_id = self._reverse_destination_holds.get(request_id)
-        if existing_hold_id is not None and not self._hold_ledger.is_released(existing_hold_id):
-            return
-        binding = self._prefill_pending_reverse_receive_bindings.get(request_id)
-        if binding is None:
-            return
-        block_size = self.block_size[0]
-        first_block = binding.token_start // block_size
-        last_block = math.ceil(binding.token_end / block_size)
-        if first_block >= last_block:
-            return
-        destination_block_ids = tuple(binding.destination_block_ids[0][first_block:last_block])
-        self._check_hold_budget(len(destination_block_ids), 1)
-        hold = self._hold_ledger.acquire(self._block_pool, destination_block_ids, HoldKind.REVERSE_DESTINATION)
-        self._reverse_destination_holds[request_id] = hold.hold_id
-        completion_job = self._job_ledger.get(binding.reverse_completion_job_id)
-        if completion_job is not None:
-            completion_job.affected_hold_ids = (hold.hold_id,)
 
     def _invalidate_prefill_activation(
         self,
@@ -1530,8 +1464,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         return None
 
     def _sweep_prefill_recovery_watchdogs(self, metadata: DualPathConnectorMetadata) -> None:
-        # Expiry fails the request through the control-failure path; it never
-        # releases a hold and never synthesizes a safety proof.
+        # Expiry fails the request through the control-failure path.
         now = time.monotonic()
         for request_id, deadline in list(self._recovery_deadlines.items()):
             if deadline > now:
@@ -1548,7 +1481,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     )
                 )
             logger.error(
-                "DualPath recovery watchdog expired for request %s; holds are retained",
+                "DualPath recovery watchdog expired for request %s; the request is failed closed",
                 request_id,
             )
 
@@ -1682,8 +1615,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._prefill_deferred_deliveries.discard(request_id)
             self._prefill_vacuous_reverse_request_ids.discard(request_id)
             self._reconcile_prefill_deliveries()
-        # Hold/job records with unreleased holds survive request cleanup; they
-        # are removed only when their jobs close.
+        # Completion-job records remain owned by their job lifecycle across
+        # request cleanup.
         self._waiting_reverse_attempt_ids.pop(request_id, None)
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
@@ -1759,16 +1692,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 continue
             if self._job_ledger.record_failure(job_id):
                 logger.error(
-                    "DualPath job %s (kind=%s) reported failed; affected holds %s are retained",
+                    "DualPath job %s (kind=%s) reported failed; the owning request is failed closed",
                     job_id,
                     job.job_kind.value,
-                    job.affected_hold_ids,
                 )
                 failed_request_id = self._request_for_failed_job(job)
                 if failed_request_id is not None:
                     # Surface the terminal failure through the existing
-                    # control-failure path at the next build pass; holds are
-                    # never released and no release proof is synthesized.
+                    # control-failure path at the next build pass.
                     if self.dual_path_cfg.role == "decode":
                         self._de_progress_deadlines[failed_request_id] = 0.0
                     else:
@@ -1796,8 +1727,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
     def _close_reverse_completion_job(self, job: JobRecord) -> set[str]:
         # I4: only the current waiting attempt's completion may publish the
-        # request id; stale-attempt jobs are absorbed without releasing holds
-        # or touching the generic finished sets.
+        # request id; stale-attempt jobs are absorbed without touching the
+        # generic finished sets.
         attempt_key = job.reverse_attempt_key
         request_id = next(
             (
@@ -1811,11 +1742,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return set()
         del self._waiting_reverse_attempt_ids[request_id]
         self._recovery_deadlines.pop(request_id, None)
-        if self._block_pool is not None:
-            for hold_id in job.affected_hold_ids:
-                self._hold_ledger.release(self._block_pool, hold_id)
-        for hold_id in job.affected_hold_ids:
-            self._hold_ledger.discard(hold_id)
         self._job_ledger.discard(job.job_id)
         return {request_id}
 
