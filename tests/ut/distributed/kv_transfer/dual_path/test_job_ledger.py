@@ -15,7 +15,15 @@ from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
     _blocks,
     _make_request,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import PathKind
+from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
+    _activate_decision,
+    _admit_decode_request,
+    _de_read_decision,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
+    PathKind,
+    ReverseAttemptKey,
+)
 
 
 def _ledgers():
@@ -161,3 +169,35 @@ class TestJobRecordReclamation:
         scheduler._release_scheduler_request_state(request)
 
         assert scheduler._job_ledger.get(job_id) is not None
+
+    @pytest.mark.parametrize("latest_closed", [False, True], ids=["latest-open", "latest-closed"])
+    def test_request_cleanup_reclaims_closed_superseded_send_jobs_and_preserves_latest_state(
+        self, decode_scheduler_factory, decode_task04_seams, latest_closed
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
+        second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
+        old_job_id = first_metadata.reverse_plans[0].reverse_send_job_id
+        latest_job_id = second_metadata.reverse_plans[0].reverse_send_job_id
+        assert old_job_id is not None
+        assert latest_job_id is not None
+        state = scheduler._decode_decision_states[request.request_id]
+        old_attempt = ReverseAttemptKey(state.request_key, 0)
+        latest_attempt = ReverseAttemptKey(state.request_key, 1)
+        assert scheduler._job_ledger.record_reports(old_job_id, 1) is True
+        if latest_closed:
+            assert scheduler._job_ledger.record_reports(latest_job_id, 1) is True
+
+        scheduler._release_scheduler_request_state(request)
+
+        assert old_attempt not in scheduler._reverse_send_job_ids
+        assert scheduler._job_ledger.get(old_job_id) is None
+        if latest_closed:
+            assert latest_attempt not in scheduler._reverse_send_job_ids
+            assert scheduler._job_ledger.get(latest_job_id) is None
+            assert request.request_id not in scheduler._latest_reverse_attempt_ids
+        else:
+            assert scheduler._reverse_send_job_ids[latest_attempt] == latest_job_id
+            assert scheduler._job_ledger.get(latest_job_id) is not None
+            assert scheduler._latest_reverse_attempt_ids[request.request_id] == 1
