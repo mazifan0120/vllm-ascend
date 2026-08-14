@@ -118,33 +118,101 @@ class PathDecisionRequest:
 class PathDecisionResult:
     request_key: DualPathRequestKey
     path: PathKind
+    reverse_attempt_id: int | None = None
+    prefill_local_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
             raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
         if not isinstance(self.path, PathKind):
             raise PathDecisionValidationError("path must be a PathKind")
+        if self.path is PathKind.PE_READ:
+            if self.reverse_attempt_id is not None or self.prefill_local_tokens is not None:
+                raise PathDecisionValidationError("PE_READ result must not carry Reverse attempt fields")
+        else:
+            for name, value in (
+                ("reverse_attempt_id", self.reverse_attempt_id),
+                ("prefill_local_tokens", self.prefill_local_tokens),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise PathDecisionValidationError(f"DE_READ result requires a non-negative integer {name}")
+
+    def to_dict(self) -> JsonObject:
+        data: JsonObject = {
+            "request_key": self.request_key.to_dict(),
+            "path": self.path.value,
+        }
+        if self.path is PathKind.DE_READ:
+            data["reverse_attempt_id"] = self.reverse_attempt_id
+            data["prefill_local_tokens"] = self.prefill_local_tokens
+        return data
+
+    @classmethod
+    def from_dict(cls, payload: JsonValue) -> PathDecisionResult:
+        if not isinstance(payload, dict):
+            raise PathDecisionValidationError("serialized payload must be a dictionary")
+        if "request_key" not in payload or "path" not in payload:
+            raise PathDecisionValidationError("serialized payload must contain request_key and path")
+        try:
+            path = PathKind(payload["path"])
+        except (TypeError, ValueError) as error:
+            raise PathDecisionValidationError("serialized path is not valid") from error
+        expected_keys = frozenset({"request_key", "path"})
+        if path is PathKind.DE_READ:
+            expected_keys = expected_keys | {"reverse_attempt_id", "prefill_local_tokens"}
+        data = require_exact_payload(payload, expected_keys)
+        return cls(
+            request_key=DualPathRequestKey.from_dict(data["request_key"]),
+            path=path,
+            reverse_attempt_id=data.get("reverse_attempt_id"),
+            prefill_local_tokens=data.get("prefill_local_tokens"),
+        )
+
+
+@dataclass(frozen=True)
+class ReverseAttemptKey:
+    """Complete identity of one DE_READ Reverse attempt."""
+
+    request_key: DualPathRequestKey
+    reverse_attempt_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request_key, DualPathRequestKey):
+            raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
+        if (
+            isinstance(self.reverse_attempt_id, bool)
+            or not isinstance(self.reverse_attempt_id, int)
+            or self.reverse_attempt_id < 0
+        ):
+            raise PathDecisionValidationError("reverse_attempt_id must be a non-negative integer")
 
     def to_dict(self) -> JsonObject:
         return {
             "request_key": self.request_key.to_dict(),
-            "path": self.path.value,
+            "reverse_attempt_id": self.reverse_attempt_id,
         }
 
     @classmethod
-    def from_dict(cls, payload: JsonValue) -> PathDecisionResult:
+    def from_dict(cls, payload: JsonValue) -> ReverseAttemptKey:
         data = require_exact_payload(
             payload,
-            frozenset({"request_key", "path"}),
+            frozenset({"request_key", "reverse_attempt_id"}),
         )
-        try:
-            path = PathKind(data["path"])
-        except (TypeError, ValueError) as error:
-            raise PathDecisionValidationError("serialized path is not valid") from error
         return cls(
             request_key=DualPathRequestKey.from_dict(data["request_key"]),
-            path=path,
+            reverse_attempt_id=data["reverse_attempt_id"],
         )
+
+
+def reverse_wire_id(attempt_key: ReverseAttemptKey) -> str:
+    """Opaque attempt-unique Reverse wire id. Lookup-only: identity is never
+    recovered by slicing a string suffix."""
+    if not isinstance(attempt_key, ReverseAttemptKey):
+        raise PathDecisionValidationError("attempt_key must be a ReverseAttemptKey")
+    return (
+        f"ra:{attempt_key.request_key.decode_engine_instance_id}:"
+        f"{attempt_key.request_key.decode_request_id}:{attempt_key.reverse_attempt_id}"
+    )
 
 
 class PathPolicy(Protocol):
@@ -177,7 +245,12 @@ class PathDecisionDecider:
         self._policy = policy
         self._decision_records: dict[DualPathRequestKey, _DecisionRecord] = {}
 
-    def decide(self, request: PathDecisionRequest, prefill_local_tokens: int) -> PathDecisionResult:
+    def decide(
+        self,
+        request: PathDecisionRequest,
+        prefill_local_tokens: int,
+        num_preemptions: int = 0,
+    ) -> PathDecisionResult:
         if not isinstance(request, PathDecisionRequest):
             raise PathDecisionValidationError("decision input must be a PathDecisionRequest")
 
@@ -191,7 +264,12 @@ class PathDecisionDecider:
 
         path = PathKind.PE_READ if prefill_local_tokens >= request.decode_store_tokens else self._policy.choose(request)
 
-        result = PathDecisionResult(request_key=request.request_key, path=path)
+        result = PathDecisionResult(
+            request_key=request.request_key,
+            path=path,
+            reverse_attempt_id=num_preemptions if path is PathKind.DE_READ else None,
+            prefill_local_tokens=prefill_local_tokens if path is PathKind.DE_READ else None,
+        )
         self._decision_records[request.request_key] = _DecisionRecord(
             request=request,
             prefill_local_tokens=prefill_local_tokens,

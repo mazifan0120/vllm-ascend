@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -112,6 +114,12 @@ class ForwardReceiveBinding:
         _validate_block_table(self.destination_block_ids, "destination_block_ids")
 
 
+def _validate_non_negative_integers(values: tuple[tuple[str, int], ...]) -> None:
+    for name, value in values:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise PathDecisionValidationError(f"{name} must be a non-negative integer and must not be a boolean")
+
+
 @dataclass(frozen=True)
 class ReversePlan:
     request_key: DualPathRequestKey
@@ -127,6 +135,9 @@ class ReversePlan:
     remote_tp_size: int
     remote_pcp_size: int
     remote_dcp_size: int
+    reverse_attempt_id: int
+    prefill_local_tokens: int
+    reverse_send_job_id: int | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
@@ -139,6 +150,14 @@ class ReversePlan:
             )
         )
         _validate_token_range(self.token_start, self.token_end)
+        _validate_non_negative_integers(
+            (
+                ("reverse_attempt_id", self.reverse_attempt_id),
+                ("prefill_local_tokens", self.prefill_local_tokens),
+            )
+        )
+        if self.reverse_send_job_id is not None:
+            _validate_non_negative_integers((("reverse_send_job_id", self.reverse_send_job_id),))
 
         source_block_ids = _freeze_block_table(self.source_block_ids)
         destination_block_ids = _freeze_block_table(self.destination_block_ids)
@@ -198,6 +217,9 @@ class ReversePlan:
             "remote_tp_size": self.remote_tp_size,
             "remote_pcp_size": self.remote_pcp_size,
             "remote_dcp_size": self.remote_dcp_size,
+            "reverse_attempt_id": self.reverse_attempt_id,
+            "prefill_local_tokens": self.prefill_local_tokens,
+            "reverse_send_job_id": self.reverse_send_job_id,
         }
 
     @classmethod
@@ -219,6 +241,9 @@ class ReversePlan:
                     "remote_tp_size",
                     "remote_pcp_size",
                     "remote_dcp_size",
+                    "reverse_attempt_id",
+                    "prefill_local_tokens",
+                    "reverse_send_job_id",
                 }
             ),
         )
@@ -237,6 +262,9 @@ class ReversePlan:
                 remote_tp_size=data["remote_tp_size"],
                 remote_pcp_size=data["remote_pcp_size"],
                 remote_dcp_size=data["remote_dcp_size"],
+                reverse_attempt_id=data["reverse_attempt_id"],
+                prefill_local_tokens=data["prefill_local_tokens"],
+                reverse_send_job_id=data["reverse_send_job_id"],
             )
         except TypeError as error:
             raise PathDecisionValidationError("serialized ReversePlan fields have invalid types") from error
@@ -250,6 +278,9 @@ class ReverseReceiveBinding:
     destination_block_ids: BlockIdGroups
     token_start: int
     token_end: int
+    reverse_attempt_id: int
+    prefill_local_tokens: int
+    reverse_completion_job_id: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
@@ -261,6 +292,13 @@ class ReverseReceiveBinding:
             )
         )
         _validate_token_range(self.token_start, self.token_end)
+        _validate_non_negative_integers(
+            (
+                ("reverse_attempt_id", self.reverse_attempt_id),
+                ("prefill_local_tokens", self.prefill_local_tokens),
+                ("reverse_completion_job_id", self.reverse_completion_job_id),
+            )
+        )
         destination_block_ids = _freeze_block_table(self.destination_block_ids)
         _validate_block_table(destination_block_ids, "destination_block_ids")
         object.__setattr__(self, "destination_block_ids", destination_block_ids)
@@ -269,6 +307,7 @@ class ReverseReceiveBinding:
 class DualPathControlFailureReason(str, Enum):
     DECISION_TIMEOUT = "DECISION_TIMEOUT"
     ACTIVATION_FAILED = "ACTIVATION_FAILED"
+    RECOVERY_TIMEOUT = "RECOVERY_TIMEOUT"
 
 
 @dataclass(frozen=True)
@@ -289,6 +328,28 @@ class DualPathControlFailureMetadata:
                 )
         if not isinstance(self.reason, DualPathControlFailureReason):
             raise PathDecisionValidationError("reason must be a DualPathControlFailureReason")
+
+
+@dataclass
+class DualPathWorkerMetadata(KVConnectorWorkerMetadata):
+    """Worker-to-scheduler completion facts: each worker emits ``{job_id: 1}``
+    at most once per job; the upstream executor-level fold performs no type
+    check, so ``aggregate`` asserts the concrete type itself."""
+
+    completed_jobs: dict[int, int] = field(default_factory=dict)
+    failed_jobs: dict[int, int] = field(default_factory=dict)
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> DualPathWorkerMetadata:
+        assert isinstance(other, DualPathWorkerMetadata)
+        merged = DualPathWorkerMetadata(
+            completed_jobs=dict(self.completed_jobs),
+            failed_jobs=dict(self.failed_jobs),
+        )
+        for job_id, count in other.completed_jobs.items():
+            merged.completed_jobs[job_id] = merged.completed_jobs.get(job_id, 0) + count
+        for job_id, count in other.failed_jobs.items():
+            merged.failed_jobs[job_id] = merged.failed_jobs.get(job_id, 0) + count
+        return merged
 
 
 class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):

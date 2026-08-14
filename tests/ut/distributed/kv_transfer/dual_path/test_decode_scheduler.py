@@ -44,8 +44,10 @@ def _make_vllm_config(kv_role="kv_consumer"):
     config.parallel_config.data_parallel_rank = 0
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.tensor_parallel_size = 1
+    config.parallel_config.pipeline_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
     config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.world_size = 1
     config.cache_config.block_size = 16
     config.scheduler_config.disable_hybrid_kv_cache_manager = True
     return config

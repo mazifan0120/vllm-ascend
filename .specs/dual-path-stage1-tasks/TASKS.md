@@ -75,17 +75,15 @@ The following requirements apply to every Task:
 
 ### Known limitations (Stage 1)
 
-- **Prefill-side preemption after decision delivery is unsafe.** vLLM
-  preemption frees the request's blocks without notifying the connector
-  (`request_finished` is not called), so an in-flight Forward send can read
-  freed or reallocated blocks, a re-admitted request can park forever, and a
-  late Reverse terminal can crash the engine core
-  (`scheduler.py:2243`). Stage 1 therefore requires Prefill deployments that
-  never preempt DualPath requests (provision KV blocks so allocation never
-  fails for running requests). The Stage 2 remedy — block pinning plus a
-  fail-closed abort driven off `preempted_req_ids`, followed by epoch-based
-  re-execution — is designed in
-  `.specs/dual-path-stage2-preemption/2026-08-11-dual-path-stage2-preemption-safety-design.md`.
+- ~~**Prefill-side preemption after decision delivery is unsafe.**~~ Resolved
+  by Stage 2: block holds plus a synchronous worker-side sender fence, a
+  fail-closed abort driven off `preempted_req_ids`, and attempt-based
+  re-execution are designed in
+  `.specs/dual-path-stage2-preemption/2026-08-11-dual-path-stage2-preemption-safety-design.md`
+  and implemented in `vllm_ascend/distributed/kv_transfer/kv_p2p/dual_path/`
+  (ledgers, fence, resume admission, attempt-keyed channel registry,
+  `CloseReverseAttempt`, watchdogs, and topology guards), with unit coverage
+  under `tests/ut/distributed/kv_transfer/dual_path/`.
 
 ## 4. Task dependency graph
 

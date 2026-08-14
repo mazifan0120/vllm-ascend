@@ -155,6 +155,7 @@ class MockVllmConfig:
         self.parallel_config.data_parallel_rank = 0
         self.parallel_config.prefill_context_parallel_size = 1
         self.parallel_config.decode_context_parallel_size = 1
+        self.parallel_config.world_size = 2
         self.cache_config.block_size = 16
         self.cache_config.mamba_cache_mode = None
         self.scheduler_config.disable_hybrid_kv_cache_manager = True
@@ -673,11 +674,35 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_prefill_local_tokens",
             "_prefill_path_results",
             "_prefill_forward_plans",
+            "_prefill_forward_plan_epochs",
             "_prefill_reverse_plans",
             "_prefill_pending_reverse_receive_bindings",
             "_prefill_control_failures",
             "_prefill_delivery_futures",
             "_prefill_invalid_request_ids",
+            "_block_pool",
+            "_hold_ledger",
+            "_job_ledger",
+            "_expected_worker_count",
+            "_reverse_destination_holds",
+            "_pending_ordinary_release",
+            "_pending_finished_sending",
+            "_waiting_reverse_attempt_ids",
+            "_reverse_send_job_ids",
+            "_prefill_delivered_reverse_attempts",
+            "_prefill_deferred_deliveries",
+            "_prefill_vacuous_reverse_request_ids",
+            "_latest_reverse_attempt_ids",
+            "_pending_close_futures",
+            "_pending_close_requests",
+            "_close_retry_deadlines",
+            "_recovery_deadlines",
+            "_de_progress_deadlines",
+            "_recovery_watchdog_s",
+            "_de_progress_watchdog_s",
+            "_close_retry_backoff_s",
+            "_max_held_recovery_blocks",
+            "_max_recovery_records",
         }
         self.assertEqual(
             set(vars(scheduler)), set(vars(parent_scheduler)) | {"dual_path_cfg"} | dual_path_scheduler_fields
@@ -704,6 +729,9 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_pending_reverse_done_wire_ids",
                 "_pending_reverse_failed_wire_ids",
                 "_consumed_reverse_terminal_wire_ids",
+                "_sender_job_facts_lock",
+                "_completed_sender_jobs",
+                "_failed_sender_jobs",
             },
         )
 
@@ -1492,7 +1520,14 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
         # path class. Any new method must update this guard together with its
         # owning Task spec.
         expected_methods = {
-            "DualPathConnector": {"__init__", "get_finished", "shutdown"},
+            "DualPathConnector": {
+                "__init__",
+                "get_finished",
+                "bind_gpu_block_pool",
+                "update_connector_output",
+                "build_connector_worker_meta",
+                "shutdown",
+            },
             "DualPathConnectorScheduler": {
                 "__init__",
                 "_is_dual_path_decode_admission",
@@ -1515,6 +1550,25 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_is_identical_duplicate_admission",
                 "_register_pending_decode_decision",
                 "_release_scheduler_request_state",
+                "_may_install_forward_plan",
+                "_ensure_reverse_destination_hold",
+                "_delay_free_for_connector",
+                "_resume_delivered_prefill_decision",
+                "_initiate_reverse_attempt_close",
+                "_submit_reverse_attempt_close",
+                "_reconcile_reverse_attempt_closes",
+                "_check_hold_budget",
+                "_deliver_prefill_decision",
+                "_request_for_failed_job",
+                "_sweep_prefill_recovery_watchdogs",
+                "_sweep_decode_progress_watchdogs",
+                "_recovery_invalid_block_ids",
+                "_aggregate_worker_job_facts",
+                "_run_job_close_action",
+                "_close_reverse_completion_job",
+                "_is_reverse_send_complete",
+                "bind_gpu_block_pool",
+                "update_connector_output",
                 "get_num_new_matched_tokens",
                 "update_state_after_alloc",
                 "build_connector_meta",
@@ -1546,6 +1600,9 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "get_finished",
                 "get_block_ids_with_load_errors",
                 "send_done_send_signal",
+                "build_connector_worker_meta",
+                "_record_sender_job",
+                "_retire_completed_prior_attempts",
                 "shutdown",
             },
         }

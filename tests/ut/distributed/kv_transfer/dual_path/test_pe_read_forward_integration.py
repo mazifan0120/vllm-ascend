@@ -115,6 +115,7 @@ def _make_pe_request(message: dict) -> SimpleNamespace:
         num_tokens=_PROMPT_TOKENS,
         num_prompt_tokens=_PROMPT_TOKENS,
         num_computed_tokens=0,
+        num_preemptions=0,
         max_tokens=8,
         prompt_token_ids=prompt_token_ids,
         prompt_embeds=None,

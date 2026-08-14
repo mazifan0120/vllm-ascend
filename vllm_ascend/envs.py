@@ -113,6 +113,39 @@ env_variables: dict[str, Callable[[], Any]] = {
     # DualPath Decode decision timeout in integer seconds. The default is 60,
     # the valid range is greater than zero, and this value is not sensitive.
     "VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT": lambda: int(os.getenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", "60")),
+    # DualPath PE Forward-recovery and Reverse-attempt close watchdog in
+    # integer seconds: bounds how long a fenced recovery or an unresolved
+    # close may make no progress before the request is failed. Default 30;
+    # valid range is greater than zero; not sensitive. Tunable per spec
+    # section 11 — the default requires NPU workload measurement.
+    "VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S": lambda: int(
+        os.getenv("VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S", "30")
+    ),
+    # DualPath DE Store/Forward/Reverse progress watchdog in integer seconds:
+    # bounds a committed DE_READ admission whose reverse-send job has not
+    # closed. Default 60; valid range is greater than zero; not sensitive.
+    # Tunable per spec section 11 — the default requires NPU measurement.
+    "VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S": lambda: int(
+        os.getenv("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", "60")
+    ),
+    # Backoff in integer seconds between identical CloseReverseAttempt retries
+    # after a NOT_SAFE reply. Default 1; valid range is greater than zero; not
+    # sensitive. Tunable per spec section 11.
+    "VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S": lambda: int(
+        os.getenv("VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S", "1")
+    ),
+    # Maximum DualPath recovery blocks held concurrently across all requests;
+    # new uncommitted admissions are rejected before pinning when the budget
+    # would be exceeded. Committed holds are never evicted. Default 1024;
+    # valid range is greater than zero; not sensitive.
+    "VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS": lambda: int(
+        os.getenv("VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS", "1024")
+    ),
+    # Maximum concurrent DualPath recovery records (unreleased holds plus open
+    # jobs). Default 256; valid range is greater than zero; not sensitive.
+    "VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS": lambda: int(
+        os.getenv("VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS", "256")
+    ),
 }
 
 # end-env-vars-definition

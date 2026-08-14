@@ -16,6 +16,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_forward_receive_binding imp
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     DECODE_REQUEST_ID,
+    REVERSE_ATTEMPT_KEY,
     WIRE_REQUEST_ID,
     _make_prefill_worker,
     _make_reverse_plan,
@@ -28,7 +29,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorScheduler
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import DualPathConnectorMetadata
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import PathKind
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import PathKind, ReverseAttemptKey
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorWorker,
     get_external_request_id,
@@ -110,7 +111,7 @@ def test_reverse_plan_install_rejects_wire_and_split_boundary_mismatch() -> None
 def test_decode_send_callback_records_failed_wins_and_always_delegates_parent_signal() -> None:
     worker = _make_worker()
     worker.start_load_kv(_make_split_metadata(include_store=False))
-    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
     req_meta = MagicMock()
 
     with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal") as parent_signal:
@@ -119,7 +120,7 @@ def test_decode_send_callback_records_failed_wins_and_always_delegates_parent_si
         worker.send_done_send_signal(DECODE_REQUEST_ID, req_meta, 0, True)
         worker.send_done_send_signal("unknown-request", req_meta, 0, False)
 
-    assert worker._pending_local_reverse_terminals == {DECODE_REQUEST_ID: False}
+    assert worker._pending_local_reverse_terminals == {REVERSE_ATTEMPT_KEY: False}
     assert parent_signal.call_count == 4
 
 
@@ -136,10 +137,11 @@ def test_reverse_done_before_binding_is_retained_and_reconciled() -> None:
     metadata.reverse_receive_bindings.append(binding)
     worker.start_load_kv(metadata)
 
-    assert worker.get_finished(set(), metadata) == (set(), {binding.prefill_request_id})
+    assert worker.get_finished(set(), metadata) == (set(), set())
+    assert worker.build_connector_worker_meta().completed_jobs == {binding.reverse_completion_job_id: 1}
     assert worker.get_finished(set(), metadata) == (set(), set())
     assert worker._pending_reverse_done_wire_ids == set()
-    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: True}
+    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: REVERSE_ATTEMPT_KEY}
 
 
 def test_reverse_failed_before_binding_is_retained_and_reconciled() -> None:
@@ -155,12 +157,13 @@ def test_reverse_failed_before_binding_is_retained_and_reconciled() -> None:
     metadata.reverse_receive_bindings.append(binding)
     worker.start_load_kv(metadata)
 
-    assert worker.get_finished(set(), metadata) == (set(), {binding.prefill_request_id})
+    assert worker.get_finished(set(), metadata) == (set(), set())
+    assert worker.build_connector_worker_meta().failed_jobs == {binding.reverse_completion_job_id: 1}
     assert worker.get_block_ids_with_load_errors() == {71, 80, 81}
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
     assert worker.get_finished(set(), metadata) == (set(), set())
     assert worker.get_block_ids_with_load_errors() == set()
-    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: False}
+    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: REVERSE_ATTEMPT_KEY}
 
 
 def test_unknown_and_ordinary_parent_terminals_are_never_attributed_to_split_requests() -> None:
@@ -184,26 +187,26 @@ def test_identical_duplicate_bindings_are_idempotent_and_conflicts_preserve_firs
 
     worker._install_reverse_receive_binding(binding)
     worker._install_reverse_receive_binding(binding)
-    with pytest.raises(RuntimeError, match="conflicting duplicate Reverse receive binding"):
+    with pytest.raises(RuntimeError, match="duplicate Reverse receive binding"):
         worker._install_reverse_receive_binding(replace(binding, destination_block_ids=((170, 171, 180, 181),)))
-    with pytest.raises(RuntimeError, match="conflicting duplicate Reverse receive binding"):
+    with pytest.raises(RuntimeError, match="duplicate Reverse receive binding"):
         worker._install_reverse_receive_binding(
             _make_reverse_receive_binding(prefill_request_id=f"{WIRE_REQUEST_ID}other-prefill")
         )
 
-    assert worker._reverse_receive_bindings == {binding.prefill_request_id: binding}
-    assert worker._reverse_request_map == {binding.wire_request_id: binding.prefill_request_id}
+    assert worker._reverse_receive_bindings == {REVERSE_ATTEMPT_KEY: binding}
+    assert worker._reverse_request_map == {binding.wire_request_id: REVERSE_ATTEMPT_KEY}
 
     ordinary_owner_worker = _make_prefill_worker()
     ordinary_owner_worker.request_map[binding.wire_request_id] = "ordinary-prefill-request"
-    with pytest.raises(RuntimeError, match="conflicting duplicate Reverse receive binding"):
+    with pytest.raises(RuntimeError, match="duplicate Reverse receive binding"):
         ordinary_owner_worker._install_reverse_receive_binding(binding)
     assert ordinary_owner_worker.request_map == {binding.wire_request_id: "ordinary-prefill-request"}
     assert ordinary_owner_worker._reverse_receive_bindings == {}
 
     consumed_forward_worker = _make_prefill_worker()
     consumed_forward_worker._consumed_forward_terminal_wire_ids[binding.wire_request_id] = "forward-request"
-    with pytest.raises(RuntimeError, match="conflicting duplicate Reverse receive binding"):
+    with pytest.raises(RuntimeError, match="duplicate Reverse receive binding"):
         consumed_forward_worker._install_reverse_receive_binding(binding)
     assert consumed_forward_worker._reverse_receive_bindings == {}
 
@@ -224,7 +227,7 @@ def test_failed_wins_over_duplicate_and_late_done_for_every_source() -> None:
     reverse_metadata = _make_split_metadata(include_store=False, include_reverse=True)
     reverse_worker.start_load_kv(_make_split_metadata(include_store=False))
     reverse_worker._install_reverse_plan(reverse_metadata.reverse_plans[0])
-    reverse_worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
+    reverse_worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
     with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
         reverse_worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, False)
     assert reverse_worker.get_finished(set(), reverse_metadata) == (set(), {DECODE_REQUEST_ID})
@@ -257,7 +260,7 @@ def test_each_failure_publishes_exactly_one_local_terminal(source: str) -> None:
         worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = {20}
     elif source == "reverse":
         tracker = worker._split_trackers[DECODE_REQUEST_ID]
-        tracker.reverse_submitted = True
+        tracker.reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
         with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
             worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, False)
             worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, False)
@@ -325,7 +328,8 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     decode_worker.start_load_kv(decode_metadata)
     plan = _make_reverse_plan()
     decode_worker._install_reverse_plan(plan)
-    decode_worker._pending_local_reverse_terminals[DECODE_REQUEST_ID] = True
+    decode_worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
+    decode_worker._pending_local_reverse_terminals[REVERSE_ATTEMPT_KEY] = True
     decode_worker._pending_forward_done_wire_ids.add(WIRE_REQUEST_ID)
     decode_worker._consumed_forward_terminal_wire_ids[WIRE_REQUEST_ID] = DECODE_REQUEST_ID
 
@@ -347,7 +351,7 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     reverse_binding = _make_reverse_receive_binding()
     prefill_worker._install_reverse_receive_binding(reverse_binding)
     prefill_worker._pending_reverse_done_wire_ids.add(reverse_binding.wire_request_id)
-    prefill_worker._consumed_reverse_terminal_wire_ids[reverse_binding.wire_request_id] = True
+    prefill_worker._consumed_reverse_terminal_wire_ids[reverse_binding.wire_request_id] = REVERSE_ATTEMPT_KEY
     unrelated_prefill_id = "unrelated-prefill-local"
     unrelated_reverse_binding = replace(
         reverse_binding,
@@ -363,10 +367,12 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
         set(),
     )
 
-    assert DECODE_REQUEST_ID not in decode_worker._split_trackers
+    # Section-5 removal rule: the local reverse terminal is drained during the
+    # first finish pass, so the tracker is removed on the next one.
+    assert DECODE_REQUEST_ID in decode_worker._split_trackers
     assert DECODE_REQUEST_ID not in decode_worker._forward_receive_bindings
     assert WIRE_REQUEST_ID not in decode_worker.request_map
-    assert DECODE_REQUEST_ID not in decode_worker._pending_local_reverse_terminals
+    assert REVERSE_ATTEMPT_KEY not in decode_worker._pending_local_reverse_terminals
     assert WIRE_REQUEST_ID not in decode_worker._pending_forward_done_wire_ids
     assert WIRE_REQUEST_ID not in decode_worker._consumed_forward_terminal_wire_ids
     assert unrelated_decode_id in decode_worker._split_trackers
@@ -374,12 +380,20 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
     assert unrelated_decode_id in decode_worker._forward_receive_bindings
     assert decode_worker.request_map[unrelated_wire_id] == unrelated_decode_id
 
-    assert reverse_binding.prefill_request_id not in prefill_worker._reverse_receive_bindings
+    assert REVERSE_ATTEMPT_KEY not in prefill_worker._reverse_receive_bindings
     assert reverse_binding.wire_request_id not in prefill_worker._reverse_request_map
     assert reverse_binding.wire_request_id not in prefill_worker._pending_reverse_done_wire_ids
     assert reverse_binding.wire_request_id not in prefill_worker._consumed_reverse_terminal_wire_ids
-    assert prefill_worker._reverse_receive_bindings[unrelated_prefill_id] == unrelated_reverse_binding
-    assert prefill_worker._reverse_request_map[unrelated_reverse_binding.wire_request_id] == unrelated_prefill_id
+    unrelated_attempt_key = ReverseAttemptKey(unrelated_reverse_binding.request_key, 0)
+    assert prefill_worker._reverse_receive_bindings[unrelated_attempt_key] == unrelated_reverse_binding
+    assert prefill_worker._reverse_request_map[unrelated_reverse_binding.wire_request_id] == unrelated_attempt_key
+
+    assert decode_worker.get_finished({DECODE_REQUEST_ID}, DualPathConnectorMetadata()) == (set(), set())
+    assert prefill_worker.get_finished({reverse_binding.prefill_request_id}, DualPathConnectorMetadata()) == (
+        set(),
+        set(),
+    )
+    assert DECODE_REQUEST_ID not in decode_worker._split_trackers
 
     decode_state = (
         dict(decode_worker._split_trackers),
@@ -439,9 +453,10 @@ def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -
 def test_release_prevents_late_reverse_callback_from_recreating_terminal_state() -> None:
     worker = _make_worker()
     worker.start_load_kv(_make_split_metadata(include_store=False))
-    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
-    worker._pending_local_reverse_terminals[DECODE_REQUEST_ID] = True
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
+    worker._pending_local_reverse_terminals[REVERSE_ATTEMPT_KEY] = True
 
+    worker._drain_local_reverse_terminals()
     worker._release_split_request_state({DECODE_REQUEST_ID})
     with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
         worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=False)
@@ -452,8 +467,8 @@ def test_release_prevents_late_reverse_callback_from_recreating_terminal_state()
 def test_shutdown_prevents_late_reverse_callback_from_recreating_terminal_state() -> None:
     worker = _make_worker()
     worker.start_load_kv(_make_split_metadata(include_store=False))
-    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
-    worker._pending_local_reverse_terminals[DECODE_REQUEST_ID] = True
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
+    worker._pending_local_reverse_terminals[REVERSE_ATTEMPT_KEY] = True
 
     with patch.object(MooncakeLayerwiseConnectorWorker, "shutdown", create=True):
         worker.shutdown()
@@ -467,7 +482,7 @@ def test_shutdown_prevents_late_reverse_callback_from_recreating_terminal_state(
 def test_reverse_callback_and_cleanup_share_one_lock_for_tracker_and_terminal_state(cleanup: str) -> None:
     worker = _make_worker()
     worker.start_load_kv(_make_split_metadata(include_store=False))
-    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted = True
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
     recording_lock = _RecordingLock()
     tracked_trackers = _LockObservedDict(recording_lock, worker._split_trackers)
     tracked_terminals = _LockObservedDict(recording_lock, worker._pending_local_reverse_terminals)
@@ -477,6 +492,7 @@ def test_reverse_callback_and_cleanup_share_one_lock_for_tracker_and_terminal_st
 
     with patch.object(MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
         worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=False)
+    worker._drain_local_reverse_terminals()
     if cleanup == "release":
         worker._release_split_request_state({DECODE_REQUEST_ID})
     else:
@@ -534,7 +550,8 @@ def test_production_de_read_result_creates_plan_binding_store_without_scheduler_
 
         assert len(metadata.forward_receive_bindings) == 1
         assert metadata.forward_receive_bindings[0].path is PathKind.DE_READ
-        assert metadata.reverse_plans == [decision.reverse_plan]
+        reverse_send_job_id = scheduler._reverse_send_job_ids[ReverseAttemptKey(state.request_key, 0)]
+        assert metadata.reverse_plans == [replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)]
         assert metadata.reverse_receive_bindings == []
         assert metadata.decode_store_metadata is store_metadata
         assert scheduler._reqs_need_recv == {}
@@ -567,6 +584,25 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_is_identical_duplicate_admission",
         "_register_pending_decode_decision",
         "_release_scheduler_request_state",
+        "_may_install_forward_plan",
+        "_ensure_reverse_destination_hold",
+        "_delay_free_for_connector",
+        "_resume_delivered_prefill_decision",
+        "_initiate_reverse_attempt_close",
+        "_submit_reverse_attempt_close",
+        "_reconcile_reverse_attempt_closes",
+        "_check_hold_budget",
+        "_deliver_prefill_decision",
+        "_request_for_failed_job",
+        "_sweep_prefill_recovery_watchdogs",
+        "_sweep_decode_progress_watchdogs",
+        "_recovery_invalid_block_ids",
+        "_aggregate_worker_job_facts",
+        "_run_job_close_action",
+        "_close_reverse_completion_job",
+        "_is_reverse_send_complete",
+        "bind_gpu_block_pool",
+        "update_connector_output",
         "get_num_new_matched_tokens",
         "update_state_after_alloc",
         "build_connector_meta",

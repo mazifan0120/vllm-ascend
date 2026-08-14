@@ -7,9 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
-from tests.ut.distributed.kv_transfer.dual_path.conftest import init_dual_path_worker_state
+from tests.ut.distributed.kv_transfer.dual_path.conftest import (
+    init_dual_path_worker_state,
+    make_worker_metadata,
+)
 from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     _make_prefill_worker,
 )
@@ -28,7 +32,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionRequest,
     PathDecisionResult,
     PathKind,
+    ReverseAttemptKey,
     RoundRobinPathPolicy,
+    reverse_wire_id,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DecodeControlEndpoint,
@@ -37,7 +43,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorScheduler,
-    get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     LoadSpec,
@@ -60,11 +65,13 @@ def _make_vllm_config(*, kv_role: str = "kv_consumer", failure_policy: str = "fa
     config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {"tls_config": {}}.get(
         key, default
     )
-    config.parallel_config.data_parallel_rank = 2
-    config.parallel_config.data_parallel_size = 4
+    config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_size = 1
     config.parallel_config.tensor_parallel_size = 2
+    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.world_size = 2
     config.parallel_config.prefill_context_parallel_size = 1
-    config.parallel_config.decode_context_parallel_size = 3
+    config.parallel_config.decode_context_parallel_size = 1
     config.cache_config.block_size = 16
     config.scheduler_config.disable_hybrid_kv_cache_manager = True
     return config
@@ -90,6 +97,7 @@ def _make_request(
     return SimpleNamespace(
         request_id=request_id,
         num_tokens=49,
+        num_preemptions=0,
         prompt_token_ids=list(range(49)),
         kv_transfer_params=params or {"do_remote_prefill": True, "metaserver": "http://proxy.example/v1/kv"},
     )
@@ -194,10 +202,12 @@ def _admit(scheduler, params: dict | None = None):
     return _admit_request(scheduler, request, (41, 42, 43, 44))
 
 
-def _result(request_id: str = "request-local-7") -> PathDecisionResult:
+def _result(request_id: str = "request-local-7", reverse_attempt_id: int = 0) -> PathDecisionResult:
     return PathDecisionResult(
         request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, request_id),
         path=PathKind.DE_READ,
+        reverse_attempt_id=reverse_attempt_id,
+        prefill_local_tokens=16,
     )
 
 
@@ -207,7 +217,9 @@ def _decision(result: PathDecisionResult | None = None) -> PathDecision:
         result=retained_result,
         reverse_plan=ReversePlan(
             request_key=retained_result.request_key,
-            wire_request_id=get_external_request_id(retained_result.request_key.decode_request_id),
+            wire_request_id=reverse_wire_id(
+                ReverseAttemptKey(retained_result.request_key, retained_result.reverse_attempt_id)
+            ),
             token_start=16,
             token_end=32,
             source_block_ids=((41, 42, 43, 44),),
@@ -216,9 +228,12 @@ def _decision(result: PathDecisionResult | None = None) -> PathDecision:
             remote_host="198.51.100.10",
             remote_port=6000,
             remote_block_sizes=(16,),
-            remote_tp_size=1,
+            remote_tp_size=2,
             remote_pcp_size=1,
             remote_dcp_size=1,
+            reverse_attempt_id=retained_result.reverse_attempt_id,
+            prefill_local_tokens=16,
+            reverse_send_job_id=None,
         ),
     )
 
@@ -300,6 +315,7 @@ def _make_prefill_request(request_id: str, params: dict) -> SimpleNamespace:
         num_tokens=len(prompt_token_ids),
         num_prompt_tokens=len(prompt_token_ids),
         num_computed_tokens=0,
+        num_preemptions=0,
         max_tokens=16,
         prompt_token_ids=prompt_token_ids,
         prompt_embeds=None,
@@ -314,9 +330,11 @@ def _bind_prefill(scheduler, request: SimpleNamespace) -> MagicMock:
         {
             "remote_block_ids": [[4, 5, 6, 7]],
             "remote_cached_tokens": decision_request["decode_local_tokens"],
-            "remote_tp_size": 1,
+            "remote_tp_size": 2,
             "remote_pcp_size": 1,
             "remote_dcp_size": 1,
+            "remote_pp_size": 1,
+            "remote_dp_size": 1,
         }
     )
     blocks = MagicMock(name=f"{request.request_id}_blocks")
@@ -462,10 +480,12 @@ class TestDecodeAdmissionControl:
             "remote_block_size": [16],
             "remote_engine_id": "decode-engine",
             "remote_host": "198.51.100.20",
-            "remote_port": 5004,
+            "remote_port": 5000,
             "remote_tp_size": 2,
             "remote_pcp_size": 1,
-            "remote_dcp_size": 3,
+            "remote_dcp_size": 1,
+            "remote_pp_size": 1,
+            "remote_dp_size": 1,
             "remote_cached_tokens": 16,
             "dual_path": _expected_dual_path_payload(),
         }
@@ -766,10 +786,10 @@ class TestPrefillDecisionHook:
         assert scheduler._prefill_local_tokens[request.request_id] == 16
         assert scheduler._prefill_path_results[request.request_id].path is PathKind.DE_READ
 
-    def test_delivered_conflicting_facts_converge_without_redecide(self, scheduler_factory, task04_seams):
+    def test_delivered_conflicting_facts_resume_with_frozen_path(self, scheduler_factory, task04_seams):
         # Once the decision has been delivered, re-deciding would fork the
-        # protocol (e.g. preemption resume after delivery): converge locally by
-        # marking the request invalid and deferring to the parent result.
+        # protocol (e.g. preemption resume after delivery): the resume branch
+        # reuses the frozen PathKind and never touches the invalid set.
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -787,10 +807,10 @@ class TestPrefillDecisionHook:
             second = scheduler.get_num_new_matched_tokens(request, 16)
 
         assert first == (0, False)
-        assert second == parent_result
+        assert second == (0, False)
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_invalid_request_ids == set()
         assert scheduler._prefill_path_results[request.request_id].path is PathKind.PE_READ
         assert list(scheduler._prefill_forward_plans) == [request.request_id]
 
@@ -908,8 +928,10 @@ class TestDecodeResultConsumption:
         with patch.object(scheduler_module, "time", clock):
             metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-        # Then
-        assert events == ["result", "clock"]
+        # Then: the decision is taken before any deadline read, so the
+        # boundary-time timeout never fires for it.
+        assert events[0] == "result"
+        assert set(events[1:]) == {"clock"}
         assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
         assert metadata.control_failures == []
         task04_seams.decode_coordinator.unregister.assert_not_called()
@@ -1104,15 +1126,22 @@ class TestCleanupAndShutdown:
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
-        decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        commit_metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
         assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
         task04_seams.decode_coordinator.unregister.assert_not_called()
 
-        # When
+        # When: the reverse-send job is still open, so the finish is delayed
+        # (engine progress) until the job closes.
         result = decode_scheduler.request_finished(request, [41, 42, 43, 44])
 
         # Then
-        assert result == (False, None)
+        assert result == (True, None)
+        reverse_send_job_id = commit_metadata.reverse_plans[0].reverse_send_job_id
+        decode_scheduler.update_connector_output(
+            KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={reverse_send_job_id: 2}))
+        )
+        result_after = decode_scheduler.request_finished(request, [41, 42, 43, 44])
+        assert result_after == (False, None)
         assert request.request_id not in decode_scheduler._decode_decision_states
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
@@ -1312,7 +1341,12 @@ class TestCleanupAndShutdown:
         scheduler.request_finished(request, [10, 11, 12, 13])
         assert worker.get_finished({request.request_id}, metadata) == (set(), set())
         assert worker._control_failed_recving == set()
-        assert worker._reverse_receive_bindings == {}
+        # §5 removal rule: the binding's terminal was never consumed, so the
+        # attempt-keyed binding is retained past the request finish.
+        installed_binding = binding_metadata.reverse_receive_bindings[0]
+        assert set(worker._reverse_receive_bindings) == {
+            ReverseAttemptKey(installed_binding.request_key, installed_binding.reverse_attempt_id)
+        }
         assert scheduler._prefill_delivery_futures == {}
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._prefill_control_failures == {}
@@ -1417,7 +1451,11 @@ class TestCleanupAndShutdown:
             _decision(_result(committed_request.request_id))
         ]
         with patch.object(scheduler_module.time, "monotonic", return_value=0.0):
-            decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
+            commit_metadata = decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
+        reverse_send_job_id = commit_metadata.reverse_plans[0].reverse_send_job_id
+        decode_scheduler.update_connector_output(
+            KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={reverse_send_job_id: 2}))
+        )
 
         # When
         decode_scheduler.request_finished(cancelled_request, [61, 62, 63, 64])

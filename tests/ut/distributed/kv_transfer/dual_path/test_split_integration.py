@@ -108,6 +108,15 @@ class SplitHarness:
             {lifecycle.WIRE_REQUEST_ID} if failed else set()
         )
 
+    @staticmethod
+    def inject_reverse_receive(worker: DualPathConnectorWorker, *, failed: bool = False) -> None:
+        worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = (
+            set() if failed else {lifecycle.REVERSE_WIRE_REQUEST_ID}
+        )
+        worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = (
+            {lifecycle.REVERSE_WIRE_REQUEST_ID} if failed else set()
+        )
+
     def poll_de(self, metadata: DualPathConnectorMetadata) -> tuple[set[str], set[str]]:
         result = self.de_worker.get_finished(set(), metadata)
         self._clear_receive(self.de_worker)
@@ -159,7 +168,7 @@ class SplitHarness:
                 0,
                 trans_flag=not failed,
             )
-        self.inject_receive(self.pe_worker, failed=failed)
+        self.inject_reverse_receive(self.pe_worker, failed=failed)
         return self.poll_de(de_metadata), self.poll_pe(pe_metadata)
 
     def run_forward(self) -> MooncakeLayerwiseConnectorMetadata:
@@ -211,7 +220,9 @@ def test_injected_split_success_with_non_empty_store_and_reverse() -> None:
 
     de_reverse, pe_reverse = harness.finish_reverse(de_metadata, pe_metadata)
     assert de_reverse == (set(), set())
-    assert pe_reverse == (set(), {PREFILL_REQUEST_ID})
+    assert pe_reverse == (set(), set())
+    pe_jobs = harness.pe_worker.build_connector_worker_meta()
+    assert pe_jobs.completed_jobs == {pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id: 1}
     forward_metadata = harness.run_forward()
     _assert_forward_tasks(harness, forward_metadata)
 
@@ -230,7 +241,7 @@ def test_injected_split_success_with_empty_store() -> None:
     assert harness.poll_pe(pe_metadata) == (set(), set())
     assert harness.finish_reverse(de_metadata, pe_metadata) == (
         (set(), set()),
-        (set(), {PREFILL_REQUEST_ID}),
+        (set(), set()),
     )
     _assert_forward_tasks(harness, harness.run_forward())
     harness.inject_receive(harness.de_worker)
@@ -281,13 +292,15 @@ def test_injected_reverse_failure_end_to_end() -> None:
 
     de_failed, pe_failed = harness.finish_reverse(de_metadata, pe_metadata, failed=True)
     assert de_failed == (set(), {lifecycle.DECODE_REQUEST_ID})
-    assert pe_failed == (set(), {PREFILL_REQUEST_ID})
+    assert pe_failed == (set(), set())
+    pe_jobs = harness.pe_worker.build_connector_worker_meta()
+    assert pe_jobs.failed_jobs == {pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id: 1}
     assert harness.de_worker.get_block_ids_with_load_errors() == FORWARD_DE_BLOCKS
     assert harness.pe_worker.get_block_ids_with_load_errors() == REVERSE_PE_BLOCKS
     assert harness.pe_worker.kv_send_layer_thread.send_queue.put.call_count == 0
 
     harness.inject_receive(harness.de_worker)
-    harness.inject_receive(harness.pe_worker)
+    harness.inject_reverse_receive(harness.pe_worker)
     assert harness.poll_de(de_metadata) == (set(), set())
     assert harness.poll_pe(pe_metadata) == (set(), set())
 
@@ -300,7 +313,7 @@ def test_injected_forward_failure_end_to_end() -> None:
     assert harness.finish_store(de_metadata) == (set(), set())
     assert harness.finish_reverse(de_metadata, pe_metadata) == (
         (set(), set()),
-        (set(), {PREFILL_REQUEST_ID}),
+        (set(), set()),
     )
     _assert_forward_tasks(harness, harness.run_forward())
 
@@ -316,7 +329,7 @@ def test_injected_early_terminal_race(failed: bool) -> None:
     harness = SplitHarness.make()
     empty_metadata = DualPathConnectorMetadata()
     harness.inject_receive(harness.de_worker, failed=failed)
-    harness.inject_receive(harness.pe_worker, failed=failed)
+    harness.inject_reverse_receive(harness.pe_worker, failed=failed)
     assert harness.poll_de(empty_metadata) == (set(), set())
     assert harness.poll_pe(empty_metadata) == (set(), set())
 
@@ -330,7 +343,13 @@ def test_injected_early_terminal_race(failed: bool) -> None:
         )
     expected_de_invalid = FORWARD_DE_BLOCKS if failed else set()
     expected_pe_invalid = REVERSE_PE_BLOCKS if failed else set()
-    assert harness.poll_pe(pe_metadata) == (set(), {PREFILL_REQUEST_ID})
+    assert harness.poll_pe(pe_metadata) == (set(), set())
+    pe_jobs = harness.pe_worker.build_connector_worker_meta()
+    pe_completion_job_id = pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id
+    if failed:
+        assert pe_jobs.failed_jobs == {pe_completion_job_id: 1}
+    else:
+        assert pe_jobs.completed_jobs == {pe_completion_job_id: 1}
     assert harness.poll_de(de_metadata) == (set(), {lifecycle.DECODE_REQUEST_ID})
     assert harness.de_worker.get_block_ids_with_load_errors() == expected_de_invalid
     assert harness.pe_worker.get_block_ids_with_load_errors() == expected_pe_invalid
@@ -363,8 +382,10 @@ def test_injected_duplicate_and_replay_safety() -> None:
         reverse_req_meta = harness._reverse_send_metadata().requests[lifecycle.DECODE_REQUEST_ID]
         harness.de_worker.send_done_send_signal(lifecycle.DECODE_REQUEST_ID, reverse_req_meta, 0, True)
         harness.de_worker.send_done_send_signal(lifecycle.DECODE_REQUEST_ID, reverse_req_meta, 0, True)
-    harness.inject_receive(harness.pe_worker)
-    assert harness.poll_pe(pe_metadata) == (set(), {PREFILL_REQUEST_ID})
+    harness.inject_reverse_receive(harness.pe_worker)
+    assert harness.poll_pe(pe_metadata) == (set(), set())
+    pe_jobs = harness.pe_worker.build_connector_worker_meta()
+    assert pe_jobs.completed_jobs == {pe_binding.reverse_completion_job_id: 1}
     assert harness.poll_pe(pe_metadata) == (set(), set())
     assert harness.poll_de(de_metadata) == (set(), set())
 
@@ -381,7 +402,7 @@ def test_after_reverse_done_prefill_executes_inherited_layerwise_forward() -> No
     assert harness.poll_pe(pe_metadata) == (set(), set())
     assert harness.finish_reverse(de_metadata, pe_metadata) == (
         (set(), set()),
-        (set(), {PREFILL_REQUEST_ID}),
+        (set(), set()),
     )
 
     forward_metadata = harness.run_forward()

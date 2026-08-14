@@ -77,6 +77,8 @@ def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None
         result=PathDecisionResult(
             request_key=DualPathRequestKey("decode-engine:0:boot", "request-late"),
             path=PathKind.DE_READ,
+            reverse_attempt_id=0,
+            prefill_local_tokens=0,
         ),
         reverse_plan=None,
     )

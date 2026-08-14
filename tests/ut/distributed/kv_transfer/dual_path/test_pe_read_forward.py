@@ -61,8 +61,10 @@ def _make_vllm_config() -> MagicMock:
     config.parallel_config.data_parallel_rank = 0
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.tensor_parallel_size = 1
+    config.parallel_config.pipeline_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
     config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.world_size = 1
     config.cache_config.block_size = _BLOCK_SIZE
     config.scheduler_config.disable_hybrid_kv_cache_manager = True
     return config
@@ -152,6 +154,8 @@ def _make_request(
         "remote_tp_size": 1,
         "remote_pcp_size": 1,
         "remote_dcp_size": 1,
+        "remote_pp_size": 1,
+        "remote_dp_size": 1,
         "dual_path": _decision_payload(
             target_tokens=target_tokens,
             local_tokens=local_tokens,
@@ -163,6 +167,7 @@ def _make_request(
         num_tokens=prompt_tokens,
         num_prompt_tokens=prompt_tokens,
         num_computed_tokens=0,
+        num_preemptions=0,
         max_tokens=16,
         prompt_token_ids=prompt_token_ids,
         prompt_embeds=None,
@@ -378,6 +383,36 @@ def test_conflicting_duplicate_alloc_fails_locally_preserving_first_plan(schedul
     assert scheduler._prefill_forward_plans[request.request_id] is first_plan
     assert request.request_id in scheduler._prefill_invalid_request_ids
     assert request.request_id not in scheduler._prefill_path_results
+
+
+def test_conflicting_forward_plan_raises_within_epoch_and_replaces_after_preemption(pe_scheduler_factory):
+    # Two disagreeing allocations within one scheduling epoch are a protocol
+    # violation; after a preemption the same reallocation is the legal replay.
+    from tests.ut.distributed.kv_transfer.dual_path.conftest import make_block_pool
+
+    pool = make_block_pool()
+    scheduler, _ = pe_scheduler_factory(PathKind.PE_READ, pool=pool)
+    request = _make_request()
+    _decide(scheduler, request)
+    scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
+    first_plan = scheduler._prefill_forward_plans[request.request_id]
+
+    # Same epoch: the conflicting reallocation raises and preserves the plan.
+    scheduler.update_state_after_alloc(request, _blocks(([13, 14, 15],)), 0)
+    assert scheduler._prefill_forward_plans[request.request_id] is first_plan
+    assert request.request_id in scheduler._prefill_invalid_request_ids
+
+    # After a preemption a fresh request replaces its plan legally.
+    resumed_request = _make_request(request_id="prefill-request-resumed")
+    _decide(scheduler, resumed_request)
+    scheduler.update_state_after_alloc(resumed_request, _blocks(([10, 11, 12],)), 0)
+    first_resumed_plan = scheduler._prefill_forward_plans[resumed_request.request_id]
+
+    resumed_request.num_preemptions += 1
+    scheduler.update_state_after_alloc(resumed_request, _blocks(([13, 14, 15],)), 0)
+    replaced_plan = scheduler._prefill_forward_plans[resumed_request.request_id]
+    assert replaced_plan is not first_resumed_plan
+    assert replaced_plan.source_block_ids == ((13, 14, 15),)
 
 
 def test_post_install_validation_failure_preserves_first_plan_and_send_state(scheduler_factory):
@@ -673,9 +708,7 @@ def test_activation_fact_mismatch_fails_with_local_control_failure(scheduler_fac
     elif mismatch == "topology":
         request.kv_transfer_params["remote_tp_size"] = 0
     wire_context = (
-        patch.object(scheduler_module, "get_external_request_id", return_value="")
-        if mismatch == "wire-id"
-        else nullcontext()
+        patch.object(scheduler_module, "reverse_wire_id", return_value="") if mismatch == "wire-id" else nullcontext()
     )
 
     with wire_context:
@@ -720,6 +753,9 @@ def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
         destination_block_ids=((70, 71, 72, 73),),
         token_start=16,
         token_end=32,
+        reverse_attempt_id=0,
+        prefill_local_tokens=16,
+        reverse_completion_job_id=0,
     )
     failure = DualPathControlFailureMetadata(
         request_id="prefill-failed",

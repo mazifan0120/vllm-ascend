@@ -21,12 +21,15 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import 
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
+    DualPathWorkerMetadata,
     ForwardReceiveBinding,
     ReversePlan,
     ReverseReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
+    ReverseAttemptKey,
+    reverse_wire_id,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
@@ -63,7 +66,7 @@ class _SplitTracker:
     store_destination_slice: tuple[int, ...]
     forward_destination_slice: tuple[int, ...]
     reverse_plan: ReversePlan | None
-    reverse_submitted: bool
+    reverse_submitted_attempt: ReverseAttemptKey | None
     store_load_failed: bool
     terminal_published: bool
 
@@ -101,17 +104,20 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._accepting_split_requests = True
         self._split_trackers: dict[str, _SplitTracker] = {}
         self._reverse_terminal_lock = threading.Lock()
-        self._pending_local_reverse_terminals: dict[str, bool] = {}
+        self._pending_local_reverse_terminals: dict[ReverseAttemptKey, bool] = {}
         self._control_failed_recving: set[str] = set()
         self._forward_receive_bindings: dict[str, ForwardReceiveBinding] = {}
         self._pending_forward_done_wire_ids: set[str] = set()
         self._pending_forward_failed_wire_ids: set[str] = set()
         self._consumed_forward_terminal_wire_ids: dict[str, str] = {}
-        self._reverse_receive_bindings: dict[str, ReverseReceiveBinding] = {}
-        self._reverse_request_map: dict[str, str] = {}
+        self._reverse_receive_bindings: dict[ReverseAttemptKey, ReverseReceiveBinding] = {}
+        self._reverse_request_map: dict[str, ReverseAttemptKey] = {}
         self._pending_reverse_done_wire_ids: set[str] = set()
         self._pending_reverse_failed_wire_ids: set[str] = set()
-        self._consumed_reverse_terminal_wire_ids: dict[str, bool] = {}
+        self._consumed_reverse_terminal_wire_ids: dict[str, ReverseAttemptKey] = {}
+        self._sender_job_facts_lock = threading.Lock()
+        self._completed_sender_jobs: dict[int, int] = {}
+        self._failed_sender_jobs: dict[int, int] = {}
         if dual_path_cfg.role == "decode":
             self._kvpool_worker_adapter = KVPoolWorkerAdapter(vllm_config, kv_cache_config)
         logger.info(
@@ -190,49 +196,61 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     def _install_reverse_receive_binding(self, binding: ReverseReceiveBinding) -> None:
         if not self._accepting_split_requests:
             return
-        existing_binding = self._reverse_receive_bindings.get(binding.prefill_request_id)
-        retained_wire_binding = next(
-            (
-                retained
-                for retained in self._reverse_receive_bindings.values()
-                if retained.wire_request_id == binding.wire_request_id
-            ),
-            None,
-        )
-        if binding.wire_request_id in self._consumed_reverse_terminal_wire_ids:
-            if retained_wire_binding == binding:
+        attempt_key = ReverseAttemptKey(binding.request_key, binding.reverse_attempt_id)
+        existing_binding = self._reverse_receive_bindings.get(attempt_key)
+        consumed_attempt_key = self._consumed_reverse_terminal_wire_ids.get(binding.wire_request_id)
+        if consumed_attempt_key is not None:
+            if consumed_attempt_key == attempt_key and existing_binding == binding:
                 return
             raise RuntimeError(
                 f"DualPath wire request {binding.wire_request_id} already belongs to a consumed Reverse terminal; "
                 "this is a bug and the engine cannot continue safely"
             )
-        existing_prefill_request_id = self._reverse_request_map.get(binding.wire_request_id)
+        existing_attempt_key = self._reverse_request_map.get(binding.wire_request_id)
         existing_parent_request_id = self.request_map.get(binding.wire_request_id)
         conflicts_with_retained_binding = any(
             retained != binding
-            and (retained.request_key == binding.request_key or retained.wire_request_id == binding.wire_request_id)
+            and (
+                retained.wire_request_id == binding.wire_request_id
+                or ReverseAttemptKey(retained.request_key, retained.reverse_attempt_id) == attempt_key
+            )
+            for retained in self._reverse_receive_bindings.values()
+        )
+        stale_attempt = any(
+            retained.request_key == binding.request_key and retained.reverse_attempt_id > binding.reverse_attempt_id
             for retained in self._reverse_receive_bindings.values()
         )
         if (
             (existing_binding is not None and existing_binding != binding)
-            or (existing_prefill_request_id is not None and existing_prefill_request_id != binding.prefill_request_id)
+            or (existing_attempt_key is not None and existing_attempt_key != attempt_key)
             or existing_parent_request_id is not None
             or binding.wire_request_id in self._consumed_forward_terminal_wire_ids
             or conflicts_with_retained_binding
+            or stale_attempt
         ):
             raise RuntimeError(
-                f"DualPath Prefill request {binding.prefill_request_id} got a conflicting duplicate "
+                f"DualPath Prefill request {binding.prefill_request_id} got a conflicting or stale duplicate "
                 "Reverse receive binding; this is a bug and the engine cannot continue safely"
             )
 
-        self._reverse_request_map[binding.wire_request_id] = binding.prefill_request_id
-        self._reverse_receive_bindings[binding.prefill_request_id] = binding
+        self._reverse_request_map[binding.wire_request_id] = attempt_key
+        self._reverse_receive_bindings[attempt_key] = binding
         if binding.wire_request_id in self._pending_forward_done_wire_ids:
             self._pending_forward_done_wire_ids.remove(binding.wire_request_id)
             self._pending_reverse_done_wire_ids.add(binding.wire_request_id)
         if binding.wire_request_id in self._pending_forward_failed_wire_ids:
             self._pending_forward_failed_wire_ids.remove(binding.wire_request_id)
             self._pending_reverse_failed_wire_ids.add(binding.wire_request_id)
+        self._retire_completed_prior_attempts(binding.request_key, keep=attempt_key)
+
+    def _retire_completed_prior_attempts(self, request_key, keep: ReverseAttemptKey) -> None:
+        # §5 removal rule: only a completed (terminal-consumed) attempt's
+        # binding retires; its tombstone is retained against terminal replays.
+        for retained_key, retained in list(self._reverse_receive_bindings.items()):
+            if retained_key == keep or retained_key.request_key != request_key:
+                continue
+            if retained.wire_request_id in self._consumed_reverse_terminal_wire_ids:
+                del self._reverse_receive_bindings[retained_key]
 
     def _release_split_request_state(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         finished_wire_ids = self._release_finished_forward_terminals(finished_req_ids)
@@ -240,29 +258,53 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._control_failed_recving.difference_update(finished_req_ids)
         with self._reverse_terminal_lock:
             for request_id in finished_req_ids:
-                self._split_trackers.pop(request_id, None)
-                self._pending_local_reverse_terminals.pop(request_id, None)
+                tracker = self._split_trackers.get(request_id)
+                if tracker is None:
+                    continue
+                if tracker.reverse_phase in (_SplitPhase.SKIPPED, _SplitPhase.DONE):
+                    # §5 removal rule: the tracker and its tombstones are
+                    # removed together once the attempt is complete.
+                    submitted_attempt = tracker.reverse_submitted_attempt
+                    self._split_trackers.pop(request_id, None)
+                    if submitted_attempt is not None:
+                        self._pending_local_reverse_terminals.pop(submitted_attempt, None)
         return finished_wire_ids, finished_reverse_wire_ids
 
     def _release_finished_reverse_terminals(self, finished_req_ids: set[str]) -> set[str]:
         finished_wire_ids: set[str] = set()
         for prefill_request_id in finished_req_ids:
-            binding = self._reverse_receive_bindings.pop(prefill_request_id, None)
-            if binding is None:
-                continue
-            finished_wire_ids.add(binding.wire_request_id)
-            self._reverse_request_map.pop(binding.wire_request_id, None)
-            self._consumed_reverse_terminal_wire_ids.pop(binding.wire_request_id, None)
+            for attempt_key, binding in list(self._reverse_receive_bindings.items()):
+                if binding.prefill_request_id != prefill_request_id:
+                    continue
+                if binding.wire_request_id not in self._consumed_reverse_terminal_wire_ids:
+                    continue
+                del self._reverse_receive_bindings[attempt_key]
+                finished_wire_ids.add(binding.wire_request_id)
+                self._reverse_request_map.pop(binding.wire_request_id, None)
+                self._consumed_reverse_terminal_wire_ids.pop(binding.wire_request_id, None)
         self._pending_reverse_done_wire_ids.difference_update(finished_wire_ids)
         self._pending_reverse_failed_wire_ids.difference_update(finished_wire_ids)
         return finished_wire_ids
 
-    def _consume_reverse_receive_binding(self, binding: ReverseReceiveBinding, terminal_flag: bool) -> None:
-        """Record the terminal and drop the wire-id mapping, but retain the
-        binding itself: ``_release_finished_reverse_terminals`` later recovers
-        the wire id from it when the Prefill-local request finishes."""
-        self._consumed_reverse_terminal_wire_ids[binding.wire_request_id] = terminal_flag
+    def _consume_reverse_receive_binding(
+        self,
+        binding: ReverseReceiveBinding,
+        attempt_key: ReverseAttemptKey,
+        terminal_flag: bool,
+    ) -> None:
+        """Tombstone the terminal, drop the wire mapping, and report the
+        attempt's reverse completion job; the binding itself is retained for
+        the §5 removal rule."""
+        self._consumed_reverse_terminal_wire_ids[binding.wire_request_id] = attempt_key
         self._reverse_request_map.pop(binding.wire_request_id, None)
+        self._record_sender_job(binding.reverse_completion_job_id, succeeded=terminal_flag)
+
+    def _record_sender_job(self, job_id: int, *, succeeded: bool) -> None:
+        with self._sender_job_facts_lock:
+            if succeeded:
+                self._completed_sender_jobs[job_id] = 1
+            else:
+                self._failed_sender_jobs[job_id] = 1
 
     def _consume_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
         """Record the terminal and pop the binding eagerly: unlike the Reverse
@@ -316,7 +358,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             store_destination_slice=store_destination_slice,
             forward_destination_slice=forward_destination_slice,
             reverse_plan=None,
-            reverse_submitted=False,
+            reverse_submitted_attempt=None,
             store_load_failed=False,
             terminal_published=False,
         )
@@ -325,10 +367,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         if not self._accepting_split_requests:
             return
         decode_request_id = plan.request_key.decode_request_id
-        if get_external_request_id(decode_request_id) != plan.wire_request_id:
+        attempt_key = ReverseAttemptKey(plan.request_key, plan.reverse_attempt_id)
+        if reverse_wire_id(attempt_key) != plan.wire_request_id:
             raise RuntimeError(
                 f"DualPath Decode request {decode_request_id} got a Reverse plan whose wire request id "
-                "does not match the Decode-local request id"
+                "does not match its attempt identity"
             )
 
         binding = self._forward_receive_bindings.get(decode_request_id)
@@ -349,16 +392,42 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         existing_plan = tracker.reverse_plan
         conflicts_with_retained_plan = any(
             retained != plan
-            and (retained.request_key == plan.request_key or retained.wire_request_id == plan.wire_request_id)
+            and (
+                retained.wire_request_id == plan.wire_request_id
+                or ReverseAttemptKey(retained.request_key, retained.reverse_attempt_id) == attempt_key
+            )
             for retained in (split_tracker.reverse_plan for split_tracker in self._split_trackers.values())
             if retained is not None
         )
-        if (existing_plan is not None and existing_plan != plan) or conflicts_with_retained_plan:
+        if conflicts_with_retained_plan:
             raise RuntimeError(
                 f"DualPath Decode request {decode_request_id} got a conflicting duplicate Reverse plan; "
                 "this is a bug and the engine cannot continue safely"
             )
         if existing_plan is not None:
+            if existing_plan.reverse_attempt_id == plan.reverse_attempt_id:
+                if existing_plan != plan:
+                    raise RuntimeError(
+                        f"DualPath Decode request {decode_request_id} got a conflicting duplicate Reverse plan; "
+                        "this is a bug and the engine cannot continue safely"
+                    )
+                return
+            if plan.reverse_attempt_id < existing_plan.reverse_attempt_id:
+                raise RuntimeError(
+                    f"DualPath Decode request {decode_request_id} got a stale Reverse plan for an older attempt; "
+                    "this is a bug and the engine cannot continue safely"
+                )
+            if tracker.reverse_phase is not _SplitPhase.DONE:
+                raise RuntimeError(
+                    f"DualPath Decode request {decode_request_id} got a replacement Reverse plan before the "
+                    "current attempt completed; this is a bug and the engine cannot continue safely"
+                )
+            # Replacement for a normally completed attempt: reset the
+            # attempt-scoped Reverse state and install the new plan.
+            tracker.reverse_plan = plan
+            tracker.reverse_phase = _SplitPhase.PENDING
+            tracker.reverse_submitted_attempt = None
+            self._submit_reverse(decode_request_id)
             return
 
         tracker.reverse_plan = plan
@@ -427,11 +496,12 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         if not self._accepting_split_requests:
             return
         tracker = self._split_trackers.get(decode_request_id)
+        if tracker is None or tracker.reverse_plan is None:
+            return
+        attempt_key = ReverseAttemptKey(tracker.reverse_plan.request_key, tracker.reverse_plan.reverse_attempt_id)
         if (
-            tracker is None
-            or tracker.store_phase not in {_SplitPhase.DONE, _SplitPhase.SKIPPED}
-            or tracker.reverse_plan is None
-            or tracker.reverse_submitted
+            tracker.store_phase not in {_SplitPhase.DONE, _SplitPhase.SKIPPED}
+            or tracker.reverse_submitted_attempt == attempt_key
         ):
             return
 
@@ -440,7 +510,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             raise RuntimeError("DualPath Reverse submission requires registered KV caches")
         ready_event = torch.npu.Event()
         ready_event.record()
-        tracker.reverse_submitted = True
+        tracker.reverse_submitted_attempt = attempt_key
         for layer_index, layer_name in self._registered_layer_order:
             self._enqueue_kv_layer_send(
                 layer_index=layer_index,
@@ -491,6 +561,21 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     published_store_terminals.add(request_id)
         return published_store_terminals
 
+    def build_connector_worker_meta(self) -> DualPathWorkerMetadata | None:
+        self.drain_terminal_ack_failures()
+        completed_jobs: dict[int, int] = {}
+        failed_jobs: dict[int, int] = {}
+        with self._sender_job_facts_lock:
+            for job_id, count in self._completed_sender_jobs.items():
+                completed_jobs[job_id] = completed_jobs.get(job_id, 0) + count
+            self._completed_sender_jobs.clear()
+            for job_id, count in self._failed_sender_jobs.items():
+                failed_jobs[job_id] = failed_jobs.get(job_id, 0) + count
+            self._failed_sender_jobs.clear()
+        if not completed_jobs and not failed_jobs:
+            return None
+        return DualPathWorkerMetadata(completed_jobs=completed_jobs, failed_jobs=failed_jobs)
+
     def start_load_kv(self, metadata: DualPathConnectorMetadata) -> None:
         store_metadata = metadata.decode_store_metadata
         is_prefill = self.dual_path_cfg.role == "prefill"
@@ -529,14 +614,31 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         super().start_load_kv(metadata)
 
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
+        tracker = None
+        submitted_attempt = None
         if self.dual_path_cfg.role == "decode":
             with self._reverse_terminal_lock:
                 tracker = self._split_trackers.get(req_id)
-                if tracker is not None and tracker.reverse_submitted:
-                    self._pending_local_reverse_terminals[req_id] = (
-                        self._pending_local_reverse_terminals.get(req_id, True) and trans_flag
+                if tracker is not None and tracker.reverse_submitted_attempt is not None:
+                    submitted_attempt = tracker.reverse_submitted_attempt
+                    self._pending_local_reverse_terminals[submitted_attempt] = (
+                        self._pending_local_reverse_terminals.get(submitted_attempt, True) and trans_flag
                     )
-        super().send_done_send_signal(req_id, req_meta, group_idx, trans_flag)
+        # The parent's return value is the single outcome source: True only
+        # after a successful terminal ACK.
+        ack_succeeded = super().send_done_send_signal(req_id, req_meta, group_idx, trans_flag)
+        # Only the Reverse direction reports to the local scheduler; a Forward
+        # send reaches its peer over the control channel like the parent's.
+        if self.dual_path_cfg.role != "decode":
+            return
+        if submitted_attempt is None or tracker is None or tracker.reverse_plan is None:
+            return
+        reverse_send_job_id = tracker.reverse_plan.reverse_send_job_id
+        if reverse_send_job_id is None:
+            return
+        # The reverse-send proof is recorded only after the final synchronous
+        # write AND a successful terminal ACK.
+        self._record_sender_job(reverse_send_job_id, succeeded=trans_flag and ack_succeeded)
 
     def get_finished(
         self,
@@ -568,17 +670,13 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             raw_done = set()
             raw_failed = set()
 
-        reverse_finished = self._consume_reverse_wire_terminals(
-            raw_done, raw_failed, finished_wire_ids, finished_reverse_wire_ids
-        )
+        self._consume_reverse_wire_terminals(raw_done, raw_failed, finished_wire_ids, finished_reverse_wire_ids)
         terminals = self._consume_forward_wire_terminals(raw_done, raw_failed)
         self._finish_ordinary_requests(terminals.ordinary_done, terminals.ordinary_failed)
 
         self._pending_forward_done_wire_ids = terminals.pending_done
         self._pending_forward_failed_wire_ids = terminals.pending_failed
-        done_recving.update(
-            terminals.ordinary_done.union(terminals.forward_finished, reverse_finished, self.virtual_request)
-        )
+        done_recving.update(terminals.ordinary_done.union(terminals.forward_finished, self.virtual_request))
         self.virtual_request = set()
         self._log_published_split_terminals(done_recving)
         done_recving.update(self._control_failed_recving)
@@ -590,11 +688,19 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         with self._reverse_terminal_lock:
             local_reverse_terminals = dict(self._pending_local_reverse_terminals)
             self._pending_local_reverse_terminals.clear()
+            trackers = {
+                attempt_key: self._split_trackers.get(attempt_key.request_key.decode_request_id)
+                for attempt_key in local_reverse_terminals
+            }
         finished: set[str] = set()
-        for request_id, terminal_flag in local_reverse_terminals.items():
-            tracker = self._split_trackers.get(request_id)
+        for attempt_key, terminal_flag in local_reverse_terminals.items():
+            tracker = trackers[attempt_key]
             if tracker is None or tracker.reverse_phase is not _SplitPhase.PENDING:
                 continue
+            if tracker.reverse_submitted_attempt != attempt_key:
+                # A terminal of a stale attempt never mutates the live tracker.
+                continue
+            request_id = attempt_key.request_key.decode_request_id
             if terminal_flag:
                 tracker.reverse_phase = _SplitPhase.DONE
                 if (
@@ -622,10 +728,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         raw_failed: set[str],
         finished_wire_ids: set[str],
         finished_reverse_wire_ids: set[str],
-    ) -> set[str]:
-        """Attribute wire terminals owned by Reverse bindings to their Prefill
-        requests. ``raw_done``/``raw_failed`` are filtered in place: ignored
-        and Reverse-owned wire ids are removed before return."""
+    ) -> None:
+        """Attribute wire terminals owned by Reverse bindings to their attempt
+        keys and report the completion jobs. ``raw_done``/``raw_failed`` are
+        filtered in place: ignored and Reverse-owned wire ids are removed
+        before return. No request id leaves the worker for a Reverse terminal."""
         ignored_wire_ids = set(self._consumed_forward_terminal_wire_ids).union(self._consumed_reverse_terminal_wire_ids)
         ignored_wire_ids.update(
             wire_request_id for wire_request_id in finished_wire_ids if wire_request_id not in self.request_map
@@ -646,31 +753,27 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         raw_done.difference_update(reverse_owned_wire_ids)
         raw_failed.difference_update(reverse_owned_wire_ids)
         reverse_done_wire_ids.difference_update(reverse_failed_wire_ids)
-        reverse_finished: set[str] = set()
         for wire_request_id in reverse_failed_wire_ids:
-            prefill_request_id = self._reverse_request_map[wire_request_id]
-            binding = self._reverse_receive_bindings[prefill_request_id]
+            attempt_key = self._reverse_request_map[wire_request_id]
+            binding = self._reverse_receive_bindings[attempt_key]
             first_reverse_block = binding.token_start // self.block_size[0]
             last_reverse_block = math.ceil(binding.token_end / self.block_size[0])
             self._invalid_block_ids.update(binding.destination_block_ids[0][first_reverse_block:last_reverse_block])
-            reverse_finished.add(prefill_request_id)
-            self._consume_reverse_receive_binding(binding, False)
+            self._consume_reverse_receive_binding(binding, attempt_key, False)
             logger.warning(
                 "dual_path data_terminal key=%s failure_source=REVERSE final_predicate=FAILED",
-                prefill_request_id,
+                binding.prefill_request_id,
             )
         for wire_request_id in reverse_done_wire_ids:
-            prefill_request_id = self._reverse_request_map[wire_request_id]
-            binding = self._reverse_receive_bindings[prefill_request_id]
-            reverse_finished.add(prefill_request_id)
-            self._consume_reverse_receive_binding(binding, True)
+            attempt_key = self._reverse_request_map[wire_request_id]
+            binding = self._reverse_receive_bindings[attempt_key]
+            self._consume_reverse_receive_binding(binding, attempt_key, True)
             logger.info(
                 "dual_path reverse_terminal key=%s terminal=DONE final_predicate=SUCCESS",
-                prefill_request_id,
+                binding.prefill_request_id,
             )
         self._pending_reverse_done_wire_ids.clear()
         self._pending_reverse_failed_wire_ids.clear()
-        return reverse_finished
 
     def _consume_forward_wire_terminals(
         self,

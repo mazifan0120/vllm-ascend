@@ -7,7 +7,7 @@ import math
 import time
 from collections.abc import Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -15,17 +15,26 @@ from typing_extensions import assert_never
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
+from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (
     KVPoolSchedulerAdapter,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.ledgers import (
+    HoldKind,
+    HoldLedger,
+    JobKind,
+    JobLedger,
+    JobRecord,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     BlockIdGroups,
     DualPathConnectorMetadata,
     DualPathControlFailureMetadata,
     DualPathControlFailureReason,
+    DualPathWorkerMetadata,
     ForwardPlan,
     ForwardReceiveBinding,
     ReversePlan,
@@ -39,9 +48,13 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionValidationError,
     PathKind,
     PathPolicy,
+    ReverseAttemptKey,
     RoundRobinPathPolicy,
+    reverse_wire_id,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    CloseReplyStatus,
+    CloseReverseAttempt,
     DecodeControlEndpoint,
     DualPathDecisionMetadata,
     PathDecision,
@@ -58,9 +71,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 
@@ -154,6 +169,24 @@ def _is_open_decision_status(status: _DecodeDecisionStatus) -> bool:
     return status is _DecodeDecisionStatus.PENDING
 
 
+def _validate_local_topology(vllm_config: VllmConfig) -> None:
+    """Stage-2 supports exactly PP == DP == PCP == DCP == 1 (spec section 6)."""
+    parallel_config = vllm_config.parallel_config
+    restrictions = (
+        ("pipeline_parallel_size", parallel_config.pipeline_parallel_size),
+        ("data_parallel_size", parallel_config.data_parallel_size),
+        ("prefill_context_parallel_size", parallel_config.prefill_context_parallel_size),
+        ("decode_context_parallel_size", parallel_config.decode_context_parallel_size),
+    )
+    for name, value in restrictions:
+        if value != 1:
+            raise ValueError(f"DualPath requires {name} == 1, got {value}")
+
+
+class DualPathHoldBudgetExceededError(RuntimeError):
+    """A new uncommitted admission would exceed the hold-pressure budget."""
+
+
 class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     """Scheduler side of DualPathConnector.
 
@@ -191,11 +224,52 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_local_tokens: dict[str, int] = {}
         self._prefill_path_results: dict[str, PathDecisionResult] = {}
         self._prefill_forward_plans: dict[str, ForwardPlan] = {}
+        # Scheduling epoch (``num_preemptions``) each Forward plan was installed
+        # in, so a replay after a preemption is distinguishable from two
+        # disagreeing allocations within one epoch.
+        self._prefill_forward_plan_epochs: dict[str, int] = {}
         self._prefill_reverse_plans: dict[str, ReversePlan] = {}
         self._prefill_pending_reverse_receive_bindings: dict[str, ReverseReceiveBinding] = {}
         self._prefill_control_failures: dict[str, DualPathControlFailureMetadata] = {}
         self._prefill_delivery_futures: dict[str, Future[None]] = {}
         self._prefill_invalid_request_ids: set[str] = set()
+        self._block_pool: BlockPool | None = None
+        self._hold_ledger = HoldLedger()
+        self._job_ledger = JobLedger()
+        self._expected_worker_count: int = vllm_config.parallel_config.world_size
+        self._reverse_destination_holds: dict[str, int] = {}
+        self._pending_ordinary_release: set[str] = set()
+        self._pending_finished_sending: set[str] = set()
+        self._waiting_reverse_attempt_ids: dict[str, ReverseAttemptKey] = {}
+        self._reverse_send_job_ids: dict[ReverseAttemptKey, int] = {}
+        self._prefill_delivered_reverse_attempts: dict[str, int] = {}
+        self._prefill_deferred_deliveries: set[str] = set()
+        self._prefill_vacuous_reverse_request_ids: set[str] = set()
+        self._latest_reverse_attempt_ids: dict[str, int] = {}
+        self._pending_close_futures: dict[str, Future[CloseReplyStatus]] = {}
+        self._pending_close_requests: dict[str, tuple[CloseReverseAttempt, DecodeControlEndpoint]] = {}
+        self._close_retry_deadlines: dict[str, float] = {}
+        self._recovery_deadlines: dict[str, float] = {}
+        self._de_progress_deadlines: dict[str, float] = {}
+        self._recovery_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S
+        self._de_progress_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S
+        self._close_retry_backoff_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S
+        self._max_held_recovery_blocks: int = ascend_envs.VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS
+        self._max_recovery_records: int = ascend_envs.VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS
+        for env_name, env_value in (
+            ("VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S", self._recovery_watchdog_s),
+            ("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", self._de_progress_watchdog_s),
+            ("VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S", self._close_retry_backoff_s),
+        ):
+            if env_value <= 0:
+                raise ValueError(f"{env_name} must be an integer greater than zero")
+        for env_name, env_value in (
+            ("VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS", self._max_held_recovery_blocks),
+            ("VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS", self._max_recovery_records),
+        ):
+            if env_value < 0:
+                raise ValueError(f"{env_name} must be a non-negative integer")
+        _validate_local_topology(vllm_config)
         if dual_path_cfg.role == "decode":
             if len(kv_cache_config.kv_cache_groups) != 1:
                 raise ValueError("DualPath Decode requires exactly one KV cache group")
@@ -229,6 +303,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             engine_id,
             dual_path_cfg.role,
         )
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        self._block_pool = gpu_block_pool
 
     def _is_dual_path_decode_admission(self, request: Request) -> bool:
         """Decode admission applies only to Decode-role requests that arrived
@@ -266,6 +343,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if delivery_future.done():
                 delivery_failed = delivery_future.cancelled() or delivery_future.exception() is not None
                 if delivery_failed:
+                    # A failed prior delivery cancels its deferred replacement
+                    # for good: the request converges to the failure path.
+                    self._prefill_deferred_deliveries.discard(request_id)
                     result = self._prefill_path_results.get(request_id)
                     if result is not None and request_id not in self._prefill_invalid_request_ids:
                         if result.path is PathKind.DE_READ:
@@ -306,7 +386,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         request: Request,
         parent_result: tuple[int, bool],
         prefill_local_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         params = request.kv_transfer_params
         if (
             not self._accepting_prefill_decisions
@@ -342,17 +422,27 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
             return parent_result
 
+        if request_id in self._prefill_delivery_futures and request_id in self._prefill_path_results:
+            return self._resume_delivered_prefill_decision(
+                request_id,
+                metadata,
+                prefill_local_tokens,
+            )
+
         assert self._path_decider is not None
         request_key = decision_request.request_key
         try:
-            result = self._path_decider.decide(decision_request, prefill_local_tokens)
+            result = self._path_decider.decide(
+                decision_request,
+                prefill_local_tokens,
+                request.num_preemptions,
+            )
         except PathDecisionValidationError as error:
-            if request_id in self._prefill_delivery_futures or request_id not in self._prefill_path_results:
-                # A delivered decision cannot be re-decided without forking the
-                # protocol (e.g. preemption resume after delivery), and a
-                # first-contact failure has nothing to discard: converge locally
-                # instead of escaping into the vLLM scheduling loop. No Result is
-                # sent and Decode converges through its decision deadline.
+            if request_id not in self._prefill_path_results:
+                # A first-contact failure has nothing to discard: converge
+                # locally instead of escaping into the vLLM scheduling loop.
+                # No Result is sent and Decode converges through its decision
+                # deadline.
                 logger.error(
                     "DualPath Prefill decision failed for request %s: %s",
                     request_id,
@@ -372,7 +462,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
             self._discard_undelivered_prefill_decision(request_id, request_key)
             try:
-                result = self._path_decider.decide(decision_request, prefill_local_tokens)
+                result = self._path_decider.decide(
+                    decision_request,
+                    prefill_local_tokens,
+                    request.num_preemptions,
+                )
             except PathDecisionValidationError as fresh_error:
                 logger.error(
                     "DualPath Prefill fresh decision failed for request %s: %s",
@@ -403,6 +497,85 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return reverse_tokens, True
         else:
             assert_never(result.path)
+
+    def _resume_delivered_prefill_decision(
+        self,
+        request_id: str,
+        metadata: DualPathDecisionMetadata,
+        prefill_local_tokens: int,
+    ) -> tuple[int | None, bool]:
+        # The decision was already delivered: reuse the frozen PathKind and
+        # never re-run eligibility or PathPolicy.
+        result = self._prefill_path_results[request_id]
+        self._prefill_local_tokens[request_id] = prefill_local_tokens
+        if result.path is PathKind.PE_READ:
+            return 0, False
+        if result.path is PathKind.DE_READ:
+            reverse_tokens = max(metadata.decision_request.decode_store_tokens - prefill_local_tokens, 0)
+            if reverse_tokens == 0:
+                # Vacuous Reverse: bypass the Reverse machinery entirely; the
+                # request never parks, so no waiting-attempt entry may linger
+                # for the I4 gate, and the retained old plan must not
+                # reinstall one at allocation time.
+                self._waiting_reverse_attempt_ids.pop(request_id, None)
+                self._prefill_vacuous_reverse_request_ids.add(request_id)
+            return (reverse_tokens, True) if reverse_tokens > 0 else (0, False)
+        assert_never(result.path)
+
+    def _initiate_reverse_attempt_close(self, request_id: str) -> None:
+        attempt_key = self._waiting_reverse_attempt_ids.get(request_id)
+        metadata = self._prefill_decision_metadata.get(request_id)
+        if attempt_key is None or metadata is None or request_id in self._pending_close_requests:
+            return
+        close = CloseReverseAttempt(
+            request_key=attempt_key.request_key,
+            reverse_attempt_id=attempt_key.reverse_attempt_id,
+        )
+        self._pending_close_requests[request_id] = (close, metadata.decode_control_endpoint)
+        self._recovery_deadlines[request_id] = time.monotonic() + self._recovery_watchdog_s
+        self._submit_reverse_attempt_close(request_id)
+
+    def _submit_reverse_attempt_close(self, request_id: str) -> None:
+        close, endpoint = self._pending_close_requests[request_id]
+        try:
+            close_future = self._path_decision_coordinator.submit_close(endpoint, close)
+        except RuntimeError as error:
+            logger.error(
+                "DualPath Prefill close submission failed for request %s: %s; the Reverse destination hold is retained",
+                request_id,
+                error,
+            )
+            return
+        self._pending_close_futures[request_id] = close_future
+
+    def _reconcile_reverse_attempt_closes(self) -> None:
+        # The destination hold is released only on SAFE; NOT_SAFE re-arms the
+        # identical retry after the close backoff, and an in-flight close or a
+        # failed delivery retains the hold. The recovery watchdog bounds the
+        # whole sequence.
+        now = time.monotonic()
+        for request_id, close_future in list(self._pending_close_futures.items()):
+            if not close_future.done():
+                continue
+            self._pending_close_futures.pop(request_id)
+            status: CloseReplyStatus | None = None
+            if not close_future.cancelled() and close_future.exception() is None:
+                status = close_future.result()
+            if status is CloseReplyStatus.SAFE:
+                self._recovery_deadlines.pop(request_id, None)
+                self._close_retry_deadlines.pop(request_id, None)
+                self._pending_close_requests.pop(request_id, None)
+                hold_id = self._reverse_destination_holds.pop(request_id, None)
+                if hold_id is not None and self._block_pool is not None:
+                    self._hold_ledger.release(self._block_pool, hold_id)
+            elif status is CloseReplyStatus.NOT_SAFE:
+                self._close_retry_deadlines[request_id] = now + self._close_retry_backoff_s
+        for request_id, retry_deadline in list(self._close_retry_deadlines.items()):
+            if retry_deadline > now or request_id in self._pending_close_futures:
+                continue
+            self._close_retry_deadlines.pop(request_id)
+            if request_id in self._pending_close_requests:
+                self._submit_reverse_attempt_close(request_id)
 
     def _discard_undelivered_prefill_decision(self, request_id: str, request_key: DualPathRequestKey) -> None:
         # Drop every record latched by the first admission of this request. The
@@ -475,7 +648,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if not 0 <= token_start < token_end:
             raise PathDecisionValidationError("Forward token range must satisfy 0 <= token_start < token_end")
 
-        topology_fields = ("remote_tp_size", "remote_pcp_size", "remote_dcp_size")
+        topology_fields = ("remote_tp_size", "remote_pcp_size", "remote_dcp_size", "remote_pp_size", "remote_dp_size")
         required_fields = (
             "remote_block_size",
             "remote_engine_id",
@@ -493,6 +666,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             value = params[field_name]
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise PathDecisionValidationError(f"{field_name} must be a positive integer")
+        if params["remote_tp_size"] != self.vllm_config.parallel_config.tensor_parallel_size:
+            raise PathDecisionValidationError("DualPath requires equal PE/DE tensor_parallel_size")
+        for field_name in ("remote_pcp_size", "remote_dcp_size", "remote_pp_size", "remote_dp_size"):
+            if params[field_name] != 1:
+                raise PathDecisionValidationError(f"DualPath requires {field_name} == 1")
         if params.get("remote_cached_tokens") != decision_request.decode_local_tokens:
             raise PathDecisionValidationError("remote_cached_tokens does not match the Decision Request local prefix")
 
@@ -537,6 +715,28 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
         return plan, send_req_info
 
+    def _may_install_forward_plan(self, request: Request, plan: ForwardPlan) -> bool:
+        """Whether ``plan`` may be installed, i.e. it is new or a legal replay.
+
+        A preemption reallocates the block table, so a pass in a later
+        scheduling epoch legitimately supersedes the plan: the Forward
+        direction pins nothing, so the old plan strands no resource. Within one
+        epoch a differing plan means two disagreeing allocations for the same
+        request, which the engine cannot resolve.
+        """
+        request_id = request.request_id
+        existing_plan = self._prefill_forward_plans.get(request_id)
+        if existing_plan is None:
+            return True
+        if existing_plan == plan:
+            return False
+        if self._prefill_forward_plan_epochs.get(request_id) == request.num_preemptions:
+            raise RuntimeError(
+                f"DualPath Prefill request {request_id} got a conflicting duplicate Forward plan; "
+                "this is a bug and the engine cannot continue safely"
+            )
+        return True
+
     def _try_install_forward_plan(self, request: Request, blocks: KVCacheBlocks) -> None:
         request_id = request.request_id
         result = self._prefill_path_results.get(request_id)
@@ -559,16 +759,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
         plan, send_req_info = prepared
 
-        existing_plan = self._prefill_forward_plans.get(request_id)
-        if existing_plan is not None:
-            if existing_plan == plan:
-                return
-            raise RuntimeError(
-                f"DualPath Prefill request {request_id} got a conflicting duplicate Forward plan; "
-                "this is a bug and the engine cannot continue safely"
-            )
-
+        if not self._may_install_forward_plan(request, plan):
+            return
         self._prefill_forward_plans[request_id] = plan
+        self._prefill_forward_plan_epochs[request_id] = request.num_preemptions
         self._reqs_need_send_layerwise[request_id] = send_req_info
 
     def _activate_de_read_path(
@@ -589,10 +783,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         token_split = decision_request.decode_store_tokens
         ready_tokens = decision_request.target_tokens
         token_end = request.num_prompt_tokens
-        if not token_start < token_split < ready_tokens <= token_end:
-            raise PathDecisionValidationError("DE_READ token ranges must satisfy L_PE < K_DE < R <= T")
         if not 0 <= decision_request.decode_local_tokens <= token_split:
             raise PathDecisionValidationError("Decode local tokens must not exceed the DE_READ split")
+
+        retained_reverse_plan = self._prefill_reverse_plans.get(request_id)
+        replacement_attempt_id: int | None = None
+        if retained_reverse_plan is not None and request.num_preemptions > retained_reverse_plan.reverse_attempt_id:
+            replacement_attempt_id = request.num_preemptions
+        if replacement_attempt_id is None and not token_start < token_split < ready_tokens <= token_end:
+            raise PathDecisionValidationError("DE_READ token ranges must satisfy L_PE < K_DE < R <= T")
 
         prepared = self._prepare_forward_plan(request, blocks, token_split)
         # vLLM admission allocates only the external-token blocks (the Reverse
@@ -609,21 +808,28 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         ):
             raise PathDecisionValidationError("DE_READ Reverse destination block table does not cover the split point")
 
-        wire_request_id = get_external_request_id(request_id)
-        retained_reverse_plan = self._prefill_reverse_plans.get(request_id)
         if retained_reverse_plan is None:
+            attempt_key = ReverseAttemptKey(result.request_key, result.reverse_attempt_id)
+            completion_job = self._job_ledger.create_job(
+                JobKind.REVERSE_COMPLETION,
+                expected_worker_count=self._expected_worker_count,
+                reverse_attempt_key=attempt_key,
+            )
             binding = ReverseReceiveBinding(
                 request_key=result.request_key,
-                wire_request_id=wire_request_id,
+                wire_request_id=reverse_wire_id(attempt_key),
                 prefill_request_id=request_id,
                 destination_block_ids=pe_block_table,
                 token_start=token_start,
                 token_end=token_split,
+                reverse_attempt_id=result.reverse_attempt_id,
+                prefill_local_tokens=token_start,
+                reverse_completion_job_id=completion_job.job_id,
             )
             parallel_config = self.vllm_config.parallel_config
             reverse_plan = ReversePlan(
                 request_key=result.request_key,
-                wire_request_id=wire_request_id,
+                wire_request_id=reverse_wire_id(attempt_key),
                 token_start=token_start,
                 token_end=token_split,
                 source_block_ids=de_block_table,
@@ -635,6 +841,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 remote_tp_size=parallel_config.tensor_parallel_size,
                 remote_pcp_size=parallel_config.prefill_context_parallel_size,
                 remote_dcp_size=parallel_config.decode_context_parallel_size,
+                reverse_attempt_id=result.reverse_attempt_id,
+                prefill_local_tokens=token_start,
+                reverse_send_job_id=None,
             )
             existing_binding = self._prefill_pending_reverse_receive_bindings.get(request_id)
             if existing_binding is not None and existing_binding != binding:
@@ -644,26 +853,66 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 )
             self._prefill_pending_reverse_receive_bindings[request_id] = binding
             self._prefill_reverse_plans[request_id] = reverse_plan
-            retained_reverse_plan = reverse_plan
+            self._recovery_deadlines[request_id] = time.monotonic() + self._recovery_watchdog_s
+        elif replacement_attempt_id is not None and token_start < token_split:
+            # Route-preserving recovery (I7): same path and frozen DE table;
+            # only the attempt-local range [L_PE(new), K_DE) and the PE block
+            # table change. The new attempt re-parks the request under the I4
+            # gate.
+            attempt_key = ReverseAttemptKey(result.request_key, replacement_attempt_id)
+            completion_job = self._job_ledger.create_job(
+                JobKind.REVERSE_COMPLETION,
+                expected_worker_count=self._expected_worker_count,
+                reverse_attempt_key=attempt_key,
+            )
+            binding = ReverseReceiveBinding(
+                request_key=result.request_key,
+                wire_request_id=reverse_wire_id(attempt_key),
+                prefill_request_id=request_id,
+                destination_block_ids=pe_block_table,
+                token_start=token_start,
+                token_end=token_split,
+                reverse_attempt_id=replacement_attempt_id,
+                prefill_local_tokens=token_start,
+                reverse_completion_job_id=completion_job.job_id,
+            )
+            parallel_config = self.vllm_config.parallel_config
+            reverse_plan = ReversePlan(
+                request_key=result.request_key,
+                wire_request_id=reverse_wire_id(attempt_key),
+                token_start=token_start,
+                token_end=token_split,
+                source_block_ids=de_block_table,
+                destination_block_ids=pe_block_table,
+                remote_engine_id=self.engine_id,
+                remote_host=self.side_channel_host,
+                remote_port=self.side_channel_port,
+                remote_block_sizes=tuple(self.block_size),
+                remote_tp_size=parallel_config.tensor_parallel_size,
+                remote_pcp_size=parallel_config.prefill_context_parallel_size,
+                remote_dcp_size=parallel_config.decode_context_parallel_size,
+                reverse_attempt_id=replacement_attempt_id,
+                prefill_local_tokens=token_start,
+                reverse_send_job_id=None,
+            )
+            self._prefill_pending_reverse_receive_bindings[request_id] = binding
+            self._prefill_reverse_plans[request_id] = reverse_plan
+            self._waiting_reverse_attempt_ids[request_id] = attempt_key
+            self._recovery_deadlines[request_id] = time.monotonic() + self._recovery_watchdog_s
 
         if prepared is None:
             # Forward table does not cover T yet; it installs on the
             # post-Reverse allocation without touching the delivered Reverse.
             return self._prefill_reverse_plans[request_id]
         forward_plan, send_req_info = prepared
-        existing_plan = self._prefill_forward_plans.get(request_id)
-        if existing_plan is not None:
-            if existing_plan == forward_plan:
-                return self._prefill_reverse_plans[request_id]
-            raise RuntimeError(
-                f"DualPath Prefill request {request_id} got a conflicting duplicate Forward plan; "
-                "this is a bug and the engine cannot continue safely"
-            )
+        if not self._may_install_forward_plan(request, forward_plan):
+            return self._prefill_reverse_plans[request_id]
         self._prefill_forward_plans[request_id] = forward_plan
+        self._prefill_forward_plan_epochs[request_id] = request.num_preemptions
         self._reqs_need_send_layerwise[request_id] = send_req_info
         return self._prefill_reverse_plans[request_id]
 
-    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
         if not self._is_dual_path_decode_admission(request):
             parent_result = super().get_num_new_matched_tokens(request, num_computed_tokens)
             if self.dual_path_cfg.role == "prefill":
@@ -752,11 +1001,48 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         result = self._prefill_path_results.get(request_id)
         if result is None:
             return
-        request_key = result.request_key
-        if request_id in self._prefill_delivery_futures:
+        try:
+            self._ensure_reverse_destination_hold(request_id, result)
+        except DualPathHoldBudgetExceededError as error:
+            logger.error(
+                "DualPath Prefill admission rejected by the hold-pressure limit for request %s: %s",
+                request_id,
+                error,
+            )
+            self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
             return
+        if (
+            result.path is PathKind.DE_READ
+            and request_id in self._prefill_reverse_plans
+            and request_id not in self._prefill_vacuous_reverse_request_ids
+        ):
+            # Parking in WAITING_FOR_REMOTE_KVS: the I4 gate only admits the
+            # Reverse completion job of exactly this attempt.
+            self._waiting_reverse_attempt_ids.setdefault(
+                request_id,
+                ReverseAttemptKey(result.request_key, result.reverse_attempt_id),
+            )
+        self._deliver_prefill_decision(request_id, request=request, blocks=blocks)
+
+    def _deliver_prefill_decision(
+        self,
+        request_id: str,
+        *,
+        request: Request | None = None,
+        blocks: KVCacheBlocks | None = None,
+    ) -> None:
+        if request_id in self._prefill_invalid_request_ids:
+            self._prefill_deferred_deliveries.discard(request_id)
+            return
+        result = self._prefill_path_results.get(request_id)
+        if result is None:
+            self._prefill_deferred_deliveries.discard(request_id)
+            return
+        request_key = result.request_key
         reverse_plan: ReversePlan | None = None
         if result.path is PathKind.PE_READ:
+            if request_id in self._prefill_delivery_futures:
+                return
             # PE_READ delivers once the Forward plan is installed.
             if request_id not in self._prefill_forward_plans:
                 return
@@ -766,11 +1052,31 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             reverse_plan = self._prefill_reverse_plans.get(request_id)
             if reverse_plan is None:
                 return
+            if (
+                request_id in self._prefill_delivery_futures
+                and self._prefill_delivered_reverse_attempts.get(request_id) == reverse_plan.reverse_attempt_id
+            ):
+                self._prefill_deferred_deliveries.discard(request_id)
+                return
         else:
             assert_never(result.path)
+        existing_future = self._prefill_delivery_futures.get(request_id)
+        if existing_future is not None and not existing_future.done():
+            # At most one unresolved delivery Future per logical request: the
+            # replacement delivery defers (never overwrites) and the next
+            # build pass retries once the earlier Future resolves.
+            self._prefill_deferred_deliveries.add(request_id)
+            return
         metadata = self._prefill_decision_metadata[request_id]
+        decision_result = result
+        if reverse_plan is not None and reverse_plan.reverse_attempt_id != result.reverse_attempt_id:
+            decision_result = replace(
+                result,
+                reverse_attempt_id=reverse_plan.reverse_attempt_id,
+                prefill_local_tokens=reverse_plan.prefill_local_tokens,
+            )
         decision = PathDecision(
-            result=result,
+            result=decision_result,
             reverse_plan=reverse_plan,
         )
         try:
@@ -784,9 +1090,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 request_id,
                 error,
             )
-            self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
+            if request is not None and blocks is not None:
+                self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
+                self._prefill_deferred_deliveries.discard(request_id)
             return
         self._prefill_delivery_futures[request_id] = delivery_future
+        self._prefill_deferred_deliveries.discard(request_id)
+        if reverse_plan is not None:
+            self._prefill_delivered_reverse_attempts[request_id] = reverse_plan.reverse_attempt_id
 
         def log_delivery_failure(completed_future: Future[None]) -> None:
             if completed_future.cancelled():
@@ -812,6 +1123,46 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
 
         delivery_future.add_done_callback(log_delivery_failure)
+
+    def _check_hold_budget(self, new_block_count: int, new_record_count: int) -> None:
+        """Reject a new uncommitted admission before pinning when the budget
+        would be exceeded; committed holds are never evicted."""
+        held_blocks = self._hold_ledger.held_block_count()
+        if held_blocks + new_block_count > self._max_held_recovery_blocks:
+            raise DualPathHoldBudgetExceededError(
+                f"held recovery blocks {held_blocks} + {new_block_count} would exceed "
+                f"the limit {self._max_held_recovery_blocks}"
+            )
+        open_records = self._hold_ledger.unreleased_count() + self._job_ledger.open_count()
+        if open_records + new_record_count > self._max_recovery_records:
+            raise DualPathHoldBudgetExceededError(
+                f"open recovery records {open_records} + {new_record_count} would exceed "
+                f"the limit {self._max_recovery_records}"
+            )
+
+    def _ensure_reverse_destination_hold(self, request_id: str, result: PathDecisionResult) -> None:
+        # Before a DE_READ Decision is delivered, pin the PE-local Reverse
+        # destination slice [L_PE, K_DE); a vacuous Reverse acquires no hold.
+        if self._block_pool is None or result.path is not PathKind.DE_READ:
+            return
+        existing_hold_id = self._reverse_destination_holds.get(request_id)
+        if existing_hold_id is not None and not self._hold_ledger.is_released(existing_hold_id):
+            return
+        binding = self._prefill_pending_reverse_receive_bindings.get(request_id)
+        if binding is None:
+            return
+        block_size = self.block_size[0]
+        first_block = binding.token_start // block_size
+        last_block = math.ceil(binding.token_end / block_size)
+        if first_block >= last_block:
+            return
+        destination_block_ids = tuple(binding.destination_block_ids[0][first_block:last_block])
+        self._check_hold_budget(len(destination_block_ids), 1)
+        hold = self._hold_ledger.acquire(self._block_pool, destination_block_ids, HoldKind.REVERSE_DESTINATION)
+        self._reverse_destination_holds[request_id] = hold.hold_id
+        completion_job = self._job_ledger.get(binding.reverse_completion_job_id)
+        if completion_job is not None:
+            completion_job.affected_hold_ids = (hold.hold_id,)
 
     def _invalidate_prefill_activation(
         self,
@@ -840,6 +1191,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
         self._prefill_reverse_plans.pop(request_id, None)
         self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
+        self._prefill_forward_plan_epochs.pop(request_id, None)
         if self._prefill_forward_plans.pop(request_id, None) is not None:
             self._reqs_need_send_layerwise.pop(request_id, None)
 
@@ -958,6 +1310,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             "remote_tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
             "remote_pcp_size": self.vllm_config.parallel_config.prefill_context_parallel_size,
             "remote_dcp_size": self.vllm_config.parallel_config.decode_context_parallel_size,
+            "remote_pp_size": self.vllm_config.parallel_config.pipeline_parallel_size,
+            "remote_dp_size": self.vllm_config.parallel_config.data_parallel_size,
             "remote_cached_tokens": snapshot.local_tokens,
             "dual_path": decision_metadata.to_dict(),
         }
@@ -1066,7 +1420,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         # A received Decision must reproduce the frozen admission facts exactly;
         # any mismatch fails the activation before binding construction.
         result = decision.result
-        request_id = result.request_key.decode_request_id
         if state.request_key != result.request_key:
             raise PathDecisionValidationError("Decision key does not match the pending Decode state")
         if state.decision_request.decode_local_tokens != snapshot.local_tokens:
@@ -1093,14 +1446,21 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # The receive path already guarantees a DE_READ Decision carries a Reverse plan.
             reverse_plan = decision.reverse_plan
             assert reverse_plan is not None
-            if reverse_plan.wire_request_id != get_external_request_id(request_id):
+            attempt_key = ReverseAttemptKey(state.request_key, result.reverse_attempt_id)
+            if reverse_plan.wire_request_id != reverse_wire_id(attempt_key):
                 raise PathDecisionValidationError("Reverse plan wire id does not match the Decode request")
+            if reverse_plan.reverse_attempt_id != result.reverse_attempt_id:
+                raise PathDecisionValidationError("Reverse plan attempt does not match the Decision result")
             if reverse_plan.token_end != snapshot.store_tokens:
                 raise PathDecisionValidationError("Reverse plan range does not end at the frozen Store boundary")
             if reverse_plan.source_block_ids != destination_block_ids:
                 raise PathDecisionValidationError("Reverse plan source does not match the advertised Decode table")
             if len(reverse_plan.remote_block_sizes) != len(self.block_size):
                 raise PathDecisionValidationError("Reverse plan block-size group count does not match Decode")
+            if reverse_plan.remote_tp_size != self.vllm_config.parallel_config.tensor_parallel_size:
+                raise PathDecisionValidationError("Reverse plan TP size does not match Decode")
+            if reverse_plan.remote_pcp_size != 1 or reverse_plan.remote_dcp_size != 1:
+                raise PathDecisionValidationError("Reverse plan PCP/DCP sizes must be 1")
         return destination_block_ids, forward_token_start, reverse_plan
 
     def _activate_received_decision(
@@ -1113,8 +1473,31 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         state = self._decode_decision_states.get(request_id)
         if state is None:
             return
+        is_attempt_refresh = False
         if not _is_open_decision_status(state.status):
-            return
+            # A committed admission accepts only a greater-attempt refresh; the
+            # logical Forward binding is neither replaced nor reinstalled.
+            latest_attempt = self._latest_reverse_attempt_ids.get(request_id)
+            if not (
+                state.status is _DecodeDecisionStatus.COMMITTED
+                and result.path is PathKind.DE_READ
+                and result.reverse_attempt_id is not None
+                and latest_attempt is not None
+                and result.reverse_attempt_id > latest_attempt
+            ):
+                return
+            is_attempt_refresh = True
+
+        if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
+            if not self._path_decision_coordinator.claim_reverse_activation(
+                state.request_key, result.reverse_attempt_id
+            ):
+                logger.info(
+                    "DualPath Decode activation suppressed for request %s attempt %s: the attempt is closed",
+                    request_id,
+                    result.reverse_attempt_id,
+                )
+                return
 
         snapshot = self._decode_kv_snapshots[request_id]
         try:
@@ -1130,7 +1513,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_start=forward_token_start,
                 token_end=snapshot.transfer_tokens,
             )
-            if result.path is PathKind.DE_READ and snapshot.store_load_spec is not None:
+            if not is_attempt_refresh and result.path is PathKind.DE_READ and snapshot.store_load_spec is not None:
                 assert self._kvpool_adapter is not None
                 self._kvpool_adapter.commit_after_alloc(
                     state.request,
@@ -1139,6 +1522,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 )
         except Exception as error:  # noqa: BLE001
             logger.error("DualPath Decode activation failed for request %s: %s", request_id, error)
+            self._de_progress_deadlines.pop(request_id, None)
+            if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
+                # The claim was won but no worker work was ever published.
+                self._path_decision_coordinator.cancel_reverse_publication(
+                    ReverseAttemptKey(state.request_key, result.reverse_attempt_id)
+                )
             state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
             self._path_decision_coordinator.unregister(state.request_key)
             metadata.control_failures.append(
@@ -1151,9 +1540,27 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
 
         if reverse_plan is not None:
+            # The reverse-send completion proof is allocated at attempt
+            # acceptance, before any layer can enter the sender queue, and is
+            # carried unchanged on the plan to every DE worker.
+            attempt_key = ReverseAttemptKey(state.request_key, result.reverse_attempt_id)
+            send_job = self._job_ledger.create_job(
+                JobKind.REVERSE_SEND,
+                expected_worker_count=self._expected_worker_count,
+                reverse_attempt_key=attempt_key,
+            )
+            reverse_plan = replace(reverse_plan, reverse_send_job_id=send_job.job_id)
+            self._reverse_send_job_ids[attempt_key] = send_job.job_id
             metadata.reverse_plans.append(reverse_plan)
+            self._path_decision_coordinator.mark_reverse_work_published(attempt_key, send_job.job_id)
+        if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
+            self._latest_reverse_attempt_ids[request_id] = result.reverse_attempt_id
+        if is_attempt_refresh:
+            return
         metadata.forward_receive_bindings.append(binding)
         state.status = _DecodeDecisionStatus.COMMITTED
+        if reverse_plan is not None:
+            self._de_progress_deadlines[request_id] = time.monotonic() + self._de_progress_watchdog_s
         self._log_decision_activation(decision, state, snapshot, reverse_plan, binding)
 
     def _log_decision_activation(
@@ -1194,6 +1601,76 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             binding.token_end,
         )
 
+    def _request_for_failed_job(self, job: JobRecord) -> str | None:
+        if job.job_kind is JobKind.REVERSE_COMPLETION:
+            for request_id, attempt_key in self._waiting_reverse_attempt_ids.items():
+                if attempt_key == job.reverse_attempt_key:
+                    return request_id
+        if job.job_kind is JobKind.REVERSE_SEND and job.reverse_attempt_key is not None:
+            return job.reverse_attempt_key.request_key.decode_request_id
+        return None
+
+    def _sweep_prefill_recovery_watchdogs(self, metadata: DualPathConnectorMetadata) -> None:
+        # Expiry fails the request through the control-failure path; it never
+        # releases a hold and never synthesizes a safety proof.
+        now = time.monotonic()
+        for request_id, deadline in list(self._recovery_deadlines.items()):
+            if deadline > now:
+                continue
+            self._recovery_deadlines.pop(request_id)
+            self._close_retry_deadlines.pop(request_id, None)
+            self._pending_close_futures.pop(request_id, None)
+            self._pending_close_requests.pop(request_id, None)
+            self._prefill_invalid_request_ids.add(request_id)
+            invalid_block_ids = self._recovery_invalid_block_ids(request_id)
+            if invalid_block_ids:
+                metadata.control_failures.append(
+                    DualPathControlFailureMetadata(
+                        request_id=request_id,
+                        invalid_block_ids=invalid_block_ids,
+                        reason=DualPathControlFailureReason.RECOVERY_TIMEOUT,
+                    )
+                )
+            logger.error(
+                "DualPath recovery watchdog expired for request %s; holds are retained",
+                request_id,
+            )
+
+    def _recovery_invalid_block_ids(self, request_id: str) -> tuple[int, ...]:
+        reverse_plan = self._prefill_reverse_plans.get(request_id)
+        if reverse_plan is not None:
+            block_size = self.block_size[0]
+            first_block = reverse_plan.token_start // block_size
+            last_block = math.ceil(reverse_plan.token_end / block_size)
+            return tuple(reverse_plan.destination_block_ids[0][first_block:last_block])
+        return ()
+
+    def _sweep_decode_progress_watchdogs(self, metadata: DualPathConnectorMetadata) -> None:
+        # Bounds a committed DE_READ admission whose reverse-send job has not
+        # closed; expiry fails the request without touching the job ledger.
+        now = time.monotonic()
+        for request_id, deadline in list(self._de_progress_deadlines.items()):
+            if deadline > now:
+                continue
+            self._de_progress_deadlines.pop(request_id)
+            state = self._decode_decision_states.get(request_id)
+            if state is None or state.status is not _DecodeDecisionStatus.COMMITTED:
+                continue
+            state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
+            self._path_decision_coordinator.unregister(state.request_key)
+            snapshot = self._decode_kv_snapshots[request_id]
+            metadata.control_failures.append(
+                self._build_decode_control_failure(
+                    request_id,
+                    snapshot,
+                    DualPathControlFailureReason.RECOVERY_TIMEOUT,
+                )
+            )
+            logger.error(
+                "DualPath DE progress watchdog expired for request %s; no safety proof is synthesized",
+                request_id,
+            )
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -1206,6 +1683,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         metadata.send_task = parent_metadata.send_task
         if self.dual_path_cfg.role != "decode":
             self._reconcile_prefill_deliveries()
+            self._reconcile_reverse_attempt_closes()
+            for deferred_request_id in list(self._prefill_deferred_deliveries):
+                self._deliver_prefill_decision(deferred_request_id)
+            self._sweep_prefill_recovery_watchdogs(metadata)
             metadata.reverse_receive_bindings.extend(self._prefill_pending_reverse_receive_bindings.values())
             metadata.control_failures.extend(self._prefill_control_failures.values())
             self._prefill_pending_reverse_receive_bindings.clear()
@@ -1216,6 +1697,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         for decision in coordinator.take_received_decisions():
             self._activate_received_decision(decision, metadata)
+        self._sweep_decode_progress_watchdogs(metadata)
 
         now = time.monotonic()
         for request_id, state in self._decode_decision_states.items():
@@ -1224,6 +1706,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if state.deadline > now:
                 continue
             state.status = _DecodeDecisionStatus.DECISION_TIMEOUT
+            self._de_progress_deadlines.pop(request_id, None)
             coordinator.unregister(state.request_key)
             snapshot = self._decode_kv_snapshots[request_id]
             metadata.control_failures.append(
@@ -1254,11 +1737,22 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         state = self._decode_decision_states.pop(request_id, None)
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)
+        self._de_progress_deadlines.pop(request_id, None)
+        latest_attempt = self._latest_reverse_attempt_ids.get(request_id)
+        if state is not None and latest_attempt is not None:
+            attempt_key = ReverseAttemptKey(state.request_key, latest_attempt)
+            send_job = self._job_ledger.get(self._reverse_send_job_ids.get(attempt_key, -1))
+            if send_job is None or send_job.closed:
+                self._latest_reverse_attempt_ids.pop(request_id, None)
+                self._reverse_send_job_ids.pop(attempt_key, None)
+            if send_job is not None and send_job.closed:
+                self._job_ledger.discard(send_job.job_id)
         if self.dual_path_cfg.role == "prefill":
             self._prefill_decision_metadata.pop(request_id, None)
             self._prefill_local_tokens.pop(request_id, None)
             self._prefill_path_results.pop(request_id, None)
             forward_plan = self._prefill_forward_plans.pop(request_id, None)
+            self._prefill_forward_plan_epochs.pop(request_id, None)
             self._prefill_reverse_plans.pop(request_id, None)
             self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
             self._prefill_control_failures.pop(request_id, None)
@@ -1269,17 +1763,170 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 assert self._path_decider is not None
                 self._path_decider.discard(released_key)
             self._prefill_invalid_request_ids.discard(request_id)
+            self._prefill_delivered_reverse_attempts.pop(request_id, None)
+            self._prefill_deferred_deliveries.discard(request_id)
+            self._prefill_vacuous_reverse_request_ids.discard(request_id)
             self._reconcile_prefill_deliveries()
+        # Hold/job records with unreleased holds survive request cleanup; they
+        # are removed only when their jobs close.
+        self._waiting_reverse_attempt_ids.pop(request_id, None)
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
+        delay_free = self._delay_free_for_connector(request)
         self._release_scheduler_request_state(request)
-        return super().request_finished(request, block_ids)
+        parent_delay_free, params = super().request_finished(request, block_ids)
+        return delay_free or parent_delay_free, params
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
+        delay_free = self._delay_free_for_connector(request)
         self._release_scheduler_request_state(request)
-        return super().request_finished_all_groups(request, block_ids)
+        parent_delay_free, params = super().request_finished_all_groups(request, block_ids)
+        return delay_free or parent_delay_free, params
+
+    def _delay_free_for_connector(self, request: Request) -> bool:
+        # The Forward direction never delays the free: it is the ordinary
+        # Layerwise push and follows the parent's immediate-free semantics.
+        # Only the Reverse direction, whose blocks are written by the peer,
+        # holds a request back.
+        request_id = request.request_id
+        if self.dual_path_cfg.role == "decode":
+            # A final Decode request with an open reverse-send job must keep
+            # the engine stepping: the delayed free retains it upstream so
+            # zero-token steps keep harvesting the job report.
+            latest_attempt = self._latest_reverse_attempt_ids.get(request_id)
+            state = self._decode_decision_states.get(request_id)
+            if latest_attempt is None or state is None:
+                return False
+            send_job = self._job_ledger.get(
+                self._reverse_send_job_ids.get(ReverseAttemptKey(state.request_key, latest_attempt), -1)
+            )
+            if send_job is None or send_job.closed:
+                return False
+            self._pending_finished_sending.add(request_id)
+            return True
+        if (
+            getattr(request, "status", None) is RequestStatus.FINISHED_ABORTED
+            and request_id in self._waiting_reverse_attempt_ids
+        ):
+            # Abort while waiting for the Reverse: ordinary ownership is freed
+            # through the finished_recving injection, but the Reverse
+            # destination hold is retained until the close proves SAFE (I8).
+            self._pending_ordinary_release.add(request_id)
+            self._initiate_reverse_attempt_close(request_id)
+        return False
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        self._reconcile_reverse_attempt_closes()
+        finished_sending_injection: set[str] = set()
+        finished_recving_injection: set[str] = set()
+        worker_metadata = connector_output.kv_connector_worker_meta
+        if worker_metadata is not None:
+            assert isinstance(worker_metadata, DualPathWorkerMetadata), (
+                f"DualPath scheduler requires DualPathWorkerMetadata, got {type(worker_metadata).__name__}"
+            )
+            finished_sending_injection, finished_recving_injection = self._aggregate_worker_job_facts(worker_metadata)
+        if finished_sending_injection:
+            if connector_output.finished_sending is None:
+                connector_output.finished_sending = set()
+            connector_output.finished_sending.update(finished_sending_injection)
+        if finished_recving_injection:
+            if connector_output.finished_recving is None:
+                connector_output.finished_recving = set()
+            connector_output.finished_recving.update(finished_recving_injection)
+        if self._pending_ordinary_release:
+            if connector_output.finished_recving is None:
+                connector_output.finished_recving = set()
+            connector_output.finished_recving.update(self._pending_ordinary_release)
+            self._pending_ordinary_release.clear()
+
+    def _aggregate_worker_job_facts(self, worker_metadata: DualPathWorkerMetadata) -> tuple[set[str], set[str]]:
+        finished_sending_injection: set[str] = set()
+        finished_recving_injection: set[str] = set()
+        for job_id, report_count in worker_metadata.completed_jobs.items():
+            job = self._job_ledger.get(job_id)
+            if job is None:
+                continue
+            if self._job_ledger.record_reports(job_id, report_count):
+                sending, recving = self._run_job_close_action(job)
+                finished_sending_injection.update(sending)
+                finished_recving_injection.update(recving)
+        for job_id in worker_metadata.failed_jobs:
+            job = self._job_ledger.get(job_id)
+            if job is None:
+                continue
+            if self._job_ledger.record_failure(job_id):
+                logger.error(
+                    "DualPath job %s (kind=%s) reported failed; affected holds %s are retained",
+                    job_id,
+                    job.job_kind.value,
+                    job.affected_hold_ids,
+                )
+                failed_request_id = self._request_for_failed_job(job)
+                if failed_request_id is not None:
+                    # Surface the terminal failure through the existing
+                    # control-failure path at the next build pass; holds are
+                    # never released and no release proof is synthesized.
+                    if self.dual_path_cfg.role == "decode":
+                        self._de_progress_deadlines[failed_request_id] = 0.0
+                    else:
+                        self._recovery_deadlines[failed_request_id] = 0.0
+        return finished_sending_injection, finished_recving_injection
+
+    def _run_job_close_action(self, job: JobRecord) -> tuple[set[str], set[str]]:
+        if job.job_kind is JobKind.REVERSE_COMPLETION:
+            return set(), self._close_reverse_completion_job(job)
+        if job.job_kind is JobKind.REVERSE_SEND:
+            attempt_key = job.reverse_attempt_key
+            if attempt_key is None:
+                return set(), set()
+            self._path_decision_coordinator.mark_reverse_send_complete(attempt_key)
+            request_id = attempt_key.request_key.decode_request_id
+            self._de_progress_deadlines.pop(request_id, None)
+            finished_sending: set[str] = set()
+            if request_id in self._pending_finished_sending:
+                self._pending_finished_sending.discard(request_id)
+                self._reverse_send_job_ids.pop(attempt_key, None)
+                self._latest_reverse_attempt_ids.pop(request_id, None)
+                self._job_ledger.discard(job.job_id)
+                finished_sending.add(request_id)
+            return finished_sending, set()
+        return set(), set()
+
+    def _close_reverse_completion_job(self, job: JobRecord) -> set[str]:
+        # I4: only the current waiting attempt's completion may publish the
+        # request id; stale-attempt jobs are absorbed without releasing holds
+        # or touching the generic finished sets.
+        attempt_key = job.reverse_attempt_key
+        request_id = next(
+            (
+                waiting_request_id
+                for waiting_request_id, waiting_attempt_key in self._waiting_reverse_attempt_ids.items()
+                if waiting_attempt_key == attempt_key
+            ),
+            None,
+        )
+        if request_id is None:
+            return set()
+        del self._waiting_reverse_attempt_ids[request_id]
+        self._recovery_deadlines.pop(request_id, None)
+        if self._block_pool is not None:
+            for hold_id in job.affected_hold_ids:
+                self._hold_ledger.release(self._block_pool, hold_id)
+        for hold_id in job.affected_hold_ids:
+            self._hold_ledger.discard(hold_id)
+        self._job_ledger.discard(job.job_id)
+        return {request_id}
+
+    def _is_reverse_send_complete(self, attempt_key: ReverseAttemptKey) -> bool:
+        """``sender_complete``: the attempt's reverse-send job is closed and
+        not failed, read only from the job ledger (the sole counting authority)."""
+        job_id = self._reverse_send_job_ids.get(attempt_key)
+        if job_id is None:
+            return False
+        job = self._job_ledger.get(job_id)
+        return job is not None and job.closed and not job.failed
 
     def shutdown(self) -> None:
         """Stop DualPath work and release all owned records and clients."""
@@ -1301,10 +1948,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         for request_id in self._prefill_forward_plans:
             self._reqs_need_send_layerwise.pop(request_id, None)
         self._prefill_forward_plans.clear()
+        self._prefill_forward_plan_epochs.clear()
         self._prefill_reverse_plans.clear()
         self._prefill_pending_reverse_receive_bindings.clear()
         self._prefill_control_failures.clear()
         self._prefill_delivery_futures.clear()
+        self._prefill_delivered_reverse_attempts.clear()
+        self._prefill_deferred_deliveries.clear()
+        self._prefill_vacuous_reverse_request_ids.clear()
         self._prefill_invalid_request_ids.clear()
         if self._kvpool_adapter is not None:
             self._kvpool_adapter.close()

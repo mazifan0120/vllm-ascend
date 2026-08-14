@@ -11,10 +11,13 @@ import importlib.util
 import sys
 import threading
 import types
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
+from vllm.v1.core.block_pool import BlockPool
 
 _fake_engine = types.ModuleType("mooncake.engine")
 _fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
@@ -34,8 +37,23 @@ _fake_uvloop.__spec__ = importlib.util.spec_from_loader("uvloop", loader=None)
 sys.modules.setdefault("uvloop", _fake_uvloop)
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as layerwise_module  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import metadata as metadata_module  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorWorker  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (  # noqa: E402
+    PathDecisionRequest,
+    PathKind,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
+    DecodeControlEndpoint,
+)
+
+_SCHEDULER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler"
+PE_TEST_BLOCK_SIZE = 16
+PE_TEST_POOL_BLOCKS = 128
+DECODE_TEST_INSTANCE_ID = "decode-engine:2:boot-7"
+DECODE_TEST_CONTROL_ENDPOINT = DecodeControlEndpoint(host="192.0.2.44", port=24001)
 
 
 def init_dual_path_worker_state(worker: DualPathConnectorWorker, role: str = "decode") -> DualPathConnectorWorker:
@@ -65,6 +83,9 @@ def init_dual_path_worker_state(worker: DualPathConnectorWorker, role: str = "de
     worker._pending_reverse_done_wire_ids = set()
     worker._pending_reverse_failed_wire_ids = set()
     worker._consumed_reverse_terminal_wire_ids = {}
+    worker._sender_job_facts_lock = threading.Lock()
+    worker._completed_sender_jobs = {}
+    worker._failed_sender_jobs = {}
     return worker
 
 
@@ -147,3 +168,252 @@ def worker_environment():
             send_threads=send_threads,
             recv_threads=recv_threads,
         )
+
+
+class FixedPathPolicy:
+    def __init__(self, path: PathKind) -> None:
+        self.path = path
+        self.calls = 0
+
+    def choose(self, request: PathDecisionRequest) -> PathKind:
+        self.calls += 1
+        return self.path
+
+
+def make_block_pool(num_blocks: int = PE_TEST_POOL_BLOCKS) -> BlockPool:
+    return BlockPool(num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=PE_TEST_BLOCK_SIZE)
+
+
+def make_prefill_vllm_config(world_size: int = 1) -> MagicMock:
+    config = MagicMock()
+    config.kv_transfer_config.kv_role = "kv_producer"
+    config.kv_transfer_config.is_kv_consumer = False
+    config.kv_transfer_config.is_kv_producer = True
+    config.kv_transfer_config.engine_id = "prefill-engine"
+    config.kv_transfer_config.kv_port = 5000
+    config.kv_transfer_config.kv_load_failure_policy = "fail"
+    config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {"tls_config": {}}.get(
+        key, default
+    )
+    config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_size = 1
+    config.parallel_config.tensor_parallel_size = world_size
+    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.world_size = world_size
+    config.cache_config.block_size = PE_TEST_BLOCK_SIZE
+    config.scheduler_config.disable_hybrid_kv_cache_manager = True
+    return config
+
+
+def make_prefill_kv_cache_config() -> SimpleNamespace:
+    spec = MagicMock()
+    spec.block_size = PE_TEST_BLOCK_SIZE
+    group = MagicMock()
+    group.kv_cache_spec = spec
+    group.layer_names = ["layer.0"]
+    return SimpleNamespace(kv_cache_groups=[group], kv_cache_tensors=[], num_blocks=64)
+
+
+def make_completed_future() -> Future[None]:
+    future: Future[None] = Future()
+    future.set_result(None)
+    return future
+
+
+def make_empty_scheduler_output(preempted_req_ids: set[str] | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[], num_computed_tokens=[]),
+        scheduled_spec_decode_tokens={},
+        scheduled_new_reqs=[],
+        num_scheduled_tokens={},
+        preempted_req_ids=preempted_req_ids,
+    )
+
+
+def make_worker_metadata(completed_jobs: dict[int, int] | None = None, failed_jobs: dict[int, int] | None = None):
+    return metadata_module.DualPathWorkerMetadata(
+        completed_jobs=completed_jobs or {},
+        failed_jobs=failed_jobs or {},
+    )
+
+
+def make_sender_req_meta() -> layerwise_module.ReqMeta:
+    return layerwise_module.ReqMeta(
+        local_block_ids=[[5]],
+        token_ids=[1],
+        remote_block_ids=[[10]],
+        remote_block_size=[[16]],
+        remote_engine_id="remote_engine",
+        remote_host="127.0.0.1",
+        remote_port=7777,
+        remote_te_rpc_port=6000,
+        remote_layer_metadata={},
+        metaserver=None,
+        remote_tp_size=1,
+        remote_pcp_size=1,
+        remote_dcp_size=1,
+        chunk_finish=True,
+        trans_count=[1],
+    )
+
+
+def make_sending_layer_thread() -> layerwise_module.KVCacheSendingLayerThread:
+    engine = MagicMock()
+    engine.batch_transfer_sync_write.return_value = 1
+    vllm_config = MagicMock()
+    vllm_config.cache_config.mamba_cache_mode = None
+    vllm_config.speculative_config = None
+    kv_cache_config = MagicMock()
+    group_spec = MagicMock()
+    group_spec.kv_cache_spec = MagicMock(block_size=PE_TEST_BLOCK_SIZE)
+    kv_cache_config.kv_cache_groups = [group_spec]
+    layer_metadata = {
+        "layer0": layerwise_module.LayerMetadata(
+            tensor_group_idx=[0],
+            kv_caches_base_addr=[1000, 2000],
+            block_len=[1024],
+            block_size_scale=[1],
+        ),
+    }
+    return layerwise_module.KVCacheSendingLayerThread(
+        engine=engine,
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        kv_cache_specs=[MagicMock(block_size=PE_TEST_BLOCK_SIZE)],
+        attn_resharding_group_idx=set(),
+        total_layers=1,
+        ready_event=threading.Event(),
+        tp_size=1,
+        tp_rank=0,
+        pd_head_ratio=1,
+        num_head_replica=1,
+        layer_metadata=layer_metadata,
+        use_mla=True,
+        use_attn_mamba_hybrid=False,
+        k_buffer=MagicMock(),
+        v_buffer=MagicMock(),
+        enable_kv_quant=False,
+        enable_c8_quant=False,
+        resharding_stream=MagicMock(),
+        callback_func=MagicMock(),
+    )
+
+
+@contextlib.contextmanager
+def successful_terminal_ack_zmq_ctx(_socket_type, _addr):
+    sock = MagicMock(name="ack_sock")
+    sock.poll.return_value = True
+    sock.recv.return_value = b"ACK"
+    yield sock
+
+
+@pytest.fixture()
+def pe_scheduler_factory():
+    schedulers = []
+    with (
+        patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{_SCHEDULER_NS}.get_ip", return_value="192.0.2.44"),
+    ):
+        coordinator = MagicMock(name="prefill_coordinator")
+        coordinator.submit.return_value = make_completed_future()
+        coordinator_cls.for_prefill.return_value = coordinator
+
+        def make(
+            path: PathKind = PathKind.PE_READ,
+            *,
+            world_size: int = 1,
+            pool: BlockPool | None = None,
+            policy=None,
+        ):
+            scheduler = connector_module.DualPathConnectorScheduler(
+                make_prefill_vllm_config(world_size),
+                make_prefill_kv_cache_config(),
+                "prefill-engine",
+                DualPathConfig(role="prefill"),
+                path_policy=policy if policy is not None else FixedPathPolicy(path),
+            )
+            scheduler.executor.shutdown(wait=False)
+            scheduler.metaserver_client.close()
+            scheduler.executor = MagicMock(name="prefill_executor")
+            scheduler.side_channel_host = "198.51.100.20"
+            if pool is not None:
+                scheduler.bind_gpu_block_pool(pool)
+            schedulers.append(scheduler)
+            return scheduler, coordinator
+
+        yield make
+
+    for scheduler in schedulers:
+        scheduler.shutdown()
+
+
+def make_decode_vllm_config(world_size: int = 1) -> MagicMock:
+    config = MagicMock()
+    config.kv_transfer_config.kv_role = "kv_consumer"
+    config.kv_transfer_config.is_kv_consumer = True
+    config.kv_transfer_config.engine_id = "decode-engine"
+    config.kv_transfer_config.kv_port = 5000
+    config.kv_transfer_config.kv_load_failure_policy = "fail"
+    config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {"tls_config": {}}.get(
+        key, default
+    )
+    config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_size = 1
+    config.parallel_config.tensor_parallel_size = world_size
+    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.world_size = world_size
+    config.cache_config.block_size = PE_TEST_BLOCK_SIZE
+    config.scheduler_config.disable_hybrid_kv_cache_manager = True
+    return config
+
+
+@pytest.fixture()
+def decode_task04_seams(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
+    with (
+        patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter") as adapter_cls,
+        patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
+        patch(f"{_SCHEDULER_NS}.get_ip", return_value="192.0.2.44"),
+    ):
+        decode_coordinator = MagicMock(name="decode_coordinator")
+        decode_coordinator.decode_engine_instance_id = DECODE_TEST_INSTANCE_ID
+        decode_coordinator.decode_control_endpoint = DECODE_TEST_CONTROL_ENDPOINT
+        prefill_coordinator = MagicMock(name="prefill_coordinator")
+        coordinator_cls.for_decode.return_value = decode_coordinator
+        coordinator_cls.for_prefill.return_value = prefill_coordinator
+        yield SimpleNamespace(
+            adapter_cls=adapter_cls,
+            coordinator_cls=coordinator_cls,
+            decode_coordinator=decode_coordinator,
+            prefill_coordinator=prefill_coordinator,
+        )
+
+
+@pytest.fixture()
+def decode_scheduler_factory(decode_task04_seams):
+    schedulers = []
+
+    def make(*, world_size: int = 1, pool: BlockPool | None = None):
+        scheduler = connector_module.DualPathConnectorScheduler(
+            make_decode_vllm_config(world_size),
+            make_prefill_kv_cache_config(),
+            "decode-engine",
+            DualPathConfig(role="decode", dual_path_control_port=7100),
+        )
+        scheduler.executor.shutdown(wait=False)
+        scheduler.metaserver_client.close()
+        scheduler.executor = MagicMock(name="decode_executor")
+        scheduler.executor.submit.return_value = make_completed_future()
+        scheduler.side_channel_host = "198.51.100.20"
+        if pool is not None:
+            scheduler.bind_gpu_block_pool(pool)
+        schedulers.append(scheduler)
+        return scheduler
+
+    yield make
+    for scheduler in schedulers:
+        scheduler.shutdown()

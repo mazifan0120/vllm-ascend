@@ -864,7 +864,8 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
     ):
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert order == ["parent", "results", "bindings", "deadlines", "store"]
+    # The trailing clock read is the W8 DE progress-watchdog sweep.
+    assert order == ["parent", "results", "bindings", "deadlines", "deadlines", "store"]
     assert len(metadata.forward_receive_bindings) == 1
 
 

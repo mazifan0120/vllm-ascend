@@ -30,6 +30,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DecisionReplyStatus,
     DecodeControlEndpoint,
     DualPathDecisionMetadata,
     PathDecision,
@@ -37,6 +38,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     PathDecisionDeliveryError,
     _deliver_decision,
     decode_path_decision,
+    encode_decision_reply,
     encode_path_decision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
@@ -86,6 +88,11 @@ def _metadata_payload() -> JsonObject:
     }
 
 
+_ACK_BYTES = encode_decision_reply(DecisionReplyStatus.ACK)
+_UNKNOWN_REQUEST_BYTES = encode_decision_reply(DecisionReplyStatus.UNKNOWN_REQUEST)
+_PROTOCOL_ERROR_BYTES = encode_decision_reply(DecisionReplyStatus.PROTOCOL_ERROR)
+
+
 def _result_payload() -> JsonObject:
     return {"request_key": _key_payload(), "path": "PE_READ"}
 
@@ -105,6 +112,9 @@ def _reverse_plan(key: DualPathRequestKey) -> ReversePlan:
         remote_tp_size=1,
         remote_pcp_size=1,
         remote_dcp_size=1,
+        reverse_attempt_id=0,
+        prefill_local_tokens=0,
+        reverse_send_job_id=None,
     )
 
 
@@ -148,8 +158,11 @@ def test_path_decision_msgpack_round_trip_result() -> None:
     )
     expected_bytes = msgspec.msgpack.encode(
         {
-            "result": _result_payload(),
-            "reverse_plan": None,
+            "kind": "Decision",
+            "payload": {
+                "result": _result_payload(),
+                "reverse_plan": None,
+            },
         }
     )
 
@@ -161,7 +174,12 @@ def test_decision_request_and_result_round_trip() -> None:
     metadata = _metadata()
     key = metadata.decision_request.request_key
     decision = PathDecision(
-        result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
+        result=PathDecisionResult(
+            request_key=key,
+            path=PathKind.DE_READ,
+            reverse_attempt_id=0,
+            prefill_local_tokens=0,
+        ),
         reverse_plan=_reverse_plan(key),
     )
 
@@ -255,7 +273,16 @@ def _coordinator(endpoint: DecodeControlEndpoint, *, boot_id: str | None = "boot
 
 def _decision(key: DualPathRequestKey, *, path: PathKind = PathKind.PE_READ) -> PathDecision:
     return PathDecision(
-        result=PathDecisionResult(request_key=key, path=path),
+        result=(
+            PathDecisionResult(request_key=key, path=path)
+            if path is PathKind.PE_READ
+            else PathDecisionResult(
+                request_key=key,
+                path=path,
+                reverse_attempt_id=0,
+                prefill_local_tokens=0,
+            )
+        ),
         reverse_plan=_reverse_plan(key) if path is PathKind.DE_READ else None,
     )
 
@@ -360,7 +387,7 @@ def test_prefill_coordinator_construction_creates_no_sockets() -> None:
     def opener(endpoint: DecodeControlEndpoint):
         nonlocal calls
         calls += 1
-        yield _FakeDeliverySocket(ack=b"ACK")
+        yield _FakeDeliverySocket(ack=_ACK_BYTES)
 
     coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener)
     try:
@@ -379,7 +406,7 @@ def test_prefill_submit_does_no_socket_io_on_caller_thread() -> None:
         opener_thread_ids.append(threading.get_ident())
         entered.set()
         assert release.wait(timeout=5)
-        yield _FakeDeliverySocket(ack=b"ACK")
+        yield _FakeDeliverySocket(ack=_ACK_BYTES)
 
     coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener)
     caller_thread_id = threading.get_ident()
@@ -418,7 +445,7 @@ def test_queue_returns_complete_path_decision() -> None:
     decision = _decision(key)
     try:
         receiver.register_pending(key)
-        assert _raw_request(endpoint, encode_path_decision(decision)) == b"ACK"
+        assert _raw_request(endpoint, encode_path_decision(decision)) == _ACK_BYTES
         assert receiver.take_received_decisions() == [decision]
     finally:
         receiver.close()
@@ -430,7 +457,7 @@ def test_receiver_ack_frame_is_exactly_ack() -> None:
     key = _request().request_key
     try:
         receiver.register_pending(key)
-        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
+        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == _ACK_BYTES
     finally:
         receiver.close()
 
@@ -449,7 +476,7 @@ def test_identical_redelivery_is_acked_without_duplicate_received_result() -> No
         first.send(encoded)
         assert first.poll(1000) != 0
         first.close(linger=0)
-        assert _raw_request(endpoint, encoded) == b"ACK"
+        assert _raw_request(endpoint, encoded) == _ACK_BYTES
         assert receiver.take_received_decisions() == [_decision(key)]
         assert receiver.take_received_decisions() == []
     finally:
@@ -475,7 +502,7 @@ def test_submit_retries_identical_bytes_until_ack() -> None:
                 assert delimiter == b""
                 captured.append(payload)
                 if attempt == 1:
-                    socket.send_multipart([identity, b"", b"ACK"])
+                    socket.send_multipart([identity, b"", _ACK_BYTES])
         finally:
             socket.close(linger=0)
             context.term()
@@ -504,8 +531,10 @@ def test_conflicting_duplicate_gets_no_ack_and_no_received_result_growth() -> No
     key = _request().request_key
     try:
         receiver.register_pending(key)
-        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
-        assert _raw_request(endpoint, encode_path_decision(_decision(key, path=PathKind.DE_READ))) is None
+        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == _ACK_BYTES
+        assert (
+            _raw_request(endpoint, encode_path_decision(_decision(key, path=PathKind.DE_READ))) == _PROTOCOL_ERROR_BYTES
+        )
         assert receiver.take_received_decisions() == [_decision(key)]
         assert receiver.take_received_decisions() == []
     finally:
@@ -523,9 +552,9 @@ def test_identical_duplicate_accepted_once_conflict_rejected() -> None:
     )
     try:
         receiver.register_pending(key)
-        assert _raw_request(endpoint, encode_path_decision(decision)) == b"ACK"
-        assert _raw_request(endpoint, encode_path_decision(decision)) == b"ACK"
-        assert _raw_request(endpoint, encode_path_decision(conflicting)) is None
+        assert _raw_request(endpoint, encode_path_decision(decision)) == _ACK_BYTES
+        assert _raw_request(endpoint, encode_path_decision(decision)) == _ACK_BYTES
+        assert _raw_request(endpoint, encode_path_decision(conflicting)) == _PROTOCOL_ERROR_BYTES
         assert receiver.take_received_decisions() == [decision]
         assert receiver.take_received_decisions() == []
     finally:
@@ -537,18 +566,28 @@ def test_de_read_requires_serialized_reverse_plan() -> None:
     receiver = _coordinator(endpoint)
     key = _request().request_key
     without_plan = PathDecision(
-        result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
+        result=PathDecisionResult(
+            request_key=key,
+            path=PathKind.DE_READ,
+            reverse_attempt_id=0,
+            prefill_local_tokens=0,
+        ),
         reverse_plan=None,
     )
     other_key = DualPathRequestKey(key.decode_engine_instance_id, "request-2")
     mismatched_plan = PathDecision(
-        result=PathDecisionResult(request_key=key, path=PathKind.DE_READ),
+        result=PathDecisionResult(
+            request_key=key,
+            path=PathKind.DE_READ,
+            reverse_attempt_id=0,
+            prefill_local_tokens=0,
+        ),
         reverse_plan=_reverse_plan(other_key),
     )
     try:
         receiver.register_pending(key)
-        assert _raw_request(endpoint, encode_path_decision(without_plan)) is None
-        assert _raw_request(endpoint, encode_path_decision(mismatched_plan)) is None
+        assert _raw_request(endpoint, encode_path_decision(without_plan)) == _PROTOCOL_ERROR_BYTES
+        assert _raw_request(endpoint, encode_path_decision(mismatched_plan)) == _PROTOCOL_ERROR_BYTES
         assert receiver.take_received_decisions() == []
     finally:
         receiver.close()
@@ -558,7 +597,7 @@ def test_unknown_key_gets_no_ack() -> None:
     endpoint = _free_control_endpoint()
     receiver = _coordinator(endpoint)
     try:
-        assert _raw_request(endpoint, encode_path_decision(_decision(_request().request_key))) is None
+        assert _raw_request(endpoint, encode_path_decision(_decision(_request().request_key))) == _UNKNOWN_REQUEST_BYTES
         assert receiver.take_received_decisions() == []
     finally:
         receiver.close()
@@ -574,7 +613,7 @@ def test_wrong_incarnation_key_gets_no_ack() -> None:
     )
     try:
         receiver.register_pending(pending)
-        assert _raw_request(endpoint, encode_path_decision(_decision(wrong))) is None
+        assert _raw_request(endpoint, encode_path_decision(_decision(wrong))) == _UNKNOWN_REQUEST_BYTES
         assert receiver.take_received_decisions() == []
     finally:
         receiver.close()
@@ -589,7 +628,7 @@ def test_registered_wrong_incarnation_key_gets_no_ack() -> None:
     )
     try:
         receiver.register_pending(wrong)
-        assert _raw_request(endpoint, encode_path_decision(_decision(wrong))) is None
+        assert _raw_request(endpoint, encode_path_decision(_decision(wrong))) == _UNKNOWN_REQUEST_BYTES
         assert receiver.take_received_decisions() == []
         assert wrong not in receiver._accepted_decisions
     finally:
@@ -603,7 +642,7 @@ def test_malformed_payload_gets_no_ack_and_receiver_survives() -> None:
     try:
         receiver.register_pending(key)
         assert _raw_request(endpoint, b"\x81") is None
-        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
+        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == _ACK_BYTES
         assert receiver.take_received_decisions() == [_decision(key)]
     finally:
         receiver.close()
@@ -678,7 +717,7 @@ def test_delivery_exhaustion_raises_typed_transport_error() -> None:
 def test_successful_delivery_completes_future_with_none() -> None:
     @contextmanager
     def opener(endpoint: DecodeControlEndpoint):
-        yield _FakeDeliverySocket(ack=b"ACK")
+        yield _FakeDeliverySocket(ack=_ACK_BYTES)
 
     coordinator = PathDecisionCoordinator.for_prefill(socket_opener=opener)
     try:
@@ -724,7 +763,7 @@ def test_unregister_removes_key_from_pending_and_accepted_registries() -> None:
     key = _request().request_key
     try:
         coordinator.register_pending(key)
-        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
+        assert _raw_request(endpoint, encode_path_decision(_decision(key))) == _ACK_BYTES
         coordinator.unregister(key)
         assert key not in coordinator._pending_keys
         assert key not in coordinator._accepted_decisions
@@ -770,7 +809,7 @@ def test_close_leaves_no_threads_sockets_futures_or_retained_state() -> None:
     coordinator = _coordinator(endpoint)
     key = _request().request_key
     coordinator.register_pending(key)
-    assert _raw_request(endpoint, encode_path_decision(_decision(key))) == b"ACK"
+    assert _raw_request(endpoint, encode_path_decision(_decision(key))) == _ACK_BYTES
 
     coordinator.close()
 
@@ -966,7 +1005,9 @@ def test_derive_decode_control_port_rejects_worker_kv_port_range_overlap() -> No
 
 
 def test_scheduler_constructs_role_specific_coordinator() -> None:
-    data_parallel_rank = 1
+    # Stage-2 topology guard restricts DualPath to data_parallel_size == 1, so
+    # the per-rank control port derivation degenerates to the base port.
+    data_parallel_rank = 0
     derived_port = _free_control_endpoint().port
     control_port = derived_port - data_parallel_rank
     decode_config = _make_scheduler_vllm_config(
@@ -974,7 +1015,7 @@ def test_scheduler_constructs_role_specific_coordinator() -> None:
         kv_role="kv_consumer",
         dual_path_control_port=control_port,
         data_parallel_rank=data_parallel_rank,
-        data_parallel_size=2,
+        data_parallel_size=1,
         tensor_parallel_size=2,
         kv_port=1,
     )

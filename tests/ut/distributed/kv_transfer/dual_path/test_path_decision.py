@@ -186,7 +186,17 @@ def test_eligibility_invokes_policy_once_when_l_pe_below_k_de(selected_path: Pat
 
     result = PathDecisionDecider(policy).decide(request, 8)
 
-    assert result == PathDecisionResult(request_key=request.request_key, path=selected_path)
+    expected = (
+        PathDecisionResult(request_key=request.request_key, path=selected_path)
+        if selected_path is PathKind.PE_READ
+        else PathDecisionResult(
+            request_key=request.request_key,
+            path=selected_path,
+            reverse_attempt_id=0,
+            prefill_local_tokens=8,
+        )
+    )
+    assert result == expected
     policy.choose.assert_called_once_with(request)
 
 
@@ -217,7 +227,12 @@ def test_round_robin_initial_choice_seeded_de_read() -> None:
 
     result = decider.decide(request, 0)
 
-    assert result == PathDecisionResult(request_key=request.request_key, path=PathKind.DE_READ)
+    assert result == PathDecisionResult(
+        request_key=request.request_key,
+        path=PathKind.DE_READ,
+        reverse_attempt_id=0,
+        prefill_local_tokens=0,
+    )
 
 
 def test_ambiguous_requests_follow_seeded_round_robin() -> None:
@@ -228,9 +243,19 @@ def test_ambiguous_requests_follow_seeded_round_robin() -> None:
 
     assert results == [
         PathDecisionResult(request_key=requests[0].request_key, path=PathKind.PE_READ),
-        PathDecisionResult(request_key=requests[1].request_key, path=PathKind.DE_READ),
+        PathDecisionResult(
+            request_key=requests[1].request_key,
+            path=PathKind.DE_READ,
+            reverse_attempt_id=0,
+            prefill_local_tokens=0,
+        ),
         PathDecisionResult(request_key=requests[2].request_key, path=PathKind.PE_READ),
-        PathDecisionResult(request_key=requests[3].request_key, path=PathKind.DE_READ),
+        PathDecisionResult(
+            request_key=requests[3].request_key,
+            path=PathKind.DE_READ,
+            reverse_attempt_id=0,
+            prefill_local_tokens=0,
+        ),
     ]
 
 
@@ -330,7 +355,16 @@ def test_second_policy_satisfies_path_policy_without_caller_change() -> None:
     ]
 
     assert results == [
-        PathDecisionResult(request_key=_key(f"request-{index}"), path=expected_path)
+        (
+            PathDecisionResult(request_key=_key(f"request-{index}"), path=expected_path)
+            if expected_path is PathKind.PE_READ
+            else PathDecisionResult(
+                request_key=_key(f"request-{index}"),
+                path=expected_path,
+                reverse_attempt_id=0,
+                prefill_local_tokens=0,
+            )
+        )
         for index, (_, expected_path) in enumerate(policies)
     ]
 
@@ -377,7 +411,12 @@ def test_request_serialization_round_trips_both_directions(
 
 @pytest.mark.parametrize("path", [PathKind.PE_READ, PathKind.DE_READ])
 def test_result_serialization_round_trips_both_directions(path: PathKind) -> None:
-    result = PathDecisionResult(request_key=_key(), path=path)
+    result = PathDecisionResult(
+        request_key=_key(),
+        path=path,
+        reverse_attempt_id=0 if path is PathKind.DE_READ else None,
+        prefill_local_tokens=0 if path is PathKind.DE_READ else None,
+    )
     payload = {
         "request_key": {
             "decode_engine_instance_id": "decode-engine-1",
@@ -385,6 +424,9 @@ def test_result_serialization_round_trips_both_directions(path: PathKind) -> Non
         },
         "path": path.value,
     }
+    if path is PathKind.DE_READ:
+        payload["reverse_attempt_id"] = 0
+        payload["prefill_local_tokens"] = 0
 
     assert PathDecisionResult.from_dict(result.to_dict()) == result
     assert PathDecisionResult.from_dict(payload).to_dict() == payload

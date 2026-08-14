@@ -18,7 +18,9 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
 )
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
@@ -38,6 +40,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
@@ -92,6 +95,19 @@ class DualPathConnector(MooncakeLayerwiseConnector):
         # Deliberately bypasses super().get_finished(): the parent facade drops Core-finished ids.
         assert isinstance(self.connector_worker, DualPathConnectorWorker)
         return self.connector_worker.get_finished(finished_req_ids, self._connector_metadata)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        if isinstance(self.connector_scheduler, DualPathConnectorScheduler):
+            self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        if isinstance(self.connector_scheduler, DualPathConnectorScheduler):
+            self.connector_scheduler.update_connector_output(connector_output)
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        if isinstance(self.connector_worker, DualPathConnectorWorker):
+            return self.connector_worker.build_connector_worker_meta()
+        return None
 
     def shutdown(self) -> None:
         """Release DualPath-owned state and adapters, then defer to the base."""

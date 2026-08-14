@@ -21,6 +21,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     PathDecisionResult,
     PathKind,
+    ReverseAttemptKey,
+    reverse_wire_id,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DecodeControlEndpoint,
@@ -53,7 +55,7 @@ def _de_read_decision(state, snapshot, **plan_overrides) -> PathDecision:
     token_end = plan_overrides.pop("token_end", snapshot.store_tokens)
     plan = ReversePlan(
         request_key=state.request_key,
-        wire_request_id=get_external_request_id(state.request_key.decode_request_id),
+        wire_request_id=reverse_wire_id(ReverseAttemptKey(state.request_key, 0)),
         token_start=token_start,
         token_end=token_end,
         source_block_ids=tuple(tuple(group) for group in snapshot.final_block_ids),
@@ -65,11 +67,19 @@ def _de_read_decision(state, snapshot, **plan_overrides) -> PathDecision:
         remote_tp_size=1,
         remote_pcp_size=1,
         remote_dcp_size=1,
+        reverse_attempt_id=0,
+        prefill_local_tokens=token_start,
+        reverse_send_job_id=None,
     )
     if plan_overrides:
         plan = dataclasses.replace(plan, **plan_overrides)
     return PathDecision(
-        result=PathDecisionResult(request_key=state.request_key, path=PathKind.DE_READ),
+        result=PathDecisionResult(
+            request_key=state.request_key,
+            path=PathKind.DE_READ,
+            reverse_attempt_id=0,
+            prefill_local_tokens=token_start,
+        ),
         reverse_plan=plan,
     )
 
@@ -84,11 +94,13 @@ def _make_vllm_config() -> MagicMock:
     config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {"tls_config": {}}.get(
         key, default
     )
-    config.parallel_config.data_parallel_rank = 2
-    config.parallel_config.data_parallel_size = 4
-    config.parallel_config.tensor_parallel_size = 2
+    config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_size = 1
+    config.parallel_config.tensor_parallel_size = 1
+    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.world_size = 2
     config.parallel_config.prefill_context_parallel_size = 1
-    config.parallel_config.decode_context_parallel_size = 3
+    config.parallel_config.decode_context_parallel_size = 1
     config.cache_config.block_size = 16
     config.scheduler_config.disable_hybrid_kv_cache_manager = True
     return config
@@ -319,7 +331,14 @@ def test_de_read_decision_requires_non_empty_reverse_plan(scheduler_factory):
     scheduler, coordinator = scheduler_factory()
     _, _, state = _admit_request(scheduler)
     coordinator.take_received_decisions.return_value = [
-        _decision(PathDecisionResult(request_key=state.request_key, path=PathKind.DE_READ))
+        _decision(
+            PathDecisionResult(
+                request_key=state.request_key,
+                path=PathKind.DE_READ,
+                reverse_attempt_id=0,
+                prefill_local_tokens=16,
+            )
+        )
     ]
 
     # When
@@ -371,7 +390,10 @@ def test_store_miss_commits_nothing_and_enters_skipped(scheduler_factory):
 
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
     assert metadata.decode_store_metadata is None
-    assert metadata.reverse_plans == [decision.reverse_plan]
+    reverse_send_job_id = scheduler._reverse_send_job_ids[ReverseAttemptKey(state.request_key, 0)]
+    assert metadata.reverse_plans == [
+        dataclasses.replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)
+    ]
     assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
 
 
@@ -410,7 +432,14 @@ def test_activation_failure_invalidates_all_external_destinations(scheduler_fact
     scheduler, coordinator = scheduler_factory()
     request, snapshot, state = _admit_request(scheduler)
     coordinator.take_received_decisions.return_value = [
-        _decision(PathDecisionResult(state.request_key, PathKind.DE_READ))
+        _decision(
+            PathDecisionResult(
+                request_key=state.request_key,
+                path=PathKind.DE_READ,
+                reverse_attempt_id=0,
+                prefill_local_tokens=16,
+            )
+        )
     ]
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
@@ -435,7 +464,10 @@ def test_de_read_activation_emits_plan_binding_store_in_one_lifecycle(scheduler_
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    assert metadata.reverse_plans == [decision.reverse_plan]
+    reverse_send_job_id = scheduler._reverse_send_job_ids[ReverseAttemptKey(state.request_key, 0)]
+    assert metadata.reverse_plans == [
+        dataclasses.replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)
+    ]
     assert metadata.forward_receive_bindings == [
         ForwardReceiveBinding(
             request_key=state.request_key,
@@ -472,7 +504,14 @@ def test_de_read_committed_only_after_all_steps_succeed(scheduler_factory, failu
     _, snapshot, state = _admit_request(scheduler)
     decision = _de_read_decision(state, snapshot)
     if failure_stage == "plan":
-        decision = _decision(PathDecisionResult(state.request_key, PathKind.DE_READ))
+        decision = _decision(
+            PathDecisionResult(
+                request_key=state.request_key,
+                path=PathKind.DE_READ,
+                reverse_attempt_id=0,
+                prefill_local_tokens=16,
+            )
+        )
     else:
         scheduler._kvpool_adapter.commit_after_alloc.side_effect = RuntimeError("commit failed")
     coordinator.take_received_decisions.return_value = [decision]

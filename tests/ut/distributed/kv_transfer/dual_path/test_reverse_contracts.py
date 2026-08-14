@@ -44,6 +44,9 @@ class _ReversePlanInput:
     remote_tp_size: int
     remote_pcp_size: int
     remote_dcp_size: int
+    reverse_attempt_id: int
+    prefill_local_tokens: int
+    reverse_send_job_id: int | None
 
     def build(self) -> metadata_module.ReversePlan:
         return metadata_module.ReversePlan(
@@ -60,6 +63,9 @@ class _ReversePlanInput:
             remote_tp_size=self.remote_tp_size,
             remote_pcp_size=self.remote_pcp_size,
             remote_dcp_size=self.remote_dcp_size,
+            reverse_attempt_id=self.reverse_attempt_id,
+            prefill_local_tokens=self.prefill_local_tokens,
+            reverse_send_job_id=self.reverse_send_job_id,
         )
 
 
@@ -78,6 +84,9 @@ def _valid_reverse_plan_input() -> _ReversePlanInput:
         remote_tp_size=2,
         remote_pcp_size=1,
         remote_dcp_size=1,
+        reverse_attempt_id=0,
+        prefill_local_tokens=16,
+        reverse_send_job_id=None,
     )
 
 
@@ -93,6 +102,9 @@ def _make_reverse_binding(
         destination_block_ids=destination_block_ids,
         token_start=token_start,
         token_end=token_end,
+        reverse_attempt_id=0,
+        prefill_local_tokens=token_start,
+        reverse_completion_job_id=0,
     )
 
 
@@ -175,6 +187,9 @@ def test_reverse_plan_wire_round_trip() -> None:
         "remote_tp_size": 2,
         "remote_pcp_size": 1,
         "remote_dcp_size": 1,
+        "reverse_attempt_id": 0,
+        "prefill_local_tokens": 16,
+        "reverse_send_job_id": None,
     }
     expected = _valid_reverse_plan_input().build()
 
@@ -295,6 +310,9 @@ def test_reverse_contracts_carry_no_runtime_or_mutable_state() -> None:
             "remote_tp_size",
             "remote_pcp_size",
             "remote_dcp_size",
+            "reverse_attempt_id",
+            "prefill_local_tokens",
+            "reverse_send_job_id",
         },
         "ReverseReceiveBinding": {
             "request_key",
@@ -303,6 +321,9 @@ def test_reverse_contracts_carry_no_runtime_or_mutable_state() -> None:
             "destination_block_ids",
             "token_start",
             "token_end",
+            "reverse_attempt_id",
+            "prefill_local_tokens",
+            "reverse_completion_job_id",
         },
     }
     forbidden_type_fragments = (

@@ -20,6 +20,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     PathDecisionRequest,
     PathKind,
+    ReverseAttemptKey,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import DecodeControlEndpoint
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
@@ -101,6 +102,14 @@ class ProductionHarness:
     def wire_request_id(self) -> str:
         return self.de_metadata.forward_receive_bindings[0].wire_request_id
 
+    @property
+    def reverse_wire_request_id(self) -> str:
+        return self.pe_metadata.reverse_receive_bindings[0].wire_request_id
+
+    @property
+    def reverse_completion_job_id(self) -> int:
+        return self.pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id
+
     def finish_store(self, *, failed: bool = False) -> tuple[set[str], set[str]]:
         self.de_worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})
         self.de_worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = {42} if failed else set()
@@ -113,10 +122,10 @@ class ProductionHarness:
         with patch.object(layerwise_module.MooncakeLayerwiseConnectorWorker, "send_done_send_signal"):
             self.de_worker.send_done_send_signal(DECODE_REQUEST_ID, MagicMock(), 0, trans_flag=not failed)
         self.pe_worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = (
-            set() if failed else {self.wire_request_id}
+            set() if failed else {self.reverse_wire_request_id}
         )
         self.pe_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = (
-            {self.wire_request_id} if failed else set()
+            {self.reverse_wire_request_id} if failed else set()
         )
         de_result = self.de_worker.get_finished(set(), self.de_metadata)
         pe_result = self.pe_worker.get_finished(set(), self.pe_metadata)
@@ -290,12 +299,12 @@ def test_partial_store_completes_before_reverse_submission(production_harness_fa
     harness = production_harness_factory()
     tracker = harness.de_worker._split_trackers[DECODE_REQUEST_ID]
     assert tracker.store_phase.value == "PENDING"
-    assert tracker.reverse_submitted is False
+    assert tracker.reverse_submitted_attempt is None
 
     assert harness.finish_store() == (set(), set())
 
     assert tracker.store_phase.value == "DONE"
-    assert tracker.reverse_submitted is True
+    assert tracker.reverse_submitted_attempt is not None
     assert harness.de_worker.kv_send_layer_thread.send_queue.put.call_count == len(split_helpers.LAYER_NAMES)
 
 
@@ -306,7 +315,7 @@ def test_store_miss_submits_reverse_after_mapping_install(production_harness_fac
     assert harness.de_worker.request_map[harness.wire_request_id] == DECODE_REQUEST_ID
     assert tracker.store_phase.value == "SKIPPED"
     assert tracker.reverse_plan is harness.de_metadata.reverse_plans[0]
-    assert tracker.reverse_submitted is True
+    assert tracker.reverse_submitted_attempt is not None
 
 
 def test_pe_execution_blocked_until_final_reverse_done(production_harness_factory) -> None:
@@ -316,7 +325,9 @@ def test_pe_execution_blocked_until_final_reverse_done(production_harness_factor
     assert harness.pe_worker.kv_send_layer_thread.send_queue.put.call_count == 0
     _, pe_finished = harness.finish_reverse()
 
-    assert pe_finished == (set(), {PREFILL_REQUEST_ID})
+    assert pe_finished == (set(), set())
+    worker_metadata = harness.pe_worker.build_connector_worker_meta()
+    assert worker_metadata.completed_jobs == {harness.reverse_completion_job_id: 1}
 
 
 def test_pe_uses_inherited_layerwise_forward_after_reverse(production_harness_factory) -> None:
@@ -376,10 +387,10 @@ def test_production_metadata_reconciles_early_terminals(production_harness_facto
     harness = production_harness_factory(include_store=False)
     early = production_harness_factory(include_store=False)
     early.pe_worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = (
-        set() if failed else {harness.wire_request_id}
+        set() if failed else {harness.reverse_wire_request_id}
     )
     early.pe_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = (
-        {harness.wire_request_id} if failed else set()
+        {harness.reverse_wire_request_id} if failed else set()
     )
     early.pe_worker._reverse_receive_bindings.clear()
     early.pe_worker._reverse_request_map.clear()
@@ -387,7 +398,12 @@ def test_production_metadata_reconciles_early_terminals(production_harness_facto
 
     early.pe_worker.start_load_kv(harness.pe_metadata)
 
-    assert early.pe_worker.get_finished(set(), harness.pe_metadata) == (set(), {PREFILL_REQUEST_ID})
+    assert early.pe_worker.get_finished(set(), harness.pe_metadata) == (set(), set())
+    worker_metadata = early.pe_worker.build_connector_worker_meta()
+    if failed:
+        assert worker_metadata.failed_jobs == {harness.reverse_completion_job_id: 1}
+    else:
+        assert worker_metadata.completed_jobs == {harness.reverse_completion_job_id: 1}
 
 
 def test_production_metadata_failed_wins_over_late_done(production_harness_factory) -> None:
@@ -430,10 +446,20 @@ def test_request_finish_releases_all_task08_state_idempotently(production_harnes
     assert set(harness.prefill_scheduler._path_decider._decision_records) == {unrelated_key}
     assert harness.decode_scheduler._decode_kv_snapshots == {}
     assert harness.decode_scheduler._decode_decision_states == {}
-    assert harness.de_worker._split_trackers == {}
+    # The reverse attempt never completed, so the section-5 removal rule
+    # retains its tracker past the request finish.
+    assert set(harness.de_worker._split_trackers) == {DECODE_REQUEST_ID}
     assert harness.de_worker._forward_receive_bindings == {}
-    assert harness.pe_worker._reverse_receive_bindings == {}
-    assert harness.pe_worker._reverse_request_map == {}
+    # The reverse terminal was never consumed, so the section-5 removal rule
+    # retains the attempt-keyed binding past the request finish.
+    assert set(harness.pe_worker._reverse_receive_bindings) == {
+        ReverseAttemptKey(harness.pe_metadata.reverse_receive_bindings[0].request_key, 0)
+    }
+    assert harness.pe_worker._reverse_request_map == {
+        harness.reverse_wire_request_id: ReverseAttemptKey(
+            harness.pe_metadata.reverse_receive_bindings[0].request_key, 0
+        )
+    }
 
 
 def test_shutdown_leaves_no_task08_residue(production_harness_factory) -> None:
