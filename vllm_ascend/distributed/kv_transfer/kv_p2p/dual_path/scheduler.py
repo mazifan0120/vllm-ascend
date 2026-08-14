@@ -1729,10 +1729,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # Request-level release is authorized only after every send attempt
             # for this exact request key has closed or disappeared.
             self._de_progress_deadlines.pop(request_id, None)
-            self._latest_reverse_attempt_ids.pop(request_id, None)
             finished_sending: set[str] = set()
             if request_id in self._pending_finished_sending:
                 self._pending_finished_sending.discard(request_id)
+                self._latest_reverse_attempt_ids.pop(request_id, None)
                 finished_sending.add(request_id)
             return finished_sending, set()
         return set(), set()

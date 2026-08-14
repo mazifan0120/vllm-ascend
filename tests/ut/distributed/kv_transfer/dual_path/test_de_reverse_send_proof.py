@@ -346,3 +346,24 @@ def test_finish_delays_when_latest_send_job_closed_but_older_attempt_is_open(
 
     old_output = _close_send_job(scheduler, old_job_id)
     assert old_output.finished_sending == {request.request_id}
+
+
+def test_active_request_retains_closed_attempt_epoch_for_later_refresh(decode_scheduler_factory, decode_task04_seams):
+    scheduler = decode_scheduler_factory()
+    request = _admit_decode_request(scheduler)
+    first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
+    first_job_id = first_metadata.reverse_plans[0].reverse_send_job_id
+    assert first_job_id is not None
+    assert request.request_id not in scheduler._pending_finished_sending
+
+    first_output = _close_send_job(scheduler, first_job_id)
+
+    assert first_output.finished_sending is None
+    assert scheduler._latest_reverse_attempt_ids[request.request_id] == 0
+
+    second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
+    assert len(second_metadata.reverse_plans) == 1
+    second_job_id = second_metadata.reverse_plans[0].reverse_send_job_id
+    assert second_job_id is not None
+    assert second_job_id != first_job_id
+    assert scheduler._latest_reverse_attempt_ids[request.request_id] == 1
