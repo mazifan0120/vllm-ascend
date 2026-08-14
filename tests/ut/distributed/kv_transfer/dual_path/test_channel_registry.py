@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import DECODE_TEST_INSTANCE_ID
@@ -129,30 +130,18 @@ def _deliver_with_replies(replies_per_attempt: list[list[bytes | None]], decisio
 
 
 class TestMessageKindEnvelope:
-    def test_message_kind_decodes_decision_vs_close(self):
-        decision = _decision()
+    def test_decision_envelope_round_trips_and_unknown_kind_is_rejected(self):
+        decision = _decision(attempt_id=0)
         kind, payload = channel.decode_control_message(channel.encode_path_decision(decision))
         assert kind is channel.ControlMessageKind.DECISION
-        assert channel.PathDecision.from_dict(payload) == decision
+        assert PathDecision.from_dict(payload) == decision
 
-        close = channel.CloseReverseAttempt(request_key=_KEY, reverse_attempt_id=2)
-        kind, payload = channel.decode_control_message(
-            channel.encode_control_message(channel.ControlMessageKind.CLOSE_REVERSE_ATTEMPT, close.to_dict())
-        )
-        assert kind is channel.ControlMessageKind.CLOSE_REVERSE_ATTEMPT
-        assert channel.CloseReverseAttempt.from_dict(payload) == close
-
+        foreign = msgspec.msgpack.encode({"kind": "CloseReverseAttempt", "payload": {}})
         with pytest.raises(PathDecisionValidationError):
-            channel.decode_control_message(channel.msgspec.msgpack.encode({"kind": "Bogus", "payload": {}}))
+            channel.decode_control_message(foreign)
 
-        # A close message is answered fail-closed in this wave, never a crash.
-        receiver = _make_receiver()
-        reply = _deliver_frames(
-            receiver,
-            channel.encode_control_message(channel.ControlMessageKind.CLOSE_REVERSE_ATTEMPT, close.to_dict()),
-        )
-        assert reply is not None
-        assert channel.decode_close_reply(reply) is channel.CloseReplyStatus.NOT_SAFE
+    def test_control_message_kind_has_only_the_decision_member(self):
+        assert [member.value for member in channel.ControlMessageKind] == ["Decision"]
 
 
 class TestRegistryMatrix:
@@ -229,11 +218,9 @@ class TestRegistryMatrix:
 
 
 class TestReplyEncoding:
-    def test_response_encoding_round_trip_both_roles(self):
+    def test_response_encoding_round_trip(self):
         for status in channel.DecisionReplyStatus:
             assert channel.decode_decision_reply(channel.encode_decision_reply(status)) is status
-        for status in channel.CloseReplyStatus:
-            assert channel.decode_close_reply(channel.encode_close_reply(status)) is status
         with pytest.raises(PathDecisionValidationError):
             channel.decode_decision_reply(channel.msgspec.msgpack.encode({"status": "BOGUS"}))
         with pytest.raises(PathDecisionValidationError):

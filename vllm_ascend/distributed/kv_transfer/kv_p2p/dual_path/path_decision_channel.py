@@ -18,11 +18,6 @@ import zmq
 from typing_extensions import assert_never
 from vllm.logger import logger
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.close_registry import (
-    ClosedReverseAttemptRecord,
-    ReverseAttemptRegistryState,
-    evaluate_close_attempt,
-)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import MAX_TCP_PORT, MIN_TCP_PORT
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
@@ -33,7 +28,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionResult,
     PathDecisionValidationError,
     PathKind,
-    ReverseAttemptKey,
     require_exact_payload,
 )
 
@@ -146,7 +140,6 @@ class PathDecision:
 
 class ControlMessageKind(str, Enum):
     DECISION = "Decision"
-    CLOSE_REVERSE_ATTEMPT = "CloseReverseAttempt"
 
 
 class DecisionReplyStatus(str, Enum):
@@ -154,11 +147,6 @@ class DecisionReplyStatus(str, Enum):
     STALE_CLOSED = "STALE_CLOSED"
     PROTOCOL_ERROR = "PROTOCOL_ERROR"
     UNKNOWN_REQUEST = "UNKNOWN_REQUEST"
-
-
-class CloseReplyStatus(str, Enum):
-    SAFE = "SAFE"
-    NOT_SAFE = "NOT_SAFE"
 
 
 def encode_control_message(kind: ControlMessageKind, payload: JsonObject) -> bytes:
@@ -180,11 +168,11 @@ def decode_control_message(payload: bytes) -> tuple[ControlMessageKind, JsonObje
     return kind, data["payload"]
 
 
-def _encode_status(status: DecisionReplyStatus | CloseReplyStatus) -> bytes:
+def _encode_status(status: DecisionReplyStatus) -> bytes:
     return msgspec.msgpack.encode({"status": status.value})
 
 
-def _decode_status(payload: bytes, enum_cls: type) -> DecisionReplyStatus | CloseReplyStatus:
+def _decode_status(payload: bytes, enum_cls: type) -> DecisionReplyStatus:
     try:
         decoded = msgspec.msgpack.decode(payload)
     except msgspec.DecodeError as error:
@@ -201,45 +189,7 @@ def encode_decision_reply(status: DecisionReplyStatus) -> bytes:
 
 
 def decode_decision_reply(payload: bytes) -> DecisionReplyStatus:
-    return _decode_status(payload, DecisionReplyStatus)  # type: ignore[return-value]
-
-
-def encode_close_reply(status: CloseReplyStatus) -> bytes:
-    return _encode_status(status)
-
-
-def decode_close_reply(payload: bytes) -> CloseReplyStatus:
-    return _decode_status(payload, CloseReplyStatus)  # type: ignore[return-value]
-
-
-@dataclass(frozen=True)
-class CloseReverseAttempt:
-    request_key: DualPathRequestKey
-    reverse_attempt_id: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request_key, DualPathRequestKey):
-            raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
-        if (
-            isinstance(self.reverse_attempt_id, bool)
-            or not isinstance(self.reverse_attempt_id, int)
-            or self.reverse_attempt_id < 0
-        ):
-            raise PathDecisionValidationError("reverse_attempt_id must be a non-negative integer")
-
-    def to_dict(self) -> JsonObject:
-        return {
-            "request_key": self.request_key.to_dict(),
-            "reverse_attempt_id": self.reverse_attempt_id,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: JsonValue) -> CloseReverseAttempt:
-        data = require_exact_payload(payload, frozenset({"request_key", "reverse_attempt_id"}))
-        return cls(
-            request_key=DualPathRequestKey.from_dict(data["request_key"]),
-            reverse_attempt_id=data["reverse_attempt_id"],
-        )
+    return _decode_status(payload, DecisionReplyStatus)
 
 
 def encode_path_decision(decision: PathDecision) -> bytes:
@@ -354,38 +304,6 @@ def _deliver_decision(
     raise PathDecisionDeliveryError("path decision delivery failed") from last_error
 
 
-def _deliver_close(
-    encoded: bytes,
-    endpoint: DecodeControlEndpoint,
-    *,
-    opener: _SocketOpener,
-    sleep: _Sleep,
-    should_stop: _ShouldStop,
-    send_timeout_ms: int,
-    poll_timeout_ms: int,
-    retry_spacing_s: float,
-) -> CloseReplyStatus:
-    """Identical-retry close delivery: the retry is idempotent under the
-    registry lock, so an uncertain reply is always safe to resend."""
-    last_error: Exception | None = None
-    for attempt in range(_MAX_DELIVERY_ATTEMPTS):
-        try:
-            with opener(endpoint) as socket:
-                socket.set_send_timeout(send_timeout_ms)
-                socket.send(encoded)
-                if not socket.poll(poll_timeout_ms):
-                    raise PathDecisionDeliveryError("close acknowledgement timed out")
-                return decode_close_reply(socket.recv())
-        except Exception as error:  # noqa: BLE001
-            last_error = error
-
-        if attempt == _MAX_DELIVERY_ATTEMPTS - 1 or should_stop():
-            break
-        sleep(retry_spacing_s)
-
-    raise PathDecisionDeliveryError("close delivery failed") from last_error
-
-
 class PathDecisionCoordinator:
     def __init__(self) -> None:
         self._role: Literal["prefill", "decode"] | None = None
@@ -395,8 +313,6 @@ class PathDecisionCoordinator:
         self._pending_keys: set[DualPathRequestKey] = set()
         self._accepted_decisions: dict[DualPathRequestKey, PathDecision] = {}
         self._closed_through_attempt_ids: dict[DualPathRequestKey, int] = {}
-        self._reverse_attempt_states: dict[ReverseAttemptKey, ReverseAttemptRegistryState] = {}
-        self._closed_reverse_records: dict[ReverseAttemptKey, ClosedReverseAttemptRecord] = {}
         self._received_decisions: queue.SimpleQueue[PathDecision] = queue.SimpleQueue()
         self._registry_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
@@ -482,9 +398,6 @@ class PathDecisionCoordinator:
             self._pending_keys.add(key)
 
     def unregister(self, key: DualPathRequestKey) -> None:
-        # ClosedReverseAttemptRecords deliberately survive: they are the only
-        # path by which a NOT_SAFE can later become SAFE, and a retained
-        # safe-close proof must answer SAFE even after admission teardown.
         with self._registry_lock:
             self._pending_keys.discard(key)
             self._accepted_decisions.pop(key, None)
@@ -525,28 +438,6 @@ class PathDecisionCoordinator:
                 retry_spacing_s=self._retry_spacing_s,
             )
 
-    def submit_close(
-        self,
-        endpoint: DecodeControlEndpoint,
-        close: CloseReverseAttempt,
-    ) -> Future[CloseReplyStatus]:
-        with self._lifecycle_lock:
-            if self._closed:
-                raise RuntimeError("path decision coordinator is closed")
-            encoded = encode_control_message(ControlMessageKind.CLOSE_REVERSE_ATTEMPT, close.to_dict())
-            assert self._executor is not None
-            return self._executor.submit(
-                _deliver_close,
-                encoded,
-                endpoint,
-                opener=self._socket_opener,
-                sleep=self._sleep,
-                should_stop=lambda: self._closed,
-                send_timeout_ms=self._send_timeout_ms,
-                poll_timeout_ms=self._poll_timeout_ms,
-                retry_spacing_s=self._retry_spacing_s,
-            )
-
     def close(self) -> None:
         with self._lifecycle_lock:
             if self._closed:
@@ -561,8 +452,6 @@ class PathDecisionCoordinator:
                 self._pending_keys.clear()
                 self._accepted_decisions.clear()
                 self._closed_through_attempt_ids.clear()
-                self._reverse_attempt_states.clear()
-                self._closed_reverse_records.clear()
             self._drain_received_decisions()
         elif self._role == "prefill":
             assert self._executor is not None
@@ -610,101 +499,10 @@ class PathDecisionCoordinator:
         except PathDecisionValidationError:
             logger.warning("path decision result receiver rejected malformed payload")
             return
-        if kind is ControlMessageKind.CLOSE_REVERSE_ATTEMPT:
-            try:
-                close = CloseReverseAttempt.from_dict(message_payload)
-            except PathDecisionValidationError:
-                logger.warning("path decision result receiver rejected malformed CloseReverseAttempt")
-                return
-            self._handle_close_frame(socket, identity, close)
+        if kind is not ControlMessageKind.DECISION:
+            logger.warning("path decision result receiver rejected non-Decision control message")
             return
         self._handle_decision_frame(socket, identity, message_payload)
-
-    def _handle_close_frame(self, socket: zmq.Socket, identity: bytes, close: CloseReverseAttempt) -> None:
-        # Bounded in-memory work only: never waits on a Worker, queue, Future,
-        # or condition variable, and every reply is sent before the next
-        # request is read.
-        with self._registry_lock:
-            attempt_key = ReverseAttemptKey(close.request_key, close.reverse_attempt_id)
-            record = self._closed_reverse_records.get(attempt_key)
-            retained = self._accepted_decisions.get(close.request_key)
-            evaluation = evaluate_close_attempt(
-                attempt_key,
-                record=record,
-                admission_present=(
-                    close.request_key in self._pending_keys or close.request_key in self._accepted_decisions
-                ),
-                decision_received=(
-                    retained is not None and retained.result.reverse_attempt_id == close.reverse_attempt_id
-                ),
-                state=self._reverse_attempt_states.get(attempt_key),
-                closed_through=self._closed_through_attempt_ids.get(close.request_key),
-            )
-            if evaluation.record is not None:
-                # The proof is persisted before any SAFE reply is sent, so a
-                # dropped SAFE followed by an identical retry still answers SAFE.
-                self._closed_reverse_records[attempt_key] = evaluation.record
-            if evaluation.new_closed_through is not None:
-                self._closed_through_attempt_ids[close.request_key] = max(
-                    self._closed_through_attempt_ids.get(close.request_key, -1),
-                    evaluation.new_closed_through,
-                )
-            status = CloseReplyStatus.SAFE if evaluation.safe else CloseReplyStatus.NOT_SAFE
-        socket.send_multipart([identity, b"", encode_close_reply(status)])
-
-    def claim_reverse_activation(self, key: DualPathRequestKey, reverse_attempt_id: int) -> bool:
-        """Atomic receipt-to-activation claim: succeeds only while the attempt
-        is open; a persisted close proof suppresses the claim."""
-        with self._registry_lock:
-            attempt_key = ReverseAttemptKey(key, reverse_attempt_id)
-            if self._closed_reverse_records.get(attempt_key) is not None:
-                return False
-            state = self._reverse_attempt_states.setdefault(attempt_key, ReverseAttemptRegistryState())
-            if state.activation_claimed:
-                return True
-            state.activation_claimed = True
-            return True
-
-    def cancel_reverse_publication(self, attempt_key: ReverseAttemptKey) -> None:
-        with self._registry_lock:
-            state = self._reverse_attempt_states.setdefault(attempt_key, ReverseAttemptRegistryState())
-            state.publication_cancelled = True
-
-    def mark_reverse_work_published(self, attempt_key: ReverseAttemptKey, reverse_send_job_id: int) -> None:
-        with self._registry_lock:
-            state = self._reverse_attempt_states.setdefault(attempt_key, ReverseAttemptRegistryState())
-            state.worker_work_published = True
-            state.reverse_send_job_id = reverse_send_job_id
-
-    def mark_reverse_send_complete(self, attempt_key: ReverseAttemptKey) -> None:
-        """Locked conversion: a not-failed reverse-send job close turns the
-        attempt's record into the retained SAFE proof."""
-        with self._registry_lock:
-            state = self._reverse_attempt_states.setdefault(attempt_key, ReverseAttemptRegistryState())
-            state.sender_complete = True
-            record = self._closed_reverse_records.get(attempt_key)
-            if record is not None and not record.safe_close_proof:
-                record.safe_close_proof = True
-            if record is None:
-                # No close ever arrived: persist the minimal completed-send
-                # proof so a later close reads it, matching the close
-                # protocol's persist-before-reply shape.
-                record = ClosedReverseAttemptRecord(
-                    attempt_key,
-                    activation_claimed=state.activation_claimed,
-                    worker_work_published=state.worker_work_published,
-                    reverse_send_job_id=state.reverse_send_job_id,
-                    safe_close_proof=True,
-                )
-                self._closed_reverse_records[attempt_key] = record
-            if record.safe_close_proof:
-                self._closed_through_attempt_ids[attempt_key.request_key] = max(
-                    self._closed_through_attempt_ids.get(attempt_key.request_key, -1),
-                    attempt_key.reverse_attempt_id,
-                )
-                # The persisted proof is authoritative now; the live state
-                # slot retires with the attempt.
-                self._reverse_attempt_states.pop(attempt_key, None)
 
     def _handle_decision_frame(self, socket: zmq.Socket, identity: bytes, payload: JsonObject) -> None:
         try:

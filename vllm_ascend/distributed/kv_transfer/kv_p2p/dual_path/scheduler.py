@@ -1424,17 +1424,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 return
             is_attempt_refresh = True
 
-        if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
-            if not self._path_decision_coordinator.claim_reverse_activation(
-                state.request_key, result.reverse_attempt_id
-            ):
-                logger.info(
-                    "DualPath Decode activation suppressed for request %s attempt %s: the attempt is closed",
-                    request_id,
-                    result.reverse_attempt_id,
-                )
-                return
-
         snapshot = self._decode_kv_snapshots[request_id]
         try:
             destination_block_ids, forward_token_start, reverse_plan = self._validate_committed_decision(
@@ -1459,11 +1448,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         except Exception as error:  # noqa: BLE001
             logger.error("DualPath Decode activation failed for request %s: %s", request_id, error)
             self._de_progress_deadlines.pop(request_id, None)
-            if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
-                # The claim was won but no worker work was ever published.
-                self._path_decision_coordinator.cancel_reverse_publication(
-                    ReverseAttemptKey(state.request_key, result.reverse_attempt_id)
-                )
             state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
             self._path_decision_coordinator.unregister(state.request_key)
             metadata.control_failures.append(
@@ -1488,7 +1472,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             reverse_plan = replace(reverse_plan, reverse_send_job_id=send_job.job_id)
             self._reverse_send_job_ids[attempt_key] = send_job.job_id
             metadata.reverse_plans.append(reverse_plan)
-            self._path_decision_coordinator.mark_reverse_work_published(attempt_key, send_job.job_id)
         if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
             self._latest_reverse_attempt_ids[request_id] = result.reverse_attempt_id
         if is_attempt_refresh:
@@ -1799,7 +1782,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             attempt_key = job.reverse_attempt_key
             if attempt_key is None:
                 return set(), set()
-            self._path_decision_coordinator.mark_reverse_send_complete(attempt_key)
             request_id = attempt_key.request_key.decode_request_id
             self._de_progress_deadlines.pop(request_id, None)
             finished_sending: set[str] = set()

@@ -10,7 +10,6 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import (
-    DECODE_TEST_INSTANCE_ID,
     make_block_pool,
     make_empty_scheduler_output,
     make_worker_metadata,
@@ -29,10 +28,6 @@ from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
 from tests.ut.distributed.kv_transfer.dual_path.test_resume_admission import (
     _admit_de_read,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel as channel
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.close_registry import (
-    ReverseAttemptRegistryState,
-)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.ledgers import (
     HoldKind,
     HoldLedger,
@@ -47,26 +42,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
     ReverseAttemptKey,
 )
-
-_KEY = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, "decode-request-9")
-
-
-def _close(receiver, attempt_id: int, key: DualPathRequestKey = _KEY) -> channel.CloseReplyStatus:
-    from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _deliver_frames
-
-    close = channel.CloseReverseAttempt(request_key=key, reverse_attempt_id=attempt_id)
-    reply = _deliver_frames(
-        receiver,
-        channel.encode_control_message(channel.ControlMessageKind.CLOSE_REVERSE_ATTEMPT, close.to_dict()),
-    )
-    assert reply is not None
-    return channel.decode_close_reply(reply)
-
-
-def _receive_decision(receiver, attempt_id: int = 0) -> None:
-    from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _decision, _deliver_frames
-
-    _deliver_frames(receiver, channel.encode_path_decision(_decision(attempt_id)))
 
 
 class TestDecodeEngineProgress:
@@ -256,47 +231,6 @@ class TestLedgerRetirementWiring:
         assert scheduler._hold_ledger.get(hold_id).released is False
         assert pool.blocks[71].ref_cnt == 1
 
-    def test_normal_reverse_send_completion_without_close_retires_state_with_proof(self):
-        from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import (
-            _make_receiver,
-        )
-
-        receiver = _make_receiver()
-        receiver.register_pending(_KEY)
-        _receive_decision(receiver, 0)
-        attempt_key = ReverseAttemptKey(_KEY, 0)
-        receiver.claim_reverse_activation(_KEY, 0)
-        receiver.mark_reverse_work_published(attempt_key, reverse_send_job_id=3)
-
-        receiver.mark_reverse_send_complete(attempt_key)
-
-        # No close ever arrived: the minimal completed-send proof is persisted
-        # and the live state slot retires with the attempt.
-        assert attempt_key not in receiver._reverse_attempt_states
-        record = receiver._closed_reverse_records[attempt_key]
-        assert record.safe_close_proof is True
-        assert _close(receiver, 0) is channel.CloseReplyStatus.SAFE
-
-    def test_state_with_pending_close_record_is_not_retired_early(self):
-        from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import (
-            _make_receiver,
-        )
-
-        receiver = _make_receiver()
-        receiver.register_pending(_KEY)
-        _receive_decision(receiver, 0)
-        attempt_key = ReverseAttemptKey(_KEY, 0)
-        receiver.claim_reverse_activation(_KEY, 0)
-        receiver.mark_reverse_work_published(attempt_key, reverse_send_job_id=3)
-        assert _close(receiver, 0) is channel.CloseReplyStatus.NOT_SAFE
-
-        # A NOT_SAFE record is pending the send job: the live state stays.
-        assert attempt_key in receiver._reverse_attempt_states
-
-        receiver.mark_reverse_send_complete(attempt_key)
-        assert attempt_key not in receiver._reverse_attempt_states
-        assert receiver._closed_reverse_records[attempt_key].safe_close_proof is True
-
 
 class TestLifecycleRetirement:
     def test_ledgers_retire_only_closed_and_released_records(self):
@@ -317,22 +251,6 @@ class TestLifecycleRetirement:
         assert not hold_ledger.discard(retained.hold_id)
         assert hold_ledger.discard(released.hold_id)
         assert hold_ledger.get(released.hold_id) is None
-
-    def test_coordinator_attempt_states_retire_after_safe_proof(self):
-        from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _make_receiver
-
-        receiver = _make_receiver()
-        receiver.register_pending(_KEY)
-        assert _close(receiver, 0) is not None
-        attempt_key = ReverseAttemptKey(_KEY, 0)
-        assert attempt_key in receiver._closed_reverse_records
-        # The live state slot is retired once the proof is authoritative; the
-        # record survives until teardown.
-        receiver._reverse_attempt_states.setdefault(attempt_key, ReverseAttemptRegistryState())
-        receiver.mark_reverse_work_published(attempt_key, reverse_send_job_id=3)
-        receiver.mark_reverse_send_complete(attempt_key)
-        assert attempt_key not in receiver._reverse_attempt_states
-        assert receiver._closed_reverse_records[attempt_key].safe_close_proof is True
 
 
 class TestStage2EnvValidation:
@@ -372,7 +290,6 @@ class TestReverseSendJobRetirement:
     def test_delayed_free_reverse_send_close_retires_job_record(self, decode_scheduler_factory, decode_task04_seams):
         from tests.ut.distributed.kv_transfer.dual_path.conftest import (
             DECODE_TEST_CONTROL_ENDPOINT,
-            DECODE_TEST_INSTANCE_ID,
         )
         from tests.ut.distributed.kv_transfer.dual_path.test_channel_registry import _make_receiver
 
@@ -382,8 +299,6 @@ class TestReverseSendJobRetirement:
         receiver._context = MagicMock(name="zmq_context")
         receiver._receiver_thread = MagicMock(name="receiver_thread")
         scheduler._path_decision_coordinator = receiver
-        request_key = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, "decode-request-7")
-
         request = _admit_decode_request(scheduler)
         _deliver_decision_to(receiver, 0)
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
@@ -401,10 +316,6 @@ class TestReverseSendJobRetirement:
 
         assert output.finished_sending == {request.request_id}
         assert scheduler._job_ledger.get(job_id) is None
-        # The coordinator's persisted proof survives; a later close is SAFE.
-        attempt_key = ReverseAttemptKey(request_key, 0)
-        assert receiver._closed_reverse_records[attempt_key].safe_close_proof is True
-        assert _close(receiver, 0, request_key) is channel.CloseReplyStatus.SAFE
 
     def test_normal_reverse_send_close_retires_at_release_and_predicate_reads_ledger(
         self, decode_scheduler_factory, decode_task04_seams
