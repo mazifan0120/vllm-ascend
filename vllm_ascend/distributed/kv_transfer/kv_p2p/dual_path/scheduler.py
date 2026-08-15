@@ -159,7 +159,7 @@ def _effective_prefill_token_count(decision_request: PathDecisionRequest, need_t
 
 
 def _is_open_decision_status(status: _DecodeDecisionStatus) -> bool:
-    """Only PENDING decisions still accept an outcome or a timeout."""
+    """Only PENDING decisions can still accept a Decision."""
     return status is _DecodeDecisionStatus.PENDING
 
 
