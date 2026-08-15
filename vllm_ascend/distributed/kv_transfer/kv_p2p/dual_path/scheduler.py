@@ -15,6 +15,7 @@ from typing_extensions import assert_never
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
+from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
@@ -39,6 +40,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    PathAbortNotice,
+    PathAbortReason,
     PathDecisionDecider,
     PathDecisionRequest,
     PathDecisionResult,
@@ -308,6 +311,66 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
         self._prefill_control_failures[request_id] = failure
 
+    def _send_abort_notice(
+        self,
+        request_key: DualPathRequestKey,
+        endpoint: DecodeControlEndpoint,
+        reason: PathAbortReason,
+    ) -> None:
+        notice = PathAbortNotice(request_key=request_key, reason=reason)
+        try:
+            delivery_future = self._path_decision_coordinator.submit_abort(endpoint, notice)
+        except RuntimeError as error:
+            logger.error(
+                "DualPath ABORT submission failed locally for request %s: %s",
+                request_key.decode_request_id,
+                error,
+            )
+            return
+
+        def log_abort_delivery(completed_future: Future[None]) -> None:
+            if completed_future.cancelled():
+                logger.warning(
+                    "dual_path abort key=%s/%s reason=%s delivery_terminal=CANCELLED",
+                    request_key.decode_engine_instance_id,
+                    request_key.decode_request_id,
+                    reason.value,
+                )
+                return
+            error = completed_future.exception()
+            if error is not None:
+                logger.error(
+                    "dual_path abort key=%s/%s reason=%s delivery_terminal=FAILED error=%s",
+                    request_key.decode_engine_instance_id,
+                    request_key.decode_request_id,
+                    reason.value,
+                    error,
+                )
+                return
+            logger.info(
+                "dual_path abort key=%s/%s reason=%s delivery_terminal=SUCCEEDED",
+                request_key.decode_engine_instance_id,
+                request_key.decode_request_id,
+                reason.value,
+            )
+
+        delivery_future.add_done_callback(log_abort_delivery)
+
+    def _send_abort_notice_for_request(
+        self,
+        request_id: str,
+        reason: PathAbortReason,
+    ) -> None:
+        request_key = self._prefill_request_keys.get(request_id)
+        metadata = self._prefill_decision_metadata.get(request_id)
+        if request_key is None or metadata is None:
+            logger.error(
+                "DualPath cannot send ABORT for request %s because decision metadata is unavailable",
+                request_id,
+            )
+            return
+        self._send_abort_notice(request_key, metadata.decode_control_endpoint, reason)
+
     def _reconcile_prefill_deliveries(self) -> None:
         """Detect failed deliveries, stage their control failures, and reclaim
         delivery futures of released requests once they complete."""
@@ -346,9 +409,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             self._prefill_invalid_request_ids.add(request_id)
                             self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
                         elif result.path is PathKind.PE_READ:
-                            pass
+                            self._prefill_invalid_request_ids.add(request_id)
                         else:
                             assert_never(result.path)
+                        self._send_abort_notice_for_request(
+                            request_id,
+                            PathAbortReason.DELIVERY_EXHAUSTED,
+                        )
             if request_id in self._prefill_request_keys:
                 # Active request: retain the future for its done-callback.
                 continue
@@ -396,6 +463,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 prefill_local_tokens,
                 effective_prefill_tokens,
             )
+            self._prefill_invalid_request_ids.add(request_id)
+            self._send_abort_notice(
+                decision_request.request_key,
+                metadata.decode_control_endpoint,
+                PathAbortReason.DECISION_FAILED,
+            )
             return parent_result
 
         if request_id in self._prefill_delivery_futures and request_id in self._prefill_path_results:
@@ -417,14 +490,19 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if request_id not in self._prefill_path_results:
                 # A first-contact failure has nothing to discard: converge
                 # locally instead of escaping into the vLLM scheduling loop.
-                # No Result is sent and Decode converges through its decision
-                # deadline.
+                # No Result is sent; the request-terminal ABORT makes Decode
+                # converge without waiting for its decision deadline.
                 logger.error(
                     "DualPath Prefill decision failed for request %s: %s",
                     request_id,
                     error,
                 )
                 self._prefill_invalid_request_ids.add(request_id)
+                self._send_abort_notice(
+                    decision_request.request_key,
+                    metadata.decode_control_endpoint,
+                    PathAbortReason.DECISION_FAILED,
+                )
                 return parent_result
             # The retained decision was never delivered, so the conflicting facts
             # come from an admission retry (allocation-failure retry or preemption
@@ -450,6 +528,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     fresh_error,
                 )
                 self._prefill_invalid_request_ids.add(request_id)
+                self._send_abort_notice(
+                    decision_request.request_key,
+                    metadata.decode_control_endpoint,
+                    PathAbortReason.DECISION_FAILED,
+                )
                 return parent_result
 
         self._prefill_request_keys[request_id] = request_key
@@ -1048,8 +1131,21 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         # delivered, in which case the installed Forward/Reverse artifacts must
         # not be handed to the Worker.
         request_id = request.request_id
+        metadata = self._prefill_decision_metadata.get(request_id)
+        if metadata is None:
+            logger.error(
+                "DualPath cannot send activation ABORT for request %s because decision metadata is unavailable",
+                request_id,
+            )
+        else:
+            self._send_abort_notice(
+                result.request_key,
+                metadata.decode_control_endpoint,
+                PathAbortReason.ACTIVATION_FAILED,
+            )
         if result.path is PathKind.DE_READ:
-            decision_request = self._prefill_decision_metadata[request_id].decision_request
+            assert metadata is not None
+            decision_request = metadata.decision_request
             self._stage_prefill_activation_failure(
                 request_id,
                 blocks.get_block_ids()[0],
@@ -1521,6 +1617,31 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 request_id,
             )
 
+    def _handle_received_abort(self, notice: PathAbortNotice) -> None:
+        request_id = notice.request_key.decode_request_id
+        state = self._decode_decision_states.get(request_id)
+        if state is None or state.status not in (
+            _DecodeDecisionStatus.PENDING,
+            _DecodeDecisionStatus.COMMITTED,
+        ):
+            return
+        state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
+        self._de_progress_deadlines.pop(request_id, None)
+        self._path_decision_coordinator.unregister(state.request_key)
+        snapshot = self._decode_kv_snapshots[request_id]
+        try:
+            self._decode_control_failures[request_id] = self._build_decode_control_failure(
+                request_id,
+                snapshot,
+                DualPathControlFailureReason.PEER_ABORT,
+            )
+        except RuntimeError as error:
+            logger.error(
+                "DualPath peer ABORT could not build Decode control failure for request %s: %s",
+                request_id,
+                error,
+            )
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -1546,9 +1667,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         for decision in coordinator.take_received_decisions():
             self._activate_received_decision(decision, metadata)
-        self._sweep_decode_progress_watchdogs(metadata)
+        for notice in coordinator.take_received_aborts():
+            self._handle_received_abort(notice)
         metadata.control_failures.extend(self._decode_control_failures.values())
         self._decode_control_failures.clear()
+        self._sweep_decode_progress_watchdogs(metadata)
 
         now = time.monotonic()
         for request_id, state in self._decode_decision_states.items():
@@ -1626,6 +1749,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         delay_free = self._delay_free_for_connector(request)
+        self._send_prefill_client_abort(request)
         self._release_scheduler_request_state(request)
         parent_delay_free, params = super().request_finished(request, block_ids)
         return delay_free or parent_delay_free, params
@@ -1634,9 +1758,32 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
         delay_free = self._delay_free_for_connector(request)
+        self._send_prefill_client_abort(request)
         self._release_scheduler_request_state(request)
         parent_delay_free, params = super().request_finished_all_groups(request, block_ids)
         return delay_free or parent_delay_free, params
+
+    def _send_prefill_client_abort(self, request: Request) -> None:
+        if (
+            self.dual_path_cfg.role != "prefill"
+            or getattr(request, "status", None) is not RequestStatus.FINISHED_ABORTED
+        ):
+            return
+        try:
+            params = request.kv_transfer_params
+            metadata = DualPathDecisionMetadata.from_dict(params["dual_path"])
+        except (KeyError, TypeError, PathDecisionValidationError) as error:
+            logger.error(
+                "DualPath Prefill could not parse client-abort metadata for request %s: %s",
+                request.request_id,
+                error,
+            )
+            return
+        self._send_abort_notice(
+            metadata.decision_request.request_key,
+            metadata.decode_control_endpoint,
+            PathAbortReason.REQUEST_ABORTED,
+        )
 
     def _delay_free_for_connector(self, request: Request) -> bool:
         # Neither direction delays the free on the Prefill side: Forward is the

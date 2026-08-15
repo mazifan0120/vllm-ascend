@@ -309,6 +309,7 @@ class DualPathControlFailureReason(str, Enum):
     ACTIVATION_FAILED = "ACTIVATION_FAILED"
     RECOVERY_TIMEOUT = "RECOVERY_TIMEOUT"
     REVERSE_JOB_FAILED = "REVERSE_JOB_FAILED"
+    PEER_ABORT = "PEER_ABORT"
 
 
 @dataclass(frozen=True)

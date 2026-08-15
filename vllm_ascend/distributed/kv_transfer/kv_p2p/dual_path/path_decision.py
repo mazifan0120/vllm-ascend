@@ -61,6 +61,43 @@ class DualPathRequestKey:
         )
 
 
+class PathAbortReason(str, Enum):
+    DECISION_FAILED = "DECISION_FAILED"
+    DELIVERY_EXHAUSTED = "DELIVERY_EXHAUSTED"
+    ACTIVATION_FAILED = "ACTIVATION_FAILED"
+    REQUEST_ABORTED = "REQUEST_ABORTED"
+
+
+@dataclass(frozen=True)
+class PathAbortNotice:
+    request_key: DualPathRequestKey
+    reason: PathAbortReason
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request_key, DualPathRequestKey):
+            raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
+        if not isinstance(self.reason, PathAbortReason):
+            raise PathDecisionValidationError("reason must be a PathAbortReason")
+
+    def to_dict(self) -> JsonObject:
+        return {
+            "request_key": self.request_key.to_dict(),
+            "reason": self.reason.value,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: JsonValue) -> PathAbortNotice:
+        data = require_exact_payload(payload, frozenset({"request_key", "reason"}))
+        try:
+            reason = PathAbortReason(data["reason"])
+        except (TypeError, ValueError) as error:
+            raise PathDecisionValidationError("serialized abort reason is not valid") from error
+        return cls(
+            request_key=DualPathRequestKey.from_dict(data["request_key"]),
+            reason=reason,
+        )
+
+
 @dataclass(frozen=True)
 class PathDecisionRequest:
     request_key: DualPathRequestKey

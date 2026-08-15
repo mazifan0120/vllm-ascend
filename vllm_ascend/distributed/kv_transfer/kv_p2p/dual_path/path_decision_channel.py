@@ -24,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     JsonObject,
     JsonValue,
+    PathAbortNotice,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
@@ -140,6 +141,7 @@ class PathDecision:
 
 class ControlMessageKind(str, Enum):
     DECISION = "Decision"
+    ABORT = "Abort"
 
 
 class DecisionReplyStatus(str, Enum):
@@ -201,6 +203,17 @@ def decode_path_decision(payload: bytes) -> PathDecision:
     if kind is not ControlMessageKind.DECISION:
         raise PathDecisionValidationError(f"control message kind {kind.value} is not a Decision")
     return PathDecision.from_dict(decision_payload)
+
+
+def encode_path_abort(notice: PathAbortNotice) -> bytes:
+    return encode_control_message(ControlMessageKind.ABORT, notice.to_dict())
+
+
+def decode_path_abort(payload: bytes) -> PathAbortNotice:
+    kind, notice_payload = decode_control_message(payload)
+    if kind is not ControlMessageKind.ABORT:
+        raise PathDecisionValidationError(f"control message kind {kind.value} is not an Abort")
+    return PathAbortNotice.from_dict(notice_payload)
 
 
 class PathDecisionDeliveryError(Exception):
@@ -314,6 +327,7 @@ class PathDecisionCoordinator:
         self._accepted_decisions: dict[DualPathRequestKey, PathDecision] = {}
         self._closed_through_attempt_ids: dict[DualPathRequestKey, int] = {}
         self._received_decisions: queue.SimpleQueue[PathDecision] = queue.SimpleQueue()
+        self._received_aborts: queue.SimpleQueue[PathAbortNotice] = queue.SimpleQueue()
         self._registry_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._context: zmq.Context | None = None
@@ -416,6 +430,17 @@ class PathDecisionCoordinator:
                 except queue.Empty:
                     return decisions
 
+    def take_received_aborts(self) -> list[PathAbortNotice]:
+        if self._closed:
+            return []
+        notices: list[PathAbortNotice] = []
+        with self._registry_lock:
+            while True:
+                try:
+                    notices.append(self._received_aborts.get_nowait())
+                except queue.Empty:
+                    return notices
+
     def submit(
         self,
         endpoint: DecodeControlEndpoint,
@@ -425,6 +450,28 @@ class PathDecisionCoordinator:
             if self._closed:
                 raise RuntimeError("path decision coordinator is closed")
             encoded = encode_path_decision(decision)
+            assert self._executor is not None
+            return self._executor.submit(
+                _deliver_decision,
+                encoded,
+                endpoint,
+                opener=self._socket_opener,
+                sleep=self._sleep,
+                should_stop=lambda: self._closed,
+                send_timeout_ms=self._send_timeout_ms,
+                poll_timeout_ms=self._poll_timeout_ms,
+                retry_spacing_s=self._retry_spacing_s,
+            )
+
+    def submit_abort(
+        self,
+        endpoint: DecodeControlEndpoint,
+        notice: PathAbortNotice,
+    ) -> Future[None]:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("path decision coordinator is closed")
+            encoded = encode_path_abort(notice)
             assert self._executor is not None
             return self._executor.submit(
                 _deliver_decision,
@@ -453,6 +500,7 @@ class PathDecisionCoordinator:
                 self._accepted_decisions.clear()
                 self._closed_through_attempt_ids.clear()
             self._drain_received_decisions()
+            self._drain_received_aborts()
         elif self._role == "prefill":
             assert self._executor is not None
             self._executor.shutdown(wait=True, cancel_futures=True)
@@ -499,10 +547,12 @@ class PathDecisionCoordinator:
         except PathDecisionValidationError:
             logger.warning("path decision result receiver rejected malformed payload")
             return
-        if kind is not ControlMessageKind.DECISION:
-            logger.warning("path decision result receiver rejected non-Decision control message")
-            return
-        self._handle_decision_frame(socket, identity, message_payload)
+        if kind is ControlMessageKind.DECISION:
+            self._handle_decision_frame(socket, identity, message_payload)
+        elif kind is ControlMessageKind.ABORT:
+            self._handle_abort_frame(socket, identity, message_payload)
+        else:
+            assert_never(kind)
 
     def _handle_decision_frame(self, socket: zmq.Socket, identity: bytes, payload: JsonObject) -> None:
         try:
@@ -532,6 +582,30 @@ class PathDecisionCoordinator:
                 reply_status = DecisionReplyStatus.UNKNOWN_REQUEST
             else:
                 reply_status = self._register_decision_locked(key, decision)
+        self._reply_decision(socket, identity, reply_status)
+
+    def _handle_abort_frame(self, socket: zmq.Socket, identity: bytes, payload: JsonObject) -> None:
+        try:
+            notice = PathAbortNotice.from_dict(payload)
+        except PathDecisionValidationError:
+            logger.warning("path decision result receiver rejected malformed Abort payload")
+            self._reply_decision(socket, identity, DecisionReplyStatus.PROTOCOL_ERROR)
+            return
+        key = notice.request_key
+        if key.decode_engine_instance_id != self.decode_engine_instance_id:
+            logger.warning("path decision result receiver rejected wrong-incarnation Abort key")
+            self._reply_decision(socket, identity, DecisionReplyStatus.UNKNOWN_REQUEST)
+            return
+        with self._registry_lock:
+            if key not in self._pending_keys and key not in self._accepted_decisions:
+                logger.warning("path decision result receiver rejected unknown or stale Abort key")
+                reply_status = DecisionReplyStatus.UNKNOWN_REQUEST
+            else:
+                self._pending_keys.discard(key)
+                self._accepted_decisions.pop(key, None)
+                self._closed_through_attempt_ids.pop(key, None)
+                self._received_aborts.put(notice)
+                reply_status = DecisionReplyStatus.ACK
         self._reply_decision(socket, identity, reply_status)
 
     def _register_decision_locked(self, key: DualPathRequestKey, decision: PathDecision) -> DecisionReplyStatus:
@@ -578,5 +652,12 @@ class PathDecisionCoordinator:
         while True:
             try:
                 self._received_decisions.get_nowait()
+            except queue.Empty:
+                return
+
+    def _drain_received_aborts(self) -> None:
+        while True:
+            try:
+                self._received_aborts.get_nowait()
             except queue.Empty:
                 return

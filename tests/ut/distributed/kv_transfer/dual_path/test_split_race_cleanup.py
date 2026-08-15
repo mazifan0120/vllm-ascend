@@ -566,6 +566,8 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "__init__",
         "_is_dual_path_decode_admission",
         "_stage_prefill_activation_failure",
+        "_send_abort_notice",
+        "_send_abort_notice_for_request",
         "_decide_prefill_path_for_admission",
         "_discard_undelivered_prefill_decision",
         "_log_prefill_decision",
@@ -592,6 +594,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_request_for_failed_job",
         "_sweep_prefill_recovery_watchdogs",
         "_sweep_decode_progress_watchdogs",
+        "_handle_received_abort",
         "_recovery_invalid_block_ids",
         "_aggregate_worker_job_facts",
         "_run_job_close_action",
@@ -603,6 +606,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "build_connector_meta",
         "request_finished",
         "request_finished_all_groups",
+        "_send_prefill_client_abort",
         "shutdown",
     }
     scheduler_methods = {

@@ -24,6 +24,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import Revers
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     JsonObject,
+    PathAbortNotice,
+    PathAbortReason,
     PathDecisionRequest,
     PathDecisionResult,
     PathDecisionValidationError,
@@ -39,6 +41,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     _deliver_decision,
     decode_path_decision,
     encode_decision_reply,
+    encode_path_abort,
     encode_path_decision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
@@ -810,6 +813,18 @@ def test_close_leaves_no_threads_sockets_futures_or_retained_state() -> None:
     key = _request().request_key
     coordinator.register_pending(key)
     assert _raw_request(endpoint, encode_path_decision(_decision(key))) == _ACK_BYTES
+    assert (
+        _raw_request(
+            endpoint,
+            encode_path_abort(
+                PathAbortNotice(
+                    request_key=key,
+                    reason=PathAbortReason.REQUEST_ABORTED,
+                )
+            ),
+        )
+        == _ACK_BYTES
+    )
 
     coordinator.close()
 
@@ -817,6 +832,8 @@ def test_close_leaves_no_threads_sockets_futures_or_retained_state() -> None:
     assert coordinator._pending_keys == set()
     assert coordinator._accepted_decisions == {}
     assert coordinator.take_received_decisions() == []
+    assert coordinator.take_received_aborts() == []
+    assert coordinator._received_aborts.empty()
     assert {thread.ident for thread in threading.enumerate()} == baseline_threads
     context = zmq.Context()
     socket = context.socket(zmq.ROUTER)

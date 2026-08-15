@@ -140,8 +140,8 @@ class TestMessageKindEnvelope:
         with pytest.raises(PathDecisionValidationError):
             channel.decode_control_message(foreign)
 
-    def test_control_message_kind_has_only_the_decision_member(self):
-        assert [member.value for member in channel.ControlMessageKind] == ["Decision"]
+    def test_control_message_kind_has_decision_and_abort_members(self):
+        assert [member.value for member in channel.ControlMessageKind] == ["Decision", "Abort"]
 
 
 class TestRegistryMatrix:
