@@ -7,6 +7,8 @@
 > 取代。当前运行时只接受显式 Decision、request-terminal ABORT 或带直接失败
 > 证据的本地/Worker 失败，不再使用计时器兜底。
 
+<!-- End of the 2026-08-16 supersession notice. -->
+
 > 状态：PR-00 Foundation 已实现并达到 `LOCAL_READY`；PR-01 至 PR-07 尚待实现
 > 方案：外层 `AscendMultiConnector` first-positive 编排，Prefill Scheduler 唯一提交路径
 > 适用范围：当前 `dev/dualpath` 分支中的 vLLM Ascend 仓库
