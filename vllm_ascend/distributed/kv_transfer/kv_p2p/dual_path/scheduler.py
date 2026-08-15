@@ -222,6 +222,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_reverse_plans: dict[str, ReversePlan] = {}
         self._prefill_pending_reverse_receive_bindings: dict[str, ReverseReceiveBinding] = {}
         self._prefill_control_failures: dict[str, DualPathControlFailureMetadata] = {}
+        self._decode_control_failures: dict[str, DualPathControlFailureMetadata] = {}
         self._prefill_delivery_futures: dict[str, Future[None]] = {}
         self._prefill_invalid_request_ids: set[str] = set()
         self._block_pool: BlockPool | None = None
@@ -1546,6 +1547,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         for decision in coordinator.take_received_decisions():
             self._activate_received_decision(decision, metadata)
         self._sweep_decode_progress_watchdogs(metadata)
+        metadata.control_failures.extend(self._decode_control_failures.values())
+        self._decode_control_failures.clear()
 
         now = time.monotonic()
         for request_id, state in self._decode_decision_states.items():
@@ -1582,6 +1585,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         request_id = request.request_id
         self._lookup_results.pop(request_id, None)
         self._decode_kv_snapshots.pop(request_id, None)
+        self._decode_control_failures.pop(request_id, None)
         state = self._decode_decision_states.pop(request_id, None)
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)
@@ -1702,12 +1706,52 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 )
                 failed_request_id = self._request_for_failed_job(job)
                 if failed_request_id is not None:
-                    # Surface the terminal failure through the existing
-                    # control-failure path at the next build pass.
                     if self.dual_path_cfg.role == "decode":
-                        self._de_progress_deadlines[failed_request_id] = 0.0
+                        state = self._decode_decision_states.get(failed_request_id)
+                        snapshot = self._decode_kv_snapshots.get(failed_request_id)
+                        if state is None or snapshot is None:
+                            logger.error(
+                                "DualPath failed job %s has no Decode state or snapshot for request %s",
+                                job_id,
+                                failed_request_id,
+                            )
+                        else:
+                            state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
+                            self._path_decision_coordinator.unregister(state.request_key)
+                            try:
+                                self._decode_control_failures[failed_request_id] = self._build_decode_control_failure(
+                                    failed_request_id,
+                                    snapshot,
+                                    DualPathControlFailureReason.REVERSE_JOB_FAILED,
+                                )
+                            except RuntimeError as error:
+                                logger.error(
+                                    "DualPath failed job %s could not build Decode control failure for request %s: %s",
+                                    job_id,
+                                    failed_request_id,
+                                    error,
+                                )
                     else:
-                        self._recovery_deadlines[failed_request_id] = 0.0
+                        self._prefill_invalid_request_ids.add(failed_request_id)
+                        invalid_block_ids = self._recovery_invalid_block_ids(failed_request_id)
+                        if invalid_block_ids:
+                            self._prefill_control_failures[failed_request_id] = DualPathControlFailureMetadata(
+                                request_id=failed_request_id,
+                                invalid_block_ids=invalid_block_ids,
+                                reason=DualPathControlFailureReason.REVERSE_JOB_FAILED,
+                            )
+                if job.job_kind is JobKind.REVERSE_SEND and job.reverse_attempt_key is not None:
+                    attempt_key = job.reverse_attempt_key
+                    request_key = attempt_key.request_key
+                    request_id = request_key.decode_request_id
+                    self._reverse_send_job_ids.pop(attempt_key, None)
+                    self._job_ledger.discard(job.job_id)
+                    if not self._has_open_reverse_send_job(request_key):
+                        self._de_progress_deadlines.pop(request_id, None)
+                        self._latest_reverse_attempt_ids.pop(request_id, None)
+                        if request_id in self._pending_finished_sending:
+                            self._pending_finished_sending.discard(request_id)
+                            finished_sending_injection.add(request_id)
         return finished_sending_injection, finished_recving_injection
 
     def _run_job_close_action(self, job: JobRecord) -> tuple[set[str], set[str]]:
@@ -1771,6 +1815,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._lookup_results.clear()
         self._decode_kv_snapshots.clear()
         self._decode_decision_states.clear()
+        self._decode_control_failures.clear()
         self._prefill_request_keys.clear()
         self._prefill_decision_metadata.clear()
         self._prefill_local_tokens.clear()

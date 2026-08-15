@@ -678,6 +678,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_prefill_reverse_plans",
             "_prefill_pending_reverse_receive_bindings",
             "_prefill_control_failures",
+            "_decode_control_failures",
             "_prefill_delivery_futures",
             "_prefill_invalid_request_ids",
             "_block_pool",

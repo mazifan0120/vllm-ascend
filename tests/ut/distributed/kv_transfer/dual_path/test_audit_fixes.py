@@ -84,12 +84,13 @@ class TestBoundedCompletionJobs:
             kv_connector_worker_meta=make_worker_metadata(failed_jobs={binding.reverse_completion_job_id: 1})
         )
         scheduler.update_connector_output(output)
+        assert request.request_id in scheduler._prefill_invalid_request_ids
         metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
 
         assert len(metadata.control_failures) == 1
         failure = metadata.control_failures[0]
         assert failure.request_id == request.request_id
-        assert failure.reason is DualPathControlFailureReason.RECOVERY_TIMEOUT
+        assert failure.reason is DualPathControlFailureReason.REVERSE_JOB_FAILED
 
     def test_missing_reverse_completion_deadline_expiry_surfaces_control_failure(self, pe_scheduler_factory):
         pool = make_block_pool()

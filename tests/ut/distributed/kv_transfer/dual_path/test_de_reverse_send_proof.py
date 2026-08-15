@@ -28,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision a
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import worker as worker_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
+    DualPathControlFailureReason,
     ReversePlan,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
@@ -134,6 +135,12 @@ def _close_send_job(scheduler, job_id: int) -> KVConnectorOutput:
     return output
 
 
+def _fail_send_job(scheduler, job_id: int) -> KVConnectorOutput:
+    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failed_jobs={job_id: 1}))
+    scheduler.update_connector_output(output)
+    return output
+
+
 def test_reverse_send_job_allocated_at_attempt_creation_and_carried_on_plan(
     decode_scheduler_factory, decode_task04_seams
 ):
@@ -196,10 +203,8 @@ def test_terminal_ack_failure_marks_job_failed_never_success(decode_scheduler_fa
     output = KVConnectorOutput(kv_connector_worker_meta=worker_metadata)
     scheduler.update_connector_output(output)
     job = scheduler._job_ledger.get(job_id)
-    assert job.closed is True
-    assert job.failed is True
-    send_job = scheduler._job_ledger.get(scheduler._reverse_send_job_ids[attempt_key])
-    assert not (send_job.closed and not send_job.failed)
+    assert job is None
+    assert attempt_key not in scheduler._reverse_send_job_ids
 
 
 def test_abort_before_final_layer_leaves_job_incomplete(decode_scheduler_factory, decode_task04_seams):
@@ -325,6 +330,33 @@ def test_latest_reverse_send_attempt_closes_without_releasing_open_old_attempt(
 
     old_output = _close_send_job(scheduler, old_job_id)
     assert old_output.finished_sending == {request.request_id}
+
+
+def test_failed_reverse_send_releases_delayed_free_only_after_every_attempt_closes(
+    decode_scheduler_factory, decode_task04_seams
+):
+    scheduler = decode_scheduler_factory()
+    request, old_job_id, latest_job_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    state = scheduler._decode_decision_states[request.request_id]
+    old_attempt = _attempt_key(0, state.request_key)
+    latest_attempt = _attempt_key(1, state.request_key)
+    assert scheduler._delay_free_for_connector(request) is True
+
+    old_output = _fail_send_job(scheduler, old_job_id)
+
+    assert old_output.finished_sending is None
+    assert old_attempt not in scheduler._reverse_send_job_ids
+    assert scheduler._reverse_send_job_ids[latest_attempt] == latest_job_id
+    assert request.request_id in scheduler._pending_finished_sending
+
+    latest_output = _fail_send_job(scheduler, latest_job_id)
+    metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+    assert latest_output.finished_sending == {request.request_id}
+    assert request.request_id not in scheduler._pending_finished_sending
+    assert latest_attempt not in scheduler._reverse_send_job_ids
+    assert metadata.control_failures[0].reason is DualPathControlFailureReason.REVERSE_JOB_FAILED
+    assert scheduler._decode_control_failures == {}
 
 
 def test_finish_delays_when_latest_send_job_closed_but_older_attempt_is_open(
