@@ -1,5 +1,11 @@
 # Task-05 Detailed Spec — `PE_READ` Forward Data Path
 
+> **Superseded lifecycle clauses (2026-08-16):** This file is a historical
+> Stage-1 task record. References below to the Task-04 Decision deadline or any
+> Forward watchdog choice are superseded by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Current termination is outcome-driven and has no DualPath timer fallback.
+
 ## 1. Status and authority
 
 This document defines the implementation contract for Task-05 in the

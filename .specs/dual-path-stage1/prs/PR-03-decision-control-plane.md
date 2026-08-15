@@ -1,5 +1,12 @@
 # PR-03 Unified Path Decision Control Plane
 
+> **Superseded lifecycle clauses (2026-08-16):** This planned PR record keeps
+> its historical timeout design for traceability. Timeout output and deadline
+> requirements below are superseded by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> The implemented control plane accepts explicit Decision and request-terminal
+> ABORT outcomes and has no timer-driven fallback.
+
 - Series position: 3 of 7
 - Spec status: `PLANNED`
 - Depends on: PR-01

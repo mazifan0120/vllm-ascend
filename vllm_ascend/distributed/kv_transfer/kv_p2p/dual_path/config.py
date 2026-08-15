@@ -3,9 +3,10 @@
 
 ``DualPathConfig`` carries only the connector role and
 ``dual_path_control_port``; inherited KVPool/Mooncake keys are read directly
-from ``kv_connector_extra_config`` by their owning components. The only
-related environment variable is ``VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT``,
-registered centrally in ``vllm_ascend/envs.py``.
+from ``kv_connector_extra_config`` by their owning components. DualPath has no
+timer-driven fallback: Decode accepts an explicit Decision or request-terminal
+ABORT, while activation and Worker-reported failures terminate through the
+fail-closed control-failure path.
 """
 
 from __future__ import annotations
@@ -49,8 +50,12 @@ MAX_TCP_PORT: int = 65535
 
 @dataclass(frozen=True)
 class DualPathConfig:
-    """Connector role and optional Decode control port, validated from the
-    connector extra config."""
+    """Connector role and optional Decode control port.
+
+    Lifecycle termination is protocol-driven: Decision commits a route,
+    request-terminal ABORT rejects it, and local activation or Worker failures
+    fail closed. No timeout setting is part of this connector config.
+    """
 
     role: Literal["prefill", "decode"]
     dual_path_control_port: int | None = None

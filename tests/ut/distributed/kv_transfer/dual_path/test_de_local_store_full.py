@@ -437,9 +437,9 @@ def test_start_load_kv_runs_store_adapter_once_between_control_and_parent() -> N
     metadata.forward_receive_bindings.append(binding)
     metadata.control_failures.append(
         DualPathControlFailureMetadata(
-            "timed-out-request",
+            "failed-request",
             (91, 92),
-            DualPathControlFailureReason.DECISION_TIMEOUT,
+            DualPathControlFailureReason.ACTIVATION_FAILED,
         )
     )
     store_metadata = _make_store_metadata()
@@ -448,7 +448,7 @@ def test_start_load_kv_runs_store_adapter_once_between_control_and_parent() -> N
     order: list[str] = []
 
     def start_store(received_metadata: AscendConnectorMetadata) -> None:
-        assert worker._control_failed_recving == {"timed-out-request"}
+        assert worker._control_failed_recving == {"failed-request"}
         assert worker._invalid_block_ids == {91, 92}
         assert received_metadata is store_metadata
         order.append("store")
@@ -689,12 +689,12 @@ def test_full_probe_then_worker_miss_fails_closed_without_proxy_fallback(decode_
     assert request.kv_transfer_params["do_remote_prefill"] is False
 
 
-def test_parent_timeout_forward_and_store_completions_stay_isolated() -> None:
+def test_parent_failure_forward_and_store_completions_stay_isolated() -> None:
     worker = _make_worker()
     ordinary_request_id = "ordinary-request"
     forward_request_id = "forward-request"
     store_request_id = "store-request"
-    timeout_request_id = "timeout-request"
+    failed_request_id = "failed-request"
     ordinary_wire_id = get_external_request_id(ordinary_request_id)
     binding = ForwardReceiveBinding(
         request_key=DualPathRequestKey("decode-instance", forward_request_id),
@@ -709,9 +709,9 @@ def test_parent_timeout_forward_and_store_completions_stay_isolated() -> None:
     metadata.forward_receive_bindings.append(binding)
     metadata.control_failures.append(
         DualPathControlFailureMetadata(
-            timeout_request_id,
+            failed_request_id,
             (401, 402),
-            DualPathControlFailureReason.DECISION_TIMEOUT,
+            DualPathControlFailureReason.ACTIVATION_FAILED,
         )
     )
     store_metadata = _make_store_metadata()
@@ -733,7 +733,7 @@ def test_parent_timeout_forward_and_store_completions_stay_isolated() -> None:
 
     assert finished == (
         set(),
-        {ordinary_request_id, forward_request_id, store_request_id, timeout_request_id},
+        {ordinary_request_id, forward_request_id, store_request_id, failed_request_id},
     )
     assert invalid_block_ids == {401, 402}
     worker._kvpool_worker_adapter.get_finished.assert_called_once_with(set(), store_metadata)
@@ -813,7 +813,7 @@ def test_parent_requests_map_never_holds_store_full_request(decode_scheduler) ->
     assert decode_scheduler._reqs_need_recv == {}
 
 
-def test_decode_metadata_composition_builds_store_after_results_bindings_and_deadlines(decode_scheduler) -> None:
+def test_decode_metadata_composition_builds_store_after_decisions_aborts_and_bindings(decode_scheduler) -> None:
     request = _make_request("composition-order", 48, _selected_params())
     partial_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
     decode_scheduler._kvpool_adapter.lookup.return_value = partial_spec
@@ -842,15 +842,16 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
         order.append("bindings")
         return original_binding_type(**kwargs)
 
-    def read_deadline_clock() -> float:
-        order.append("deadlines")
-        return state.deadline - 1
+    def take_aborts() -> list:
+        order.append("aborts")
+        return []
 
     def build_store(_scheduler_output) -> AscendConnectorMetadata:
         order.append("store")
         return store_metadata
 
     decode_scheduler._path_decision_coordinator.take_received_decisions.side_effect = take_decisions
+    decode_scheduler._path_decision_coordinator.take_received_aborts.side_effect = take_aborts
     decode_scheduler._kvpool_adapter.build_connector_meta.side_effect = build_store
     with (
         patch.object(
@@ -860,12 +861,10 @@ def test_decode_metadata_composition_builds_store_after_results_bindings_and_dea
             side_effect=build_parent,
         ),
         patch.object(scheduler_module, "ForwardReceiveBinding", side_effect=build_binding),
-        patch.object(scheduler_module.time, "monotonic", side_effect=read_deadline_clock),
     ):
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    # The trailing clock read is the W8 DE progress-watchdog sweep.
-    assert order == ["parent", "results", "bindings", "deadlines", "deadlines", "store"]
+    assert order == ["parent", "results", "bindings", "aborts", "store"]
     assert len(metadata.forward_receive_bindings) == 1
 
 

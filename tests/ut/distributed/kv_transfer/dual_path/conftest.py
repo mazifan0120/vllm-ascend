@@ -372,8 +372,7 @@ def make_decode_vllm_config(world_size: int = 1) -> MagicMock:
 
 
 @pytest.fixture()
-def decode_task04_seams(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
+def decode_task04_seams():
     with (
         patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter") as adapter_cls,
         patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,

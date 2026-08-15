@@ -3,9 +3,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
@@ -91,21 +90,6 @@ class TestBoundedCompletionJobs:
         failure = metadata.control_failures[0]
         assert failure.request_id == request.request_id
         assert failure.reason is DualPathControlFailureReason.REVERSE_JOB_FAILED
-
-    def test_missing_reverse_completion_deadline_expiry_surfaces_control_failure(self, pe_scheduler_factory):
-        pool = make_block_pool()
-        scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
-        clock = MagicMock(name="monotonic_clock")
-        clock.monotonic.return_value = 2000.0
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
-
-        with patch.object(scheduler_module, "time", clock):
-            request = _admit_de_read_request(scheduler)
-            clock.monotonic.return_value = 2000.0 + scheduler._recovery_watchdog_s + 1.0
-            metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
-
-        assert len(metadata.control_failures) == 1
-        assert metadata.control_failures[0].request_id == request.request_id
 
 
 class TestSingleUnresolvedDeliveryFuture:
@@ -218,20 +202,6 @@ class TestJobLedgerRetirementWiring:
         scheduler.update_connector_output(output)
 
         assert scheduler._job_ledger.get(binding.reverse_completion_job_id).failed is True
-
-
-class TestStage2EnvValidation:
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S",
-            "VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S",
-        ],
-    )
-    def test_non_positive_timeouts_rejected(self, monkeypatch, pe_scheduler_factory, name):
-        monkeypatch.setenv(name, "0")
-        with pytest.raises(ValueError, match=name):
-            pe_scheduler_factory(PathKind.PE_READ)
 
 
 def _deliver_decision_to(receiver, attempt_id: int) -> None:

@@ -1,5 +1,12 @@
 # DualPath Stage 1 Task Catalog
 
+> **Superseded lifecycle clauses (2026-08-16):** This catalog remains a
+> historical Stage-1 delivery record. All Decision-deadline, timeout-reason,
+> timeout-environment, and watchdog clauses below are superseded by the
+> [ABORT and watchdog-removal decision](../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> The current runtime waits for an explicit Decision, request-terminal ABORT,
+> or an evidence-bearing local/Worker failure; it has no timer-driven fallback.
+
 ## 1. Purpose
 
 This catalog defines the remaining DualPath Stage 1 delivery units after the

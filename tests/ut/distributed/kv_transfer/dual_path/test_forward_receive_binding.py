@@ -117,7 +117,6 @@ def _make_kv_cache_config() -> SimpleNamespace:
 
 @pytest.fixture()
 def scheduler_factory(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
     schedulers = []
     with (
         patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter"),
@@ -286,28 +285,6 @@ def test_binding_destination_table_includes_hybrid_trimming(scheduler_factory):
     assert metadata.forward_receive_bindings[0].destination_block_ids == derived_destination
 
 
-def test_hybrid_timeout_uses_literal_frozen_table_suffix_without_changing_message_trim(scheduler_factory):
-    # Given
-    scheduler, coordinator = scheduler_factory(need_truncate=True)
-    request, snapshot, state = _admit_request(scheduler)
-    assert snapshot.final_block_ids == ((41, 42, 43, 44),)
-    assert scheduler.executor.submit.call_args.kwargs["message"]["remote_block_ids"] == ([41, 42, 43],)
-    coordinator.take_received_decisions.return_value = []
-
-    # When
-    with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline):
-        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-
-    # Then
-    assert metadata.control_failures == [
-        DualPathControlFailureMetadata(
-            request_id=request.request_id,
-            invalid_block_ids=(42, 43, 44),
-            reason=DualPathControlFailureReason.DECISION_TIMEOUT,
-        )
-    ]
-
-
 def test_duplicate_pe_read_result_does_not_emit_second_binding(scheduler_factory):
     # Given
     scheduler, coordinator = scheduler_factory()
@@ -414,15 +391,14 @@ def test_commit_failure_rolls_back_and_emits_one_activation_failure(scheduler_fa
     scheduler._kvpool_adapter.commit_after_alloc.assert_called_once()
 
 
-def test_snapshot_plan_mismatch_uses_activation_failure_not_timeout(scheduler_factory):
+def test_snapshot_plan_mismatch_uses_activation_failure(scheduler_factory):
     scheduler, coordinator = scheduler_factory()
     _, snapshot, state = _admit_request(scheduler)
     coordinator.take_received_decisions.return_value = [
         _de_read_decision(state, snapshot, source_block_ids=((51, 52, 53, 54),))
     ]
 
-    with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline + 1):
-        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+    metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
     assert metadata.control_failures[0].reason is DualPathControlFailureReason.ACTIVATION_FAILED

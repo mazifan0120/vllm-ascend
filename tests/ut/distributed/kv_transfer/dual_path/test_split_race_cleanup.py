@@ -592,8 +592,6 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_resume_delivered_prefill_decision",
         "_deliver_prefill_decision",
         "_request_for_failed_job",
-        "_sweep_prefill_recovery_watchdogs",
-        "_sweep_decode_progress_watchdogs",
         "_handle_received_abort",
         "_recovery_invalid_block_ids",
         "_aggregate_worker_job_facts",

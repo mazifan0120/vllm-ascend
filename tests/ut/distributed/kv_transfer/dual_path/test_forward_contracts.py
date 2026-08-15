@@ -196,7 +196,7 @@ def test_control_failure_metadata_carries_reason(reason):
     assert metadata.invalid_block_ids == (41, 42, 43)
     assert metadata.reason is reason
     with pytest.raises(FrozenInstanceError):
-        metadata.reason = DualPathControlFailureReason.DECISION_TIMEOUT
+        metadata.reason = DualPathControlFailureReason.ACTIVATION_FAILED
 
 
 def test_control_failure_metadata_rejects_bad_reason():
@@ -204,7 +204,7 @@ def test_control_failure_metadata_rejects_bad_reason():
         DualPathControlFailureMetadata(
             request_id="request-1",
             invalid_block_ids=(41,),
-            reason="DECISION_TIMEOUT",
+            reason="NOT_A_REASON",
         )
 
 

@@ -17,7 +17,6 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
 from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     _make_prefill_worker,
 )
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import scheduler as scheduler_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
@@ -53,7 +52,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 _CONNECTOR_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector"
 _SCHEDULER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler"
-_TIMEOUT_ENV = "VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT"
 _DECODE_INSTANCE_ID = "decode-engine:2:boot-7"
 _CONTROL_ENDPOINT = DecodeControlEndpoint(host="192.0.2.44", port=24001)
 
@@ -177,8 +175,7 @@ def scheduler_factory(task04_seams):
 
 
 @pytest.fixture()
-def decode_scheduler(monkeypatch, scheduler_factory):
-    monkeypatch.delenv(_TIMEOUT_ENV, raising=False)
+def decode_scheduler(scheduler_factory):
     return scheduler_factory()
 
 
@@ -346,35 +343,6 @@ def _bind_prefill(scheduler, request: SimpleNamespace) -> MagicMock:
     return blocks
 
 
-class TestDecisionTimeoutEnv:
-    def test_default_is_60_seconds(self, monkeypatch, scheduler_factory):
-        monkeypatch.delenv(_TIMEOUT_ENV, raising=False)
-        scheduler = scheduler_factory()
-        assert scheduler._decision_timeout_seconds == 60
-
-    def test_valid_override_is_read_once_and_does_not_rearm(self, monkeypatch, scheduler_factory):
-        monkeypatch.setenv(_TIMEOUT_ENV, "7")
-        scheduler = scheduler_factory()
-        monkeypatch.setenv(_TIMEOUT_ENV, "99")
-        with patch.object(scheduler_module.time, "monotonic", return_value=100.0):
-            request, _ = _admit(scheduler)
-        assert scheduler._decision_timeout_seconds == 7
-        assert scheduler._decode_decision_states[request.request_id].deadline == 107.0
-
-    @pytest.mark.parametrize("raw", ["not-an-int", "True", "False", "0", "-3"])
-    def test_invalid_string_zero_and_negative_values_fail_fast(self, raw, monkeypatch, scheduler_factory):
-        monkeypatch.setenv(_TIMEOUT_ENV, raw)
-        with pytest.raises(ValueError):
-            scheduler_factory()
-
-    def test_prefill_role_never_reads_timeout_env(self, monkeypatch, scheduler_factory):
-        reader = MagicMock(side_effect=AssertionError("prefill read decode timeout"))
-        monkeypatch.setitem(ascend_envs.env_variables, _TIMEOUT_ENV, reader)
-        scheduler = scheduler_factory(role="prefill")
-        reader.assert_not_called()
-        assert scheduler._decision_timeout_seconds is None
-
-
 class TestDecodeConstructionGuards:
     def test_decode_rejects_multiple_kv_cache_groups(self, scheduler_factory, task04_seams):
         with pytest.raises(ValueError, match="exactly one KV cache group"):
@@ -428,8 +396,7 @@ class TestDecodeAdmissionControl:
         decode_scheduler.executor.submit.assert_not_called()
 
     def test_snapshot_builds_exact_key_request_and_metadata(self, decode_scheduler):
-        with patch.object(scheduler_module.time, "monotonic", return_value=10.0):
-            request, _ = _admit(decode_scheduler)
+        request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         snapshot = decode_scheduler._decode_kv_snapshots[request.request_id]
         expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, request.request_id)
@@ -439,7 +406,6 @@ class TestDecodeAdmissionControl:
         assert state.request_key == expected_key
         assert state.decision_request == PathDecisionRequest(expected_key, 48, 16, 32)
         assert state.status is scheduler_module._DecodeDecisionStatus.PENDING
-        assert state.deadline == 70.0
         assert (
             decode_scheduler.executor.submit.call_args.kwargs["message"]["dual_path"] == _expected_dual_path_payload()
         )
@@ -506,14 +472,13 @@ class TestDecodeAdmissionControl:
         decode_scheduler._path_decision_coordinator.register_pending.assert_called_once()
         decode_scheduler.executor.submit.assert_called_once()
 
-    def test_identical_duplicate_does_not_register_notify_or_reset_deadline(self, decode_scheduler):
+    def test_identical_duplicate_does_not_register_or_notify_again(self, decode_scheduler):
         request, blocks = _admit(decode_scheduler)
         first_state = decode_scheduler._decode_decision_states[request.request_id]
         decode_scheduler._path_decision_coordinator.register_pending.reset_mock()
         decode_scheduler.executor.submit.reset_mock()
         decode_scheduler.update_state_after_alloc(request, blocks, 33)
         assert decode_scheduler._decode_decision_states[request.request_id] is first_state
-        assert decode_scheduler._decode_decision_states[request.request_id].deadline == first_state.deadline
         decode_scheduler._path_decision_coordinator.register_pending.assert_not_called()
         decode_scheduler.executor.submit.assert_not_called()
 
@@ -544,17 +509,15 @@ class TestDecodeAdmissionControl:
         decode_scheduler.executor.submit.assert_called_once()
         log_error.assert_called_once()
 
-    def test_virtual_request_skips_http_and_keeps_deadline(self, decode_scheduler):
+    def test_virtual_request_skips_http_and_remains_pending(self, decode_scheduler):
         params = {
             "do_remote_prefill": True,
             "do_virtual": True,
             "metaserver": "http://proxy.example/v1/kv",
         }
-        with patch.object(scheduler_module.time, "monotonic", return_value=30.0):
-            request, _ = _admit(decode_scheduler, params)
+        request, _ = _admit(decode_scheduler, params)
         state = decode_scheduler._decode_decision_states[request.request_id]
         assert state.status is scheduler_module._DecodeDecisionStatus.PENDING
-        assert state.deadline == 90.0
         decode_scheduler.executor.submit.assert_not_called()
 
 
@@ -1097,88 +1060,6 @@ class TestDecodeResultConsumption:
         assert decode_scheduler._reqs_need_recv == {}
         task04_seams.decode_coordinator.unregister.assert_not_called()
 
-    def test_result_at_call_start_wins_deadline_boundary(self, decode_scheduler, task04_seams):
-        # Given
-        request, _ = _admit(decode_scheduler)
-        state = decode_scheduler._decode_decision_states[request.request_id]
-        events = []
-        task04_seams.decode_coordinator.take_received_decisions.side_effect = lambda: (
-            events.append("result") or [_decision()]
-        )
-        clock = MagicMock(name="time")
-        clock.monotonic.side_effect = lambda: events.append("clock") or state.deadline + 1
-
-        # When
-        with patch.object(scheduler_module, "time", clock):
-            metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-
-        # Then: the decision is taken before any deadline read, so the
-        # boundary-time timeout never fires for it.
-        assert events[0] == "result"
-        assert set(events[1:]) == {"clock"}
-        assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
-        assert metadata.control_failures == []
-        task04_seams.decode_coordinator.unregister.assert_not_called()
-
-    def test_timeout_emits_one_aligned_suffix_control_failure_and_unregisters_once(
-        self,
-        decode_scheduler,
-        task04_seams,
-    ):
-        # Given
-        request, _ = _admit(decode_scheduler)
-        state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_decisions.return_value = []
-
-        # When
-        with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline):
-            metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-
-        # Then
-        assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
-        assert metadata.requests == {}
-        assert metadata.control_failures == [
-            DualPathControlFailureMetadata(
-                request_id=request.request_id,
-                invalid_block_ids=(42, 43, 44),
-                reason=DualPathControlFailureReason.DECISION_TIMEOUT,
-            )
-        ]
-        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
-
-    def test_timeout_control_failure_is_never_emitted_twice(self, decode_scheduler, task04_seams):
-        # Given
-        request, _ = _admit(decode_scheduler)
-        state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_decisions.return_value = []
-
-        # When
-        with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline):
-            first_metadata = decode_scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
-            second_metadata = decode_scheduler.build_connector_meta(MagicMock(name="second_scheduler_output"))
-
-        # Then
-        assert len(first_metadata.control_failures) == 1
-        assert second_metadata.control_failures == []
-        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
-
-    def test_late_result_after_timeout_is_stale(self, decode_scheduler, task04_seams):
-        # Given
-        request, _ = _admit(decode_scheduler)
-        state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_decisions.return_value = []
-        with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline):
-            decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
-        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
-
-        # When
-        metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_result_scheduler_output"))
-
-        # Then
-        assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
-        assert metadata.control_failures == []
-        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
-
     def test_late_decision_after_activation_failure_is_stale(self, decode_scheduler, task04_seams):
         request, snapshot = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
@@ -1208,7 +1089,7 @@ class TestWorkerFailureRelay:
             DualPathControlFailureMetadata(
                 "request-local-7",
                 (42, 43, 44),
-                DualPathControlFailureReason.DECISION_TIMEOUT,
+                DualPathControlFailureReason.ACTIVATION_FAILED,
             )
         )
         assert metadata.requests == {}
@@ -1231,7 +1112,7 @@ class TestWorkerFailureRelay:
             DualPathControlFailureMetadata(
                 "request-local-7",
                 (42, 43, 44),
-                DualPathControlFailureReason.DECISION_TIMEOUT,
+                DualPathControlFailureReason.ACTIVATION_FAILED,
             )
         )
         worker.start_load_kv(metadata)
@@ -1255,7 +1136,7 @@ class TestWorkerFailureRelay:
             DualPathControlFailureMetadata(
                 "request-local-7",
                 (42, 43, 44),
-                DualPathControlFailureReason.DECISION_TIMEOUT,
+                DualPathControlFailureReason.ACTIVATION_FAILED,
             )
         )
         worker.start_load_kv(metadata)
@@ -1329,14 +1210,19 @@ class TestCleanupAndShutdown:
         assert request.request_id not in decode_scheduler._decode_decision_states
         task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
-    def test_cancellation_after_timeout_unregisters_idempotently(self, decode_scheduler, task04_seams):
+    def test_cancellation_after_peer_abort_unregisters_idempotently(self, decode_scheduler, task04_seams):
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         task04_seams.decode_coordinator.take_received_decisions.return_value = []
-        with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline):
-            decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
+        task04_seams.decode_coordinator.take_received_aborts.return_value = [
+            PathAbortNotice(
+                request_key=state.request_key,
+                reason=PathAbortReason.REQUEST_ABORTED,
+            )
+        ]
+        decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
 
         # When
         result = decode_scheduler.request_finished(request, [41, 42, 43, 44])
@@ -1620,9 +1506,9 @@ class TestCleanupAndShutdown:
             _make_request(request_id="request-committed"),
             (41, 42, 43, 44),
         )
-        timed_out_request, _ = _admit_request(
+        aborted_request, _ = _admit_request(
             decode_scheduler,
-            _make_request(request_id="request-timed-out"),
+            _make_request(request_id="request-aborted"),
             (51, 52, 53, 54),
         )
         cancelled_request, _ = _admit_request(
@@ -1631,7 +1517,7 @@ class TestCleanupAndShutdown:
             (61, 62, 63, 64),
         )
         committed_state = decode_scheduler._decode_decision_states[committed_request.request_id]
-        timed_out_state = decode_scheduler._decode_decision_states[timed_out_request.request_id]
+        aborted_state = decode_scheduler._decode_decision_states[aborted_request.request_id]
         cancelled_state = decode_scheduler._decode_decision_states[cancelled_request.request_id]
 
         completed_delivery_future = _completed_future()
@@ -1652,7 +1538,7 @@ class TestCleanupAndShutdown:
         inflight_prefill_request = _make_prefill_request(
             "prefill-inflight",
             _remote_decode_params(
-                dual_path=_prefill_decision_payload(decode_request_id=timed_out_request.request_id),
+                dual_path=_prefill_decision_payload(decode_request_id=aborted_request.request_id),
             ),
         )
         prefill_scheduler.get_num_new_matched_tokens(committed_prefill_request, 0)
@@ -1664,8 +1550,7 @@ class TestCleanupAndShutdown:
         task04_seams.decode_coordinator.take_received_decisions.return_value = [
             _decision(_result(committed_request.request_id))
         ]
-        with patch.object(scheduler_module.time, "monotonic", return_value=0.0):
-            commit_metadata = decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
+        commit_metadata = decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
         reverse_send_job_id = commit_metadata.reverse_plans[0].reverse_send_job_id
         decode_scheduler.update_connector_output(
             KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={reverse_send_job_id: 2}))
@@ -1674,61 +1559,66 @@ class TestCleanupAndShutdown:
         # When
         decode_scheduler.request_finished(cancelled_request, [61, 62, 63, 64])
         task04_seams.decode_coordinator.take_received_decisions.return_value = []
-        with patch.object(scheduler_module.time, "monotonic", return_value=timed_out_state.deadline):
-            failure_metadata = decode_scheduler.build_connector_meta(MagicMock(name="timeout_scheduler_output"))
+        task04_seams.decode_coordinator.take_received_aborts.return_value = [
+            PathAbortNotice(
+                request_key=aborted_state.request_key,
+                reason=PathAbortReason.REQUEST_ABORTED,
+            )
+        ]
+        failure_metadata = decode_scheduler.build_connector_meta(MagicMock(name="abort_scheduler_output"))
 
         # Then
         assert committed_state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
-        assert timed_out_state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
+        assert aborted_state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
         assert cancelled_request.request_id not in decode_scheduler._decode_decision_states
         assert set(decode_scheduler._decode_decision_states) == {
             committed_request.request_id,
-            timed_out_request.request_id,
+            aborted_request.request_id,
         }
         assert set(decode_scheduler._decode_kv_snapshots) == {
             committed_request.request_id,
-            timed_out_request.request_id,
+            aborted_request.request_id,
         }
         assert failure_metadata.control_failures == [
             DualPathControlFailureMetadata(
-                request_id=timed_out_request.request_id,
+                request_id=aborted_request.request_id,
                 invalid_block_ids=(52, 53, 54),
-                reason=DualPathControlFailureReason.DECISION_TIMEOUT,
+                reason=DualPathControlFailureReason.PEER_ABORT,
             )
         ]
         assert task04_seams.decode_coordinator.register_pending.call_args_list == [
             call(committed_state.request_key),
-            call(timed_out_state.request_key),
+            call(aborted_state.request_key),
             call(cancelled_state.request_key),
         ]
         assert task04_seams.decode_coordinator.unregister.call_args_list == [
             call(cancelled_state.request_key),
-            call(timed_out_state.request_key),
+            call(aborted_state.request_key),
         ]
         assert [
             submitted.args[1].result.request_key for submitted in task04_seams.prefill_coordinator.submit.call_args_list
-        ] == [committed_state.request_key, timed_out_state.request_key]
+        ] == [committed_state.request_key, aborted_state.request_key]
         assert completed_delivery_future is not inflight_delivery_future
         assert prefill_scheduler._prefill_request_keys == {
-            inflight_prefill_request.request_id: timed_out_state.request_key,
+            inflight_prefill_request.request_id: aborted_state.request_key,
         }
         assert prefill_scheduler._prefill_delivery_futures == {
             inflight_prefill_request.request_id: inflight_delivery_future,
         }
         assert not inflight_delivery_future.done()
         assert prefill_scheduler._path_decider is not None
-        assert set(prefill_scheduler._path_decider._decision_records) == {timed_out_state.request_key}
+        assert set(prefill_scheduler._path_decider._decision_records) == {aborted_state.request_key}
         assert policy.choose.call_count == 2
 
         decode_scheduler.request_finished(committed_request, [41, 42, 43, 44])
-        decode_scheduler.request_finished(timed_out_request, [51, 52, 53, 54])
+        decode_scheduler.request_finished(aborted_request, [51, 52, 53, 54])
         assert decode_scheduler._decode_decision_states == {}
         assert decode_scheduler._decode_kv_snapshots == {}
         assert task04_seams.decode_coordinator.unregister.call_args_list == [
             call(cancelled_state.request_key),
-            call(timed_out_state.request_key),
+            call(aborted_state.request_key),
             call(committed_state.request_key),
-            call(timed_out_state.request_key),
+            call(aborted_state.request_key),
         ]
         assert decode_scheduler.executor.submit.call_count == 3
 

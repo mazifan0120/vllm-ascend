@@ -1,5 +1,12 @@
 # Task-07 Detailed Spec — Bidirectional Split Runtime
 
+> **Superseded lifecycle clauses (2026-08-16):** This file is a historical
+> Stage-1 task record. Its watchdog/non-watchdog scope statements are superseded
+> by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> All DualPath watchdogs and their environment variables are now removed;
+> explicit outcomes and staged failures remain.
+
 ## 1. Status, authority, and implementation starting point
 
 This document is the complete implementation contract for Task-07 in the

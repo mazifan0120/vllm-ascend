@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import time
 from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
@@ -17,7 +16,6 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.request import RequestStatus
 
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (
     KVPoolSchedulerAdapter,
@@ -106,7 +104,6 @@ class DecodeKVSnapshot:
 class _DecodeDecisionStatus(str, Enum):
     PENDING = "PENDING"
     COMMITTED = "COMMITTED"
-    DECISION_TIMEOUT = "DECISION_TIMEOUT"
     ACTIVATION_FAILED = "ACTIVATION_FAILED"
 
 
@@ -114,7 +111,6 @@ class _DecodeDecisionStatus(str, Enum):
 class DecodePathDecisionState:
     decision_request: PathDecisionRequest
     request: Request
-    deadline: float
     status: _DecodeDecisionStatus
 
     @property
@@ -188,8 +184,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     allocation, receives the Prefill decision, and installs the Store,
     Reverse, and Forward plans for the selected route. Prefill evaluates the
     path decision hook from the admitted Decode facts and installs its local
-    send/receive plans after allocation. Requests outside the DualPath
-    admission shapes delegate to the parent unchanged.
+    send/receive plans after allocation. Decision and request-terminal ABORT
+    are the remote outcomes; local activation and Worker failures fail closed.
+    Requests outside the DualPath admission shapes delegate to the parent
+    unchanged.
     """
 
     def __init__(
@@ -206,7 +204,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._lookup_results: dict[str, _AdmissionLookup] = {}
         self._decode_kv_snapshots: dict[str, DecodeKVSnapshot] = {}
         self._decode_decision_states: dict[str, DecodePathDecisionState] = {}
-        self._decision_timeout_seconds: int | None = None
         self._kvpool_adapter: KVPoolSchedulerAdapter | None = None
         self._accepting_decode_admission = True
         self._accepting_prefill_decisions = True
@@ -238,26 +235,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_deferred_deliveries: set[str] = set()
         self._prefill_vacuous_reverse_request_ids: set[str] = set()
         self._latest_reverse_attempt_ids: dict[str, int] = {}
-        self._recovery_deadlines: dict[str, float] = {}
-        self._de_progress_deadlines: dict[str, float] = {}
-        self._recovery_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S
-        self._de_progress_watchdog_s: int = ascend_envs.VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S
-        for env_name, env_value in (
-            ("VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S", self._recovery_watchdog_s),
-            ("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", self._de_progress_watchdog_s),
-        ):
-            if env_value <= 0:
-                raise ValueError(f"{env_name} must be an integer greater than zero")
         _validate_local_topology(vllm_config)
         if dual_path_cfg.role == "decode":
             if len(kv_cache_config.kv_cache_groups) != 1:
                 raise ValueError("DualPath Decode requires exactly one KV cache group")
             if vllm_config.kv_transfer_config.kv_load_failure_policy != "fail":
                 raise ValueError("DualPath Decode requires kv_load_failure_policy='fail'")
-            decision_timeout_seconds = ascend_envs.VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT
-            if decision_timeout_seconds <= 0:
-                raise ValueError("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT must be an integer greater than zero")
-            self._decision_timeout_seconds = decision_timeout_seconds
             self._kvpool_adapter = KVPoolSchedulerAdapter(vllm_config, kv_cache_config)
             data_parallel_rank = vllm_config.parallel_config.data_parallel_rank
             control_port = derive_decode_control_port(
@@ -490,8 +473,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if request_id not in self._prefill_path_results:
                 # A first-contact failure has nothing to discard: converge
                 # locally instead of escaping into the vLLM scheduling loop.
-                # No Result is sent; the request-terminal ABORT makes Decode
-                # converge without waiting for its decision deadline.
+                # No Result is sent; request-terminal ABORT makes Decode
+                # converge through the explicit protocol outcome.
                 logger.error(
                     "DualPath Prefill decision failed for request %s: %s",
                     request_id,
@@ -857,7 +840,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 )
             self._prefill_pending_reverse_receive_bindings[request_id] = binding
             self._prefill_reverse_plans[request_id] = reverse_plan
-            self._recovery_deadlines[request_id] = time.monotonic() + self._recovery_watchdog_s
         elif replacement_attempt_id is not None and token_start < token_split:
             # Route-preserving recovery (I7): same path and frozen DE table;
             # only the attempt-local range [L_PE(new), K_DE) and the PE block
@@ -902,7 +884,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._prefill_pending_reverse_receive_bindings[request_id] = binding
             self._prefill_reverse_plans[request_id] = reverse_plan
             self._waiting_reverse_attempt_ids[request_id] = attempt_key
-            self._recovery_deadlines[request_id] = time.monotonic() + self._recovery_watchdog_s
 
         if prepared is None:
             # Forward table does not cover T yet; it installs on the
@@ -1317,11 +1298,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
 
         coordinator.register_pending(request_key)
-        assert self._decision_timeout_seconds is not None
         state = DecodePathDecisionState(
             decision_request=decision_request,
             request=request,
-            deadline=time.monotonic() + self._decision_timeout_seconds,
             status=_DecodeDecisionStatus.PENDING,
         )
         self._decode_decision_states[request_id] = state
@@ -1478,7 +1457,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 )
         except Exception as error:  # noqa: BLE001
             logger.error("DualPath Decode activation failed for request %s: %s", request_id, error)
-            self._de_progress_deadlines.pop(request_id, None)
             state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
             self._path_decision_coordinator.unregister(state.request_key)
             metadata.control_failures.append(
@@ -1509,8 +1487,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
         metadata.forward_receive_bindings.append(binding)
         state.status = _DecodeDecisionStatus.COMMITTED
-        if reverse_plan is not None:
-            self._de_progress_deadlines[request_id] = time.monotonic() + self._de_progress_watchdog_s
         self._log_decision_activation(decision, state, snapshot, reverse_plan, binding)
 
     def _log_decision_activation(
@@ -1560,28 +1536,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return job.reverse_attempt_key.request_key.decode_request_id
         return None
 
-    def _sweep_prefill_recovery_watchdogs(self, metadata: DualPathConnectorMetadata) -> None:
-        # Expiry fails the request through the control-failure path.
-        now = time.monotonic()
-        for request_id, deadline in list(self._recovery_deadlines.items()):
-            if deadline > now:
-                continue
-            self._recovery_deadlines.pop(request_id)
-            self._prefill_invalid_request_ids.add(request_id)
-            invalid_block_ids = self._recovery_invalid_block_ids(request_id)
-            if invalid_block_ids:
-                metadata.control_failures.append(
-                    DualPathControlFailureMetadata(
-                        request_id=request_id,
-                        invalid_block_ids=invalid_block_ids,
-                        reason=DualPathControlFailureReason.RECOVERY_TIMEOUT,
-                    )
-                )
-            logger.error(
-                "DualPath recovery watchdog expired for request %s; the request is failed closed",
-                request_id,
-            )
-
     def _recovery_invalid_block_ids(self, request_id: str) -> tuple[int, ...]:
         reverse_plan = self._prefill_reverse_plans.get(request_id)
         if reverse_plan is not None:
@@ -1590,32 +1544,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             last_block = math.ceil(reverse_plan.token_end / block_size)
             return tuple(reverse_plan.destination_block_ids[0][first_block:last_block])
         return ()
-
-    def _sweep_decode_progress_watchdogs(self, metadata: DualPathConnectorMetadata) -> None:
-        # Bounds a committed DE_READ admission whose reverse-send job has not
-        # closed; expiry fails the request without touching the job ledger.
-        now = time.monotonic()
-        for request_id, deadline in list(self._de_progress_deadlines.items()):
-            if deadline > now:
-                continue
-            self._de_progress_deadlines.pop(request_id)
-            state = self._decode_decision_states.get(request_id)
-            if state is None or state.status is not _DecodeDecisionStatus.COMMITTED:
-                continue
-            state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
-            self._path_decision_coordinator.unregister(state.request_key)
-            snapshot = self._decode_kv_snapshots[request_id]
-            metadata.control_failures.append(
-                self._build_decode_control_failure(
-                    request_id,
-                    snapshot,
-                    DualPathControlFailureReason.RECOVERY_TIMEOUT,
-                )
-            )
-            logger.error(
-                "DualPath DE progress watchdog expired for request %s; no safety proof is synthesized",
-                request_id,
-            )
 
     def _handle_received_abort(self, notice: PathAbortNotice) -> None:
         request_id = notice.request_key.decode_request_id
@@ -1626,7 +1554,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         ):
             return
         state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
-        self._de_progress_deadlines.pop(request_id, None)
         self._path_decision_coordinator.unregister(state.request_key)
         snapshot = self._decode_kv_snapshots[request_id]
         try:
@@ -1656,7 +1583,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._reconcile_prefill_deliveries()
             for deferred_request_id in list(self._prefill_deferred_deliveries):
                 self._deliver_prefill_decision(deferred_request_id)
-            self._sweep_prefill_recovery_watchdogs(metadata)
             metadata.reverse_receive_bindings.extend(self._prefill_pending_reverse_receive_bindings.values())
             metadata.control_failures.extend(self._prefill_control_failures.values())
             self._prefill_pending_reverse_receive_bindings.clear()
@@ -1671,25 +1597,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._handle_received_abort(notice)
         metadata.control_failures.extend(self._decode_control_failures.values())
         self._decode_control_failures.clear()
-        self._sweep_decode_progress_watchdogs(metadata)
-
-        now = time.monotonic()
-        for request_id, state in self._decode_decision_states.items():
-            if not _is_open_decision_status(state.status):
-                continue
-            if state.deadline > now:
-                continue
-            state.status = _DecodeDecisionStatus.DECISION_TIMEOUT
-            self._de_progress_deadlines.pop(request_id, None)
-            coordinator.unregister(state.request_key)
-            snapshot = self._decode_kv_snapshots[request_id]
-            metadata.control_failures.append(
-                self._build_decode_control_failure(
-                    request_id,
-                    snapshot,
-                    DualPathControlFailureReason.DECISION_TIMEOUT,
-                )
-            )
 
         assert self._kvpool_adapter is not None
         store_metadata = self._kvpool_adapter.build_connector_meta(scheduler_output)
@@ -1712,7 +1619,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         state = self._decode_decision_states.pop(request_id, None)
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)
-        self._de_progress_deadlines.pop(request_id, None)
         if state is not None:
             for attempt_key in [key for key in self._reverse_send_job_ids if key.request_key == state.request_key]:
                 send_job = self._job_ledger.get(self._reverse_send_job_ids[attempt_key])
@@ -1894,7 +1800,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     self._reverse_send_job_ids.pop(attempt_key, None)
                     self._job_ledger.discard(job.job_id)
                     if not self._has_open_reverse_send_job(request_key):
-                        self._de_progress_deadlines.pop(request_id, None)
                         self._latest_reverse_attempt_ids.pop(request_id, None)
                         if request_id in self._pending_finished_sending:
                             self._pending_finished_sending.discard(request_id)
@@ -1919,7 +1824,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
             # Request-level release is authorized only after every send attempt
             # for this exact request key has closed or disappeared.
-            self._de_progress_deadlines.pop(request_id, None)
             finished_sending: set[str] = set()
             if request_id in self._pending_finished_sending:
                 self._pending_finished_sending.discard(request_id)
@@ -1945,7 +1849,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._job_ledger.discard(job.job_id)
             return set()
         del self._waiting_reverse_attempt_ids[request_id]
-        self._recovery_deadlines.pop(request_id, None)
         self._job_ledger.discard(job.job_id)
         return {request_id}
 

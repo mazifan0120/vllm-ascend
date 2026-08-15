@@ -1,5 +1,11 @@
 # Task-06 Detailed Spec — DE-Local Store-Full Completion
 
+> **Superseded lifecycle clauses (2026-08-16):** This file is a historical
+> Stage-1 task record. Its Task-04 deadline references are superseded by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Store-full remains local; remote-required requests wait for explicit Decision,
+> request-terminal ABORT, or an evidence-bearing local/Worker failure.
+
 ## 1. Status, authority, and implementation starting point
 
 This document is the complete implementation contract for Task-06 in the

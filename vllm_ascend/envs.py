@@ -110,24 +110,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # DualPath Decode decision timeout in integer seconds. The default is 60,
-    # the valid range is greater than zero, and this value is not sensitive.
-    "VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT": lambda: int(os.getenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", "60")),
-    # DualPath PE Reverse-completion watchdog in integer seconds: bounds how
-    # long a parked DE_READ request may wait for its Reverse completion before
-    # the request is failed. Default 30; valid range is greater than zero; not
-    # sensitive. Tunable per spec section 11 — the default requires NPU
-    # workload measurement.
-    "VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S": lambda: int(
-        os.getenv("VLLM_ASCEND_DUALPATH_RECOVERY_WATCHDOG_S", "30")
-    ),
-    # DualPath DE Store/Forward/Reverse progress watchdog in integer seconds:
-    # bounds a committed DE_READ admission whose reverse-send job has not
-    # closed. Default 60; valid range is greater than zero; not sensitive.
-    # Tunable per spec section 11 — the default requires NPU measurement.
-    "VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S": lambda: int(
-        os.getenv("VLLM_ASCEND_DUALPATH_DE_PROGRESS_WATCHDOG_S", "60")
-    ),
 }
 
 # end-env-vars-definition

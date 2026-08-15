@@ -1,5 +1,14 @@
 # Task-04 Detailed Spec — DE/PE Connector Scheduler Decision Control Loop
 
+> **Superseded lifecycle clauses (2026-08-16):** This file preserves the
+> historical Stage-1 deadline design. All deadline fields, timeout states and
+> reasons, timeout-environment requirements, and timeout tests below are
+> superseded by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Decode now remains pending until Decision, request-terminal ABORT, or an
+> evidence-bearing local/Worker failure; the named timeout environment variable
+> is removed.
+
 ## 1. Status and authority
 
 This document defines the implementation contract for Task-04 in the

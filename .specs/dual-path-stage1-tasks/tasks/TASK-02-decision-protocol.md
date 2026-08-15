@@ -1,5 +1,12 @@
 # Task-02 Detailed Spec — PE-Owned Decision Protocol and Policy
 
+> **Superseded lifecycle clauses (2026-08-16):** This file is a historical
+> Stage-1 task record. Any Decision-deadline or timeout behavior below is
+> superseded by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Current convergence is explicit Decision, request-terminal ABORT, or an
+> evidence-bearing local/Worker failure; no elapsed-time fallback remains.
+
 ## 1. Status and authority
 
 This document defines the implementation contract for Task-02 in the

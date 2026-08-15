@@ -3,8 +3,14 @@
 Status: design — single-stage delivery (approved direction: route-specific
 recovery; no 2a/2b split)
 Date: 2026-08-11
-Updated: 2026-08-14
-Revision note: 2026-08-14 implementation sync retires the
+Updated: 2026-08-16
+Revision note: 2026-08-16 removes every DualPath Decision, PE recovery, and
+DE progress watchdog and their environment variables, and adds explicit
+request-terminal ABORT delivery. Decisions are consumed before ABORT notices;
+already-staged direct failures are published afterward. This supersedes the
+2026-08-14 watchdog-retention choice; see the
+[ABORT and watchdog-removal decision](../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+The 2026-08-14 implementation sync retired the
 `CloseReverseAttempt` protocol and Reverse destination hold while retaining the
 Decision epoch, `STALE_CLOSED`, I4 gate, and `JobLedger`. Earlier review history
 is preserved below. A later source-alignment correction also records that the
@@ -23,22 +29,31 @@ Supersedes: the Stage-1 known limitation recorded in
 `.specs/dual-path-stage1-tasks/TASKS.md` §3 ("prefill dual_path request
 preempted after decision delivery is unsafe").
 
-> **2026-08-14 修订：CloseReverseAttempt 协议与 Reverse destination hold 已下线。**
+> **2026-08-16 修订：所有 Decision/recovery/progress watchdog 与对应环境变量
+> 已移除。** 运行时只接受显式 Decision、request-terminal ABORT 或带直接证据的
+> 本地/Worker 失败；计时器不再生成完成或安全证明。该决策取代 2026-08-14
+> “保留 recovery/progress watchdog”的选择，并明确接受对端失联时无限等待的
+> 风险。
+>
+> **2026-08-14 历史修订：CloseReverseAttempt 协议与 Reverse destination hold
+> 下线。**
 >
 > 二者服务的都是同一个场景：PE 侧请求在 Reverse 完成前异常终止（abort 或
-> recovery watchdog 超时），此时 DE 可能仍在写 PE 的 destination block。
-> 现决定该场景与 main 分支保持一致的语义——立即释放，不等远程安全证明。
+> 当时仍存在的 recovery watchdog 超时），此时 DE 可能仍在写 PE 的
+> destination block。当时决定两种终止都立即释放；2026-08-16 后只保留显式
+> ABORT 的立即释放，超时路径不再存在。
 >
 > 保留的部分：`reverse_attempt_id`（取值 `num_preemptions`）作为控制面
 > epoch，`_register_decision_locked` 的去重与单调性，以及 I4 gate。控制面
 > 投递是 at-least-once 且多个 attempt 并发投递，执行端仍须据此拒绝过期指令。
 
-This revision deliberately accepts the same use-after-free risk already
+The active 2026-08-16 contract deliberately accepts the same use-after-free risk already
 present in the parent/main P-to-D direction: if DE is still sending when PE
-aborts or its recovery watchdog expires, the late D-to-P write can target a
+aborts, the late D-to-P write can target a
 block already reallocated to another request. DualPath adds this symmetric
-D-to-P exposure; the retired hold/close design below documents the stronger
-alternative and why it was not retained.
+D-to-P exposure. If PE dies without delivering ABORT, Decode may instead wait
+indefinitely. The retired hold/close and watchdog designs below document the
+historical alternatives and why they were not retained.
 
 ## 1. Problem
 
@@ -89,12 +104,13 @@ unsafe if the vLLM scheduler later preempts it:
   re-admission writes into the old PE block table, which may now belong to
   another request. Current worker installers reject changed bindings/plans
   (dual_path `worker.py:216-226`, `:349-360`), so no replacement path exists.
-- **F6 — exceptional Reverse termination risk (accepted on 2026-08-14).** If a
-  `DE_READ` Decision was accepted but the PE request aborts or its recovery
-  watchdog expires while waiting for Reverse, DE may still start or continue
-  writing the old destination. The retired close/hold design tried to prove
-  that writer safe before reuse; the implemented contract now releases
-  immediately, matching the parent/main behavior and accepting this risk.
+- **F6 — exceptional Reverse termination risk (revised on 2026-08-16).** If a
+  `DE_READ` Decision was accepted and PE delivers ABORT while waiting for
+  Reverse, DE may still start or continue writing the old destination. The
+  retired close/hold design tried to prove that writer safe before reuse; the
+  implemented ABORT contract releases immediately and accepts this risk. If PE
+  dies or ABORT delivery exhausts, no timer fallback releases the request; the
+  request may wait indefinitely.
 
 F2-F6 require a Reverse direction and therefore apply only to `DE_READ`.
 `PE_READ` has no DE-to-PE write, no PE-side remote-KV wait, and no Reverse
@@ -132,9 +148,10 @@ Goals:
 - Keep one stable logical Forward binding on DE for both paths. Recovery only
   replaces PE-local Forward source state; `DE_READ` additionally creates a new
   Reverse attempt for the current PE allocation.
-- Keep request-visible waits bounded. Normal Reverse completion is still
-  attempt-gated; exceptional abort/watchdog expiry fails the request and
-  releases its destination without waiting for remote proof.
+- Keep request-visible waits evidence-gated. Normal Reverse completion remains
+  attempt-gated; explicit ABORT or a direct failure report fails the request.
+  Missing outcomes can wait indefinitely rather than manufacturing a safety
+  proof from elapsed time.
 - Support matching `TP>1` within the Stage-1 topology contract through
   all-participating-worker aggregation.
 - Reject unsupported local and PE/DE parallel topologies before a decision is
@@ -259,8 +276,8 @@ runtime replacement is not gated by a DualPath hold, job, or fence.
 - **I8 — retired exceptional-close invariant.** The original design required a
   `SAFE` reply from `CloseReverseAttempt` or verified teardown before releasing
   an uncertain Reverse destination. This invariant is no longer implemented:
-  abort and recovery-watchdog expiry release immediately and accept a possible
-  late write into a reallocated block. I4 remains the normal-completion gate.
+  explicit ABORT releases immediately and accepts a possible late write into a
+  reallocated block. No expiry path remains; I4 is the normal-completion gate.
 
 ## 5. Design
 
@@ -291,8 +308,8 @@ Active ledger rules:
   mutate a later attempt.
 - A Reverse completion job and a DE reverse-send job each map to exactly one
   `ReverseAttemptKey`.
-- A failure report closes the job as `failed`; the owning request is failed
-  through the existing control-failure/watchdog path.
+- A failure report closes the job as `failed`; the Scheduler stages a direct
+  control failure for publication on the next metadata build.
 - The job ledger is the sole authority for reverse-send counting:
   `completed_worker_count`, `failed`, and `closed` for a `reverse_send_job_id`
   live only here. No second structure keeps a completion counter.
@@ -658,7 +675,7 @@ DecodeAdmissionRecord
 
 A Reverse attempt contains its receipt/activation state, Decision, Reverse
 plan/binding, tracker/latch references, jobs (including its
-`reverse_send_job_id`), deadline, and terminal result.
+`reverse_send_job_id`), and terminal result.
 Normal replacement discards the completed current attempt before installing the
 next, so DE holds at most one live Reverse attempt per logical request plus the
 monotonic `closed_through_attempt_id` watermark. No staged-attempt slot and no unbounded
@@ -693,7 +710,8 @@ else:
 > **Retired on 2026-08-14.** This section preserves the stronger design and its
 > close matrix for review history; it is not an implemented protocol or release
 > gate. The active PE path sends no close, retains no Reverse destination hold,
-> and releases immediately on abort or recovery-watchdog expiry.
+> and releases immediately on explicit ABORT. Recovery-watchdog expiry was
+> retained in the 2026-08-14 implementation but removed on 2026-08-16.
 
 The retired `CloseReverseAttempt` asked one narrow question:
 
@@ -875,8 +893,7 @@ ordinary parent/main release:
    `False`. RUNNING Forward abort, normal Prefill finish, and preemption use the
    same immediate-release ownership contract.
 2. The aborted request and its ordinary destination ownership are released by
-   the parent lifecycle immediately; recovery-watchdog expiry follows the same
-   terminal path.
+   the parent lifecycle immediately. No elapsed-time terminal path remains.
 3. No remote safety proof is awaited. If DE has already published or is still
    executing Reverse work, a late DMA can write a block that PE has reallocated
    to another request. This is the accepted behavioral risk and is symmetric
@@ -920,10 +937,10 @@ job would never aggregate. The rule that prevents this:
   request running.
 - A finished request with no pending connector work must return
   `(False, None)` from `request_finished` so the engine can go idle.
-- The bounded-watchdog fallback fails the request. On PE it does not synthesize
-  a remote proof or retain a destination hold.
+- No timer fallback closes a missing send report. A hung sender can therefore
+  keep the finished Decode request delayed indefinitely.
 
-### Cleanup and bounded waits
+### Cleanup and evidence-gated waits
 
 - Final logical cleanup removes admission, Forward, and current Reverse state;
   it does not retain a close record or destination hold.
@@ -933,9 +950,10 @@ job would never aggregate. The rule that prevents this:
 - `closed_through_attempt_id` lives only with the active logical admission and
   is used by `_register_decision_locked` to reject stale Decisions. It is not a
   post-cleanup safety proof.
-- The PE recovery watchdog and DE progress watchdog remain. PE expiry fails the
-  request and follows immediate-free semantics; DE expiry continues to bound
-  Store, Forward, and Reverse progress.
+- **Superseded on 2026-08-16:** the earlier PE recovery-watchdog and DE
+  progress-watchdog retention choice is removed. Neither elapsed time nor a
+  missing report closes a request; only explicit ABORT or direct failure facts
+  do so.
 - There are no hold-pressure limits. The removed
   `VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS` and
   `VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS` variables no longer have any
@@ -987,8 +1005,8 @@ The Scheduler accumulates counts across steps and completes at the recorded
 `vllm_config.parallel_config.world_size`, which equals TP under the supported
 `PP == PCP == DP == 1` topology (`vllm/config/parallel.py:774-784`). A
 rank-local terminal can never publish process-wide Reverse completion. A
-missing or failed rank leaves the job incomplete and takes the watchdog/failure
-path.
+reported failed rank takes the staged-failure path; a missing rank leaves the
+job incomplete indefinitely.
 
 ### 6.3 PCP/DCP reuse boundary
 
@@ -1017,7 +1035,7 @@ acceptance matrix, not a change to the route-specific recovery model.
 | F3 exhausted Reverse latch | no old-plan reuse | fresh per-attempt tracker and latch keyed by `ReverseAttemptKey` | old DONE attempt retired on normal replacement |
 | F4 stale Reverse terminal | ordinary ownership remains until current completion | Worker reports an opaque completion job; PE Scheduler maps job_id to `ReverseAttemptKey` | I4 job-based gate absorbs stale-attempt jobs; only PE Scheduler publishes `finished_recving` |
 | F5 stale Reverse destination | new ordinary allocation is used for the new attempt | new plan uses current PE block table | old plan never resubmitted |
-| F6 exceptional abort/watchdog expiry | immediate parent/main release; no Reverse hold | Decision epoch rejects delayed lower attempts but cannot stop an already published writer | accepted risk: late DE DMA may write a reallocated PE block |
+| F6 exceptional explicit ABORT | immediate parent/main release; no Reverse hold | Decision epoch rejects delayed lower attempts but cannot stop an already published writer | accepted risk: late DE DMA may write a reallocated PE block; missing ABORT may wait indefinitely |
 
 ## 8. Connector facade requirements
 
@@ -1127,12 +1145,12 @@ each implementation step of §10. Coverage must include:
 - No PE close-driver fields or methods, close retry backoff, close message/reply
   schema, close registry, `ClosedReverseAttemptRecord`, `HoldLedger`, Forward or
   Reverse hold map, or hold-pressure limit remains.
-- The Decision envelope accepts `Decision` only. A literal legacy
+- The control envelope accepts `Decision` and request-terminal `Abort`. A literal legacy
   `CloseReverseAttempt` message produces one warning and no reply; this pins the
   unsupported mixed-version behavior.
-- Abort while waiting and PE recovery-watchdog expiry create no connector
-  delayed-free state and retain no destination reference. Ordinary ownership is
-  released immediately through the parent/main lifecycle.
+- ABORT while waiting creates no connector delayed-free state and retains no
+  destination reference. Ordinary ownership is released immediately through
+  the parent/main lifecycle. There is no expiry alternative.
 - No-pinning regressions assert unchanged block refcounts and absence of the
   retired scheduler surface.
 - The epoch contract remains independently covered: `reverse_attempt_id` comes
@@ -1142,12 +1160,12 @@ each implementation step of §10. Coverage must include:
 - I4 and both JobLedger kinds remain covered, including stale Reverse terminal
   absorption, all-worker completion, failed jobs, and closed-record reclamation.
 
-**Step 8 — cleanup, watchdogs, limits, facade:**
+**Step 8 — cleanup, direct failure reporting, limits, facade:**
 
 - Logical cleanup removes current Reverse/Forward state and reclaims every
   closed job record while leaving open JobLedger records reportable.
-- PE watchdog expiry fails the request and releases without a destination hold;
-  the retired hold-pressure limits are absent.
+- Explicit ABORT and Worker-reported failure paths fail closed; the retired
+  watchdog and hold-pressure surfaces are absent.
 - Facade and MultiConnector forwarding for every new hook.
 - Explicit rejection for PP>1, DP>1, PCP>1, DCP>1, and PE/DE TP mismatch via
   the new bootstrap fields; matching TP=2 follows the same semantics as TP=1.
@@ -1184,7 +1202,7 @@ split. Each step lands with its §9 tests.
 7. **Retire close and Reverse hold.** Remove the PE close driver, Decode close
    protocol/registry, Reverse destination hold and budgets; preserve Decision
    epoch monotonicity, `STALE_CLOSED`, I4, and JobLedger.
-8. **Cleanup, watchdogs, failure reporting, and facade/MultiConnector
+8. **Cleanup, ABORT/direct failure reporting, and facade/MultiConnector
    forwarding**, plus topology fail-fast validation.
 9. Implement the §9 tests per step and the separate PE_READ/DE_READ NPU
    preemption and TP acceptance scenarios.
@@ -1192,15 +1210,16 @@ split. Each step lands with its §9 tests.
     `.specs/dual-path-stage1-tasks/TASKS.md` §3 and link to the implemented
     result.
 
-## 11. Tunable parameters (not correctness decisions)
+## 11. Removed timer parameters
 
-- PE Reverse-completion recovery watchdog.
-- DE Store/Forward/Reverse progress watchdog.
+The former Decision timeout, PE Reverse-completion recovery watchdog, and DE
+Store/Forward/Reverse progress watchdog are removed. Their environment
+variables no longer alter runtime behavior; this supersedes the 2026-08-14
+retention choice.
 
 `VLLM_ASCEND_DUALPATH_CLOSE_RETRY_BACKOFF_S`,
 `VLLM_ASCEND_DUALPATH_MAX_HELD_RECOVERY_BLOCKS`, and
 `VLLM_ASCEND_DUALPATH_MAX_RECOVERY_RECORDS` are removed. Setting them no longer
 changes runtime behavior.
 
-Defaults require NPU workload measurement, but every correctness predicate in
-this document is independent of those values.
+No timeout default is available or required for correctness.

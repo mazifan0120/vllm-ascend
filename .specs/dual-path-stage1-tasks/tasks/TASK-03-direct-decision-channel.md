@@ -1,5 +1,12 @@
 # Task-03 Detailed Spec — Direct PE-to-DE Decision Channel
 
+> **Superseded lifecycle clauses (2026-08-16):** This file is a historical
+> Stage-1 task record. Its Decision-deadline convergence clauses are superseded
+> by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> The channel now carries Decision and request-terminal ABORT outcomes; no
+> elapsed-time fallback remains.
+
 ## 1. Status and authority
 
 This document defines the implementation contract for Task-03 in the

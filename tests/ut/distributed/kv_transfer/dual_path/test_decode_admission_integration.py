@@ -7,8 +7,8 @@ constrained at their existing seams. Proves that for ``L_DE < R`` one
 ``schedule()`` call admits the request into ``WAITING_FOR_REMOTE_KVS`` with
 final blocks bound in a ``DecodeKVSnapshot``, and that an HBM-complete
 request takes the normal local path with no Task-01 state. It also proves that
-a Task-04 decision timeout reaches ``FINISHED_ERROR`` and releases delayed
-blocks through the Worker/Core relay. Task-06 coverage drives the complete
+an explicit PE ABORT reaches ``FINISHED_ERROR`` and releases delayed blocks
+through the Worker/Core relay. Task-06 coverage drives the complete
 DE-local Store-full success and probe/load-race failure lifecycles through the
 same real Scheduler, including final-token recomputation and delayed-block
 release without Proxy, PE, Decision, Forward, or Reverse activity.
@@ -56,12 +56,15 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (  # n
     DualPathControlFailureMetadata,
     DualPathControlFailureReason,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (  # noqa: E402
+    PathAbortNotice,
+    PathAbortReason,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
     DecodeControlEndpoint,
 )
 
 _BLOCK_SIZE = 16
-_DECISION_TIMEOUT_ENV = "VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT"
 _NONE_HASH_INITIALIZED = False
 _CONNECTOR_REGISTERED = False
 
@@ -634,25 +637,29 @@ def test_store_full_failure_fails_closed_and_releases_delayed_blocks(
     assert dual._reqs_need_recv == {}
 
 
-class TestDecisionTimeoutIntegration:
-    def test_timeout_output_finishes_request_and_releases_delayed_blocks(
+class TestAbortIntegration:
+    def test_pending_request_waits_until_abort_then_finishes_and_releases_delayed_blocks(
         self,
-        monkeypatch,
         _constrain_kvpool_seams,
     ):
         # Given
-        monkeypatch.setenv(_DECISION_TIMEOUT_ENV, "1")
         _constrain_kvpool_seams.return_value.lookup.return_value = 0
         scheduler = _make_scheduler(_make_vllm_config())
         dual = _dual_scheduler(scheduler)
         coordinator = dual._path_decision_coordinator
         coordinator.take_received_decisions.return_value = []
+        coordinator.take_received_aborts.return_value = []
         block_pool = scheduler.kv_cache_manager.block_pool
         baseline_free_blocks = block_pool.free_block_queue.num_free_blocks
 
         try:
             with (
-                patch.object(scheduler_module.time, "monotonic", return_value=100.0),
+                patch.object(
+                    scheduler_module,
+                    "time",
+                    SimpleNamespace(monotonic=lambda: 100.0),
+                    create=True,
+                ),
                 patch.object(dual, "_access_metaserver") as proxy_http,
             ):
                 request, scheduler_output, matched_returns, lookup_mock, _, alloc_mock = _admit_one_request(scheduler)
@@ -670,24 +677,44 @@ class TestDecisionTimeoutIntegration:
             proxy_http.assert_not_called()
             coordinator.submit.assert_not_called()
             assert state.status is scheduler_module._DecodeDecisionStatus.PENDING
-            assert state.deadline == 101.0
             assert dual._reqs_need_recv == {}
             assert block_pool.free_block_queue.num_free_blocks < baseline_free_blocks
 
             scheduler.update_from_output(scheduler_output, _runner_output_for([]))
 
-            # When
-            with patch.object(scheduler_module.time, "monotonic", return_value=state.deadline + 1):
-                timeout_scheduler_output = scheduler.schedule()
+            # The request remains parked without an explicit outcome, even after
+            # the former Decision timeout window would have elapsed.
+            with patch.object(
+                scheduler_module,
+                "time",
+                SimpleNamespace(monotonic=lambda: 10_000.0),
+                create=True,
+            ):
+                waiting_scheduler_output = scheduler.schedule()
+            waiting_metadata = waiting_scheduler_output.kv_connector_metadata
+            assert isinstance(waiting_metadata, DualPathConnectorMetadata)
+            assert waiting_metadata.control_failures == []
+            assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert block_pool.free_block_queue.num_free_blocks < baseline_free_blocks
 
-            metadata = timeout_scheduler_output.kv_connector_metadata
+            coordinator.take_received_aborts.return_value = [
+                PathAbortNotice(
+                    request_key=state.request_key,
+                    reason=PathAbortReason.ACTIVATION_FAILED,
+                )
+            ]
+
+            # When
+            abort_scheduler_output = scheduler.schedule()
+
+            metadata = abort_scheduler_output.kv_connector_metadata
             assert isinstance(metadata, DualPathConnectorMetadata)
             assert metadata.requests == {}
             assert metadata.control_failures == [
                 DualPathControlFailureMetadata(
                     request_id=request.request_id,
                     invalid_block_ids=external_block_ids,
-                    reason=DualPathControlFailureReason.DECISION_TIMEOUT,
+                    reason=DualPathControlFailureReason.PEER_ABORT,
                 )
             ]
 
@@ -706,10 +733,10 @@ class TestDecisionTimeoutIntegration:
             )
             model_runner_output = _runner_output_for([])
             model_runner_output.kv_connector_output = connector_output
-            scheduler.update_from_output(timeout_scheduler_output, model_runner_output)
+            scheduler.update_from_output(abort_scheduler_output, model_runner_output)
 
             # Then
-            assert state.status is scheduler_module._DecodeDecisionStatus.DECISION_TIMEOUT
+            assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
             assert connector_output.finished_recving == {request.request_id}
             assert connector_output.invalid_block_ids == set(external_block_ids)
             assert request.status is RequestStatus.FINISHED_ERROR

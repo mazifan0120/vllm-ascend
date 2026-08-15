@@ -1,5 +1,12 @@
 # Task-08 Detailed Spec — Non-full Production Activation
 
+> **Superseded lifecycle clauses (2026-08-16):** This file is a historical
+> Stage-1 task record. All inherited Decision-deadline, timeout-reason, and
+> watchdog clauses below are superseded by the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Current non-full activation is driven by Decision, request-terminal ABORT,
+> or an evidence-bearing local/Worker failure, without a timer fallback.
+
 ## 1. Status, authority, and implementation starting point
 
 This document is the complete implementation contract for Task-08 in the

@@ -178,8 +178,7 @@ class ProductionHarness:
 
 
 @pytest.fixture()
-def production_harness_factory(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DUALPATH_DECISION_TIMEOUT", raising=False)
+def production_harness_factory():
     schedulers = []
     with (
         patch(f"{SCHEDULER_NS}.KVPoolSchedulerAdapter"),
