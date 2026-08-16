@@ -7,6 +7,8 @@ import importlib
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_block_pool,
@@ -172,6 +174,25 @@ class TestJobRecordReclamation:
         scheduler._release_scheduler_request_state(request)
 
         assert scheduler._job_ledger.get(job_id) is not None
+
+    def test_late_completion_failure_after_request_finished_discards_orphan_without_side_effects(
+        self,
+        pe_scheduler_factory,
+    ):
+        scheduler, request = self._admit_de_read(pe_scheduler_factory)
+        job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == job_id
+        request.status = RequestStatus.FINISHED_STOPPED
+        assert scheduler.request_finished(request, [70, 71]) == (False, None)
+        assert scheduler._job_ledger.get(job_id) is not None
+
+        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failed_jobs={job_id: 1}))
+        scheduler.update_connector_output(output)
+
+        assert scheduler._job_ledger.get(job_id) is None
+        assert scheduler._prefill_control_failures == {}
+        assert output.finished_recving is None
 
     def test_request_cleanup_reclaims_every_closed_completion_job_after_binding_delivery(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)

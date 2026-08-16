@@ -1,5 +1,11 @@
 # PR-04 Activate Store-Full DE_READ
 
+> **Superseded on 2026-08-16:** This historical Stage-1 plan predates the active
+> no-timer control contract. Runtime failure now requires an explicit Decision,
+> request-terminal ABORT, or direct local/Worker failure fact; elapsed time does
+> not synthesize failure or completion. See the
+> [ABORT and watchdog-removal decision](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+
 - Series position: 4 of 7
 - Spec status: `PLANNED`
 - Depends on: PR-03
@@ -46,7 +52,9 @@ path.
   Layerwise Forward behavior.
 - Zero-compute/zero-transfer termination of the PE request after a Store-full
   `DE_READ` commit.
-- Store DONE/FAILED, invalid blocks, terminal cleanup, timeout, and no fallback.
+- Store DONE/FAILED, invalid blocks, terminal cleanup, and no fallback. The
+  timeout item in this 2026-08-11 plan is historical and was superseded on
+  2026-08-16; the active runtime has no timer-derived terminal outcome.
 - A minimal existing-KVPool completion seam, if required, so async completion
   preserves request-level DONE versus FAILED and shares invalid block IDs with
   the polling Worker.
@@ -99,8 +107,9 @@ be treated as `STORE_DONE` when the underlying load reported invalid blocks.
   when Decode reported full Store coverage.
 - `STORE_DONE` completes Decode and triggers only final-prompt-token
   recomputation.
-- `STORE_FAILED`, decision timeout, PE request failure, and cancellation are
-  fail-closed with no post-commit path switch.
+- `STORE_FAILED`, PE request failure, and cancellation are fail-closed with no
+  post-commit path switch. The historical decision-timeout case is superseded;
+  the active runtime does not synthesize failure from elapsed time.
 - Async Store get failure is published as FAILED with all affected invalid
   blocks before the failed receive terminal; it cannot appear as DONE merely
   because the request ID reached a finished set.

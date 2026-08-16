@@ -7,7 +7,9 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     DECODE_TEST_INSTANCE_ID,
@@ -330,6 +332,44 @@ def test_latest_reverse_send_attempt_closes_without_releasing_open_old_attempt(
 
     old_output = _close_send_job(scheduler, old_job_id)
     assert old_output.finished_sending == {request.request_id}
+
+
+@pytest.mark.parametrize("first_failure", ["older", "latest"])
+def test_request_finished_retains_delayed_free_until_last_exact_send_attempt_fails(
+    decode_scheduler_factory,
+    decode_task04_seams,
+    first_failure,
+):
+    scheduler = decode_scheduler_factory()
+    request, old_job_id, latest_job_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    state = scheduler._decode_decision_states[request.request_id]
+    old_attempt = _attempt_key(0, state.request_key)
+    latest_attempt = _attempt_key(1, state.request_key)
+    request.status = RequestStatus.FINISHED_STOPPED
+
+    assert scheduler.request_finished(request, []) == (True, None)
+    assert request.request_id not in scheduler._decode_decision_states
+    first_job_id, first_attempt, final_job_id, final_attempt = (
+        (old_job_id, old_attempt, latest_job_id, latest_attempt)
+        if first_failure == "older"
+        else (latest_job_id, latest_attempt, old_job_id, old_attempt)
+    )
+
+    first_output = _fail_send_job(scheduler, first_job_id)
+
+    assert first_output.finished_sending is None
+    assert first_attempt not in scheduler._reverse_send_job_ids
+    assert scheduler._job_ledger.get(first_job_id) is None
+    assert scheduler._reverse_send_job_ids[final_attempt] == final_job_id
+    assert scheduler._job_ledger.get(final_job_id) is not None
+    assert request.request_id in scheduler._pending_finished_sending
+
+    final_output = _fail_send_job(scheduler, final_job_id)
+
+    assert final_output.finished_sending == {request.request_id}
+    assert final_attempt not in scheduler._reverse_send_job_ids
+    assert scheduler._job_ledger.get(final_job_id) is None
+    assert request.request_id not in scheduler._pending_finished_sending
 
 
 def test_failed_reverse_send_releases_delayed_free_only_after_every_attempt_closes(

@@ -598,8 +598,10 @@ class PathDecisionCoordinator:
             return
         with self._registry_lock:
             if key not in self._pending_keys and key not in self._accepted_decisions:
-                logger.warning("path decision result receiver rejected unknown or stale Abort key")
-                reply_status = DecisionReplyStatus.UNKNOWN_REQUEST
+                # ABORT is an ensure-absent terminal notification. For this
+                # receiver incarnation, absence already satisfies its
+                # postcondition; ACK without queueing or retaining a tombstone.
+                reply_status = DecisionReplyStatus.ACK
             else:
                 self._pending_keys.discard(key)
                 self._accepted_decisions.pop(key, None)

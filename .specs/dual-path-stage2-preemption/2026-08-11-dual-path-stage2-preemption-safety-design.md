@@ -308,8 +308,12 @@ Active ledger rules:
   mutate a later attempt.
 - A Reverse completion job and a DE reverse-send job each map to exactly one
   `ReverseAttemptKey`.
-- A failure report closes the job as `failed`; the Scheduler stages a direct
-  control failure for publication on the next metadata build.
+- A failure report closes the job as `failed`. When the exact current attempt
+  owner still exists, the Scheduler stages a direct control failure for
+  publication on the next metadata build. If request cleanup retained an open
+  `REVERSE_COMPLETION` record but removed its owner mapping, a later failure
+  discards only that newly closed orphaned record; it stages no failure and
+  publishes no generic `finished_recving` side effect.
 - The job ledger is the sole authority for reverse-send counting:
   `completed_worker_count`, `failed`, and `closed` for a `reverse_send_job_id`
   live only here. No second structure keeps a completion counter.
@@ -595,16 +599,18 @@ sequenceDiagram
     PS->>PW: compute remainder + ordinary Forward Layerwise push
 ```
 
-This normal sequence uses Decision messages only: N completed before the
-request became preemptible, and M does not exist until the new Decision is
-sent.
+This normal re-admission sequence uses Decision messages only: N completed
+before the request became preemptible, and M does not exist until the new
+Decision is sent. The same endpoint also accepts request-terminal ABORT; ABORT
+is exceptional termination, not part of this successful sequence.
 
-#### Decision channel framing and registry semantics
+#### Decision and request-terminal ABORT channel semantics
 
-The wire envelope keeps an explicit kind field, but the only supported kind is
-`Decision`. The Decode endpoint warns and drops any other kind without a
-reply. In particular, an old `CloseReverseAttempt` sender retries until its
-delivery budget is exhausted; mixed old/new deployments are unsupported.
+The wire envelope keeps an explicit kind field. The active Decode endpoint
+supports `Decision` and request-terminal `Abort`. Only the retired
+`CloseReverseAttempt` kind is warned and dropped without a reply; an old close
+sender therefore retries until its delivery budget is exhausted. Mixed old/new
+deployments remain unsupported.
 
 Decision delivery remains at-least-once: an attempt can be retried after an
 uncertain ACK, and delivery Futures for multiple attempts may overlap. The
@@ -617,6 +623,18 @@ execution-side registry therefore remains attempt-aware under one logical key:
 - lower attempt, or an attempt at/below `closed_through_attempt_id`: reply
   `STALE_CLOSED`, never enqueue or reopen it;
 - logical key not registered: reply `UNKNOWN_REQUEST` without creating state.
+
+ABORT is an ensure-absent notification with receiver-owned idempotency:
+
+- an exact current-incarnation key retained as pending or accepted is removed,
+  acknowledged, and enqueued exactly once;
+- a duplicate or never-registered key from the current receiver incarnation is
+  acknowledged without enqueueing and without creating a tombstone;
+- a wrong-incarnation key is rejected as `UNKNOWN_REQUEST`;
+- malformed payload is rejected as `PROTOCOL_ERROR`.
+
+The PE sender remains strict: `UNKNOWN_REQUEST` is a terminal rejection, not a
+successful ABORT outcome. Unknown Decision semantics also remain unchanged.
 
 `reverse_attempt_id` remains the control-plane epoch and is sourced from
 `request.num_preemptions`. `_register_decision_locked` performs the duplicate,
@@ -877,10 +895,11 @@ sequenceDiagram
     end
 ```
 
-The active endpoint accepts Decision messages only. A legacy close kind is
-logged as a warning and dropped without a reply. An old PE therefore exhausts
-its `_deliver_close` retries against a new DE. This is intentional evidence
-that old/new mixed deployment is unsupported, not a compatibility fallback.
+The active endpoint accepts Decision and request-terminal ABORT messages. Only
+the legacy `CloseReverseAttempt` kind is logged as a warning and dropped
+without a reply. An old PE therefore exhausts its `_deliver_close` retries
+against a new DE. This is intentional evidence that old/new mixed deployment
+is unsupported, not a compatibility fallback.
 
 ### Abort release (replaces the retired dual-release)
 
@@ -1119,13 +1138,18 @@ each implementation step of §10. Coverage must include:
 - The old invalid-set convergence no longer fires for delivered decisions.
 - Resume has no Forward barrier defer and creates no `barrier_jobs` metadata.
 
-**Step 5 — Decision-only receiver schema and registry:**
+**Step 5 — Decision and request-terminal ABORT receiver schema:**
 
-- Message-kind field accepts `Decision`; a legacy `CloseReverseAttempt` kind is
-  warned and dropped without a reply.
+- Message-kind field accepts `Decision` and request-terminal `Abort`; only a
+  legacy `CloseReverseAttempt` kind is warned and dropped without a reply.
 - Decision registry matrix: equal+identical ACK duplicate; equal+conflicting
   protocol error; greater attempt accepted under the serialization rule;
   closed/lower attempt `STALE_CLOSED`; unknown logical key `UNKNOWN_REQUEST`.
+- ABORT registry matrix: a known exact-incarnation key is ACKed and enqueued
+  once; duplicate or unknown same-incarnation ABORT is ACKed without enqueue or
+  tombstone; wrong incarnation is `UNKNOWN_REQUEST`; malformed payload is
+  `PROTOCOL_ERROR`. The PE sender does not reinterpret `UNKNOWN_REQUEST` as
+  success.
 - `_accepted_decisions` migration: an existing single-decision registry entry
   upgrades to attempt-aware comparison without rejecting legitimate retries.
 - Decision response encoding round-trip and at-least-once retry idempotence;
@@ -1192,9 +1216,10 @@ split. Each step lands with its §9 tests.
 4. **Resume admission.** The delivered-state resume branch in
    `_decide_prefill_path_for_admission`, replacing the invalid-set convergence
    for delivered decisions without a Forward barrier defer.
-5. **Decision-only receiver schema and registry.** Message-kind field,
-   attempt-aware `_accepted_decisions` semantics, response encoding,
-   at-least-once retry behavior, and stale-epoch rejection.
+5. **Decision and request-terminal ABORT receiver schema.** Message-kind field,
+   attempt-aware `_accepted_decisions` semantics, receiver-owned ABORT
+   idempotency without tombstones, response encoding, at-least-once retry
+   behavior, and stale-epoch rejection.
 6. **Forward plan wiring.** Ordinary Layerwise push for PE_READ (no new
    Decision, no DE reactivation), then DE_READ (new Reverse attempt from
    current `L_PE`, fresh tracker/latch, stable Forward binding unchanged),

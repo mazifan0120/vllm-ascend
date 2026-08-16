@@ -135,20 +135,34 @@ def test_abort_is_accepted_when_only_accepted_decision_registry_retains_key() ->
     assert receiver.take_received_aborts() == [_abort("REQUEST_ABORTED")]
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        pytest.param(_KEY, id="unknown-key"),
-        pytest.param(
-            DualPathRequestKey("decode-engine:2:wrong-boot", _KEY.decode_request_id),
-            id="wrong-incarnation",
-        ),
-    ],
-)
-def test_unknown_or_wrong_incarnation_abort_is_rejected(key) -> None:
+def test_duplicate_abort_is_acked_without_duplicate_notice() -> None:
     receiver = _make_receiver()
-    if key != _KEY:
-        receiver.register_pending(_KEY)
+    receiver.register_pending(_KEY)
+    notice = _abort("REQUEST_ABORTED")
+
+    first_reply = _deliver_frames(receiver, channel.encode_path_abort(notice))
+    duplicate_reply = _deliver_frames(receiver, channel.encode_path_abort(notice))
+
+    assert channel.decode_decision_reply(first_reply) is channel.DecisionReplyStatus.ACK
+    assert channel.decode_decision_reply(duplicate_reply) is channel.DecisionReplyStatus.ACK
+    assert receiver.take_received_aborts() == [notice]
+    assert receiver.take_received_aborts() == []
+
+
+def test_never_registered_same_incarnation_abort_is_acked_without_notice() -> None:
+    receiver = _make_receiver()
+    notice = _abort("REQUEST_ABORTED")
+
+    reply = _deliver_frames(receiver, channel.encode_path_abort(notice))
+
+    assert channel.decode_decision_reply(reply) is channel.DecisionReplyStatus.ACK
+    assert receiver.take_received_aborts() == []
+
+
+def test_wrong_incarnation_abort_is_rejected() -> None:
+    receiver = _make_receiver()
+    receiver.register_pending(_KEY)
+    key = DualPathRequestKey("decode-engine:2:wrong-boot", _KEY.decode_request_id)
     notice = decision_model.PathAbortNotice(
         request_key=key,
         reason=decision_model.PathAbortReason.REQUEST_ABORTED,
@@ -192,6 +206,58 @@ class _NoAckSocket:
 
     def close(self) -> None:
         pass
+
+
+class _LoopbackAbortSocket:
+    def __init__(self, receiver, *, drop_reply: bool) -> None:
+        self._receiver = receiver
+        self._drop_reply = drop_reply
+        self._reply: bytes | None = None
+
+    def set_send_timeout(self, timeout_ms: int) -> None:
+        pass
+
+    def send(self, payload: bytes) -> None:
+        self._reply = _deliver_frames(self._receiver, payload)
+
+    def poll(self, timeout_ms: int) -> bool:
+        return not self._drop_reply and self._reply is not None
+
+    def recv(self) -> bytes:
+        assert self._reply is not None
+        return self._reply
+
+    def close(self) -> None:
+        pass
+
+
+def test_lost_first_abort_ack_retries_to_success_without_duplicate_notice() -> None:
+    receiver = _make_receiver()
+    receiver.register_pending(_KEY)
+    notice = _abort("REQUEST_ABORTED")
+    attempts = 0
+
+    @contextmanager
+    def opener(endpoint):
+        nonlocal attempts
+        attempts += 1
+        yield _LoopbackAbortSocket(receiver, drop_reply=attempts == 1)
+
+    sender = channel.PathDecisionCoordinator.for_prefill(
+        socket_opener=opener,
+        sleep=lambda _: None,
+        poll_timeout_ms=1,
+        retry_spacing_s=0,
+    )
+    try:
+        future = sender.submit_abort(_ENDPOINT, notice)
+        assert future.result(timeout=5) is None
+    finally:
+        sender.close()
+
+    assert attempts == 2
+    assert receiver.take_received_aborts() == [notice]
+    assert receiver.take_received_aborts() == []
 
 
 def test_abort_submission_uses_shared_three_attempt_delivery_pool() -> None:

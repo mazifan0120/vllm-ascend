@@ -56,11 +56,17 @@ at-least-once three-attempt delivery pool as Decision. A delivery Future is
 observed asynchronously. Exhausting ABORT delivery is logged; it does not
 create a second failure channel or a timer fallback.
 
-The Decode receiver accepts ABORT only for the exact current engine incarnation
-and a request key retained by the pending or accepted-decision registry. It
-ACKs and enqueues the notice once. Unknown or wrong-incarnation keys are
-rejected, malformed payloads receive a protocol error, and an accepted ABORT
-makes a later Decision for that key unknown.
+The Decode receiver treats ABORT as an ensure-absent terminal notification. For
+the exact current engine incarnation, a key retained by the pending or
+accepted-decision registry is removed, ACKed, and enqueued exactly once. A
+duplicate or never-registered same-incarnation ABORT is also ACKed, but it is
+not enqueued and creates no tombstone because the terminal postcondition
+already holds. Wrong-incarnation ABORT remains `UNKNOWN_REQUEST`, malformed
+ABORT remains `PROTOCOL_ERROR`, and an accepted ABORT makes a later Decision
+for that key unknown. Unknown Decision remains `UNKNOWN_REQUEST`.
+
+This idempotency rule belongs only to the receiver. The PE sender remains
+strict: an `UNKNOWN_REQUEST` reply is a terminal rejection, not ABORT success.
 
 ### PE trigger semantics
 
@@ -97,15 +103,17 @@ handling starts no Store or P2P operation for that control failure; it reports
 `finished_recving` plus the invalid block IDs. The vLLM core then transitions
 the request to `FINISHED_ERROR` and returns its delayed blocks.
 
-Unknown and already-terminal requests ignore ABORT. Failure to construct valid
-control-failure metadata keeps the terminal state and logs the local error; it
-does not invent a timeout outcome.
+Receiver-unknown and duplicate same-incarnation ABORT never reaches the
+Scheduler. Already-terminal Scheduler state ignores a notice already queued
+for a formerly known key. Failure to construct valid control-failure metadata
+keeps the terminal state and logs the local error; it does not invent a timeout
+outcome.
 
 ## Direct failure staging
 
-Worker-reported failed Reverse-completion and Reverse-send jobs are direct
-failure facts. Scheduler `update_connector_output` records them in the
-role-local staging buffer:
+Worker-reported failed Reverse-completion and Reverse-send jobs with an exact
+current owner are direct failure facts. Scheduler `update_connector_output`
+records them in the role-local staging buffer:
 
 - Prefill stages `REVERSE_JOB_FAILED` in `_prefill_control_failures` and marks
   the request invalid.
@@ -116,6 +124,11 @@ The next `build_connector_meta` publishes those records after received
 Decisions and ABORT notices. Staging avoids dropping failures produced after
 the current step's connector metadata was built. It does not alter attempt
 identity, epoch monotonicity, or JobLedger close/discard ownership.
+
+Request cleanup can retain an open `REVERSE_COMPLETION` ledger record while
+removing its exact-attempt owner. A later failure closes and discards only that
+newly orphaned record; it stages no request failure and produces no generic
+`finished_recving` side effect. Live-current attempt facts remain untouched.
 
 Local activation errors continue to use `ACTIVATION_FAILED`. No staging buffer
 or explicit failure path is replaced by a timer.
