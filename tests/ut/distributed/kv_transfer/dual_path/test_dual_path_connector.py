@@ -726,9 +726,9 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_pending_reverse_done_wire_ids",
                 "_pending_reverse_failed_wire_ids",
                 "_consumed_reverse_terminal_wire_ids",
-                "_sender_job_facts_lock",
-                "_completed_sender_jobs",
-                "_failed_sender_jobs",
+                "_completion_facts_lock",
+                "_pending_completion_reports",
+                "_pending_failure_reports",
             },
         )
 
@@ -1595,7 +1595,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "get_block_ids_with_load_errors",
                 "send_done_send_signal",
                 "build_connector_worker_meta",
-                "_record_sender_job",
+                "_publish_completion_fact",
                 "_retire_completed_prior_attempts",
                 "shutdown",
             },

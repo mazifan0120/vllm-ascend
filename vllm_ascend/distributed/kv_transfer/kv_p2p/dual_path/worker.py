@@ -115,9 +115,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._pending_reverse_done_wire_ids: set[str] = set()
         self._pending_reverse_failed_wire_ids: set[str] = set()
         self._consumed_reverse_terminal_wire_ids: dict[str, ReverseAttemptKey] = {}
-        self._sender_job_facts_lock = threading.Lock()
-        self._completed_sender_jobs: dict[int, int] = {}
-        self._failed_sender_jobs: dict[int, int] = {}
+        self._completion_facts_lock = threading.Lock()
+        self._pending_completion_reports: dict[int, int] = {}
+        self._pending_failure_reports: dict[int, int] = {}
         if dual_path_cfg.role == "decode":
             self._kvpool_worker_adapter = KVPoolWorkerAdapter(vllm_config, kv_cache_config)
         logger.info(
@@ -293,18 +293,18 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         terminal_flag: bool,
     ) -> None:
         """Tombstone the terminal, drop the wire mapping, and report the
-        attempt's reverse completion job; the binding itself is retained for
+        attempt's reverse completion; the binding itself is retained for
         the §5 removal rule."""
         self._consumed_reverse_terminal_wire_ids[binding.wire_request_id] = attempt_key
         self._reverse_request_map.pop(binding.wire_request_id, None)
-        self._record_sender_job(binding.reverse_receive_completion_id, succeeded=terminal_flag)
+        self._publish_completion_fact(binding.reverse_receive_completion_id, succeeded=terminal_flag)
 
-    def _record_sender_job(self, completion_id: int, *, succeeded: bool) -> None:
-        with self._sender_job_facts_lock:
+    def _publish_completion_fact(self, completion_id: int, *, succeeded: bool) -> None:
+        with self._completion_facts_lock:
             if succeeded:
-                self._completed_sender_jobs[completion_id] = 1
+                self._pending_completion_reports[completion_id] = 1
             else:
-                self._failed_sender_jobs[completion_id] = 1
+                self._pending_failure_reports[completion_id] = 1
 
     def _consume_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
         """Record the terminal and pop the binding eagerly: unlike the Reverse
@@ -564,13 +564,13 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     def build_connector_worker_meta(self) -> DualPathWorkerMetadata | None:
         completion_reports: dict[int, int] = {}
         failure_reports: dict[int, int] = {}
-        with self._sender_job_facts_lock:
-            for completion_id, count in self._completed_sender_jobs.items():
+        with self._completion_facts_lock:
+            for completion_id, count in self._pending_completion_reports.items():
                 completion_reports[completion_id] = completion_reports.get(completion_id, 0) + count
-            self._completed_sender_jobs.clear()
-            for completion_id, count in self._failed_sender_jobs.items():
+            self._pending_completion_reports.clear()
+            for completion_id, count in self._pending_failure_reports.items():
                 failure_reports[completion_id] = failure_reports.get(completion_id, 0) + count
-            self._failed_sender_jobs.clear()
+            self._pending_failure_reports.clear()
         if not completion_reports and not failure_reports:
             return None
         return DualPathWorkerMetadata(completion_reports=completion_reports, failure_reports=failure_reports)
@@ -640,7 +640,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             return
         # The reverse-send proof is recorded only after the final synchronous
         # write AND a successful terminal ACK.
-        self._record_sender_job(reverse_send_completion_id, succeeded=terminal_succeeded)
+        self._publish_completion_fact(reverse_send_completion_id, succeeded=terminal_succeeded)
 
     def get_finished(
         self,
@@ -732,7 +732,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         finished_reverse_wire_ids: set[str],
     ) -> None:
         """Attribute wire terminals owned by Reverse bindings to their attempt
-        keys and report the completion jobs. ``raw_done``/``raw_failed`` are
+        keys and publish the completion facts. ``raw_done``/``raw_failed`` are
         filtered in place: ignored and Reverse-owned wire ids are removed
         before return. No request id leaves the worker for a Reverse terminal."""
         ignored_wire_ids = set(self._consumed_forward_terminal_wire_ids).union(self._consumed_reverse_terminal_wire_ids)
