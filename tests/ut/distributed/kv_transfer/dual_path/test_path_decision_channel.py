@@ -1049,7 +1049,7 @@ def test_derive_decode_control_port_rejects_worker_kv_port_range_overlap() -> No
 
 
 def test_scheduler_constructs_role_specific_coordinator() -> None:
-    # Stage-2 topology guard restricts DualPath to data_parallel_size == 1, so
+    # DualPath restricts data_parallel_size to one, so
     # the per-rank control port derivation degenerates to the base port.
     data_parallel_rank = 0
     derived_port = _free_control_endpoint().port

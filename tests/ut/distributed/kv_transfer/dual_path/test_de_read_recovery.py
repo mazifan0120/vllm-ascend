@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W6: DE_READ route-preserving recovery after a normal preemption."""
+"""DE_READ route-preserving recovery after a normal preemption."""
 
 from __future__ import annotations
 
@@ -13,17 +13,17 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_empty_scheduler_output,
     make_worker_metadata,
 )
-from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
-    _activate_decision,
-    _admit_decode_request,
-    _de_read_decision,
-)
 from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
     _blocks,
     _make_request,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_reverse_attempt_identity import (
     _make_reverse_plan,
+)
+from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion import (
+    _activate_decision,
+    _admit_decode_request,
+    _de_read_decision,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     _make_worker,
@@ -80,8 +80,8 @@ def _resume(scheduler, request, new_local_tokens: int, new_blocks=None):
     return result
 
 
-def test_de_read_reverse_range_expands_shrinks_vacuous_forward_remains_k_de_to_t(pe_scheduler_factory):
-    # (new L_PE, expected reverse range or None when vacuous)
+def test_de_read_reverse_range_expands_shrinks_or_becomes_empty(pe_scheduler_factory):
+    # (new Prefill local-token count, expected Reverse range or None when empty)
     cases = [(0, (0, _K_DE)), (32, (32, _K_DE)), (64, None)]
     for new_local_tokens, expected_reverse_range in cases:
         pool = make_block_pool()
@@ -158,7 +158,7 @@ def test_attempt_n_plus_1_created_on_resume_allocation(pe_scheduler_factory):
     assert second_decision.reverse_plan == new_reverse_plan
 
 
-def test_failed_old_delivery_after_i7_replacement_invalidates_current_attempt_blocks(pe_scheduler_factory):
+def test_failed_old_delivery_after_attempt_refresh_invalidates_current_attempt_blocks(pe_scheduler_factory):
     pool = make_block_pool()
     scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     attempt_zero_future: Future[None] = Future()
@@ -199,7 +199,7 @@ def test_fresh_tracker_and_latch_for_new_attempt_old_plan_never_resubmitted():
         reverse_plan=plan_zero,
         reverse_submitted_attempt=attempt_zero,
         store_load_failed=False,
-        terminal_published=False,
+        terminal_reported=False,
     )
     worker._split_trackers[decode_request_id] = tracker
     binding = MagicMock(name="forward_binding")
@@ -228,10 +228,10 @@ def test_fresh_tracker_and_latch_for_new_attempt_old_plan_never_resubmitted():
     assert enqueue.call_count == 1
 
 
-def test_de_validation_rejects_admission_drift(decode_scheduler_factory, decode_task04_seams):
+def test_de_validation_rejects_admission_drift(decode_scheduler_factory, decode_control_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
-    first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
+    first_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0))
     assert len(first_metadata.reverse_plans) == 1
 
     # A greater attempt whose Store boundary drifted from the frozen admission
@@ -239,7 +239,7 @@ def test_de_validation_rejects_admission_drift(decode_scheduler_factory, decode_
     drifted = _de_read_decision(1)
     drifted_plan = drifted.reverse_plan
     object.__setattr__(drifted_plan, "token_end", 48)
-    second_metadata = _activate_decision(scheduler, decode_task04_seams, drifted)
+    second_metadata = _activate_decision(scheduler, decode_control_seams, drifted)
 
     assert second_metadata.reverse_plans == []
     assert len(second_metadata.control_failures) == 1
@@ -247,15 +247,15 @@ def test_de_validation_rejects_admission_drift(decode_scheduler_factory, decode_
 
 
 def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_completion(
-    decode_scheduler_factory, decode_task04_seams
+    decode_scheduler_factory, decode_control_seams
 ):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
-    first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
+    first_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0))
     assert len(first_metadata.forward_receive_bindings) == 1
     first_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
 
-    second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
+    second_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(1))
 
     # The logical Forward binding is neither replaced nor reinstalled; a fresh
     # Reverse plan with a new reverse_send_completion_id is installed.

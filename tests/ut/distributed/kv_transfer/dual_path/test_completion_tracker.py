@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W2: completion tracker accounting and the no-pinning contract."""
+"""Completion tracker accounting and block-release behavior."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_block_pool,
     make_worker_metadata,
 )
-from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
-    _activate_decision,
-    _admit_decode_request,
-    _de_read_decision,
-)
 from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
     _blocks,
     _make_request,
+)
+from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion import (
+    _activate_decision,
+    _admit_decode_request,
+    _de_read_decision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
@@ -286,12 +286,12 @@ class TestCompletionRecordReclamation:
 
     @pytest.mark.parametrize("latest_closed", [False, True], ids=["latest-open", "latest-closed"])
     def test_request_cleanup_reclaims_closed_superseded_send_completions_and_preserves_latest_state(
-        self, decode_scheduler_factory, decode_task04_seams, latest_closed
+        self, decode_scheduler_factory, decode_control_seams, latest_closed
     ):
         scheduler = decode_scheduler_factory()
         request = _admit_decode_request(scheduler)
-        first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
-        second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
+        first_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0))
+        second_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(1))
         old_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
         latest_completion_id = second_metadata.reverse_plans[0].reverse_send_completion_id
         assert old_completion_id is not None

@@ -296,7 +296,7 @@ def test_empty_reverse_interval_creates_no_plan_or_binding() -> None:
         _make_reverse_binding(token_start=64, token_end=64)
 
 
-def test_reverse_contracts_carry_no_runtime_or_mutable_state() -> None:
+def test_reverse_metadata_carries_no_runtime_or_mutable_state() -> None:
     expected_fields = {
         "ReversePlan": {
             "request_key",

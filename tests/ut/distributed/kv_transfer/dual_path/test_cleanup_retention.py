@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 cleanup retention."""
+"""Cleanup retention for request-owned Scheduler state."""
 
 from __future__ import annotations
 

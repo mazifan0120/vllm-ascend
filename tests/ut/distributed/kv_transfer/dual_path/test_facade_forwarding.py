@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W8: facade forwarding matrix and MultiConnector compatibility."""
+"""Facade forwarding matrix and MultiConnector compatibility."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W9: implementation-audit regression tests (B1, M2, M3, M4, m6, m7)."""
+"""Completion and delivery recovery regression tests."""
 
 from __future__ import annotations
 
@@ -13,12 +13,7 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_empty_scheduler_output,
     make_worker_metadata,
 )
-from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
-    _activate_decision,
-    _admit_decode_request,
-    _de_read_decision,
-)
-from tests.ut.distributed.kv_transfer.dual_path.test_i4_gate import (
+from tests.ut.distributed.kv_transfer.dual_path.test_current_reverse_attempt_completion import (
     _admit_de_read_request,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
@@ -26,6 +21,11 @@ from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_resume_admission import (
     _admit_de_read,
+)
+from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion import (
+    _activate_decision,
+    _admit_decode_request,
+    _de_read_decision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathControlFailureReason,
@@ -39,11 +39,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 
 class TestDecodeEngineProgress:
     def test_de_final_request_delayed_free_until_reverse_send_completion_closes(
-        self, decode_scheduler_factory, decode_task04_seams
+        self, decode_scheduler_factory, decode_control_seams
     ):
         scheduler = decode_scheduler_factory()
         request = _admit_decode_request(scheduler)
-        metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
+        metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0))
         completion_id = metadata.reverse_plans[0].reverse_send_completion_id
 
         # The final Decode request finishes with its reverse-send completion open:
@@ -223,7 +223,7 @@ def _deliver_decision_to(receiver, attempt_id: int) -> None:
 
 class TestReverseSendCompletionRetirement:
     def test_delayed_free_reverse_send_close_retires_tracker_record(
-        self, decode_scheduler_factory, decode_task04_seams
+        self, decode_scheduler_factory, decode_control_seams
     ):
         from tests.ut.distributed.kv_transfer.dual_path.conftest import (
             DECODE_TEST_CONTROL_ENDPOINT,
@@ -255,11 +255,11 @@ class TestReverseSendCompletionRetirement:
         assert scheduler._completion_tracker.get(completion_id) is None
 
     def test_normal_reverse_send_close_retires_its_attempt_immediately(
-        self, decode_scheduler_factory, decode_task04_seams
+        self, decode_scheduler_factory, decode_control_seams
     ):
         scheduler = decode_scheduler_factory()
         request = _admit_decode_request(scheduler)
-        metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
+        metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0))
         completion_id = metadata.reverse_plans[0].reverse_send_completion_id
         attempt_key = ReverseAttemptKey(
             DualPathRequestKey(

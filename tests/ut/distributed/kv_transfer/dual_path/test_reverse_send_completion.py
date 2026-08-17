@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W3: DE Reverse sender completion proof via the completion tracker."""
+"""Decode Reverse sender completion reporting via the completion tracker."""
 
 from __future__ import annotations
 
@@ -97,8 +97,8 @@ def _de_read_decision(reverse_attempt_id: int = 0, remote_tp_size: int = 1) -> P
     )
 
 
-def _activate_decision(scheduler, decode_task04_seams, decision: PathDecision):
-    decode_task04_seams.decode_coordinator.take_received_decisions.return_value = [decision]
+def _activate_decision(scheduler, decode_control_seams, decision: PathDecision):
+    decode_control_seams.decode_coordinator.take_received_decisions.return_value = [decision]
     return scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
 
@@ -116,16 +116,16 @@ def _seed_reverse_send_tracker(worker, reverse_send_completion_id: int, reverse_
         reverse_plan=plan,
         reverse_submitted_attempt=attempt_key,
         store_load_failed=False,
-        terminal_published=False,
+        terminal_reported=False,
     )
     worker._split_trackers[_REQUEST_ID] = tracker
     return tracker
 
 
-def _activate_two_reverse_attempts(scheduler, decode_task04_seams):
+def _activate_two_reverse_attempts(scheduler, decode_control_seams):
     request = _admit_decode_request(scheduler)
-    first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
-    second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
+    first_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0))
+    second_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(1))
     first_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
     second_completion_id = second_metadata.reverse_plans[0].reverse_send_completion_id
     assert first_completion_id is not None
@@ -146,12 +146,12 @@ def _fail_send_completion(scheduler, completion_id: int) -> KVConnectorOutput:
 
 
 def test_reverse_send_completion_allocated_at_attempt_creation_and_carried_on_plan(
-    decode_scheduler_factory, decode_task04_seams
+    decode_scheduler_factory, decode_control_seams
 ):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
 
-    metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
+    metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision())
 
     assert len(metadata.reverse_plans) == 1
     carried_plan = metadata.reverse_plans[0]
@@ -166,10 +166,10 @@ def test_reverse_send_completion_allocated_at_attempt_creation_and_carried_on_pl
     assert not (send_completion.closed and not send_completion.failed)
 
 
-def test_partial_tp_completion_never_sender_complete(decode_scheduler_factory, decode_task04_seams):
+def test_partial_tp_completion_never_sender_complete(decode_scheduler_factory, decode_control_seams):
     scheduler = decode_scheduler_factory(world_size=2)
     _admit_decode_request(scheduler)
-    metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0, remote_tp_size=2))
+    metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0, remote_tp_size=2))
     completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
@@ -183,10 +183,10 @@ def test_partial_tp_completion_never_sender_complete(decode_scheduler_factory, d
     assert not (send_completion.closed and not send_completion.failed)
 
 
-def test_terminal_ack_failure_marks_completion_failed_never_success(decode_scheduler_factory, decode_task04_seams):
+def test_terminal_ack_failure_marks_completion_failed_never_success(decode_scheduler_factory, decode_control_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
-    metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
+    metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision())
     completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
@@ -211,10 +211,10 @@ def test_terminal_ack_failure_marks_completion_failed_never_success(decode_sched
     assert attempt_key not in scheduler._reverse_send_completion_ids
 
 
-def test_abort_before_final_layer_leaves_completion_incomplete(decode_scheduler_factory, decode_task04_seams):
+def test_abort_before_final_layer_leaves_completion_incomplete(decode_scheduler_factory, decode_control_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
-    metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
+    metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision())
     completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
@@ -231,10 +231,10 @@ def test_abort_before_final_layer_leaves_completion_incomplete(decode_scheduler_
     assert not (send_completion.closed and not send_completion.failed)
 
 
-def test_close_marks_the_send_completion_closed_and_not_failed(decode_scheduler_factory, decode_task04_seams):
+def test_close_marks_the_send_completion_closed_and_not_failed(decode_scheduler_factory, decode_control_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
-    metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
+    metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision())
     completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
@@ -291,10 +291,10 @@ def test_reverse_terminal_is_not_visible_while_terminal_ack_is_blocked():
 
 
 def test_old_reverse_send_attempt_closes_without_releasing_open_latest_attempt(
-    decode_scheduler_factory, decode_task04_seams
+    decode_scheduler_factory, decode_control_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_control_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
@@ -314,10 +314,10 @@ def test_old_reverse_send_attempt_closes_without_releasing_open_latest_attempt(
 
 
 def test_latest_reverse_send_attempt_closes_without_releasing_open_old_attempt(
-    decode_scheduler_factory, decode_task04_seams
+    decode_scheduler_factory, decode_control_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_control_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
@@ -339,11 +339,11 @@ def test_latest_reverse_send_attempt_closes_without_releasing_open_old_attempt(
 @pytest.mark.parametrize("first_failure", ["older", "latest"])
 def test_request_finished_retains_delayed_free_until_last_exact_send_attempt_fails(
     decode_scheduler_factory,
-    decode_task04_seams,
+    decode_control_seams,
     first_failure,
 ):
     scheduler = decode_scheduler_factory()
-    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_control_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
@@ -375,10 +375,10 @@ def test_request_finished_retains_delayed_free_until_last_exact_send_attempt_fai
 
 
 def test_failed_reverse_send_releases_delayed_free_only_after_every_attempt_closes(
-    decode_scheduler_factory, decode_task04_seams
+    decode_scheduler_factory, decode_control_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_control_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
@@ -402,10 +402,10 @@ def test_failed_reverse_send_releases_delayed_free_only_after_every_attempt_clos
 
 
 def test_finish_delays_when_latest_send_completion_closed_but_older_attempt_is_open(
-    decode_scheduler_factory, decode_task04_seams
+    decode_scheduler_factory, decode_control_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_control_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
@@ -422,10 +422,10 @@ def test_finish_delays_when_latest_send_completion_closed_but_older_attempt_is_o
     assert old_output.finished_sending == {request.request_id}
 
 
-def test_active_request_retains_closed_attempt_epoch_for_later_refresh(decode_scheduler_factory, decode_task04_seams):
+def test_active_request_retains_closed_attempt_epoch_for_later_refresh(decode_scheduler_factory, decode_control_seams):
     scheduler = decode_scheduler_factory()
     request = _admit_decode_request(scheduler)
-    first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
+    first_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(0))
     first_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
     assert first_completion_id is not None
     assert request.request_id not in scheduler._pending_finished_sending
@@ -435,7 +435,7 @@ def test_active_request_retains_closed_attempt_epoch_for_later_refresh(decode_sc
     assert first_output.finished_sending is None
     assert scheduler._latest_reverse_attempt_ids[request.request_id] == 0
 
-    second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
+    second_metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision(1))
     assert len(second_metadata.reverse_plans) == 1
     second_completion_id = second_metadata.reverse_plans[0].reverse_send_completion_id
     assert second_completion_id is not None

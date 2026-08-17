@@ -4,7 +4,7 @@
 ``KVPoolSchedulerAdapter`` gives the Decode Scheduler a private, non-layerwise
 ``KVPoolScheduler``. Lookup detaches candidate ``LoadSpec`` records; an
 explicit post-allocation commit authorizes the existing async load lifecycle
-using a copy so the detached admission fact remains unchanged.
+using a copy so the detached lookup result remains unchanged.
 
 ``KVPoolWorkerAdapter`` delegates that load lifecycle to one private
 ``KVPoolWorker``; the existing ``LookupKeyServer`` lifetime follows the
@@ -96,8 +96,10 @@ class KVPoolSchedulerAdapter:
         blocks: KVCacheBlocks,
         load_spec: LoadSpec,
     ) -> None:
-        """Commit a copy of load_spec so pool-side can_load mutation cannot pollute the
-        detached admission fact; on failure, roll back the state created above."""
+        """Commit a copy of ``load_spec`` without mutating the detached lookup result.
+
+        On failure, roll back the partially committed pool-side state.
+        """
         pool = self._pool_scheduler
         request_id = request.request_id
         store_delta = load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens

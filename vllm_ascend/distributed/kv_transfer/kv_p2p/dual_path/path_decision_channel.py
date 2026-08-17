@@ -611,9 +611,8 @@ class PathDecisionCoordinator:
             return
         with self._registry_lock:
             if key not in self._pending_keys and key not in self._accepted_decisions:
-                # ABORT is an ensure-absent terminal notification. For this
-                # receiver incarnation, absence already satisfies its
-                # postcondition; ACK without queueing or retaining a tombstone.
+                # ABORT removes any queued Decision for this exact request key.
+                # If none exists, acknowledge immediately.
                 reply_status = DecisionReplyStatus.ACK
             else:
                 self._pending_keys.discard(key)

@@ -38,7 +38,7 @@ def test_store_failure_starts_no_reverse_and_invalidates_only_store_destination_
 
     assert tracker.store_phase.value == "FAILED"
     assert tracker.reverse_submitted_attempt is None
-    assert tracker.terminal_published is True
+    assert tracker.terminal_reported is True
     assert first_finished == (set(), {DECODE_REQUEST_ID})
     assert first_invalid == {20, 21}
     assert second_finished == (set(), set())
@@ -65,14 +65,14 @@ def test_store_failure_seen_before_done_stays_failed_when_done_arrives_later() -
         assert first_finished == (set(), set())
         assert tracker.store_load_failed is True
         assert tracker.store_phase.value == "PENDING"
-        assert tracker.terminal_published is False
+        assert tracker.terminal_reported is False
         submit_reverse.assert_not_called()
 
         second_finished = worker.get_finished(set(), metadata)
 
     assert second_finished == (set(), {DECODE_REQUEST_ID})
     assert tracker.store_phase.value == "FAILED"
-    assert tracker.terminal_published is True
+    assert tracker.terminal_reported is True
     submit_reverse.assert_not_called()
 
 
@@ -149,7 +149,7 @@ def test_forward_failure_invalidates_only_decode_forward_suffix() -> None:
     assert worker.get_block_ids_with_load_errors() == {30, 31, 40, 41}
 
 
-def test_failure_provenance_block_math_matches_spec_example() -> None:
+def test_failure_block_ranges_match_expected_transfer_slices() -> None:
     store_worker = _make_worker()
     store_metadata = _make_split_metadata()
     store_worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})

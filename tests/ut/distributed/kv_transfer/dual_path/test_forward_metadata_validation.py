@@ -170,7 +170,7 @@ def test_plan_and_binding_carry_no_layer_rank_endpoint_or_engine_objects():
             )
 
 
-def test_task05_methods_have_no_synchronous_waits():
+def test_forward_plan_methods_have_no_synchronous_waits():
     source = inspect.getsource(metadata_module)
     for forbidden in (".result(", ".wait(", "time.sleep"):
         assert forbidden not in source, f"metadata.py contains forbidden synchronous wait {forbidden!r}"

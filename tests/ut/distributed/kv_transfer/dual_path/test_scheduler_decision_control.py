@@ -114,7 +114,7 @@ def _completed_future(error: RuntimeError | None = None) -> Future[None]:
 
 
 @pytest.fixture()
-def task04_seams():
+def control_seams():
     with (
         patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter") as adapter_cls,
         patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
@@ -147,7 +147,7 @@ def task04_seams():
 
 
 @pytest.fixture()
-def scheduler_factory(task04_seams):
+def scheduler_factory(control_seams):
     schedulers = []
 
     def make(
@@ -362,18 +362,18 @@ def _bind_prefill(
 
 
 class TestDecodeConstructionGuards:
-    def test_decode_rejects_multiple_kv_cache_groups(self, scheduler_factory, task04_seams):
+    def test_decode_rejects_multiple_kv_cache_groups(self, scheduler_factory, control_seams):
         with pytest.raises(ValueError, match="exactly one KV cache group"):
             scheduler_factory(kv_cache_config=_make_kv_cache_config(group_count=2))
-        task04_seams.adapter_cls.assert_not_called()
+        control_seams.adapter_cls.assert_not_called()
 
-    def test_decode_rejects_non_fail_load_policy(self, scheduler_factory, task04_seams):
+    def test_decode_rejects_non_fail_load_policy(self, scheduler_factory, control_seams):
         config = _make_vllm_config(failure_policy="recompute")
         with pytest.raises(ValueError, match="kv_load_failure_policy.*fail"):
             scheduler_factory(config=config)
-        task04_seams.adapter_cls.assert_not_called()
+        control_seams.adapter_cls.assert_not_called()
 
-    def test_prefill_skips_decode_only_guards(self, scheduler_factory, task04_seams):
+    def test_prefill_skips_decode_only_guards(self, scheduler_factory, control_seams):
         config = _make_vllm_config(kv_role="kv_producer", failure_policy="recompute")
         scheduler = scheduler_factory(
             role="prefill",
@@ -381,11 +381,11 @@ class TestDecodeConstructionGuards:
             kv_cache_config=_make_kv_cache_config(group_count=2),
         )
         assert scheduler._kvpool_adapter is None
-        task04_seams.adapter_cls.assert_not_called()
+        control_seams.adapter_cls.assert_not_called()
 
 
 class TestDecodeAdmissionControl:
-    def test_hbm_complete_bypass_has_no_task04_side_effects(self, decode_scheduler):
+    def test_hbm_complete_bypass_has_no_control_side_effects(self, decode_scheduler):
         request = _make_request()
         assert decode_scheduler.get_num_new_matched_tokens(request, 48) == (0, False)
         blocks = MagicMock()
@@ -595,7 +595,7 @@ class TestPrefillDecisionHook:
     def test_invalid_token_bounds_are_scoped_to_the_parsed_admission_key(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
@@ -618,8 +618,8 @@ class TestPrefillDecisionHook:
 
         assert result == replacement_result == (0, False)
         policy.choose.assert_not_called()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
                 request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
@@ -634,7 +634,7 @@ class TestPrefillDecisionHook:
     def test_prefill_hook_passes_incoming_l_pe_to_forced_eligibility(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.DE_READ
@@ -652,10 +652,10 @@ class TestPrefillDecisionHook:
         assert result == (0, False)
         policy.choose.assert_not_called()
         assert scheduler._prefill_path_results[request.request_id].path is PathKind.PE_READ
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._prefill_local_tokens == {request.request_id: 32}
 
-    def test_parent_accounting_runs_exactly_once_for_ordinary_request(self, scheduler_factory, task04_seams):
+    def test_parent_accounting_runs_exactly_once_for_ordinary_request(self, scheduler_factory, control_seams):
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request(
             "prefill-ordinary",
@@ -664,7 +664,7 @@ class TestPrefillDecisionHook:
 
         self._assert_parent_accounting_once(scheduler, request)
 
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
 
     @pytest.mark.parametrize(
         "params",
@@ -686,7 +686,7 @@ class TestPrefillDecisionHook:
         self,
         params,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         # Given
         policy = MagicMock(name="path_policy")
@@ -706,11 +706,11 @@ class TestPrefillDecisionHook:
         # Then
         assert result == parent_result
         policy.choose.assert_not_called()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._prefill_request_keys == {}
         assert scheduler._prefill_delivery_futures == {}
 
-    def test_seeded_non_full_requests_invoke_policy_once_and_alternate(self, scheduler_factory, task04_seams):
+    def test_seeded_non_full_requests_invoke_policy_once_and_alternate(self, scheduler_factory, control_seams):
         policy = MagicMock(spec=RoundRobinPathPolicy, wraps=RoundRobinPathPolicy(random.Random(1)))
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         requests = [
@@ -729,9 +729,9 @@ class TestPrefillDecisionHook:
             PathKind.PE_READ,
             PathKind.DE_READ,
         ]
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
 
-    def test_identical_replay_neither_advances_policy_nor_submits_second_future(self, scheduler_factory, task04_seams):
+    def test_identical_replay_neither_advances_policy_nor_submits_second_future(self, scheduler_factory, control_seams):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -744,15 +744,15 @@ class TestPrefillDecisionHook:
 
         assert first == second == (0, False)
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
+        control_seams.prefill_coordinator.submit.assert_called_once()
         assert list(scheduler._prefill_forward_plans) == [request.request_id]
         assert list(scheduler._prefill_delivery_futures) == [
             DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
         ]
 
-    def test_undelivered_conflicting_facts_discard_and_redecide(self, scheduler_factory, task04_seams):
-        # An admission retry carrying changed facts before any delivery discards
-        # the uncommitted decision and decides fresh from the new facts.
+    def test_undelivered_conflicting_inputs_discard_and_redecide(self, scheduler_factory, control_seams):
+        # An admission retry carrying changed inputs before any delivery discards
+        # the uncommitted decision and decides fresh from the new inputs.
         policy = MagicMock(name="path_policy")
         policy.choose.side_effect = [PathKind.PE_READ, PathKind.DE_READ]
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -770,7 +770,7 @@ class TestPrefillDecisionHook:
         assert first == (0, False)
         assert second == (32, True)
         assert policy.choose.call_count == 2
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._prefill_invalid_request_keys == set()
         assert scheduler._prefill_forward_plans == {}
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
@@ -782,7 +782,7 @@ class TestPrefillDecisionHook:
     def test_undelivered_prefill_prefix_change_discards_and_redecides(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         # The same request re-admitted with a different local prefix (e.g. an
         # allocation-failure retry re-probing a grown prefix cache) re-decides
@@ -804,7 +804,7 @@ class TestPrefillDecisionHook:
         assert first == (0, False)
         assert second == (16, True)
         assert policy.choose.call_count == 2
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
         assert scheduler._prefill_invalid_request_keys == set()
         assert scheduler._prefill_forward_plans == {}
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
@@ -812,7 +812,7 @@ class TestPrefillDecisionHook:
         assert scheduler._prefill_local_tokens[request.request_id] == 16
         assert scheduler._prefill_path_results[request.request_id].path is PathKind.DE_READ
 
-    def test_delivered_conflicting_facts_resume_with_frozen_path(self, scheduler_factory, task04_seams):
+    def test_delivered_conflicting_inputs_resume_with_frozen_path(self, scheduler_factory, control_seams):
         # Once the decision has been delivered, re-deciding would fork the
         # protocol (e.g. preemption resume after delivery): the resume branch
         # reuses the frozen PathKind and never touches the invalid set.
@@ -835,7 +835,7 @@ class TestPrefillDecisionHook:
         assert first == (0, False)
         assert second == (0, False)
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
+        control_seams.prefill_coordinator.submit.assert_called_once()
         assert scheduler._prefill_invalid_request_keys == set()
         assert scheduler._prefill_path_results[request.request_id].path is PathKind.PE_READ
         assert list(scheduler._prefill_forward_plans) == [request.request_id]
@@ -843,10 +843,10 @@ class TestPrefillDecisionHook:
     def test_same_key_distinct_request_object_resumes_the_same_admission(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -859,9 +859,9 @@ class TestPrefillDecisionHook:
         assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
 
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
+        control_seams.prefill_coordinator.submit.assert_called_once()
 
-    def test_malformed_decision_envelope_converges_to_parent_result(self, scheduler_factory, task04_seams):
+    def test_malformed_decision_envelope_converges_to_parent_result(self, scheduler_factory, control_seams):
         policy = MagicMock(name="path_policy")
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request(
@@ -881,14 +881,14 @@ class TestPrefillDecisionHook:
 
         assert first == second == parent_result
         policy.choose.assert_not_called()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-        task04_seams.prefill_coordinator.submit_abort.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit_abort.assert_not_called()
         assert scheduler._prefill_invalid_request_keys == set()
 
     def test_malformed_first_contact_does_not_fence_a_valid_reparse(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
@@ -910,14 +910,14 @@ class TestPrefillDecisionHook:
             assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
 
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
 
     def test_active_key_accepts_same_admission_after_delivery_reconciles(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
-        task04_seams.prefill_coordinator.submit.return_value = _completed_future()
+        control_seams.prefill_coordinator.submit.return_value = _completed_future()
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -933,7 +933,7 @@ class TestPrefillDecisionHook:
         assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
 
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
+        control_seams.prefill_coordinator.submit.assert_called_once()
 
     def test_update_state_after_alloc_suppresses_send_queue_for_dual_path(self, scheduler_factory):
         scheduler = scheduler_factory(role="prefill")
@@ -993,12 +993,12 @@ class TestAdmissionKeyedPrefillState:
         self,
         old_outcome,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         old_future: Future[None] = Future()
         new_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.side_effect = [old_future, new_future]
-        task04_seams.prefill_coordinator.submit_abort.return_value = _completed_future()
+        control_seams.prefill_coordinator.submit.side_effect = [old_future, new_future]
+        control_seams.prefill_coordinator.submit_abort.return_value = _completed_future()
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -1035,21 +1035,21 @@ class TestAdmissionKeyedPrefillState:
         assert scheduler._prefill_delivery_futures == {new_key: new_future}
         assert scheduler._prefill_invalid_request_keys == set()
         if old_outcome == "failed":
-            task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+            control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
                 _CONTROL_ENDPOINT,
                 PathAbortNotice(request_key=old_key, reason=PathAbortReason.DELIVERY_EXHAUSTED),
             )
         else:
-            task04_seams.prefill_coordinator.submit_abort.assert_not_called()
+            control_seams.prefill_coordinator.submit_abort.assert_not_called()
 
     def test_deferred_old_key_never_delivers_reused_admission_result(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         old_future: Future[None] = Future()
         new_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.side_effect = [old_future, new_future]
+        control_seams.prefill_coordinator.submit.side_effect = [old_future, new_future]
         policy = MagicMock(name="path_policy")
         policy.choose.side_effect = [PathKind.DE_READ, PathKind.PE_READ]
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -1073,18 +1073,18 @@ class TestAdmissionKeyedPrefillState:
         )
         assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
         _bind_prefill(scheduler, new_request, local_block_ids=(30, 31, 32, 33))
-        submitted_before_stale_drain = task04_seams.prefill_coordinator.submit.call_count
+        submitted_before_stale_drain = control_seams.prefill_coordinator.submit.call_count
 
         scheduler._prefill_deferred_deliveries.add(old_key)
         scheduler._deliver_prefill_decision(old_key)
 
-        assert task04_seams.prefill_coordinator.submit.call_count == submitted_before_stale_drain
+        assert control_seams.prefill_coordinator.submit.call_count == submitted_before_stale_drain
         assert scheduler._prefill_deferred_deliveries == set()
         assert scheduler._prefill_delivery_futures == {
             old_key: old_future,
             new_key: new_future,
         }
-        assert task04_seams.prefill_coordinator.submit.call_args_list[-1].args[1].result.request_key == new_key
+        assert control_seams.prefill_coordinator.submit.call_args_list[-1].args[1].result.request_key == new_key
 
     def test_invalid_key_is_released_without_suppressing_reused_admission(
         self,
@@ -1122,7 +1122,7 @@ class TestAdmissionKeyedPrefillState:
     def test_malformed_bootstrap_reparses_without_retaining_an_owner_fence(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
@@ -1154,7 +1154,7 @@ class TestAdmissionKeyedPrefillState:
         )
         assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
         assert scheduler._prefill_request_keys[request_id].admission_id == 1
-        task04_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit.assert_not_called()
 
     def test_two_simultaneously_live_keys_for_one_local_id_tripwire(self, scheduler_factory):
         policy = MagicMock(name="path_policy")
@@ -1186,7 +1186,7 @@ class TestPrefillAbortTriggers:
     def test_initial_decision_failure_marks_only_the_parsed_admission_key(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request("prefill-initial-decision-failure", _remote_decode_params())
@@ -1210,7 +1210,7 @@ class TestPrefillAbortTriggers:
             DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
         }
         assert scheduler._prefill_request_keys == {}
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             self._expected_notice(PathAbortReason.DECISION_FAILED),
         )
@@ -1218,7 +1218,7 @@ class TestPrefillAbortTriggers:
     def test_fresh_redecision_failure_emits_abort_from_current_metadata(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
@@ -1238,7 +1238,7 @@ class TestPrefillAbortTriggers:
             scheduler._path_decider,
             "decide",
             side_effect=[
-                PathDecisionValidationError("facts changed"),
+                PathDecisionValidationError("inputs changed"),
                 PathDecisionValidationError("fresh decision failed"),
             ],
         ):
@@ -1248,7 +1248,7 @@ class TestPrefillAbortTriggers:
             DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
         }
         assert scheduler._prefill_request_keys == {}
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             self._expected_notice(PathAbortReason.DECISION_FAILED),
         )
@@ -1256,7 +1256,7 @@ class TestPrefillAbortTriggers:
     def test_local_activation_exception_emits_activation_failed_abort(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
@@ -1276,7 +1276,7 @@ class TestPrefillAbortTriggers:
         }
         replacement = _make_prefill_request(request.request_id, _remote_decode_params())
         assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             self._expected_notice(PathAbortReason.ACTIVATION_FAILED),
         )
@@ -1284,7 +1284,7 @@ class TestPrefillAbortTriggers:
     def test_real_malformed_forward_plan_emits_activation_failed_abort(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
@@ -1312,8 +1312,8 @@ class TestPrefillAbortTriggers:
         }
         assert scheduler._prefill_path_results == {}
         assert scheduler._prefill_forward_plans == {}
-        task04_seams.prefill_coordinator.submit.assert_not_called()
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit.assert_not_called()
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             self._expected_notice(PathAbortReason.ACTIVATION_FAILED),
         )
@@ -1321,15 +1321,15 @@ class TestPrefillAbortTriggers:
     def test_closed_coordinator_submit_failure_still_attempts_abort_without_escaping(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-submit-failure", _remote_decode_params())
         scheduler.get_num_new_matched_tokens(request, 0)
-        task04_seams.prefill_coordinator.submit.side_effect = RuntimeError("coordinator closed")
-        task04_seams.prefill_coordinator.submit_abort.side_effect = RuntimeError("coordinator closed")
+        control_seams.prefill_coordinator.submit.side_effect = RuntimeError("coordinator closed")
+        control_seams.prefill_coordinator.submit_abort.side_effect = RuntimeError("coordinator closed")
 
         with patch.object(scheduler_module.logger, "error") as log_error:
             _bind_prefill(scheduler, request)
@@ -1338,22 +1338,22 @@ class TestPrefillAbortTriggers:
             DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
         }
         assert scheduler._prefill_forward_plans == {}
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             self._expected_notice(PathAbortReason.ACTIVATION_FAILED),
         )
         assert log_error.call_count == 2
 
-    def test_exhausted_abort_delivery_is_logged_asynchronously(self, scheduler_factory, task04_seams):
+    def test_exhausted_abort_delivery_is_logged_asynchronously(self, scheduler_factory, control_seams):
         scheduler = scheduler_factory(role="prefill")
         abort_error = PathDecisionDeliveryError("abort delivery exhausted")
-        task04_seams.prefill_coordinator.submit_abort.return_value = _completed_future(abort_error)
+        control_seams.prefill_coordinator.submit_abort.return_value = _completed_future(abort_error)
         notice = self._expected_notice(PathAbortReason.DELIVERY_EXHAUSTED)
 
         with patch.object(scheduler_module.logger, "error") as log_error:
             scheduler._send_abort_notice(notice.request_key, _CONTROL_ENDPOINT, notice.reason)
 
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(_CONTROL_ENDPOINT, notice)
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(_CONTROL_ENDPOINT, notice)
         assert abort_error in log_error.call_args.args
         assert (log_error.call_args.args[0] % log_error.call_args.args[1:]).endswith("admission_id=0")
 
@@ -1369,7 +1369,7 @@ class TestPrefillAbortTriggers:
         method_name,
         block_ids,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request("prefill-client-abort", _remote_decode_params())
@@ -1378,7 +1378,7 @@ class TestPrefillAbortTriggers:
 
         assert getattr(scheduler, method_name)(request, block_ids) == (False, None)
 
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             self._expected_notice(PathAbortReason.REQUEST_ABORTED),
         )
@@ -1391,7 +1391,7 @@ class TestPrefillAbortTriggers:
         self,
         status,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         scheduler = scheduler_factory(role="prefill")
         request = _make_prefill_request("prefill-normal-finish", _remote_decode_params())
@@ -1399,20 +1399,20 @@ class TestPrefillAbortTriggers:
 
         scheduler.request_finished(request, [4, 5])
 
-        task04_seams.prefill_coordinator.submit_abort.assert_not_called()
+        control_seams.prefill_coordinator.submit_abort.assert_not_called()
 
 
 class TestDecodeResultConsumption:
     def test_received_result_commits_via_build_connector_meta_without_worker_metadata(
         self,
         decode_scheduler,
-        task04_seams,
+        control_seams,
     ):
         # Given
         request, _ = _admit(decode_scheduler)
         request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
         result = _result()
-        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision(result)]
+        control_seams.decode_coordinator.take_received_decisions.return_value = [_decision(result)]
 
         # When
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
@@ -1424,18 +1424,18 @@ class TestDecodeResultConsumption:
         assert request.request_id not in metadata.requests
         assert request.status is RequestStatus.WAITING_FOR_REMOTE_KVS
         assert decode_scheduler._reqs_need_recv == {}
-        task04_seams.decode_coordinator.unregister.assert_not_called()
+        control_seams.decode_coordinator.unregister.assert_not_called()
 
-    def test_late_decision_after_activation_failure_is_stale(self, decode_scheduler, task04_seams):
+    def test_late_decision_after_activation_failure_is_stale(self, decode_scheduler, control_seams):
         request, snapshot = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         invalid_decision = PathDecision(
             result=_result(),
             reverse_plan=None,
         )
-        task04_seams.decode_coordinator.take_received_decisions.return_value = [invalid_decision]
+        control_seams.decode_coordinator.take_received_decisions.return_value = [invalid_decision]
         first_metadata = decode_scheduler.build_connector_meta(MagicMock(name="failure_scheduler_output"))
-        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
+        control_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
 
         late_metadata = decode_scheduler.build_connector_meta(MagicMock(name="late_scheduler_output"))
 
@@ -1448,7 +1448,7 @@ class TestDecodeResultConsumption:
     def test_queued_old_admission_decision_does_not_fail_reused_request_id(
         self,
         decode_scheduler,
-        task04_seams,
+        control_seams,
     ):
         first_request, _ = _admit(decode_scheduler)
         first_state = decode_scheduler._decode_decision_states[first_request.request_id]
@@ -1458,9 +1458,9 @@ class TestDecodeResultConsumption:
         second_request, _ = _admit(decode_scheduler)
         second_state = decode_scheduler._decode_decision_states[second_request.request_id]
         assert second_state.request_key.admission_id == first_state.request_key.admission_id + 1
-        task04_seams.decode_coordinator.unregister.reset_mock()
-        task04_seams.decode_coordinator.take_received_decisions.return_value = [old_decision]
-        task04_seams.decode_coordinator.take_received_aborts.return_value = []
+        control_seams.decode_coordinator.unregister.reset_mock()
+        control_seams.decode_coordinator.take_received_decisions.return_value = [old_decision]
+        control_seams.decode_coordinator.take_received_aborts.return_value = []
 
         metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
@@ -1468,7 +1468,7 @@ class TestDecodeResultConsumption:
         assert metadata.control_failures == []
         assert metadata.forward_receive_bindings == []
         assert metadata.reverse_plans == []
-        task04_seams.decode_coordinator.unregister.assert_not_called()
+        control_seams.decode_coordinator.unregister.assert_not_called()
 
 
 class TestWorkerFailureRelay:
@@ -1519,7 +1519,7 @@ class TestWorkerFailureRelay:
         assert worker.get_finished(set(), metadata) == (set(), set())
         assert worker.get_block_ids_with_load_errors() == set()
 
-    def test_finished_request_removes_pending_control_failure_without_publication(self):
+    def test_finished_request_removes_pending_control_failure_without_reporting(self):
         # Given
         worker = _control_only_worker()
         metadata = DualPathConnectorMetadata()
@@ -1553,7 +1553,7 @@ class TestCleanupAndShutdown:
         method_name,
         block_ids,
         decode_scheduler,
-        task04_seams,
+        control_seams,
     ):
         # Given
         request, _ = _admit(decode_scheduler)
@@ -1574,17 +1574,17 @@ class TestCleanupAndShutdown:
         assert decode_scheduler._lookup_results == {}
         assert decode_scheduler._decode_kv_snapshots == {}
         assert decode_scheduler._decode_decision_states == {}
-        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+        control_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
         parent_finish.assert_called_once_with(decode_scheduler, request, block_ids)
 
-    def test_cancellation_after_commit_unregisters_first_time(self, decode_scheduler, task04_seams):
+    def test_cancellation_after_commit_unregisters_first_time(self, decode_scheduler, control_seams):
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
+        control_seams.decode_coordinator.take_received_decisions.return_value = [_decision()]
         commit_metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
         assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
-        task04_seams.decode_coordinator.unregister.assert_not_called()
+        control_seams.decode_coordinator.unregister.assert_not_called()
 
         # When: the reverse-send completion is still open, so the finish is delayed
         # (engine progress) until the completion closes.
@@ -1601,14 +1601,14 @@ class TestCleanupAndShutdown:
         result_after = decode_scheduler.request_finished(request, [41, 42, 43, 44])
         assert result_after == (False, None)
         assert request.request_id not in decode_scheduler._decode_decision_states
-        task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+        control_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
-    def test_cancellation_after_peer_abort_unregisters_idempotently(self, decode_scheduler, task04_seams):
+    def test_cancellation_after_peer_abort_unregisters_idempotently(self, decode_scheduler, control_seams):
         # Given
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
-        task04_seams.decode_coordinator.take_received_decisions.return_value = []
-        task04_seams.decode_coordinator.take_received_aborts.return_value = [
+        control_seams.decode_coordinator.take_received_decisions.return_value = []
+        control_seams.decode_coordinator.take_received_aborts.return_value = [
             PathAbortNotice(
                 request_key=state.request_key,
                 reason=PathAbortReason.REQUEST_ABORTED,
@@ -1623,7 +1623,7 @@ class TestCleanupAndShutdown:
         # Then
         assert result == (False, None)
         assert request.request_id not in decode_scheduler._decode_decision_states
-        assert task04_seams.decode_coordinator.unregister.call_args_list == [
+        assert control_seams.decode_coordinator.unregister.call_args_list == [
             call(state.request_key),
             call(state.request_key),
         ]
@@ -1640,11 +1640,11 @@ class TestCleanupAndShutdown:
         method_name,
         block_ids,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         # Given
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -1708,18 +1708,18 @@ class TestCleanupAndShutdown:
         "finishing_metadata",
         ["malformed-dual-path", "missing-dual-path"],
     )
-    def test_unparseable_old_release_preserves_live_reused_prefill_admission(
+    def test_unparsable_old_release_preserves_live_reused_prefill_admission(
         self,
         finishing_metadata,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="de_read_path_policy")
         policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
-        request_id = "prefill-unparseable-release"
+        request_id = "prefill-unparsable-release"
         live_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 1)
         live_request = _make_prefill_request(
             request_id,
@@ -1767,18 +1767,18 @@ class TestCleanupAndShutdown:
         assert request_id in warning_message
         assert str(live_key) in warning_message
 
-    def test_unparseable_release_without_active_key_skips_request_id_cleanup(
+    def test_unparsable_release_without_active_key_skips_request_id_cleanup(
         self,
         scheduler_factory,
     ):
         scheduler = scheduler_factory(role="prefill")
-        request_id = "prefill-unparseable-no-active"
+        request_id = "prefill-unparsable-no-active"
         orphan_result = MagicMock(name="orphan_path_result")
         orphan_reverse_plan = MagicMock(name="orphan_reverse_plan")
         scheduler._prefill_local_tokens[request_id] = 17
         scheduler._prefill_path_results[request_id] = orphan_result
         scheduler._prefill_reverse_plans[request_id] = orphan_reverse_plan
-        scheduler._prefill_vacuous_reverse_request_ids.add(request_id)
+        scheduler._prefill_empty_reverse_request_ids.add(request_id)
         finishing_request = _make_prefill_request(
             request_id,
             _remote_decode_params(dual_path={"unexpected": "shape"}),
@@ -1792,7 +1792,7 @@ class TestCleanupAndShutdown:
         assert scheduler._prefill_local_tokens == {request_id: 17}
         assert scheduler._prefill_path_results == {request_id: orphan_result}
         assert scheduler._prefill_reverse_plans == {request_id: orphan_reverse_plan}
-        assert scheduler._prefill_vacuous_reverse_request_ids == {request_id}
+        assert scheduler._prefill_empty_reverse_request_ids == {request_id}
 
     @pytest.mark.parametrize(
         "old_delivery_state",
@@ -1802,11 +1802,11 @@ class TestCleanupAndShutdown:
         self,
         old_delivery_state,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         old_future: Future[None] = Future()
         live_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.side_effect = [old_future, live_future]
+        control_seams.prefill_coordinator.submit.side_effect = [old_future, live_future]
         policy = MagicMock(name="de_read_path_policy")
         policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -1882,23 +1882,23 @@ class TestCleanupAndShutdown:
     def test_pe_read_delivery_exhaustion_emits_peer_abort_on_next_decode_build(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         # Given
         decode_scheduler = scheduler_factory(role="decode")
         decode_request, _ = _admit(decode_scheduler)
         decode_state = decode_scheduler._decode_decision_states[decode_request.request_id]
-        task04_seams.decode_coordinator.take_received_decisions.return_value = []
+        control_seams.decode_coordinator.take_received_decisions.return_value = []
         received_aborts = []
-        task04_seams.decode_coordinator.take_received_aborts.side_effect = lambda: (
+        control_seams.decode_coordinator.take_received_aborts.side_effect = lambda: (
             [received_aborts.pop(0)] if received_aborts else []
         )
 
         delivery_error = PathDecisionDeliveryError("delivery exhausted")
         delivery_future: Future[None] = Future()
         delivery_future.set_exception(delivery_error)
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
-        task04_seams.prefill_coordinator.submit_abort.side_effect = lambda endpoint, notice: (
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit_abort.side_effect = lambda endpoint, notice: (
             received_aborts.append(notice) or _completed_future()
         )
         policy = MagicMock(name="path_policy")
@@ -1923,8 +1923,8 @@ class TestCleanupAndShutdown:
         log_error.assert_called_once()
         assert delivery_future.exception() is delivery_error
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit.assert_called_once()
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
                 request_key=decode_state.request_key,
@@ -1947,12 +1947,12 @@ class TestCleanupAndShutdown:
         self,
         cancelled,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         # Given
         delivery_error = PathDecisionDeliveryError("delivery exhausted")
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="de_read_path_policy")
         policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -1985,7 +1985,7 @@ class TestCleanupAndShutdown:
         assert DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0) in (
             scheduler._prefill_invalid_request_keys
         )
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
                 request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
@@ -2005,7 +2005,7 @@ class TestCleanupAndShutdown:
         scheduler.request_finished(request, [10, 11, 12, 13])
         assert worker.get_finished({request.request_id}, metadata) == (set(), set())
         assert worker._control_failed_recving == set()
-        # §5 removal rule: the binding's terminal was never consumed, so the
+        # The binding's terminal was never consumed, so the
         # attempt-keyed binding is retained past the request finish.
         installed_binding = binding_metadata.reverse_receive_bindings[0]
         assert set(worker._reverse_receive_bindings) == {
@@ -2018,11 +2018,11 @@ class TestCleanupAndShutdown:
     def test_de_read_delivery_failure_before_first_build_emits_control_only(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         # Given
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="de_read_path_policy")
         policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -2047,7 +2047,7 @@ class TestCleanupAndShutdown:
                 reason=DualPathControlFailureReason.ACTIVATION_FAILED,
             )
         ]
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
                 request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
@@ -2063,10 +2063,10 @@ class TestCleanupAndShutdown:
     def test_de_read_delivery_failure_after_binding_drain_without_forward_plan_uses_delivery_context(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="de_read_path_policy")
         policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -2089,7 +2089,7 @@ class TestCleanupAndShutdown:
                 reason=DualPathControlFailureReason.ACTIVATION_FAILED,
             )
         ]
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
                 request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
@@ -2100,12 +2100,12 @@ class TestCleanupAndShutdown:
     def test_released_failed_delivery_aborts_without_staging_or_invalidating_reused_request(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         delivery_future: Future[None] = Future()
         new_delivery_future = _completed_future()
-        task04_seams.prefill_coordinator.submit.side_effect = [delivery_future, new_delivery_future]
-        task04_seams.prefill_coordinator.submit_abort.return_value = _completed_future()
+        control_seams.prefill_coordinator.submit.side_effect = [delivery_future, new_delivery_future]
+        control_seams.prefill_coordinator.submit_abort.return_value = _completed_future()
         policy = MagicMock(name="de_read_path_policy")
         policy.choose.side_effect = [PathKind.DE_READ, PathKind.PE_READ]
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -2129,7 +2129,7 @@ class TestCleanupAndShutdown:
         metadata = scheduler.build_connector_meta(MagicMock(name="new_scheduler_output"))
 
         assert metadata.control_failures == []
-        task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+        control_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
                 request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
@@ -2141,14 +2141,14 @@ class TestCleanupAndShutdown:
         assert policy.choose.call_count == 2
         assert scheduler._prefill_delivery_futures == {new_key: new_delivery_future}
 
-    def test_active_failed_delivery_record_is_retained_until_failure_is_published(
+    def test_active_failed_delivery_record_is_retained_until_failure_is_reported(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
-        task04_seams.prefill_coordinator.submit_abort.return_value = _completed_future()
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit_abort.return_value = _completed_future()
         policy = MagicMock(name="de_read_path_policy")
         policy.choose.return_value = PathKind.DE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -2189,10 +2189,10 @@ class TestCleanupAndShutdown:
     def test_request_id_reuse_is_not_blocked_by_prior_delivery_resolution(
         self,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -2223,7 +2223,7 @@ class TestCleanupAndShutdown:
         self,
         decode_scheduler,
         scheduler_factory,
-        task04_seams,
+        control_seams,
     ):
         # Given
         decode_scheduler.executor.submit.side_effect = [
@@ -2252,7 +2252,7 @@ class TestCleanupAndShutdown:
 
         completed_delivery_future = _completed_future()
         inflight_delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.side_effect = [
+        control_seams.prefill_coordinator.submit.side_effect = [
             completed_delivery_future,
             inflight_delivery_future,
         ]
@@ -2283,7 +2283,7 @@ class TestCleanupAndShutdown:
         _bind_prefill(prefill_scheduler, inflight_prefill_request)
         prefill_scheduler.request_finished(committed_prefill_request, [4, 5])
 
-        task04_seams.decode_coordinator.take_received_decisions.return_value = [
+        control_seams.decode_coordinator.take_received_decisions.return_value = [
             _decision(
                 _result(
                     committed_request.request_id,
@@ -2301,8 +2301,8 @@ class TestCleanupAndShutdown:
 
         # When
         decode_scheduler.request_finished(cancelled_request, [61, 62, 63, 64])
-        task04_seams.decode_coordinator.take_received_decisions.return_value = []
-        task04_seams.decode_coordinator.take_received_aborts.return_value = [
+        control_seams.decode_coordinator.take_received_decisions.return_value = []
+        control_seams.decode_coordinator.take_received_aborts.return_value = [
             PathAbortNotice(
                 request_key=aborted_state.request_key,
                 reason=PathAbortReason.REQUEST_ABORTED,
@@ -2329,17 +2329,18 @@ class TestCleanupAndShutdown:
                 reason=DualPathControlFailureReason.PEER_ABORT,
             )
         ]
-        assert task04_seams.decode_coordinator.register_pending.call_args_list == [
+        assert control_seams.decode_coordinator.register_pending.call_args_list == [
             call(committed_state.request_key),
             call(aborted_state.request_key),
             call(cancelled_state.request_key),
         ]
-        assert task04_seams.decode_coordinator.unregister.call_args_list == [
+        assert control_seams.decode_coordinator.unregister.call_args_list == [
             call(cancelled_state.request_key),
             call(aborted_state.request_key),
         ]
         assert [
-            submitted.args[1].result.request_key for submitted in task04_seams.prefill_coordinator.submit.call_args_list
+            submitted.args[1].result.request_key
+            for submitted in control_seams.prefill_coordinator.submit.call_args_list
         ] == [committed_state.request_key, aborted_state.request_key]
         assert completed_delivery_future is not inflight_delivery_future
         assert prefill_scheduler._prefill_request_keys == {
@@ -2357,7 +2358,7 @@ class TestCleanupAndShutdown:
         decode_scheduler.request_finished(aborted_request, [51, 52, 53, 54])
         assert decode_scheduler._decode_decision_states == {}
         assert decode_scheduler._decode_kv_snapshots == {}
-        assert task04_seams.decode_coordinator.unregister.call_args_list == [
+        assert control_seams.decode_coordinator.unregister.call_args_list == [
             call(cancelled_state.request_key),
             call(aborted_state.request_key),
             call(committed_state.request_key),
@@ -2365,13 +2366,13 @@ class TestCleanupAndShutdown:
         ]
         assert decode_scheduler.executor.submit.call_count == 3
 
-    def test_shutdown_is_idempotent_and_leaves_no_owned_state(self, scheduler_factory, task04_seams):
+    def test_shutdown_is_idempotent_and_leaves_no_owned_state(self, scheduler_factory, control_seams):
         # Given
         decode_scheduler = scheduler_factory(role="decode")
         decode_request, _ = _admit(decode_scheduler)
 
         delivery_future: Future[None] = Future()
-        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        control_seams.prefill_coordinator.submit.return_value = delivery_future
         policy = MagicMock(name="path_policy")
         policy.choose.return_value = PathKind.PE_READ
         prefill_scheduler = scheduler_factory(role="prefill", path_policy=policy)
@@ -2411,13 +2412,13 @@ class TestCleanupAndShutdown:
             events.append(
                 (
                     "decode-adapter",
-                    task04_seams.decode_coordinator.close.call_count,
+                    control_seams.decode_coordinator.close.call_count,
                     not decode_scheduler._decode_decision_states,
                 )
             )
 
-        task04_seams.decode_coordinator.close.side_effect = record_decode_close
-        task04_seams.prefill_coordinator.close.side_effect = record_prefill_close
+        control_seams.decode_coordinator.close.side_effect = record_decode_close
+        control_seams.prefill_coordinator.close.side_effect = record_prefill_close
         decode_scheduler._kvpool_adapter.close.side_effect = record_decode_adapter_close
 
         # When
@@ -2439,7 +2440,7 @@ class TestCleanupAndShutdown:
         ]
         assert post_shutdown_result == (0, False)
         policy.choose.assert_called_once()
-        task04_seams.prefill_coordinator.submit.assert_called_once()
+        control_seams.prefill_coordinator.submit.assert_called_once()
         assert delivery_future.cancelled()
         assert decode_scheduler._lookup_results == {}
         assert decode_scheduler._decode_kv_snapshots == {}
@@ -2451,7 +2452,7 @@ class TestCleanupAndShutdown:
         assert prefill_scheduler._path_decider is not None
         assert prefill_scheduler._path_decider._decision_records == {}
         assert worker._control_failed_recving == set()
-        assert task04_seams.decode_coordinator.close.call_count == 2
-        assert task04_seams.prefill_coordinator.close.call_count == 2
+        assert control_seams.decode_coordinator.close.call_count == 2
+        assert control_seams.prefill_coordinator.close.call_count == 2
         assert decode_scheduler._kvpool_adapter.close.call_count == 2
         worker._kvpool_worker_adapter.close.assert_not_called()

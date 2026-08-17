@@ -578,7 +578,7 @@ def test_conflicting_binding_install_preserves_first_binding():
     assert worker._forward_receive_bindings == {binding.decode_request_id: binding}
 
 
-def test_done_after_binding_publishes_finished_recving_only():
+def test_done_after_binding_emits_finished_recving_only():
     # Given
     worker = _make_worker()
     binding = _make_binding()
@@ -597,7 +597,7 @@ def test_done_after_binding_publishes_finished_recving_only():
     assert worker._consumed_forward_terminal_wire_ids == {binding.wire_request_id: binding.decode_request_id}
 
 
-def test_failed_after_binding_publishes_exact_forward_suffix_and_finished_recving_prefix_preserved():
+def test_failed_after_binding_emits_exact_forward_suffix_and_preserves_finished_recving_prefix():
     # Given
     worker = _make_worker()
     binding = _make_binding()
@@ -742,7 +742,7 @@ def test_duplicate_terminals_are_idempotent_and_consumed_record_releases_on_fini
     assert worker._pending_forward_failed_wire_ids == set()
 
 
-def test_shutdown_clears_task05_worker_state_and_active_wire_mapping():
+def test_shutdown_clears_forward_worker_state_and_active_wire_mapping():
     # Given
     worker = _make_worker()
     consumed_binding = _make_binding()

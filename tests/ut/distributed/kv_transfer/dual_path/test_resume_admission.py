@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W4: resume admission for delivered DualPath decisions."""
+"""Resume admission for delivered DualPath decisions."""
 
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def test_de_read_resume_token_matrix(pe_scheduler_factory):
         assert scheduler.get_num_new_matched_tokens(request, new_local_tokens) == expected
 
 
-def test_de_read_vacuous_reverse_returns_zero_false_and_skips_reverse_machinery(pe_scheduler_factory):
+def test_de_read_empty_reverse_returns_zero_false_and_skips_reverse_machinery(pe_scheduler_factory):
     pool = make_block_pool()
     scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     request = _admit_de_read(scheduler)
@@ -108,7 +108,7 @@ def test_de_read_vacuous_reverse_returns_zero_false_and_skips_reverse_machinery(
     request.num_preemptions += 1
     assert scheduler.get_num_new_matched_tokens(request, 40) == (0, False)
 
-    # A vacuous Reverse bypasses the Reverse machinery entirely: no new
+    # An empty Reverse range bypasses the Reverse machinery entirely: no new
     # completion and no waiting-attempt entry (the request goes straight
     # back to RUNNING, never parks).
     assert len(scheduler._completion_tracker._records) == completion_records_before

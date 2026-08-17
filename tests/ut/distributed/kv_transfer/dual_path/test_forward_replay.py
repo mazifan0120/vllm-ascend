@@ -2,7 +2,7 @@
 """Replay oracles for the Forward plan across a preemption.
 
 The Forward direction pins nothing, so a resume rebuilds the plan and the send
-state directly from the new block table without waiting on a release proof.
+state directly from the new block table without waiting on a release signal.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W3: ReverseAttemptKey identity, wire ids, attempt-keyed installers."""
+"""ReverseAttemptKey identity, wire ids, and attempt-keyed installers."""
 
 from __future__ import annotations
 
@@ -181,17 +181,17 @@ def lambda_policy(path: PathKind):
 
 
 class TestAttemptKeyedInstallers:
-    def test_installers_accept_attempt_m_while_retaining_attempt_n_tombstones(self):
+    def test_installers_accept_new_attempt_while_retaining_consumed_terminal_records(self):
         worker = _make_prefill_worker()
         binding_n = _make_reverse_binding(reverse_attempt_id=0)
         worker._install_reverse_receive_binding(binding_n)
 
-        # Consume attempt 0's DONE terminal: tombstone recorded for its wire id.
+        # Consume attempt 0's DONE terminal and retain its wire-id record.
         raw_done = {binding_n.wire_request_id}
         worker._consume_reverse_wire_terminals(raw_done, set(), set(), set())
         assert binding_n.wire_request_id in worker._consumed_reverse_terminal_wire_ids
 
-        # A greater attempt installs alongside; attempt 0's tombstone survives.
+        # A greater attempt installs alongside while attempt 0's record survives.
         binding_m = _make_reverse_binding(reverse_attempt_id=1, reverse_receive_completion_id=42)
         worker._install_reverse_receive_binding(binding_m)
         assert worker._reverse_receive_bindings[_attempt_key(1)] == binding_m
@@ -222,20 +222,20 @@ class TestAttemptKeyedInstallers:
             reverse_plan=plan,
             reverse_submitted_attempt=attempt_key,
             store_load_failed=False,
-            terminal_published=False,
+            terminal_reported=False,
         )
         decode_request_id = _KEY.decode_request_id
         worker._split_trackers[decode_request_id] = tracker
         worker._pending_local_reverse_terminals[attempt_key] = True
 
         # Terminal not yet consumed and attempt not complete: the finish
-        # retains the tracker and its tombstones.
+        # retains the tracker and its consumed-terminal records.
         worker._release_split_request_state({decode_request_id})
         assert decode_request_id in worker._split_trackers
         assert attempt_key in worker._pending_local_reverse_terminals
 
         # Terminal consumed and the attempt normally complete: removal takes
-        # the tracker and its tombstones together.
+        # the tracker and its consumed-terminal records together.
         worker._drain_local_reverse_terminals()
         assert tracker.reverse_phase is worker_module._SplitPhase.DONE
         worker._release_split_request_state({decode_request_id})

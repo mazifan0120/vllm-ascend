@@ -84,7 +84,7 @@ def init_dual_path_worker_state(worker: DualPathConnectorWorker, role: str = "de
     worker._pending_reverse_done_wire_ids = set()
     worker._pending_reverse_failed_wire_ids = set()
     worker._consumed_reverse_terminal_wire_ids = {}
-    worker._completion_facts_lock = threading.Lock()
+    worker._completion_reports_lock = threading.Lock()
     worker._pending_completion_reports = {}
     worker._pending_failure_reports = {}
     return worker
@@ -375,7 +375,7 @@ def make_decode_vllm_config(world_size: int = 1) -> MagicMock:
 
 
 @pytest.fixture()
-def decode_task04_seams():
+def decode_control_seams():
     with (
         patch(f"{_SCHEDULER_NS}.KVPoolSchedulerAdapter") as adapter_cls,
         patch(f"{_SCHEDULER_NS}.PathDecisionCoordinator") as coordinator_cls,
@@ -402,7 +402,7 @@ def decode_task04_seams():
 
 
 @pytest.fixture()
-def decode_scheduler_factory(decode_task04_seams):
+def decode_scheduler_factory(decode_control_seams):
     schedulers = []
 
     def make(*, world_size: int = 1, pool: BlockPool | None = None):

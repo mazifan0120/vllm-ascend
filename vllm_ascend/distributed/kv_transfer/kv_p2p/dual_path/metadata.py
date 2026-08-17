@@ -186,7 +186,7 @@ class ReversePlan:
         if any(self.token_end % block_size != 0 for block_size in remote_block_sizes):
             # The Reverse terminal signal only fires when the transferred range
             # covers whole blocks; an unaligned token_end would hang the pull
-            # silently, so reject it at the contract boundary.
+            # silently, so reject it before constructing the block mapping.
             raise PathDecisionValidationError("token_end must align with every remote block size")
         for name, block_table in (
             ("source_block_ids", source_block_ids),
@@ -332,9 +332,11 @@ class DualPathControlFailureMetadata:
 
 @dataclass
 class DualPathWorkerMetadata(KVConnectorWorkerMetadata):
-    """Worker-to-scheduler completion facts: each worker emits ``{completion_id: 1}``
-    at most once per completion; the upstream executor-level fold performs no type
-    check, so ``aggregate`` asserts the concrete type itself."""
+    """Worker-to-scheduler completion reports.
+
+    Each worker emits ``{completion_id: 1}`` at most once per completion.
+    ``aggregate`` validates the concrete metadata type before merging counts.
+    """
 
     completion_reports: dict[int, int] = field(default_factory=dict)
     failure_reports: dict[int, int] = field(default_factory=dict)

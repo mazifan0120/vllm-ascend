@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the Task-01 Decode ``KVPoolSchedulerAdapter`` (spec §11.1).
+"""Unit tests for the Decode ``KVPoolSchedulerAdapter``.
 
 The adapter owns a dedicated non-layerwise ``KVPoolScheduler``; these tests
 prove lookup results are always detached from the owned ``load_specs`` map,

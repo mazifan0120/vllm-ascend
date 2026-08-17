@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Configuration parsing and validation for ``DualPathConnector``.
 
-``DualPathConfig`` carries only the connector role and
-``dual_path_control_port``; inherited KVPool/Mooncake keys are read directly
-from ``kv_connector_extra_config`` by their owning components. DualPath has no
-timer-driven fallback: Decode accepts an explicit Decision or request-terminal
-ABORT, while activation and Worker-reported failures terminate through the
-fail-closed control-failure path.
+``DualPathConfig`` carries the connector role and ``dual_path_control_port``.
+KVPool and Mooncake settings are read directly from
+``kv_connector_extra_config`` by their owning components.
 """
 
 from __future__ import annotations
@@ -22,8 +19,8 @@ if TYPE_CHECKING:
 # type-checked here; ``tls_config`` is only let through for its owning
 # component, which reads it directly from ``kv_connector_extra_config``.
 # Decode Store loads require ``load_async`` so synchronous Store I/O never
-# runs in the Scheduler or model thread. ``consumer_is_to_put`` remains
-# rejected because Decode-side put is out of scope for DualPath.
+# runs in the Scheduler or model thread. ``consumer_is_to_put`` is unsupported:
+# DualPath never puts into Store from the Decode side.
 ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "role",
@@ -50,12 +47,7 @@ MAX_TCP_PORT: int = 65535
 
 @dataclass(frozen=True)
 class DualPathConfig:
-    """Connector role and optional Decode control port.
-
-    Lifecycle termination is protocol-driven: Decision commits a route,
-    request-terminal ABORT rejects it, and local activation or Worker failures
-    fail closed. No timeout setting is part of this connector config.
-    """
+    """Connector role and optional Decode control port."""
 
     role: Literal["prefill", "decode"]
     dual_path_control_port: int | None = None

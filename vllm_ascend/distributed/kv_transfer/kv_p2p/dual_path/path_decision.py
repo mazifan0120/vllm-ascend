@@ -247,8 +247,7 @@ class ReverseAttemptKey:
 
 
 def reverse_wire_id(attempt_key: ReverseAttemptKey) -> str:
-    """Opaque attempt-unique Reverse wire id. Lookup-only: identity is never
-    recovered by slicing a string suffix."""
+    """Return an opaque, attempt-unique Reverse wire id that callers must not parse."""
     if not isinstance(attempt_key, ReverseAttemptKey):
         raise PathDecisionValidationError("attempt_key must be a ReverseAttemptKey")
     return (
@@ -301,7 +300,7 @@ class PathDecisionDecider:
         if existing is not None:
             if request != existing.request or prefill_local_tokens != existing.prefill_local_tokens:
                 raise PathDecisionValidationError(
-                    "request key is already associated with different token facts or prefill_local_tokens"
+                    "request key is already associated with different token counts or prefill_local_tokens"
                 )
             return existing.result
 

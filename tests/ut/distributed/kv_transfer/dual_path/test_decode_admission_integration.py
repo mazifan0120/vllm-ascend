@@ -6,9 +6,9 @@ only the KVPool backend module and the ``LookupKeyClient`` transport are
 constrained at their existing seams. Proves that for ``L_DE < R`` one
 ``schedule()`` call admits the request into ``WAITING_FOR_REMOTE_KVS`` with
 final blocks bound in a ``DecodeKVSnapshot``, and that an HBM-complete
-request takes the normal local path with no Task-01 state. It also proves that
+request takes the normal local path with no DualPath admission state. It also proves that
 an explicit PE ABORT reaches ``FINISHED_ERROR`` and releases delayed blocks
-through the Worker/Core relay. Task-06 coverage drives the complete
+through the Worker/Core relay. The suite also drives the complete
 DE-local Store-full success and probe/load-race failure lifecycles through the
 same real Scheduler, including final-token recomputation and delayed-block
 release without Proxy, PE, Decision, Forward, or Reverse activity.
@@ -311,7 +311,7 @@ def _assert_admission_invariants(
         dual._path_decision_coordinator.register_pending.assert_not_called()
     else:
         dual._path_decision_coordinator.register_pending.assert_called_once()
-    # 8. no finished_recving completion is published
+    # 8. no finished_recving completion is emitted
     scheduler.update_from_output(scheduler_output, _runner_output_for([]))
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert scheduler.finished_recving_kv_req_ids == set()
@@ -403,7 +403,7 @@ def test_admission_store_miss(_constrain_kvpool_seams, scheduler):
     )
 
 
-def test_hbm_complete_schedules_normally_without_task01_state(_constrain_kvpool_seams, scheduler):
+def test_hbm_complete_schedules_normally_without_dual_path_state(_constrain_kvpool_seams, scheduler):
     dual = _dual_scheduler(scheduler)
     prompt = list(range(33))
 
@@ -425,7 +425,8 @@ def test_hbm_complete_schedules_normally_without_task01_state(_constrain_kvpool_
     with lookup_spy as lookup_mock:
         scheduler_output = scheduler.schedule()
 
-    # L_DE = 32 = R: no KVPool lookup, no Task-01 state, normal local scheduling
+    # The Decode-local prefix covers the ready range: no KVPool lookup or
+    # DualPath admission state, and normal local scheduling.
     # with last-token recomputation.
     lookup_mock.assert_not_called()
     assert dual._lookup_results == {}

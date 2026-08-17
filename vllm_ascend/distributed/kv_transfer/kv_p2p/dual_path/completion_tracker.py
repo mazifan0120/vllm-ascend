@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-attempt transfer completion tracking for DualPath Stage-2.
+"""Track per-attempt DualPath transfer completion across workers.
 
 Each reverse attempt opens one completion on the Scheduler; every
 participating worker reports it exactly once through
@@ -7,23 +7,9 @@ participating worker reports it exactly once through
 runs exactly once. Reports arriving for a closed completion are ignored,
 and a failure report closes the completion as failed.
 
-Why this lives on the Scheduler: only the Scheduler sees every worker's
-reports (the per-step worker-metadata fold is the sole cross-worker
-aggregation point), and only it owns the close actions — unparking a
-parked request via ``finished_recving``, authorizing the delayed free of
-source blocks via ``finished_sending``, and failing the owning request.
-
-Phase coupling makes per-worker epoch serialization structural: a
-worker's completion report and its local reverse DONE latch drain in the
-same step boundary, while replacement plans install at step start, so a
-worker cannot hold an unfinished attempt alongside a replacement (it
-raises instead). Tolerating concurrently open completions on the
-Scheduler is defense in depth, not a normal-path state.
-
-In-tree precedent: ascend_store's ``sending_events`` is the same counting
-pattern without attempt identity; the upstream ``KVOutputAggregator``
-cannot express attempt-scoped identity, failure closure, or closed-report
-dedup (its per-request counting reopens on late duplicates).
+Close actions run on the Scheduler: they unpark via ``finished_recving``,
+authorize delayed free via ``finished_sending``, or fail the owning request.
+Concurrently open completions are tolerated and each closes independently.
 """
 
 from __future__ import annotations

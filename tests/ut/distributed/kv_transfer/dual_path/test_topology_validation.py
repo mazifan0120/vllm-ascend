@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W8: local and remote parallel-topology fail-fast validation."""
+"""Local and remote parallel-topology fail-fast validation."""
 
 from __future__ import annotations
 
@@ -13,13 +13,13 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_prefill_kv_cache_config,
     make_prefill_vllm_config,
 )
-from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
-    _admit_decode_request,
-    _de_read_decision,
-)
 from tests.ut.distributed.kv_transfer.dual_path.test_pe_read_forward import (
     _blocks,
     _make_request,
+)
+from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion import (
+    _admit_decode_request,
+    _de_read_decision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import connector as connector_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
@@ -85,7 +85,7 @@ class TestRemoteTopologyValidation:
         pool = make_block_pool()
         scheduler, coordinator = pe_scheduler_factory(PathKind.PE_READ, pool=pool)
         request = _make_request()
-        # A pre-Stage-2 bootstrap message lacks the new fields entirely.
+        # A legacy bootstrap message lacks the topology fields entirely.
         del request.kv_transfer_params["remote_pp_size"]
         del request.kv_transfer_params["remote_dp_size"]
 
@@ -94,13 +94,13 @@ class TestRemoteTopologyValidation:
         assert scheduler._prefill_request_keys[request.request_id] in scheduler._prefill_invalid_request_keys
         assert coordinator.submit.call_count == 0
 
-    def test_de_side_rejects_reverse_plan_topology_mismatch(self, decode_scheduler_factory, decode_task04_seams):
+    def test_de_side_rejects_reverse_plan_topology_mismatch(self, decode_scheduler_factory, decode_control_seams):
         scheduler = decode_scheduler_factory()
         _admit_decode_request(scheduler)
         decision = _de_read_decision(0)
         drifted_plan = replace(decision.reverse_plan, remote_tp_size=2)
         decision = replace(decision, reverse_plan=drifted_plan)
-        decode_task04_seams.decode_coordinator.take_received_decisions.return_value = [decision]
+        decode_control_seams.decode_coordinator.take_received_decisions.return_value = [decision]
 
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 

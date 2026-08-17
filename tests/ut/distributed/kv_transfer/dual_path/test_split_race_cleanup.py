@@ -250,7 +250,7 @@ def test_failed_wins_over_duplicate_and_late_done_for_every_source() -> None:
 
 
 @pytest.mark.parametrize("source", ["store", "reverse", "forward"])
-def test_each_failure_publishes_exactly_one_local_terminal(source: str) -> None:
+def test_each_failure_emits_exactly_one_local_terminal(source: str) -> None:
     worker = _make_worker()
     metadata = _make_split_metadata(include_reverse=source == "reverse")
     worker.start_load_kv(metadata)
@@ -322,7 +322,7 @@ def test_unconsumed_pe_read_forward_binding_is_released_on_request_finish() -> N
     assert WIRE_REQUEST_ID not in worker.request_map
 
 
-def test_finished_req_ids_and_shutdown_release_all_task07_state_idempotently() -> None:
+def test_finished_req_ids_and_shutdown_release_all_split_state_idempotently() -> None:
     decode_worker = _make_worker()
     decode_metadata = _make_split_metadata(include_store=False)
     decode_worker.start_load_kv(decode_metadata)
@@ -596,7 +596,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_request_for_failed_completion",
         "_handle_received_abort",
         "_recovery_invalid_block_ids",
-        "_aggregate_worker_completion_facts",
+        "_aggregate_worker_completion_reports",
         "_run_completion_close_action",
         "_close_reverse_receive_completion",
         "bind_gpu_block_pool",

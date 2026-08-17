@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Executable PR-00 contract for DualPath stage 1.
+"""Connector configuration, construction, parity, and registration tests.
 
-This suite implements DETAILED-SPEC section 11: the connector config matrix,
-call-through construction parity, ten Mooncake Layerwise behavior-parity
-scenarios, section 9 inheritance/drift guards, and connector registration.
+The suite covers the connector config matrix, call-through construction
+parity, Mooncake Layerwise behavior-parity scenarios, inheritance guards,
+and connector registration.
 It is deterministic and stubs optional Mooncake/NPU extensions before imports.
 """
 
@@ -105,12 +105,12 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (  # noqa: E402
 )
 
 
-# Task-01: Decode-role DualPath components compose KVPool lookup adapters.
+# Decode-role DualPath components compose KVPool lookup adapters.
 # The parity/construction suites in this file target parent-behavior parity,
-# so the adapters are replaced with mocks; the Task-01 admission contract
+# so the adapters are replaced with mocks; the admission behavior
 # itself is covered by test_decode_scheduler.py with the same seam.
 @pytest.fixture(autouse=True)
-def _patch_task01_adapters():
+def _patch_decode_adapters():
     with (
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.KVPoolSchedulerAdapter"),
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.worker.KVPoolWorkerAdapter"),
@@ -394,7 +394,7 @@ class TestDualPathConfig(unittest.TestCase):
         for key, value in passthrough_extra.items():
             extra = {"role": "decode", "dual_path_control_port": 7100, key: value}
             if key == "consumer_is_to_load":
-                # Decode consumer load requires async Store I/O (Task-06).
+                # Decode consumer load requires async Store I/O.
                 extra["load_async"] = True
             config = DualPathConfig.from_extra_config(extra, make_kv_transfer_config("kv_both"))
             self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
@@ -698,7 +698,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_reverse_send_completion_ids",
             "_prefill_delivered_reverse_attempts",
             "_prefill_deferred_deliveries",
-            "_prefill_vacuous_reverse_request_ids",
+            "_prefill_empty_reverse_request_ids",
             "_latest_reverse_attempt_ids",
         }
         self.assertEqual(
@@ -726,7 +726,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_pending_reverse_done_wire_ids",
                 "_pending_reverse_failed_wire_ids",
                 "_consumed_reverse_terminal_wire_ids",
-                "_completion_facts_lock",
+                "_completion_reports_lock",
                 "_pending_completion_reports",
                 "_pending_failure_reports",
             },
@@ -886,7 +886,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(parent_blocks.get_block_ids.call_count, 0)
         self.assertEqual(dual_blocks.get_block_ids.call_count, parent_blocks.get_block_ids.call_count)
 
-    def test_decode_remote_prefill_routes_to_task01_admission(self):
+    def test_decode_remote_prefill_routes_to_dual_path_admission(self):
         parent, dual = self.make_scheduler_pair("decode", "kv_consumer")
         parent_future, dual_future = self.replace_executors_with_mocks(parent, dual)
         params = {"do_remote_prefill": True, "metaserver": "http://meta"}
@@ -907,7 +907,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertFalse(parent_request.kv_transfer_params["do_remote_prefill"])
         self.assertEqual(parent_future.add_done_callback.call_count, 1)
 
-        # Task-01: ordinary Attention preserves the Layerwise target T = P = 4
+        # Ordinary Attention preserves the Layerwise target T = P = 4
         # and binds a DecodeKVSnapshot without touching parent machinery.
         self.assertEqual(dual_match, (4, True))
         self.assertEqual(dual._reqs_need_recv, {})
@@ -925,7 +925,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertIn("req-load", dual._decode_decision_states)
         self.assertNotIn("req-load", dual.build_connector_meta(MockSchedulerOutput()).requests)
 
-        # Parent metadata still carries the legacy recv entry; Task-01 metadata does not.
+        # Parent metadata still carries the legacy recv entry; DualPath metadata does not.
         parent_meta = parent.build_connector_meta(MockSchedulerOutput())
         self.assertEqual(parent_meta.requests["req-load"].local_block_ids, ([4, 5, 6],))
         self.assertEqual(parent._reqs_need_recv, {})
@@ -1038,7 +1038,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             num_external_tokens=16,
         )
         # R = P - 1 = 16 coincides with the parent's hybrid-truncated count, but
-        # the dual side reaches it through the Task-01 admission path.
+        # the dual side reaches it through the Decode admission path.
         self.assertEqual(parent_match, (16, True))
         self.assertEqual(dual_match, parent_match)
         self.assertEqual(parent.executor.submit.call_count, 1)
@@ -1053,7 +1053,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
         self.assertEqual(snapshot.external_tokens, 16)
         self.assertEqual(snapshot.final_block_ids, ((4, 5),))
 
-    def test_allocation_task01_snapshot_replaces_parent_bookkeeping(self):
+    def test_allocation_snapshot_replaces_parent_bookkeeping(self):
         parent, dual = self.make_scheduler_pair("decode", "kv_consumer")
         self.replace_executors_with_mocks(parent, dual)
         params = {"do_remote_prefill": True, "do_virtual": True, "metaserver": "http://meta"}
@@ -1080,7 +1080,7 @@ class TestDualPathBehaviorParity(unittest.TestCase):
             num_external_tokens=24,
         )
         # Parent: legacy bookkeeping tracks the request for receive and clears
-        # the remote-prefill flag; DualPath Task-01: no parent bookkeeping at all.
+        # the remote-prefill flag; DualPath adds no parent bookkeeping.
         parent_state = parent._reqs_need_recv["req-alloc"]
         self.assertIs(parent_state[0], parent_request)
         self.assertEqual(parent_state[2], ([[4, 5, 6]],))
@@ -1557,7 +1557,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_request_for_failed_completion",
                 "_handle_received_abort",
                 "_recovery_invalid_block_ids",
-                "_aggregate_worker_completion_facts",
+                "_aggregate_worker_completion_reports",
                 "_run_completion_close_action",
                 "_close_reverse_receive_completion",
                 "bind_gpu_block_pool",
@@ -1588,14 +1588,14 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_consume_reverse_wire_terminals",
                 "_consume_forward_wire_terminals",
                 "_finish_ordinary_requests",
-                "_log_published_split_terminals",
+                "_log_reported_split_terminals",
                 "register_kv_caches",
                 "start_load_kv",
                 "get_finished",
                 "get_block_ids_with_load_errors",
                 "send_done_send_signal",
                 "build_connector_worker_meta",
-                "_publish_completion_fact",
+                "_record_completion_report",
                 "_retire_completed_prior_attempts",
                 "shutdown",
             },
@@ -1685,9 +1685,7 @@ class TestDualPathRegistration(unittest.TestCase):
 
 
 class TestParentRuntimeStartExtraction(unittest.TestCase):
-    """Task-07 section 6: parent register_kv_caches delegates thread
-    construction to idempotent protected starters; ordinary roles remain
-    one-directional."""
+    """Cache registration uses idempotent thread starters per worker role."""
 
     def _make_parent_worker(self, role, kv_role):
         config = MockVllmConfig(role, kv_role)
@@ -1738,9 +1736,7 @@ class TestParentRuntimeStartExtraction(unittest.TestCase):
 
 
 class TestParentEnqueueExtraction(unittest.TestCase):
-    """Task-07 section 7: save_kv_layer derives the ready event and delegates
-    per-layer SendTask construction/enqueue to a protected helper shared by the
-    Forward and Reverse call sites, with unchanged parent behavior."""
+    """Layer saves enqueue through the helper shared by Forward and Reverse."""
 
     @staticmethod
     def _two_layer_kv_caches():

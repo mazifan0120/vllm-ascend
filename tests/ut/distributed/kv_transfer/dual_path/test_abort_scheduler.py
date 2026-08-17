@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
+from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion import (
     _admit_decode_request,
     _de_read_decision,
 )
@@ -28,12 +28,12 @@ def _notice(request_key, reason: str = "REQUEST_ABORTED"):
     )
 
 
-def test_pending_decode_abort_stages_peer_abort_failure(decode_scheduler_factory, decode_task04_seams) -> None:
+def test_pending_decode_abort_stages_peer_abort_failure(decode_scheduler_factory, decode_control_seams) -> None:
     scheduler = decode_scheduler_factory()
     request = _admit_decode_request(scheduler)
     state = scheduler._decode_decision_states[request.request_id]
-    decode_task04_seams.decode_coordinator.take_received_decisions.return_value = []
-    decode_task04_seams.decode_coordinator.take_received_aborts.return_value = [_notice(state.request_key)]
+    decode_control_seams.decode_coordinator.take_received_decisions.return_value = []
+    decode_control_seams.decode_coordinator.take_received_aborts.return_value = [_notice(state.request_key)]
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
@@ -46,19 +46,19 @@ def test_pending_decode_abort_stages_peer_abort_failure(decode_scheduler_factory
         )
     ]
     assert scheduler._decode_control_failures == {}
-    decode_task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+    decode_control_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
 
 def test_same_drain_commits_decision_then_aborts_without_touching_completion_tracker(
     decode_scheduler_factory,
-    decode_task04_seams,
+    decode_control_seams,
 ) -> None:
     scheduler = decode_scheduler_factory()
     request = _admit_decode_request(scheduler)
     state = scheduler._decode_decision_states[request.request_id]
     decision = _de_read_decision()
-    decode_task04_seams.decode_coordinator.take_received_decisions.return_value = [decision]
-    decode_task04_seams.decode_coordinator.take_received_aborts.return_value = [_notice(state.request_key)]
+    decode_control_seams.decode_coordinator.take_received_decisions.return_value = [decision]
+    decode_control_seams.decode_coordinator.take_received_aborts.return_value = [_notice(state.request_key)]
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
@@ -81,10 +81,10 @@ def test_same_drain_commits_decision_then_aborts_without_touching_completion_tra
     ]
 
 
-def test_unknown_decode_abort_is_ignored(decode_scheduler_factory, decode_task04_seams) -> None:
+def test_unknown_decode_abort_is_ignored(decode_scheduler_factory, decode_control_seams) -> None:
     scheduler = decode_scheduler_factory()
     unknown_key = decision_model.DualPathRequestKey(
-        decode_task04_seams.decode_coordinator.decode_engine_instance_id,
+        decode_control_seams.decode_coordinator.decode_engine_instance_id,
         "unknown-request",
         0,
     )
@@ -92,10 +92,10 @@ def test_unknown_decode_abort_is_ignored(decode_scheduler_factory, decode_task04
     scheduler._handle_received_abort(_notice(unknown_key))
 
     assert scheduler._decode_control_failures == {}
-    decode_task04_seams.decode_coordinator.unregister.assert_not_called()
+    decode_control_seams.decode_coordinator.unregister.assert_not_called()
 
 
-def test_already_terminal_decode_abort_is_ignored(decode_scheduler_factory, decode_task04_seams) -> None:
+def test_already_terminal_decode_abort_is_ignored(decode_scheduler_factory, decode_control_seams) -> None:
     scheduler = decode_scheduler_factory()
     request = _admit_decode_request(scheduler)
     state = scheduler._decode_decision_states[request.request_id]
@@ -104,12 +104,12 @@ def test_already_terminal_decode_abort_is_ignored(decode_scheduler_factory, deco
     scheduler._handle_received_abort(_notice(state.request_key))
 
     assert scheduler._decode_control_failures == {}
-    decode_task04_seams.decode_coordinator.unregister.assert_not_called()
+    decode_control_seams.decode_coordinator.unregister.assert_not_called()
 
 
 def test_queued_old_admission_abort_does_not_fail_reused_request_id(
     decode_scheduler_factory,
-    decode_task04_seams,
+    decode_control_seams,
 ) -> None:
     scheduler = decode_scheduler_factory()
     first_request = _admit_decode_request(scheduler)
@@ -120,26 +120,26 @@ def test_queued_old_admission_abort_does_not_fail_reused_request_id(
     second_request = _admit_decode_request(scheduler)
     second_state = scheduler._decode_decision_states[second_request.request_id]
     assert second_state.request_key.admission_id == first_state.request_key.admission_id + 1
-    decode_task04_seams.decode_coordinator.unregister.reset_mock()
-    decode_task04_seams.decode_coordinator.take_received_decisions.return_value = []
-    decode_task04_seams.decode_coordinator.take_received_aborts.return_value = [old_notice]
+    decode_control_seams.decode_coordinator.unregister.reset_mock()
+    decode_control_seams.decode_coordinator.take_received_decisions.return_value = []
+    decode_control_seams.decode_coordinator.take_received_aborts.return_value = [old_notice]
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     assert second_state.status is scheduler_module._DecodeDecisionStatus.PENDING
     assert metadata.control_failures == []
-    decode_task04_seams.decode_coordinator.unregister.assert_not_called()
+    decode_control_seams.decode_coordinator.unregister.assert_not_called()
 
 
 def test_decode_abort_keeps_terminal_state_when_failure_metadata_cannot_be_built(
     decode_scheduler_factory,
-    decode_task04_seams,
+    decode_control_seams,
 ) -> None:
     scheduler = decode_scheduler_factory()
     request = _admit_decode_request(scheduler)
     state = scheduler._decode_decision_states[request.request_id]
-    decode_task04_seams.decode_coordinator.take_received_decisions.return_value = []
-    decode_task04_seams.decode_coordinator.take_received_aborts.return_value = [_notice(state.request_key)]
+    decode_control_seams.decode_coordinator.take_received_decisions.return_value = []
+    decode_control_seams.decode_coordinator.take_received_aborts.return_value = [_notice(state.request_key)]
 
     with (
         patch.object(
@@ -153,5 +153,5 @@ def test_decode_abort_keeps_terminal_state_when_failure_metadata_cannot_be_built
 
     assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
     assert metadata.control_failures == []
-    decode_task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+    decode_control_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
     log_error.assert_called_once()

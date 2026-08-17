@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W5: control-channel envelope, reply statuses, attempt-aware registry."""
+"""Control-channel envelope, reply statuses, and attempt-aware registry."""
 
 from __future__ import annotations
 
@@ -239,7 +239,7 @@ class TestRegistryMatrix:
             result=PathDecisionResult(request_key=_KEY, path=PathKind.PE_READ),
             reverse_plan=None,
         )
-        # A pre-Stage-2 single-decision registry entry (bare PathDecision).
+        # A legacy single-decision registry entry stores a bare PathDecision.
         receiver._accepted_decisions[_KEY] = legacy
 
         assert _decision_reply(receiver, legacy) is channel.DecisionReplyStatus.ACK

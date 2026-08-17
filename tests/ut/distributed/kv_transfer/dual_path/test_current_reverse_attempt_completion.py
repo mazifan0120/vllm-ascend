@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W3: the I4 current-attempt gate for Reverse completion reports."""
+"""Current-attempt filtering for Reverse completion reports."""
 
 from __future__ import annotations
 
@@ -90,7 +90,7 @@ def test_current_attempt_completion_inserts_req_id_only_while_waiting(pe_schedul
     output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_id: 1}))
     scheduler.update_connector_output(output)
 
-    # I4 gate passes: the request id enters the mutable finished_recving.
+    # The current attempt matches, so the request id enters finished_recving.
     assert output.finished_recving == {request.request_id}
     assert pool.blocks[71].ref_cnt == 0
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids

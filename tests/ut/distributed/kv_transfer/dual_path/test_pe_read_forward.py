@@ -800,7 +800,7 @@ def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
         ("request_finished_all_groups", ([10, 11, 12],)),
     ],
 )
-def test_pe_finish_and_shutdown_remove_task05_records_idempotently(
+def test_pe_finish_and_shutdown_remove_forward_records_idempotently(
     scheduler_factory,
     method_name,
     block_ids,
@@ -988,8 +988,8 @@ def test_non_block_aligned_T_selects_containing_final_block(parent_forward_metad
     ) == (12, 12, token_end, token_end, token_end)
 
 
-def test_task05_methods_have_no_synchronous_waits():
-    task05_methods = (
+def test_forward_methods_have_no_synchronous_waits():
+    forward_methods = (
         connector_module.DualPathConnectorScheduler._try_install_forward_plan,
         connector_module.DualPathConnectorScheduler.build_connector_meta,
         connector_module.DualPathConnectorWorker._install_forward_receive_binding,
@@ -998,7 +998,7 @@ def test_task05_methods_have_no_synchronous_waits():
     )
     blocking_calls = (".result(", ".wait(", "time.sleep(", ".recv(")
 
-    for method in task05_methods:
+    for method in forward_methods:
         source = inspect.getsource(method)
         for blocking_call in blocking_calls:
             assert blocking_call not in source, f"{method.__qualname__} contains {blocking_call}"

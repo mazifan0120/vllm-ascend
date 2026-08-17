@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the Task-01 Decode ``KVPoolWorkerAdapter`` (spec §11.3).
+"""Unit tests for the Decode ``KVPoolWorkerAdapter``.
 
 The worker adapter is a lookup-only composition: a non-layerwise
 ``KVPoolWorker`` plus the existing ``LookupKeyServer`` bound only on the

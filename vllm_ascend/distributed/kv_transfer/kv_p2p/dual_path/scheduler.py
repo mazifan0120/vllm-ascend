@@ -177,7 +177,7 @@ def _is_open_decision_status(status: _DecodeDecisionStatus) -> bool:
 
 
 def _validate_local_topology(vllm_config: VllmConfig) -> None:
-    """Stage-2 supports exactly PP == DP == PCP == DCP == 1 (spec section 6)."""
+    """Require PP, DP, PCP, and DCP sizes of one."""
     parallel_config = vllm_config.parallel_config
     restrictions = (
         ("pipeline_parallel_size", parallel_config.pipeline_parallel_size),
@@ -196,7 +196,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     Decode admission combines HBM and Store lookup state, freezes final block
     allocation, receives the Prefill decision, and installs the Store,
     Reverse, and Forward plans for the selected route. Prefill evaluates the
-    path decision hook from the admitted Decode facts and installs its local
+    path decision hook from the admitted Decode inputs and installs its local
     send/receive plans after allocation. Decision and request-terminal ABORT
     are the remote outcomes; local activation and Worker failures fail closed.
     Requests outside the DualPath admission shapes delegate to the parent
@@ -247,7 +247,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._reverse_send_completion_ids: dict[ReverseAttemptKey, int] = {}
         self._prefill_delivered_reverse_attempts: dict[str, int] = {}
         self._prefill_deferred_deliveries: set[DualPathRequestKey] = set()
-        self._prefill_vacuous_reverse_request_ids: set[str] = set()
+        self._prefill_empty_reverse_request_ids: set[str] = set()
         self._latest_reverse_attempt_ids: dict[str, int] = {}
         _validate_local_topology(vllm_config)
         if dual_path_cfg.role == "decode":
@@ -376,7 +376,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 if delivery_record.future is not delivery_future:
                     raise RuntimeError(f"DualPath Prefill request {request_id} has mismatched Decision delivery state")
                 delivery_failed = delivery_future.cancelled() or delivery_future.exception() is not None
-                retain_publication_fence = False
+                retain_delivery_record = False
                 if delivery_failed:
                     # A failed prior delivery cancels its deferred replacement
                     # for good: the request converges to the failure path.
@@ -398,7 +398,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                 reason=DualPathControlFailureReason.ACTIVATION_FAILED,
                             )
                             self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
-                            retain_publication_fence = True
+                            retain_delivery_record = True
                         elif delivery_record.path is not PathKind.PE_READ:
                             assert_never(delivery_record.path)
                     self._send_abort_notice(
@@ -406,10 +406,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                         delivery_record.endpoint,
                         PathAbortReason.DELIVERY_EXHAUSTED,
                     )
-                    # The terminal failure has been consumed. A staged DE_READ
-                    # failure keeps only its immutable record until publication.
+                    # Keep a failed DE_READ delivery record until its staged
+                    # control failure has been included in connector metadata.
                     self._prefill_delivery_futures.pop(request_key, None)
-                if not retain_publication_fence:
+                if not retain_delivery_record:
                     self._prefill_delivery_records.pop(request_key, None)
                 if delivery_failed:
                     continue
@@ -504,12 +504,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     PathAbortReason.DECISION_FAILED,
                 )
                 return parent_result
-            # The retained decision was never delivered, so the conflicting facts
+            # The retained decision was never delivered, so the conflicting inputs
             # come from an admission retry (allocation-failure retry or preemption
             # resume re-probing a changed prefix cache). Discard the uncommitted
-            # decision state wholesale and decide fresh from the new facts.
+            # decision state wholesale and decide fresh from the new inputs.
             logger.warning(
-                "DualPath Prefill admission facts changed for request %s before decision "
+                "DualPath Prefill admission inputs changed for request %s before decision "
                 "delivery; discarding the undelivered decision and re-deciding: %s",
                 request_id,
                 error,
@@ -572,12 +572,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if result.path is PathKind.DE_READ:
             reverse_tokens = max(metadata.decision_request.decode_store_tokens - prefill_local_tokens, 0)
             if reverse_tokens == 0:
-                # Vacuous Reverse: bypass the Reverse machinery entirely; the
+                # An empty Reverse range bypasses the Reverse machinery; the
                 # request never parks, so no waiting-attempt entry may linger
-                # for the I4 gate, and the retained old plan must not
+                # for the current-attempt check, and the retained old plan must not
                 # reinstall one at allocation time.
                 self._waiting_reverse_attempt_ids.pop(request_id, None)
-                self._prefill_vacuous_reverse_request_ids.add(request_id)
+                self._prefill_empty_reverse_request_ids.add(request_id)
             return (reverse_tokens, True) if reverse_tokens > 0 else (0, False)
         assert_never(result.path)
 
@@ -786,12 +786,18 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if retained_reverse_plan is not None and request.num_preemptions > retained_reverse_plan.reverse_attempt_id:
             replacement_attempt_id = request.num_preemptions
         if replacement_attempt_id is None and not token_start < token_split < ready_tokens <= token_end:
-            raise PathDecisionValidationError("DE_READ token ranges must satisfy L_PE < K_DE < R <= T")
+            raise PathDecisionValidationError(
+                "DE_READ token ranges must satisfy prefill_local_tokens < decode_store_tokens "
+                "< target_tokens <= num_prompt_tokens; got "
+                f"prefill_local_tokens={token_start}, decode_store_tokens={token_split}, "
+                f"target_tokens={ready_tokens}, num_prompt_tokens={token_end}"
+            )
 
         prepared = self._prepare_forward_plan(request, blocks, token_split)
         # vLLM admission allocates only the external-token blocks (the Reverse
-        # destination [L_PE, K_DE)) and then parks the request in
-        # WAITING_FOR_REMOTE_KVS, so a T-covering Forward table can only appear
+        # destination from Prefill's local prefix to Decode's Store boundary)
+        # and then parks the request in
+        # WAITING_FOR_REMOTE_KVS, so a prompt-covering Forward table can only appear
         # on the post-Reverse allocation. Install the Reverse artifacts from
         # the admission table and deliver immediately; the Forward plan
         # installs on that later allocation without a second delivery.
@@ -849,10 +855,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._prefill_pending_reverse_receive_bindings[request_id] = binding
             self._prefill_reverse_plans[request_id] = reverse_plan
         elif replacement_attempt_id is not None and token_start < token_split:
-            # Route-preserving recovery (I7): same path and frozen DE table;
-            # only the attempt-local range [L_PE(new), K_DE) and the PE block
-            # table change. The new attempt re-parks the request under the I4
-            # gate.
+            # Recovery keeps the route and frozen DE table. Only the
+            # attempt-local Reverse range and PE block table change; the new
+            # attempt re-parks the request under the current-attempt check.
             attempt_key = ReverseAttemptKey(result.request_key, replacement_attempt_id)
             completion = self._completion_tracker.open_completion(
                 CompletionKind.REVERSE_RECEIVE,
@@ -894,7 +899,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._waiting_reverse_attempt_ids[request_id] = attempt_key
 
         if prepared is None:
-            # Forward table does not cover T yet; it installs on the
+            # Forward table does not cover the prompt yet; it installs on the
             # post-Reverse allocation without touching the delivered Reverse.
             return self._prefill_reverse_plans[request_id]
         forward_plan, send_req_info = prepared
@@ -936,7 +941,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 # Identical duplicate lookup (e.g. allocation-failure retry):
                 # reuse the detached result instead of re-probing the KV pool.
                 return cached.external_tokens, True
-            # Changed admission facts invalidate the unbound result; discard it before
+            # Changed admission inputs invalidate the unbound result; discard it before
             # the fresh lookup so a failing re-probe cannot leave it behind.
             del self._lookup_results[request_id]
 
@@ -995,10 +1000,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if (
             result.path is PathKind.DE_READ
             and request_id in self._prefill_reverse_plans
-            and request_id not in self._prefill_vacuous_reverse_request_ids
+            and request_id not in self._prefill_empty_reverse_request_ids
         ):
-            # Parking in WAITING_FOR_REMOTE_KVS: the I4 gate only admits the
-            # Reverse-receive completion of exactly this attempt.
+            # Parking in WAITING_FOR_REMOTE_KVS admits only the Reverse-receive
+            # completion of exactly the current attempt.
             self._waiting_reverse_attempt_ids.setdefault(
                 request_id,
                 ReverseAttemptKey(result.request_key, result.reverse_attempt_id),
@@ -1258,7 +1263,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         frozen_block_ids: tuple[tuple[int, ...], ...],
         num_external_tokens: int,
     ) -> bool:
-        # A repeated allocation carrying facts identical to the bound snapshot
+        # A repeated allocation matching the bound snapshot
         # is a benign retry (e.g. allocation-failure retry); a mismatch conflicts.
         ready_tokens = _decode_ready_token_count(request.num_tokens)
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
@@ -1400,7 +1405,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         state: DecodePathDecisionState,
         snapshot: DecodeKVSnapshot,
     ) -> tuple[BlockIdGroups, int, ReversePlan | None]:
-        # A received Decision must reproduce the frozen admission facts exactly;
+        # A received Decision must reproduce the frozen admission inputs exactly;
         # any mismatch fails the activation before binding construction.
         result = decision.result
         if state.request_key != result.request_key:
@@ -1508,7 +1513,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
 
         if reverse_plan is not None:
-            # The reverse-send completion proof is allocated at attempt
+            # The reverse-send completion report id is allocated at attempt
             # acceptance, before any layer can enter the sender queue, and is
             # carried unchanged on the plan to every DE worker.
             attempt_key = ReverseAttemptKey(state.request_key, result.reverse_attempt_id)
@@ -1626,11 +1631,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             for deferred_request_key in list(self._prefill_deferred_deliveries):
                 self._deliver_prefill_decision(deferred_request_key)
             metadata.reverse_receive_bindings.extend(self._prefill_pending_reverse_receive_bindings.values())
-            published_failure_request_ids = tuple(self._prefill_control_failures)
+            reported_failure_request_ids = tuple(self._prefill_control_failures)
             metadata.control_failures.extend(self._prefill_control_failures.values())
             self._prefill_pending_reverse_receive_bindings.clear()
             self._prefill_control_failures.clear()
-            for request_id in published_failure_request_ids:
+            for request_id in reported_failure_request_ids:
                 request_key = self._prefill_request_keys.get(request_id)
                 if request_key is not None and request_key not in self._prefill_delivery_futures:
                     self._prefill_delivery_records.pop(request_key, None)
@@ -1692,7 +1697,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             releases_active_admission = active_key is not None and metadata_key == active_key
             if metadata_key is None and active_key is not None:
                 logger.warning(
-                    "DualPath Prefill release metadata is unparseable for request %s; "
+                    "DualPath Prefill release metadata is unparsable for request %s; "
                     "skipping cleanup of active admission %s",
                     request_id,
                     active_key,
@@ -1710,7 +1715,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     self._reqs_need_send_layerwise.pop(request_id, None)
                 self._prefill_request_keys.pop(request_id, None)
                 self._prefill_delivered_reverse_attempts.pop(request_id, None)
-                self._prefill_vacuous_reverse_request_ids.discard(request_id)
+                self._prefill_empty_reverse_request_ids.discard(request_id)
                 self._waiting_reverse_attempt_ids.pop(request_id, None)
             if released_key is not None:
                 if released_key not in self._prefill_delivery_futures:
@@ -1797,7 +1802,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             assert isinstance(worker_metadata, DualPathWorkerMetadata), (
                 f"DualPath scheduler requires DualPathWorkerMetadata, got {type(worker_metadata).__name__}"
             )
-            finished_sending_injection, finished_recving_injection = self._aggregate_worker_completion_facts(
+            finished_sending_injection, finished_recving_injection = self._aggregate_worker_completion_reports(
                 worker_metadata
             )
         if finished_sending_injection:
@@ -1809,7 +1814,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 connector_output.finished_recving = set()
             connector_output.finished_recving.update(finished_recving_injection)
 
-    def _aggregate_worker_completion_facts(self, worker_metadata: DualPathWorkerMetadata) -> tuple[set[str], set[str]]:
+    def _aggregate_worker_completion_reports(
+        self, worker_metadata: DualPathWorkerMetadata
+    ) -> tuple[set[str], set[str]]:
         finished_sending_injection: set[str] = set()
         finished_recving_injection: set[str] = set()
         for completion_id, report_count in worker_metadata.completion_reports.items():
@@ -1885,7 +1892,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     # Request cleanup removes the exact-attempt owner mapping but
                     # deliberately leaves an open completion record reportable.
                     # A late failure closes that orphaned record without staging
-                    # a request failure or publishing generic finished_recving.
+                    # a request failure or emitting generic finished_recving.
                     self._completion_tracker.discard(completion.completion_id)
         return finished_sending_injection, finished_recving_injection
 
@@ -1899,7 +1906,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             request_key = attempt_key.request_key
             request_id = request_key.decode_request_id
             # Each attempt owns exactly one mapping and record. Closing one
-            # attempt retires only those attempt-scoped facts.
+            # attempt retires only that attempt-scoped state.
             self._reverse_send_completion_ids.pop(attempt_key, None)
             self._completion_tracker.discard(completion.completion_id)
             if self._has_open_reverse_send_completion(request_key):
@@ -1916,9 +1923,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         return set(), set()
 
     def _close_reverse_receive_completion(self, completion: CompletionRecord) -> set[str]:
-        # I4: only the current waiting attempt's completion may publish the
-        # request id; stale-attempt completions are absorbed without touching
-        # the generic finished sets.
+        # Only the current waiting attempt's completion may emit the request id;
+        # stale-attempt completions are absorbed without touching the generic
+        # finished sets.
         attempt_key = completion.reverse_attempt_key
         request_id = next(
             (
@@ -1964,7 +1971,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_delivery_records.clear()
         self._prefill_delivered_reverse_attempts.clear()
         self._prefill_deferred_deliveries.clear()
-        self._prefill_vacuous_reverse_request_ids.clear()
+        self._prefill_empty_reverse_request_ids.clear()
         self._prefill_invalid_request_keys.clear()
         if self._kvpool_adapter is not None:
             self._kvpool_adapter.close()

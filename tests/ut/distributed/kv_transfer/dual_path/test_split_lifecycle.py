@@ -187,7 +187,7 @@ def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
         tracker.forward_destination_slice,
         tracker.reverse_plan,
         tracker.reverse_submitted_attempt,
-        tracker.terminal_published,
+        tracker.terminal_reported,
     )
     finished = worker.get_finished(set(), metadata)
 
@@ -198,7 +198,7 @@ def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
     assert tracker.forward_destination_slice == (30, 31, 40, 41)
     assert tracker.reverse_plan is None
     assert tracker.reverse_submitted_attempt is None
-    assert tracker.terminal_published is False
+    assert tracker.terminal_reported is False
     assert finished == (set(), set())
     assert (
         tracker.store_phase,
@@ -208,11 +208,11 @@ def test_nonempty_store_does_not_submit_reverse_before_store_done() -> None:
         tracker.forward_destination_slice,
         tracker.reverse_plan,
         tracker.reverse_submitted_attempt,
-        tracker.terminal_published,
+        tracker.terminal_reported,
     ) == before_poll
 
 
-def test_prefill_publishes_no_completion_before_final_reverse_done() -> None:
+def test_prefill_emits_no_completion_before_final_reverse_done() -> None:
     worker = _make_prefill_worker()
     metadata = DualPathConnectorMetadata()
     binding = _make_reverse_receive_binding()
@@ -255,7 +255,7 @@ def test_store_done_marks_phase_without_outer_completion() -> None:
 
     assert tracker.store_phase.value == "DONE"
     assert tracker.reverse_submitted_attempt is None
-    assert tracker.terminal_published is False
+    assert tracker.terminal_reported is False
     assert finished == (set(), set())
     assert worker.get_block_ids_with_load_errors() == set()
     assert worker._split_trackers[DECODE_REQUEST_ID] is tracker
@@ -280,7 +280,7 @@ def test_reverse_done_does_not_complete_decode_before_forward() -> None:
     assert finished == (set(), set())
 
 
-def test_decode_publishes_completion_only_when_full_predicate_satisfied() -> None:
+def test_decode_emits_completion_only_when_all_phases_finish() -> None:
     worker = _make_worker()
     metadata = _make_split_metadata(include_reverse=True)
     worker.start_load_kv(metadata)
@@ -299,7 +299,7 @@ def test_decode_publishes_completion_only_when_full_predicate_satisfied() -> Non
     assert tracker.store_phase.value == "DONE"
     assert tracker.reverse_phase.value == "DONE"
     assert tracker.forward_phase.value == "DONE"
-    assert tracker.terminal_published is True
+    assert tracker.terminal_reported is True
     assert first_finished == (set(), {DECODE_REQUEST_ID})
     assert second_finished == (set(), set())
     assert worker.get_block_ids_with_load_errors() == set()
@@ -343,7 +343,7 @@ def test_after_reverse_done_prefill_executes_inherited_layerwise_forward() -> No
     reverse_metadata.reverse_receive_bindings.append(binding)
     worker.start_load_kv(reverse_metadata)
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
-    # The Reverse terminal leaves the worker only as a completion id (I4).
+    # The Reverse terminal leaves the worker only as a completion id.
     assert worker.get_finished(set(), reverse_metadata) == (set(), set())
     worker_metadata = worker.build_connector_worker_meta()
     assert worker_metadata.completion_reports == {binding.reverse_receive_completion_id: 1}

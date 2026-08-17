@@ -483,7 +483,7 @@ def test_start_load_kv_runs_store_adapter_once_between_control_and_parent() -> N
     assert worker.kv_recv_layer_thread.method_calls == []
 
 
-def test_store_done_publishes_finished_recving_exactly_once() -> None:
+def test_store_done_emits_finished_recving_exactly_once() -> None:
     worker = _make_worker()
     metadata = DualPathConnectorMetadata()
     store_metadata = _make_store_metadata()
@@ -505,7 +505,7 @@ def test_store_done_publishes_finished_recving_exactly_once() -> None:
     ]
 
 
-def test_store_failed_publishes_destination_invalid_blocks_and_finished_recving_together() -> None:
+def test_store_failed_emits_destination_invalid_blocks_and_finished_recving_together() -> None:
     worker = _make_worker()
     metadata = DualPathConnectorMetadata()
     store_metadata = _make_store_metadata()
@@ -620,9 +620,9 @@ def test_real_store_worker_miss_reports_only_external_blocks_and_finishes_withou
     assert request.kv_transfer_params["do_remote_prefill"] is False
 
 
-def test_real_store_worker_publishes_load_errors_before_done_recving() -> None:
+def test_real_store_worker_emits_load_errors_before_done_recving() -> None:
     # Given
-    request_id = "real-store-publication-race"
+    request_id = "real-store-reporting-race"
     adapter, _ = _make_real_store_worker_adapter(None)
     worker = _make_worker()
     worker._kvpool_worker_adapter = adapter

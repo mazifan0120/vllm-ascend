@@ -310,10 +310,10 @@ def test_identical_replay_reuses_result_without_policy_turn() -> None:
     assert policy.requests == [request]
 
 
-@pytest.mark.parametrize("conflict", ["prefill-local", "request-facts"])
+@pytest.mark.parametrize("conflict", ["prefill-local", "request-tokens"])
 def test_conflicting_l_pe_or_facts_retain_first_record(conflict: str) -> None:
     original = _make_request()
-    conflicting = _make_request(decode_store_tokens=24) if conflict == "request-facts" else _make_request()
+    conflicting = _make_request(decode_store_tokens=24) if conflict == "request-tokens" else _make_request()
     conflicting_prefill_local_tokens = 9 if conflict == "prefill-local" else 8
     policy = SpyPolicy(PathKind.PE_READ)
     decider = PathDecisionDecider(policy)

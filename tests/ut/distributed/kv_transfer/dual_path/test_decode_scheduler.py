@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the Task-01 Decode Scheduler admission path (spec §11.2).
+"""Unit tests for the Decode Scheduler admission path.
 
 Covers token accounting (E_DE = T - L_DE independent of the Store hit), the
 pre-allocation lookup cache lifecycle, DecodeKVSnapshot creation/binding
@@ -303,7 +303,7 @@ class TestDecodeAdmission(unittest.TestCase):
         self.scheduler._kvpool_adapter.lookup.assert_called_once()
 
     def test_retry_reuse_requires_matching_local_and_external_tokens(self):
-        request = _make_request("req-retry-facts", 48, _selected_params())
+        request = _make_request("req-retry-inputs", 48, _selected_params())
         spec_a = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=False)
         spec_b = LoadSpec(vllm_cached_tokens=32, kvpool_cached_tokens=48, can_load=False)
         self.scheduler._kvpool_adapter.lookup.side_effect = [spec_a, spec_b]
@@ -428,7 +428,7 @@ class TestDecodeAdmission(unittest.TestCase):
         no_params = _make_request("req-none", 48, None)
         self.assertEqual(self.scheduler.get_num_new_matched_tokens(no_params, 0), (0, False))
 
-    def test_finish_callbacks_and_shutdown_clear_all_task01_state(self):
+    def test_finish_callbacks_and_shutdown_clear_all_admission_state(self):
         request = _make_request("req-fin", 48, _selected_params())
         self._admit(request, 16)
         other = _make_request("req-pending", 48, _selected_params())

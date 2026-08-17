@@ -41,7 +41,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 CONNECTOR_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector"
 SCHEDULER_NS = "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler"
 DECODE_REQUEST_ID = "request-local-7"
-PREFILL_REQUEST_ID = "reques123456789"
+PREFILL_REQUEST_ID = "request123456789"
 L_DE = 16
 K_DE = 32
 L_PE = 16
@@ -350,10 +350,10 @@ def test_de_does_not_complete_on_single_phase_terminals(production_harness_facto
 
     assert harness.finish_store() == (set(), set())
     assert harness.finish_reverse()[0] == (set(), set())
-    assert harness.de_worker._split_trackers[DECODE_REQUEST_ID].terminal_published is False
+    assert harness.de_worker._split_trackers[DECODE_REQUEST_ID].terminal_reported is False
 
 
-def test_de_completes_exactly_once_after_full_predicate(production_harness_factory) -> None:
+def test_decode_completes_exactly_once_after_all_phases_finish(production_harness_factory) -> None:
     harness = production_harness_factory()
     harness.finish_store()
     harness.finish_reverse()
@@ -367,7 +367,7 @@ def test_de_completes_exactly_once_after_full_predicate(production_harness_facto
     ("source", "expected_invalid"),
     [("store", {42}), ("reverse", {43, 44}), ("forward", {43, 44})],
 )
-def test_production_metadata_failure_provenance_is_exact(
+def test_production_metadata_failure_reporting_is_exact(
     production_harness_factory,
     source: str,
     expected_invalid: set[int],
@@ -422,7 +422,7 @@ def test_production_metadata_failed_wins_over_late_done(production_harness_facto
     assert harness.de_worker._split_trackers[DECODE_REQUEST_ID].reverse_phase.value == "FAILED"
 
 
-def test_request_finish_releases_all_task08_state_idempotently(production_harness_factory) -> None:
+def test_request_finish_releases_all_worker_state_idempotently(production_harness_factory) -> None:
     harness = production_harness_factory()
     unrelated_key = DualPathRequestKey("decode-instance", "unrelated", 0)
     harness.prefill_scheduler._prefill_local_tokens["unrelated"] = 7
@@ -466,7 +466,7 @@ def test_request_finish_releases_all_task08_state_idempotently(production_harnes
     }
 
 
-def test_shutdown_leaves_no_task08_residue(production_harness_factory) -> None:
+def test_shutdown_leaves_no_worker_state(production_harness_factory) -> None:
     harness = production_harness_factory()
 
     harness.prefill_scheduler.shutdown()
@@ -508,7 +508,7 @@ def test_structured_logs_reconstruct_request_facts(production_harness_factory) -
     assert "eligibility=policy selected_path=DE_READ store=partial" in messages
     assert "store_range=[16,32) reverse_range=[16,32) forward_range=[32,49)" in messages
     assert "delivery_terminal=SUCCEEDED" in messages
-    assert "final_predicate=SUCCESS" in messages
+    assert "status=SUCCESS" in messages
     assert "PathDecision" not in messages
     for prefix in ("dual_path decision", "dual_path activation", "dual_path delivery"):
         matching = [line for line in messages.splitlines() if line.startswith(prefix)]
