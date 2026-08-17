@@ -1,5 +1,10 @@
 # PR-06 Bidirectional Runtime and Lifecycle
 
+> **Superseded on 2026-08-17:** The current lifecycle and identity contract is
+> [DualPath ABORT Notification and Watchdog Removal](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Elapsed-time failure, ABORT tombstones, and two-field request keys below are
+> historical only.
+
 - Series position: 6 of 7
 - Spec status: `PLANNED`
 - Depends on: PR-04, PR-05

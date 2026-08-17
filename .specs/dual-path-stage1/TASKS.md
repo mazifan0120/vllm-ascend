@@ -1,5 +1,10 @@
 # DualPathConnector Stage 1 Task Catalog
 
+> **Superseded on 2026-08-17:** The current lifecycle and identity contract is
+> [DualPath ABORT Notification and Watchdog Removal](../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Elapsed-time failure, ABORT tombstones, and two-field request keys below are
+> historical only.
+
 This file is the only source for Stage 1 implementation task definitions and
 their PR ownership. The architecture spec owns semantics; each PR spec owns its
 merge boundary; this catalog only decomposes that approved work into reviewable

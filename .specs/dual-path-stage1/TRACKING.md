@@ -1,5 +1,10 @@
 # DualPathConnector Stage 1 PR Tracking
 
+> **Superseded on 2026-08-17:** The current lifecycle and identity contract is
+> [DualPath ABORT Notification and Watchdog Removal](../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Elapsed-time failure, ABORT tombstones, and two-field request keys below are
+> historical only.
+
 Last reviewed: 2026-08-04
 
 Target series: PR-00 foundation plus PR-01 through PR-07
@@ -85,7 +90,7 @@ YYYY-MM-DD | PR-XX | command or external check | PASS/FAIL | concise result or l
 
 2026-08-03 | PR-00 | python3 -m py_compile on dual_path sources, foundation UT, and e2e smoke | PASS | all files compile; diff scope limited to the six spec-owned paths (no parent/Store/Proxy/MultiConnector change)
 
-2026-08-03 | PR-00 | pytest -sv tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py | PASS | 49 passed, 15 subtests passed on openEuler 22.03 + Miniforge Python 3.10 + vllm v0.23.0; fixed 2 test-side bugs developed on macOS without vllm: (1) patch.object get_decode_context_model_parallel_world_size needed create=True because mooncake_layerwise_connector.py imports only _rank not _world_size; (2) LIFECYCLE_METHODS was tuple but .isdisjoint() called on it, changed to frozenset
+2026-08-03 | PR-00 | pytest -sv tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py | PASS | 49 passed, 15 subtests passed on openEuler 22.03 + Miniforge Python 3.10 + vllm v0.23.0; fixed 2 test-side bugs developed on macOS without vllm: (1) patch.object get_decode_context_model_parallel_world_size needed create=True because mooncake_layerwise_connector.py imports only `_rank` not `_world_size`; (2) LIFECYCLE_METHODS was tuple but .isdisjoint() called on it, changed to frozenset
 
 2026-08-03 | PR-00 | pytest -sv tests/ut/kv_offload/test_mooncake_layerwise_connector.py | PASS | 41 passed, 0 failed on same env; parent regression confirmed untouched by PR-00 cleanup
 

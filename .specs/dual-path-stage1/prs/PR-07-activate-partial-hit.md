@@ -1,5 +1,10 @@
 # PR-07 Activate Partial DE_READ and Complete Stage 1
 
+> **Superseded on 2026-08-17:** The current lifecycle and identity contract is
+> [DualPath ABORT Notification and Watchdog Removal](../../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Elapsed-time failure, ABORT tombstones, and two-field request keys below are
+> historical only.
+
 - Series position: 7 of 7
 - Spec status: `PLANNED`
 - Depends on: PR-06

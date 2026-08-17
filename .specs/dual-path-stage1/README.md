@@ -1,5 +1,10 @@
 # DualPathConnector Stage 1 Delivery
 
+> **Superseded on 2026-08-17:** The current lifecycle and identity contract is
+> [DualPath ABORT Notification and Watchdog Removal](../../docs/superpowers/specs/2026-08-16-dual-path-abort-notification-and-watchdog-removal.md).
+> Elapsed-time failure, ABORT tombstones, and two-field request keys below are
+> historical only.
+
 This directory is the delivery control center for DualPathConnector Stage 1.
 It tracks the ordered pull-request series, the contract of each PR, and the
 evidence required to advance a PR. It does not contain implementation code or

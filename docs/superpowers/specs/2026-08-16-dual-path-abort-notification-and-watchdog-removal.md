@@ -1,7 +1,6 @@
 # DualPath ABORT Notification and Watchdog Removal
 
-Status: accepted; watchdog removal implemented; admission-identity revision
-approved for implementation
+Status: accepted and implemented
 
 Date: 2026-08-16
 
