@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_block_pool,
+    make_empty_scheduler_output,
     make_worker_metadata,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_de_reverse_send_proof import (
@@ -154,6 +156,30 @@ def test_attempt_n_plus_1_created_on_resume_allocation(pe_scheduler_factory):
     second_decision = coordinator.submit.call_args_list[1].args[1]
     assert second_decision.result.reverse_attempt_id == 1
     assert second_decision.reverse_plan == new_reverse_plan
+
+
+def test_failed_old_delivery_after_i7_replacement_invalidates_current_attempt_blocks(pe_scheduler_factory):
+    pool = make_block_pool()
+    scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
+    attempt_zero_future: Future[None] = Future()
+    coordinator.submit.return_value = attempt_zero_future
+    request = _admit_de_read(scheduler)
+    attempt_zero_record = scheduler._prefill_delivery_records[request.request_id]
+    assert attempt_zero_record.invalid_block_ids == (71, 72)
+
+    assert _resume(scheduler, request, 32, _RESUME_BLOCKS) == (16, True)
+    current_plan = scheduler._prefill_reverse_plans[request.request_id]
+    assert current_plan.reverse_attempt_id == 1
+    assert current_plan.destination_block_ids == (tuple(_RESUME_BLOCKS),)
+
+    attempt_zero_future.set_exception(RuntimeError("attempt-0 delivery exhausted"))
+    metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
+
+    assert len(metadata.control_failures) == 1
+    failure = metadata.control_failures[0]
+    assert failure.request_id == request.request_id
+    assert failure.invalid_block_ids == (82,)
+    assert set(failure.invalid_block_ids).isdisjoint(attempt_zero_record.invalid_block_ids)
 
 
 def test_fresh_tracker_and_latch_for_new_attempt_old_plan_never_resubmitted():

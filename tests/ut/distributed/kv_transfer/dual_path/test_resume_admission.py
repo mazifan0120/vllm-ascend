@@ -72,6 +72,17 @@ def test_frozen_path_kind_reused_policy_never_rerun(pe_scheduler_factory):
     assert scheduler._prefill_path_results[request.request_id].path is PathKind.DE_READ
 
 
+def test_same_request_object_can_resume_after_delivery(pe_scheduler_factory):
+    pool = make_block_pool()
+    policy = _ExplodingOnRerunPolicy(PathKind.DE_READ)
+    scheduler, _ = pe_scheduler_factory(policy=policy, pool=pool)
+    request = _admit_de_read(scheduler)
+
+    assert scheduler.get_num_new_matched_tokens(request, 24) == (_K_DE - 24, True)
+    assert scheduler._prefill_path_results[request.request_id].path is PathKind.DE_READ
+    assert policy.calls == 1
+
+
 def test_de_read_resume_token_matrix(pe_scheduler_factory):
     cases = [
         (8, (24, True)),

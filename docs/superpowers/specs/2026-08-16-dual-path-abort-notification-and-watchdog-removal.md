@@ -83,6 +83,38 @@ If PE cannot recover the request key or Decode control endpoint from corrupt
 bootstrap metadata, it cannot address an ABORT. That case is one of the
 accepted indefinite-wait risks below.
 
+### Admission-scoped Decision delivery failure
+
+Each submitted Decision Future is owned by the stable Prefill `Request` object
+that produced it. Ownership comparison uses object identity, not only the local
+request ID, `DualPathRequestKey`, or a newly parsed `DualPathDecisionMetadata`
+instance. The exact same `Request` may legitimately reparse its envelope during
+an allocation retry or preemption resume and continues with the frozen path. A
+different `Request` reusing the local ID is rejected while either the active
+owner or an unresolved delivery record still belongs to the earlier admission.
+
+Every terminally failed Decision delivery sends `DELIVERY_EXHAUSTED` ABORT for
+the delivery record's exact key and endpoint. Local Prefill failure staging is
+stricter: it occurs only while that record's `Request` remains the active
+admission owner. A failure reconciled after release or against another admission
+sends ABORT but stages no local failure and invalidates no blocks in the reused
+request lifecycle.
+
+For a live `DE_READ` admission, reconciliation consumes the terminal Future
+exactly once and retains its immutable delivery record until the staged control
+failure is copied into outgoing connector metadata. Request cleanup may instead
+drop the staged failure and retire the record. This short-lived record is an
+admission/publication fence: it has no expiry, timer, receiver state, or
+late-ABORT semantics and is not an ABORT tombstone.
+
+If I7 has already installed a replacement Reverse attempt when an older
+Decision Future fails, local invalidation follows the current Reverse plan for
+the same request key. Its destination slice is recomputed from
+`floor(token_start / block_size)` through `ceil(token_end / block_size)`. The
+older delivery record's block snapshot is only a fallback when no matching
+current plan exists; a released or different-owner delivery never invokes local
+invalidation.
+
 ### Decode receive semantics
 
 Each Decode metadata build preserves this order:
