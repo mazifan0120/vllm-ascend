@@ -27,7 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 
 _KEY = DualPathRequestKey("decode-instance-1", "decode-request-1", 0)
 _ATTEMPT_TOKENS = 16
-_COMPLETION_JOB_ID = 41
+_COMPLETION_ID = 41
 
 
 def _attempt_key(attempt_id: int, request_key: DualPathRequestKey = _KEY):
@@ -44,7 +44,7 @@ def _make_reverse_binding(
     prefill_request_id: str = "prefill-request-1",
     token_start: int = _ATTEMPT_TOKENS,
     token_end: int = 64,
-    reverse_receive_completion_id: int = _COMPLETION_JOB_ID,
+    reverse_receive_completion_id: int = _COMPLETION_ID,
 ):
     return metadata_module.ReverseReceiveBinding(
         request_key=_KEY,

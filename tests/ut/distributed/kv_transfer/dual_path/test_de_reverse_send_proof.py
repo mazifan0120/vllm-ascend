@@ -126,26 +126,26 @@ def _activate_two_reverse_attempts(scheduler, decode_task04_seams):
     request = _admit_decode_request(scheduler)
     first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
     second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
-    first_job_id = first_metadata.reverse_plans[0].reverse_send_completion_id
-    second_job_id = second_metadata.reverse_plans[0].reverse_send_completion_id
-    assert first_job_id is not None
-    assert second_job_id is not None
-    return request, first_job_id, second_job_id
+    first_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
+    second_completion_id = second_metadata.reverse_plans[0].reverse_send_completion_id
+    assert first_completion_id is not None
+    assert second_completion_id is not None
+    return request, first_completion_id, second_completion_id
 
 
-def _close_send_job(scheduler, completion_id: int) -> KVConnectorOutput:
+def _close_send_completion(scheduler, completion_id: int) -> KVConnectorOutput:
     output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_id: 1}))
     scheduler.update_connector_output(output)
     return output
 
 
-def _fail_send_job(scheduler, completion_id: int) -> KVConnectorOutput:
+def _fail_send_completion(scheduler, completion_id: int) -> KVConnectorOutput:
     output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failure_reports={completion_id: 1}))
     scheduler.update_connector_output(output)
     return output
 
 
-def test_reverse_send_job_allocated_at_attempt_creation_and_carried_on_plan(
+def test_reverse_send_completion_allocated_at_attempt_creation_and_carried_on_plan(
     decode_scheduler_factory, decode_task04_seams
 ):
     scheduler = decode_scheduler_factory()
@@ -183,7 +183,7 @@ def test_partial_tp_completion_never_sender_complete(decode_scheduler_factory, d
     assert not (send_completion.closed and not send_completion.failed)
 
 
-def test_terminal_ack_failure_marks_job_failed_never_success(decode_scheduler_factory, decode_task04_seams):
+def test_terminal_ack_failure_marks_completion_failed_never_success(decode_scheduler_factory, decode_task04_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
@@ -211,7 +211,7 @@ def test_terminal_ack_failure_marks_job_failed_never_success(decode_scheduler_fa
     assert attempt_key not in scheduler._reverse_send_completion_ids
 
 
-def test_abort_before_final_layer_leaves_job_incomplete(decode_scheduler_factory, decode_task04_seams):
+def test_abort_before_final_layer_leaves_completion_incomplete(decode_scheduler_factory, decode_task04_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
@@ -231,7 +231,7 @@ def test_abort_before_final_layer_leaves_job_incomplete(decode_scheduler_factory
     assert not (send_completion.closed and not send_completion.failed)
 
 
-def test_job_close_marks_the_send_job_closed_and_not_failed(decode_scheduler_factory, decode_task04_seams):
+def test_close_marks_the_send_completion_closed_and_not_failed(decode_scheduler_factory, decode_task04_seams):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
@@ -294,22 +294,22 @@ def test_old_reverse_send_attempt_closes_without_releasing_open_latest_attempt(
     decode_scheduler_factory, decode_task04_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_job_id, latest_job_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
     assert scheduler._delay_free_for_connector(request) is True
 
-    old_output = _close_send_job(scheduler, old_job_id)
+    old_output = _close_send_completion(scheduler, old_completion_id)
 
     assert old_output.finished_sending is None
     assert old_attempt not in scheduler._reverse_send_completion_ids
-    assert scheduler._completion_tracker.get(old_job_id) is None
-    assert scheduler._reverse_send_completion_ids[latest_attempt] == latest_job_id
+    assert scheduler._completion_tracker.get(old_completion_id) is None
+    assert scheduler._reverse_send_completion_ids[latest_attempt] == latest_completion_id
     assert request.request_id in scheduler._pending_finished_sending
     assert scheduler._latest_reverse_attempt_ids[request.request_id] == 1
 
-    latest_output = _close_send_job(scheduler, latest_job_id)
+    latest_output = _close_send_completion(scheduler, latest_completion_id)
     assert latest_output.finished_sending == {request.request_id}
 
 
@@ -317,22 +317,22 @@ def test_latest_reverse_send_attempt_closes_without_releasing_open_old_attempt(
     decode_scheduler_factory, decode_task04_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_job_id, latest_job_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
     assert scheduler._delay_free_for_connector(request) is True
 
-    latest_output = _close_send_job(scheduler, latest_job_id)
+    latest_output = _close_send_completion(scheduler, latest_completion_id)
 
     assert latest_output.finished_sending is None
     assert latest_attempt not in scheduler._reverse_send_completion_ids
-    assert scheduler._completion_tracker.get(latest_job_id) is None
-    assert scheduler._reverse_send_completion_ids[old_attempt] == old_job_id
+    assert scheduler._completion_tracker.get(latest_completion_id) is None
+    assert scheduler._reverse_send_completion_ids[old_attempt] == old_completion_id
     assert request.request_id in scheduler._pending_finished_sending
     assert scheduler._latest_reverse_attempt_ids[request.request_id] == 1
 
-    old_output = _close_send_job(scheduler, old_job_id)
+    old_output = _close_send_completion(scheduler, old_completion_id)
     assert old_output.finished_sending == {request.request_id}
 
 
@@ -343,7 +343,7 @@ def test_request_finished_retains_delayed_free_until_last_exact_send_attempt_fai
     first_failure,
 ):
     scheduler = decode_scheduler_factory()
-    request, old_job_id, latest_job_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
@@ -351,26 +351,26 @@ def test_request_finished_retains_delayed_free_until_last_exact_send_attempt_fai
 
     assert scheduler.request_finished(request, []) == (True, None)
     assert request.request_id not in scheduler._decode_decision_states
-    first_job_id, first_attempt, final_job_id, final_attempt = (
-        (old_job_id, old_attempt, latest_job_id, latest_attempt)
+    first_completion_id, first_attempt, final_completion_id, final_attempt = (
+        (old_completion_id, old_attempt, latest_completion_id, latest_attempt)
         if first_failure == "older"
-        else (latest_job_id, latest_attempt, old_job_id, old_attempt)
+        else (latest_completion_id, latest_attempt, old_completion_id, old_attempt)
     )
 
-    first_output = _fail_send_job(scheduler, first_job_id)
+    first_output = _fail_send_completion(scheduler, first_completion_id)
 
     assert first_output.finished_sending is None
     assert first_attempt not in scheduler._reverse_send_completion_ids
-    assert scheduler._completion_tracker.get(first_job_id) is None
-    assert scheduler._reverse_send_completion_ids[final_attempt] == final_job_id
-    assert scheduler._completion_tracker.get(final_job_id) is not None
+    assert scheduler._completion_tracker.get(first_completion_id) is None
+    assert scheduler._reverse_send_completion_ids[final_attempt] == final_completion_id
+    assert scheduler._completion_tracker.get(final_completion_id) is not None
     assert request.request_id in scheduler._pending_finished_sending
 
-    final_output = _fail_send_job(scheduler, final_job_id)
+    final_output = _fail_send_completion(scheduler, final_completion_id)
 
     assert final_output.finished_sending == {request.request_id}
     assert final_attempt not in scheduler._reverse_send_completion_ids
-    assert scheduler._completion_tracker.get(final_job_id) is None
+    assert scheduler._completion_tracker.get(final_completion_id) is None
     assert request.request_id not in scheduler._pending_finished_sending
 
 
@@ -378,20 +378,20 @@ def test_failed_reverse_send_releases_delayed_free_only_after_every_attempt_clos
     decode_scheduler_factory, decode_task04_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_job_id, latest_job_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
     assert scheduler._delay_free_for_connector(request) is True
 
-    old_output = _fail_send_job(scheduler, old_job_id)
+    old_output = _fail_send_completion(scheduler, old_completion_id)
 
     assert old_output.finished_sending is None
     assert old_attempt not in scheduler._reverse_send_completion_ids
-    assert scheduler._reverse_send_completion_ids[latest_attempt] == latest_job_id
+    assert scheduler._reverse_send_completion_ids[latest_attempt] == latest_completion_id
     assert request.request_id in scheduler._pending_finished_sending
 
-    latest_output = _fail_send_job(scheduler, latest_job_id)
+    latest_output = _fail_send_completion(scheduler, latest_completion_id)
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     assert latest_output.finished_sending == {request.request_id}
@@ -401,24 +401,24 @@ def test_failed_reverse_send_releases_delayed_free_only_after_every_attempt_clos
     assert scheduler._decode_control_failures == {}
 
 
-def test_finish_delays_when_latest_send_job_closed_but_older_attempt_is_open(
+def test_finish_delays_when_latest_send_completion_closed_but_older_attempt_is_open(
     decode_scheduler_factory, decode_task04_seams
 ):
     scheduler = decode_scheduler_factory()
-    request, old_job_id, latest_job_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
+    request, old_completion_id, latest_completion_id = _activate_two_reverse_attempts(scheduler, decode_task04_seams)
     state = scheduler._decode_decision_states[request.request_id]
     old_attempt = _attempt_key(0, state.request_key)
     latest_attempt = _attempt_key(1, state.request_key)
 
-    latest_output = _close_send_job(scheduler, latest_job_id)
+    latest_output = _close_send_completion(scheduler, latest_completion_id)
     assert latest_output.finished_sending is None
     assert latest_attempt not in scheduler._reverse_send_completion_ids
-    assert scheduler._reverse_send_completion_ids[old_attempt] == old_job_id
+    assert scheduler._reverse_send_completion_ids[old_attempt] == old_completion_id
 
     assert scheduler._delay_free_for_connector(request) is True
     assert request.request_id in scheduler._pending_finished_sending
 
-    old_output = _close_send_job(scheduler, old_job_id)
+    old_output = _close_send_completion(scheduler, old_completion_id)
     assert old_output.finished_sending == {request.request_id}
 
 
@@ -426,18 +426,18 @@ def test_active_request_retains_closed_attempt_epoch_for_later_refresh(decode_sc
     scheduler = decode_scheduler_factory()
     request = _admit_decode_request(scheduler)
     first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
-    first_job_id = first_metadata.reverse_plans[0].reverse_send_completion_id
-    assert first_job_id is not None
+    first_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
+    assert first_completion_id is not None
     assert request.request_id not in scheduler._pending_finished_sending
 
-    first_output = _close_send_job(scheduler, first_job_id)
+    first_output = _close_send_completion(scheduler, first_completion_id)
 
     assert first_output.finished_sending is None
     assert scheduler._latest_reverse_attempt_ids[request.request_id] == 0
 
     second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
     assert len(second_metadata.reverse_plans) == 1
-    second_job_id = second_metadata.reverse_plans[0].reverse_send_completion_id
-    assert second_job_id is not None
-    assert second_job_id != first_job_id
+    second_completion_id = second_metadata.reverse_plans[0].reverse_send_completion_id
+    assert second_completion_id is not None
+    assert second_completion_id != first_completion_id
     assert scheduler._latest_reverse_attempt_ids[request.request_id] == 1

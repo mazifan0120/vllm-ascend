@@ -16,14 +16,14 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.completion_tracker import (
+    CompletionKind,
+    CompletionRecord,
+    TransferCompletionTracker,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import (
     KVPoolSchedulerAdapter,
-)
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.ledgers import (
-    CompletionKind,
-    TransferCompletionTracker,
-    CompletionRecord,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     BlockIdGroups,
@@ -805,7 +805,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         if retained_reverse_plan is None:
             attempt_key = ReverseAttemptKey(result.request_key, result.reverse_attempt_id)
-            completion_job = self._completion_tracker.open_completion(
+            completion = self._completion_tracker.open_completion(
                 CompletionKind.REVERSE_RECEIVE,
                 expected_worker_count=self._expected_worker_count,
                 reverse_attempt_key=attempt_key,
@@ -819,7 +819,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_end=token_split,
                 reverse_attempt_id=result.reverse_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_receive_completion_id=completion_job.completion_id,
+                reverse_receive_completion_id=completion.completion_id,
             )
             parallel_config = self.vllm_config.parallel_config
             reverse_plan = ReversePlan(
@@ -854,7 +854,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # table change. The new attempt re-parks the request under the I4
             # gate.
             attempt_key = ReverseAttemptKey(result.request_key, replacement_attempt_id)
-            completion_job = self._completion_tracker.open_completion(
+            completion = self._completion_tracker.open_completion(
                 CompletionKind.REVERSE_RECEIVE,
                 expected_worker_count=self._expected_worker_count,
                 reverse_attempt_key=attempt_key,
@@ -868,7 +868,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_end=token_split,
                 reverse_attempt_id=replacement_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_receive_completion_id=completion_job.completion_id,
+                reverse_receive_completion_id=completion.completion_id,
             )
             parallel_config = self.vllm_config.parallel_config
             reverse_plan = ReversePlan(
@@ -1797,8 +1797,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             assert isinstance(worker_metadata, DualPathWorkerMetadata), (
                 f"DualPath scheduler requires DualPathWorkerMetadata, got {type(worker_metadata).__name__}"
             )
-            finished_sending_injection, finished_recving_injection = (
-                self._aggregate_worker_completion_facts(worker_metadata)
+            finished_sending_injection, finished_recving_injection = self._aggregate_worker_completion_facts(
+                worker_metadata
             )
         if finished_sending_injection:
             if connector_output.finished_sending is None:

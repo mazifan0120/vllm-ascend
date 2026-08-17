@@ -123,10 +123,9 @@ def test_reverse_failure_records_local_terminal_invalidates_pe_destinations_and_
     assert decode_invalid == {30, 31, 40, 41}
     assert decode_late == (set(), set())
     assert prefill_finished == (set(), set())
-    assert (
-        prefill_worker.build_connector_worker_meta().failure_reports
-        == {reverse_binding.reverse_receive_completion_id: 1}
-    )
+    assert prefill_worker.build_connector_worker_meta().failure_reports == {
+        reverse_binding.reverse_receive_completion_id: 1
+    }
     assert prefill_worker.get_block_ids_with_load_errors() == {71, 80, 81}
 
 
@@ -180,10 +179,9 @@ def test_failure_provenance_block_math_matches_spec_example() -> None:
     prefill_worker.start_load_kv(reverse_metadata)
     prefill_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = {reverse_binding.wire_request_id}
     assert prefill_worker.get_finished(set(), reverse_metadata) == (set(), set())
-    assert (
-        prefill_worker.build_connector_worker_meta().failure_reports
-        == {reverse_binding.reverse_receive_completion_id: 1}
-    )
+    assert prefill_worker.build_connector_worker_meta().failure_reports == {
+        reverse_binding.reverse_receive_completion_id: 1
+    }
 
     assert store_worker.get_block_ids_with_load_errors() == {20, 21}
     assert prefill_worker.get_block_ids_with_load_errors() == {71, 80, 81}

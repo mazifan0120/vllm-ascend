@@ -103,7 +103,7 @@ def test_de_read_vacuous_reverse_returns_zero_false_and_skips_reverse_machinery(
     pool = make_block_pool()
     scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     request = _admit_de_read(scheduler)
-    job_records_before = len(scheduler._completion_tracker._records)
+    completion_records_before = len(scheduler._completion_tracker._records)
 
     request.num_preemptions += 1
     assert scheduler.get_num_new_matched_tokens(request, 40) == (0, False)
@@ -111,7 +111,7 @@ def test_de_read_vacuous_reverse_returns_zero_false_and_skips_reverse_machinery(
     # A vacuous Reverse bypasses the Reverse machinery entirely: no new
     # completion and no waiting-attempt entry (the request goes straight
     # back to RUNNING, never parks).
-    assert len(scheduler._completion_tracker._records) == job_records_before
+    assert len(scheduler._completion_tracker._records) == completion_records_before
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids
 
     # The bypass survives the post-resume allocation: no waiting entry is
@@ -119,7 +119,7 @@ def test_de_read_vacuous_reverse_returns_zero_false_and_skips_reverse_machinery(
     # delivered, and only the local Forward source is rebuilt.
     scheduler.update_state_after_alloc(request, _blocks(([80, 81, 82, 83],)), 0)
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids
-    assert len(scheduler._completion_tracker._records) == job_records_before
+    assert len(scheduler._completion_tracker._records) == completion_records_before
     assert scheduler._prefill_forward_plans[request.request_id].source_block_ids == ((80, 81, 82, 83),)
     assert coordinator.submit.call_count == 1
     # The Forward source is never pinned, so its blocks keep no extra reference.
@@ -137,12 +137,12 @@ def test_pe_read_resume_returns_zero_false_rebuilds_local_source_only(pe_schedul
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
     plan_before = scheduler._prefill_forward_plans[request.request_id]
-    job_records_before = len(scheduler._completion_tracker._records)
+    completion_records_before = len(scheduler._completion_tracker._records)
 
     assert scheduler.get_num_new_matched_tokens(request, 8) == (0, False)
     # No plan/completion mutation and no re-delivery on the resume admission itself.
     assert scheduler._prefill_forward_plans[request.request_id] is plan_before
-    assert len(scheduler._completion_tracker._records) == job_records_before
+    assert len(scheduler._completion_tracker._records) == completion_records_before
     assert scheduler._reqs_need_send_layerwise[request.request_id].local_block_ids == [[10, 11, 12]]
 
 

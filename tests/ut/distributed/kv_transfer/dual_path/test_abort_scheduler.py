@@ -49,7 +49,7 @@ def test_pending_decode_abort_stages_peer_abort_failure(decode_scheduler_factory
     decode_task04_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
 
 
-def test_same_drain_commits_decision_then_aborts_without_touching_job_ledger(
+def test_same_drain_commits_decision_then_aborts_without_touching_completion_tracker(
     decode_scheduler_factory,
     decode_task04_seams,
 ) -> None:

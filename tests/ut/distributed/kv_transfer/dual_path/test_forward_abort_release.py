@@ -64,5 +64,5 @@ class TestForwardRetainsNothing:
 
         # A preempting pass carries no fence completion and pins nothing, so the
         # worker has no barrier to drain before the next forward pass.
-        assert not hasattr(metadata, "barrier_jobs")
+        assert not hasattr(metadata, "barrier_completions")
         _assert_nothing_retained(scheduler, pool)

@@ -246,14 +246,14 @@ def test_de_validation_rejects_admission_drift(decode_scheduler_factory, decode_
     assert second_metadata.control_failures[0].reason is DualPathControlFailureReason.ACTIVATION_FAILED
 
 
-def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_job(
+def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_completion(
     decode_scheduler_factory, decode_task04_seams
 ):
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
     assert len(first_metadata.forward_receive_bindings) == 1
-    first_job_id = first_metadata.reverse_plans[0].reverse_send_completion_id
+    first_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
 
     second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
 
@@ -264,7 +264,7 @@ def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_job(
     refreshed_plan = second_metadata.reverse_plans[0]
     assert refreshed_plan.reverse_attempt_id == 1
     assert refreshed_plan.reverse_send_completion_id is not None
-    assert refreshed_plan.reverse_send_completion_id != first_job_id
+    assert refreshed_plan.reverse_send_completion_id != first_completion_id
     attempt_one = ReverseAttemptKey(
         DualPathRequestKey(
             first_metadata.forward_receive_bindings[0].request_key.decode_engine_instance_id,

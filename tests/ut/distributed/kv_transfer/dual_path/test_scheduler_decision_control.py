@@ -1818,8 +1818,8 @@ class TestCleanupAndShutdown:
         assert scheduler.get_num_new_matched_tokens(old_request, 0) == (32, True)
         _bind_prefill(scheduler, old_request, local_block_ids=(10, 11))
         old_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
-        old_job_id = old_binding.reverse_receive_completion_id
-        assert scheduler._completion_tracker.tally_reports(old_job_id, scheduler._expected_worker_count) is True
+        old_completion_id = old_binding.reverse_receive_completion_id
+        assert scheduler._completion_tracker.tally_reports(old_completion_id, scheduler._expected_worker_count) is True
 
         # Arrange the scheduler race: the old admission's key-scoped artifacts
         # remain while request-ID-keyed active state has been rebound to B.
@@ -1842,7 +1842,7 @@ class TestCleanupAndShutdown:
         live_result = scheduler._prefill_path_results[request_id]
         live_reverse_plan = scheduler._prefill_reverse_plans[request_id]
         live_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
-        live_job_id = live_binding.reverse_receive_completion_id
+        live_completion_id = live_binding.reverse_receive_completion_id
         scheduler._prefill_deferred_deliveries.update({old_key, live_key})
         scheduler._prefill_invalid_request_keys.update({old_key, live_key})
         assert scheduler._path_decider is not None
@@ -1866,8 +1866,8 @@ class TestCleanupAndShutdown:
         assert scheduler._waiting_reverse_attempt_ids == {
             request_id: ReverseAttemptKey(live_key, 0),
         }
-        assert scheduler._completion_tracker.get(old_job_id) is None
-        assert scheduler._completion_tracker.get(live_job_id) is not None
+        assert scheduler._completion_tracker.get(old_completion_id) is None
+        assert scheduler._completion_tracker.get(live_completion_id) is not None
         assert scheduler._prefill_deferred_deliveries == {live_key}
         assert scheduler._prefill_invalid_request_keys == {live_key}
         assert set(scheduler._path_decider._decision_records) == {live_key}

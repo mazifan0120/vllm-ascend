@@ -38,7 +38,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 
 
 class TestDecodeEngineProgress:
-    def test_de_final_request_delayed_free_until_reverse_send_job_closes(
+    def test_de_final_request_delayed_free_until_reverse_send_completion_closes(
         self, decode_scheduler_factory, decode_task04_seams
     ):
         scheduler = decode_scheduler_factory()
@@ -78,8 +78,8 @@ class TestDecodeEngineProgress:
         assert request.request_id not in scheduler._latest_reverse_attempt_ids
 
 
-class TestBoundedCompletionJobs:
-    def test_failed_reverse_completion_job_surfaces_control_failure(self, pe_scheduler_factory):
+class TestBoundedCompletions:
+    def test_failed_reverse_completion_surfaces_control_failure(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
         request = _admit_de_read_request(scheduler)
@@ -185,8 +185,8 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         assert len(metadata.control_failures) == 1
 
 
-class TestJobLedgerRetirementWiring:
-    def test_reverse_completion_close_retires_job_record(self, pe_scheduler_factory):
+class TestCompletionTrackerRetirementWiring:
+    def test_reverse_completion_close_retires_tracker_record(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
         request = _admit_de_read_request(scheduler)
@@ -200,7 +200,7 @@ class TestJobLedgerRetirementWiring:
         assert output.finished_recving == {request.request_id}
         assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
 
-    def test_failed_job_record_is_retained(self, pe_scheduler_factory):
+    def test_failed_completion_record_is_retained(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
         request = _admit_de_read_request(scheduler)
@@ -221,8 +221,10 @@ def _deliver_decision_to(receiver, attempt_id: int) -> None:
     _deliver_frames(receiver, channel.encode_path_decision(_de_read_decision(attempt_id)))
 
 
-class TestReverseSendJobRetirement:
-    def test_delayed_free_reverse_send_close_retires_job_record(self, decode_scheduler_factory, decode_task04_seams):
+class TestReverseSendCompletionRetirement:
+    def test_delayed_free_reverse_send_close_retires_tracker_record(
+        self, decode_scheduler_factory, decode_task04_seams
+    ):
         from tests.ut.distributed.kv_transfer.dual_path.conftest import (
             DECODE_TEST_CONTROL_ENDPOINT,
         )
