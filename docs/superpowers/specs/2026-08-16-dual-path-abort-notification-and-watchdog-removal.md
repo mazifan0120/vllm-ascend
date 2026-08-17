@@ -1,6 +1,7 @@
 # DualPath ABORT Notification and Watchdog Removal
 
-Status: accepted and implemented
+Status: accepted; watchdog removal implemented; admission-identity revision
+approved for implementation
 
 Date: 2026-08-16
 
@@ -68,6 +69,37 @@ for that key unknown. Unknown Decision remains `UNKNOWN_REQUEST`.
 This idempotency rule belongs only to the receiver. The PE sender remains
 strict: an `UNKNOWN_REQUEST` reply is a terminal rejection, not ABORT success.
 
+### Admission identity
+
+`DualPathRequestKey` is the single identity for one Decode admission:
+
+```text
+(decode_engine_instance_id, decode_request_id, admission_id)
+```
+
+The Decode `PathDecisionCoordinator` allocates `admission_id` from a
+monotonically increasing integer counter. The counter is scoped to one Decode
+engine incarnation, so the incarnation plus the integer is globally sufficient
+for this protocol; no UUID, TTL, or tombstone is required. Decode mints the key
+exactly once when it registers the pending decision. Allocation retry and
+preemption resume reuse the same `Request` and its already registered key.
+
+Every Decision, ABORT, `ReversePlan`, `ReverseAttemptKey`,
+`REVERSE_COMPLETION` job, and `REVERSE_SEND` job already embeds the request key,
+so the admission component propagates through those paths without a second job
+identity or close epoch. `reverse_wire_id` also encodes `admission_id`; otherwise
+two attempt-zero Reverse transfers for reused client request IDs would still
+collide at the data-plane boundary.
+
+`DualPathRequestKey.from_dict` continues to require the exact key set. There is
+no mixed-schema compatibility layer: PE, DE, and their external ops log parser
+must be upgraded together. Existing log field order remains stable and the
+admission ID is appended as a new field so the full identity is observable.
+
+The coordinator's attempt watermark remains admission-local and unchanged. It
+orders preemption attempts within one admission; it is not a substitute for the
+admission identity.
+
 ### PE trigger semantics
 
 PE sends a request-terminal ABORT when any of these terminal facts occurs:
@@ -85,24 +117,27 @@ accepted indefinite-wait risks below.
 
 ### Admission-scoped Decision delivery failure
 
-Each submitted Decision Future is owned by the stable Prefill `Request` object
-that produced it. Ownership comparison uses object identity, not only the local
-request ID, `DualPathRequestKey`, or a newly parsed `DualPathDecisionMetadata`
-instance. The exact same `Request` may legitimately reparse its envelope during
-an allocation retry or preemption resume and continues with the frozen path. A
-different `Request` reusing the local ID is rejected while either the active
-owner or an unresolved delivery record still belongs to the earlier admission.
-A retained pre-submit invalid marker is installed atomically with the `Request`
-that encountered the failure. A successful Decision that has not yet been
-submitted installs no owner, so changed admission facts may still discard and
-re-decide that uncommitted Decision from a distinct replacement `Request`.
+Prefill delivery Futures, immutable delivery records, deferred replacements,
+and invalid markers are keyed by `DualPathRequestKey`, not the local request ID
+or Python `Request` object identity. An old in-flight delivery can therefore
+coexist with a later admission that reuses the local ID, while allocation retry
+and preemption within one admission continue to share the same key and frozen
+path. The earlier `Request is` owner map, owner field, and request-ID reuse
+crash fences are removed rather than layered under the new identity.
+
+The request-ID-keyed Prefill maps continue to represent only the one currently
+active local admission. Installing a second live admission under the same local
+ID before the first is released remains an upstream duplicate-injection bug and
+may retain one explicit tripwire. Once release removes the active admission,
+its unresolved delivery state remains independently addressable by its full
+request key.
 
 Every terminally failed Decision delivery sends `DELIVERY_EXHAUSTED` ABORT for
 the delivery record's exact key and endpoint. Local Prefill failure staging is
-stricter: it occurs only while that record's `Request` remains the active
-admission owner. A failure reconciled after release or against another admission
-sends ABORT but stages no local failure and invalidates no blocks in the reused
-request lifecycle.
+stricter: it occurs only while `_prefill_request_keys[request_id]` equals the
+record's request key. A failure reconciled after release or against another
+admission sends ABORT but stages no local failure and invalidates no blocks in
+the reused request lifecycle.
 
 For a live `DE_READ` admission, reconciliation consumes the terminal Future
 exactly once and retains its immutable delivery record until the staged control
@@ -116,8 +151,8 @@ Decision Future fails, local invalidation follows the current Reverse plan for
 the same request key. Its destination slice is recomputed from
 `floor(token_start / block_size)` through `ceil(token_end / block_size)`. The
 older delivery record's block snapshot is only a fallback when no matching
-current plan exists; a released or different-owner delivery never invokes local
-invalidation.
+current plan exists; a released or different-admission delivery never invokes
+local invalidation.
 
 ### Decode receive semantics
 
@@ -145,14 +180,21 @@ for a formerly known key. Failure to construct valid control-failure metadata
 keeps the terminal state and logs the local error; it does not invent a timeout
 outcome.
 
+Because queues may outlive a released admission, Decode consumers compare the
+complete key before applying a message to request-ID-keyed active state. A
+queued ABORT whose key differs from the current state's key is a no-op. A queued
+Decision with that mismatch is also discarded before validation, rather than
+falling through activation failure and terminating the newer admission. A
+genuine malformed Decision for the current key remains fail-closed.
+
 ## Direct failure staging
 
 Worker-reported failed Reverse-completion and Reverse-send jobs with an exact
-current owner are direct failure facts. Scheduler `update_connector_output`
+current admission key are direct failure facts. Scheduler `update_connector_output`
 records them in the role-local staging buffer:
 
 - Prefill stages `REVERSE_JOB_FAILED` in `_prefill_control_failures` and marks
-  the request invalid.
+  the admission key invalid.
 - Decode stages `REVERSE_JOB_FAILED` in `_decode_control_failures` and marks
   the decision state `ACTIVATION_FAILED`.
 
@@ -186,11 +228,28 @@ blocks, close jobs, advance epochs, or synthesize completion. Recovery requires
 external process supervision, cancellation that can deliver ABORT, or a future
 protocol carrying direct failure/quiescence evidence.
 
+## Known remaining Forward wire-identity limitation
+
+The inherited Forward data path still derives
+`ForwardReceiveBinding.wire_request_id` from the external client request ID. It
+does not carry the Decode incarnation or `admission_id`. This revision does not
+change the parent Mooncake sender contract. Consequently, reusing a client
+request ID while an older admission still has an in-flight Forward chunk or a
+Worker terminal tombstone remains unsafe: an old chunk can target the new
+binding, or an old tombstone can suppress its installation.
+
+Admission identity therefore closes the control-channel and Reverse-job
+collisions in this revision, but it does not claim end-to-end same-ID reuse
+safety across the inherited Forward wire path. Until that parent interface can
+accept a caller-supplied wire ID, operations must avoid such reuse during the
+Forward in-flight/tombstone window. Clearing pending Worker terminal state at
+binding installation would only mask part of the race and is not adopted.
+
 ## Preserved correctness contracts
 
 This change does not alter:
 
-- `reverse_attempt_id` and `ReverseAttemptKey` identity;
+- `reverse_attempt_id` ordering within one admission;
 - accepted-decision epoch monotonicity and stale-attempt rejection;
 - I4 current-attempt Reverse completion gating;
 - `JobLedger` all-worker aggregation, failure staging, and close/discard rules;
