@@ -46,7 +46,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 _REQUEST_ID = "decode-request-7"
-_REQUEST_KEY = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, _REQUEST_ID)
+_REQUEST_KEY = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, _REQUEST_ID, 0)
 
 
 def _admit_decode_request(scheduler, request_id: str = _REQUEST_ID) -> SimpleNamespace:

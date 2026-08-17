@@ -124,6 +124,7 @@ def _decision_payload(*, target_tokens: int, local_tokens: int, store_tokens: in
             "request_key": {
                 "decode_engine_instance_id": _DECODE_INSTANCE_ID,
                 "decode_request_id": "decode-request-7",
+                "admission_id": 0,
             },
             "target_tokens": target_tokens,
             "decode_local_tokens": local_tokens,
@@ -745,7 +746,7 @@ def test_pe_read_local_plan_failure_sends_no_decision(scheduler_factory):
 
 def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
     scheduler, _, _ = scheduler_factory(PathKind.DE_READ)
-    request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+    request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
     binding = ReverseReceiveBinding(
         request_key=request_key,
         wire_request_id="wire-request-7",

@@ -323,6 +323,7 @@ class PathDecisionCoordinator:
         self._closed = False
         self._decode_engine_instance_id: str | None = None
         self._decode_control_endpoint: DecodeControlEndpoint | None = None
+        self._next_admission_id = 0
         self._pending_keys: set[DualPathRequestKey] = set()
         self._accepted_decisions: dict[DualPathRequestKey, PathDecision] = {}
         self._closed_through_attempt_ids: dict[DualPathRequestKey, int] = {}
@@ -404,6 +405,18 @@ class PathDecisionCoordinator:
     def decode_control_endpoint(self) -> DecodeControlEndpoint:
         assert self._decode_control_endpoint is not None
         return self._decode_control_endpoint
+
+    def new_request_key(self, decode_request_id: str) -> DualPathRequestKey:
+        if self._role != "decode":
+            raise RuntimeError("only a Decode coordinator can mint admission keys")
+        with self._registry_lock:
+            admission_id = self._next_admission_id
+            self._next_admission_id += 1
+        return DualPathRequestKey(
+            decode_engine_instance_id=self.decode_engine_instance_id,
+            decode_request_id=decode_request_id,
+            admission_id=admission_id,
+        )
 
     def register_pending(self, key: DualPathRequestKey) -> None:
         # Unlike unregister, this also takes _lifecycle_lock so close() cannot

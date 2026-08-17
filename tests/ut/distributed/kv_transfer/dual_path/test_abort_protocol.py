@@ -45,8 +45,9 @@ def test_abort_notice_has_exact_reasons_and_round_trips() -> None:
     notice = _abort()
     payload = {
         "request_key": {
-            "decode_engine_instance_id": _KEY.decode_engine_instance_id,
-            "decode_request_id": _KEY.decode_request_id,
+                "decode_engine_instance_id": _KEY.decode_engine_instance_id,
+                "decode_request_id": _KEY.decode_request_id,
+                "admission_id": _KEY.admission_id,
         },
         "reason": "DELIVERY_EXHAUSTED",
     }
@@ -162,7 +163,7 @@ def test_never_registered_same_incarnation_abort_is_acked_without_notice() -> No
 def test_wrong_incarnation_abort_is_rejected() -> None:
     receiver = _make_receiver()
     receiver.register_pending(_KEY)
-    key = DualPathRequestKey("decode-engine:2:wrong-boot", _KEY.decode_request_id)
+    key = DualPathRequestKey("decode-engine:2:wrong-boot", _KEY.decode_request_id, _KEY.admission_id)
     notice = decision_model.PathAbortNotice(
         request_key=key,
         reason=decision_model.PathAbortReason.REQUEST_ABORTED,

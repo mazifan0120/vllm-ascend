@@ -31,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     ForwardReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
+    DualPathRequestKey,
     PathDecisionRequest,
     PathKind,
 )
@@ -370,6 +371,12 @@ def _constrain_external_seams():
         decode_coordinator = MagicMock(name="decode_coordinator")
         decode_coordinator.decode_engine_instance_id = "integration-engine:0:test-boot"
         decode_coordinator.decode_control_endpoint = DecodeControlEndpoint(host="127.0.0.1", port=24001)
+        admission_ids = iter(range(1_000_000))
+        decode_coordinator.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+            "integration-engine:0:test-boot",
+            request_id,
+            next(admission_ids),
+        )
         coordinator_cls.for_decode.return_value = decode_coordinator
         yield backend
 

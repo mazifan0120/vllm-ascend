@@ -24,6 +24,7 @@ def _key(request_id: str = "request-1") -> DualPathRequestKey:
     return DualPathRequestKey(
         decode_engine_instance_id="decode-engine-1",
         decode_request_id=request_id,
+        admission_id=0,
     )
 
 

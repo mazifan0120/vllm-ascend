@@ -42,6 +42,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import metadata as met
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.config import DualPathConfig  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import DualPathConnectorWorker  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (  # noqa: E402
+    DualPathRequestKey,
     PathDecisionRequest,
     PathKind,
 )
@@ -381,6 +382,12 @@ def decode_task04_seams():
         decode_coordinator = MagicMock(name="decode_coordinator")
         decode_coordinator.decode_engine_instance_id = DECODE_TEST_INSTANCE_ID
         decode_coordinator.decode_control_endpoint = DECODE_TEST_CONTROL_ENDPOINT
+        admission_ids = iter(range(1_000_000))
+        decode_coordinator.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+            DECODE_TEST_INSTANCE_ID,
+            request_id,
+            next(admission_ids),
+        )
         prefill_coordinator = MagicMock(name="prefill_coordinator")
         coordinator_cls.for_decode.return_value = decode_coordinator
         coordinator_cls.for_prefill.return_value = prefill_coordinator

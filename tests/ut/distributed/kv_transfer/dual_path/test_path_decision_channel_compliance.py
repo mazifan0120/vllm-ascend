@@ -68,14 +68,14 @@ def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None
     coordinator._role = "decode"
     initial_decision = PathDecision(
         result=PathDecisionResult(
-            request_key=DualPathRequestKey("decode-engine:0:boot", "request-initial"),
+            request_key=DualPathRequestKey("decode-engine:0:boot", "request-initial", 0),
             path=PathKind.PE_READ,
         ),
         reverse_plan=None,
     )
     late_decision = PathDecision(
         result=PathDecisionResult(
-            request_key=DualPathRequestKey("decode-engine:0:boot", "request-late"),
+            request_key=DualPathRequestKey("decode-engine:0:boot", "request-late", 0),
             path=PathKind.DE_READ,
             reverse_attempt_id=0,
             prefill_local_tokens=0,

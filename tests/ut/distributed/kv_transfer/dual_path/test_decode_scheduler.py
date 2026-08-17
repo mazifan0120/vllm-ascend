@@ -19,6 +19,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # 
     DecodeKVSnapshot,
     DualPathConnectorScheduler,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (  # noqa: E402
+    DualPathRequestKey,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
     DecodeControlEndpoint,
 )
@@ -114,6 +117,12 @@ class TestDecodeAdmission(unittest.TestCase):
         self.coordinator = MagicMock(name="decode_coordinator")
         self.coordinator.decode_engine_instance_id = "test_engine:0:test-boot"
         self.coordinator.decode_control_endpoint = DecodeControlEndpoint(host="127.0.0.1", port=7100)
+        admission_ids = iter(range(1_000_000))
+        self.coordinator.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+            "test_engine:0:test-boot",
+            request_id,
+            next(admission_ids),
+        )
         coordinator_cls.for_decode.return_value = self.coordinator
         coordinator_cls.for_prefill.return_value = MagicMock(name="prefill_coordinator")
         self._get_ip_patch.start()

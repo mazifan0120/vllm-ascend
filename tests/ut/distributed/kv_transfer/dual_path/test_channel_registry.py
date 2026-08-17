@@ -27,7 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     PathDecisionDeliveryError,
 )
 
-_KEY = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, "decode-request-9")
+_KEY = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, "decode-request-9", 0)
 _ENDPOINT = DecodeControlEndpoint(host="192.0.2.10", port=24009)
 
 

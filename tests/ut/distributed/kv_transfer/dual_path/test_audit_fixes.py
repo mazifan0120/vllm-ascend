@@ -65,7 +65,11 @@ class TestDecodeEngineProgress:
         delay_free_after, _ = scheduler.request_finished(request, [])
         assert delay_free_after is False
         attempt_key = ReverseAttemptKey(
-            DualPathRequestKey(scheduler._path_decision_coordinator.decode_engine_instance_id, request.request_id),
+            DualPathRequestKey(
+                scheduler._path_decision_coordinator.decode_engine_instance_id,
+                request.request_id,
+                0,
+            ),
             0,
         )
         assert attempt_key not in scheduler._reverse_send_job_ids
@@ -253,6 +257,7 @@ class TestReverseSendJobRetirement:
             DualPathRequestKey(
                 scheduler._path_decision_coordinator.decode_engine_instance_id,
                 request.request_id,
+                0,
             ),
             0,
         )

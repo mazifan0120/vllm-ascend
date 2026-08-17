@@ -54,6 +54,7 @@ def _request() -> PathDecisionRequest:
         request_key=DualPathRequestKey(
             decode_engine_instance_id="decode-engine-1:0:boot-1",
             decode_request_id="request-1",
+            admission_id=0,
         ),
         target_tokens=32,
         decode_local_tokens=8,
@@ -65,6 +66,7 @@ def _key_payload() -> JsonObject:
     return {
         "decode_engine_instance_id": "decode-engine-1:0:boot-1",
         "decode_request_id": "request-1",
+        "admission_id": 0,
     }
 
 
@@ -353,6 +355,29 @@ def test_decode_engine_instance_id_is_stable_within_one_coordinator() -> None:
         coordinator.close()
 
 
+def test_decode_coordinator_mints_monotonic_admission_keys() -> None:
+    coordinator = _coordinator(_free_control_endpoint())
+    try:
+        first = coordinator.new_request_key("decode-request-7")
+        second = coordinator.new_request_key("decode-request-7")
+
+        assert first.decode_engine_instance_id == second.decode_engine_instance_id
+        assert first.decode_request_id == second.decode_request_id == "decode-request-7"
+        assert (first.admission_id, second.admission_id) == (0, 1)
+        assert first != second
+    finally:
+        coordinator.close()
+
+
+def test_prefill_coordinator_cannot_mint_decode_admission_key() -> None:
+    coordinator = PathDecisionCoordinator.for_prefill()
+    try:
+        with pytest.raises(RuntimeError, match="Decode coordinator"):
+            coordinator.new_request_key("decode-request-7")
+    finally:
+        coordinator.close()
+
+
 def test_injected_boot_id_produces_deterministic_instance_id() -> None:
     coordinator = _coordinator(_free_control_endpoint(), boot_id="known-boot")
     try:
@@ -577,7 +602,7 @@ def test_de_read_requires_serialized_reverse_plan() -> None:
         ),
         reverse_plan=None,
     )
-    other_key = DualPathRequestKey(key.decode_engine_instance_id, "request-2")
+    other_key = DualPathRequestKey(key.decode_engine_instance_id, "request-2", 0)
     mismatched_plan = PathDecision(
         result=PathDecisionResult(
             request_key=key,
@@ -613,6 +638,7 @@ def test_wrong_incarnation_key_gets_no_ack() -> None:
     wrong = DualPathRequestKey(
         decode_engine_instance_id="decode-engine-1:0:other-boot",
         decode_request_id=pending.decode_request_id,
+        admission_id=pending.admission_id,
     )
     try:
         receiver.register_pending(pending)
@@ -628,6 +654,7 @@ def test_registered_wrong_incarnation_key_gets_no_ack() -> None:
     wrong = DualPathRequestKey(
         decode_engine_instance_id="decode-engine-1:0:wrong",
         decode_request_id="request-1",
+        admission_id=0,
     )
     try:
         receiver.register_pending(wrong)
@@ -733,7 +760,7 @@ def test_concurrent_submissions_stay_isolated() -> None:
     endpoint = _free_control_endpoint()
     receiver = _coordinator(endpoint)
     sender = PathDecisionCoordinator.for_prefill()
-    keys = [DualPathRequestKey(receiver.decode_engine_instance_id, f"request-{index}") for index in range(8)]
+    keys = [DualPathRequestKey(receiver.decode_engine_instance_id, f"request-{index}", 0) for index in range(8)]
     decisions = [
         _decision(key, path=PathKind.PE_READ if index % 2 == 0 else PathKind.DE_READ) for index, key in enumerate(keys)
     ]

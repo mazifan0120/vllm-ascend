@@ -36,28 +36,33 @@ class PathKind(str, Enum):
 class DualPathRequestKey:
     decode_engine_instance_id: str
     decode_request_id: str
+    admission_id: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.decode_engine_instance_id, str) or not self.decode_engine_instance_id:
             raise PathDecisionValidationError("decode_engine_instance_id must be a non-empty string")
         if not isinstance(self.decode_request_id, str) or not self.decode_request_id:
             raise PathDecisionValidationError("decode_request_id must be a non-empty string")
+        if isinstance(self.admission_id, bool) or not isinstance(self.admission_id, int) or self.admission_id < 0:
+            raise PathDecisionValidationError("admission_id must be a non-negative integer")
 
     def to_dict(self) -> JsonObject:
         return {
             "decode_engine_instance_id": self.decode_engine_instance_id,
             "decode_request_id": self.decode_request_id,
+            "admission_id": self.admission_id,
         }
 
     @classmethod
     def from_dict(cls, payload: JsonValue) -> DualPathRequestKey:
         data = require_exact_payload(
             payload,
-            frozenset({"decode_engine_instance_id", "decode_request_id"}),
+            frozenset({"decode_engine_instance_id", "decode_request_id", "admission_id"}),
         )
         return cls(
             decode_engine_instance_id=data["decode_engine_instance_id"],
             decode_request_id=data["decode_request_id"],
+            admission_id=data["admission_id"],
         )
 
 
@@ -248,7 +253,8 @@ def reverse_wire_id(attempt_key: ReverseAttemptKey) -> str:
         raise PathDecisionValidationError("attempt_key must be a ReverseAttemptKey")
     return (
         f"ra:{attempt_key.request_key.decode_engine_instance_id}:"
-        f"{attempt_key.request_key.decode_request_id}:{attempt_key.reverse_attempt_id}"
+        f"{attempt_key.request_key.decode_request_id}:"
+        f"{attempt_key.request_key.admission_id}:{attempt_key.reverse_attempt_id}"
     )
 
 

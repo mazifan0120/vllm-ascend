@@ -336,27 +336,30 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         def log_abort_delivery(completed_future: Future[None]) -> None:
             if completed_future.cancelled():
                 logger.warning(
-                    "dual_path abort key=%s/%s reason=%s delivery_terminal=CANCELLED",
+                    "dual_path abort key=%s/%s reason=%s delivery_terminal=CANCELLED admission_id=%s",
                     request_key.decode_engine_instance_id,
                     request_key.decode_request_id,
                     reason.value,
+                    request_key.admission_id,
                 )
                 return
             error = completed_future.exception()
             if error is not None:
                 logger.error(
-                    "dual_path abort key=%s/%s reason=%s delivery_terminal=FAILED error=%s",
+                    "dual_path abort key=%s/%s reason=%s delivery_terminal=FAILED error=%s admission_id=%s",
                     request_key.decode_engine_instance_id,
                     request_key.decode_request_id,
                     reason.value,
                     error,
+                    request_key.admission_id,
                 )
                 return
             logger.info(
-                "dual_path abort key=%s/%s reason=%s delivery_terminal=SUCCEEDED",
+                "dual_path abort key=%s/%s reason=%s delivery_terminal=SUCCEEDED admission_id=%s",
                 request_key.decode_engine_instance_id,
                 request_key.decode_request_id,
                 reason.value,
+                request_key.admission_id,
             )
 
         delivery_future.add_done_callback(log_abort_delivery)
@@ -644,7 +647,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             assert_never(result.path)
         logger.info(
             "dual_path decision key=%s/%s decode_local_tokens=%s decode_store_tokens=%s prefill_local_tokens=%s "
-            "decode_ready_tokens=%s target_tokens=%s eligibility=%s selected_path=%s store=%s",
+            "decode_ready_tokens=%s target_tokens=%s eligibility=%s selected_path=%s store=%s admission_id=%s",
             request_key.decode_engine_instance_id,
             request_key.decode_request_id,
             decision_request.decode_local_tokens,
@@ -655,6 +658,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             eligibility,
             result.path.value,
             store_coverage,
+            request_key.admission_id,
         )
 
     def _prepare_forward_plan(
@@ -1135,24 +1139,28 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         def log_delivery_failure(completed_future: Future[None]) -> None:
             if completed_future.cancelled():
                 logger.warning(
-                    "dual_path delivery key=%s/%s delivery_terminal=CANCELLED",
+                    "dual_path delivery key=%s/%s delivery_terminal=CANCELLED admission_id=%s",
                     request_key.decode_engine_instance_id,
                     request_key.decode_request_id,
+                    request_key.admission_id,
                 )
                 return
             error = completed_future.exception()
             if error is not None:
                 logger.error(
-                    "dual_path delivery key=%s/%s delivery_terminal=FAILED failure_source=DELIVERY error=%s",
+                    "dual_path delivery key=%s/%s delivery_terminal=FAILED failure_source=DELIVERY error=%s "
+                    "admission_id=%s",
                     request_key.decode_engine_instance_id,
                     request_key.decode_request_id,
                     error,
+                    request_key.admission_id,
                 )
                 return
             logger.info(
-                "dual_path delivery key=%s/%s delivery_terminal=SUCCEEDED",
+                "dual_path delivery key=%s/%s delivery_terminal=SUCCEEDED admission_id=%s",
                 request_key.decode_engine_instance_id,
                 request_key.decode_request_id,
+                request_key.admission_id,
             )
 
         delivery_future.add_done_callback(log_delivery_failure)
@@ -1333,7 +1341,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         # arriving ahead of the proxy round-trip still finds its state.
         request_id = request.request_id
         coordinator = self._path_decision_coordinator
-        request_key = DualPathRequestKey(coordinator.decode_engine_instance_id, request_id)
+        request_key = coordinator.new_request_key(request_id)
         decision_request = PathDecisionRequest(
             request_key=request_key,
             target_tokens=_decode_ready_token_count(request.num_tokens),
@@ -1572,7 +1580,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             assert_never(result.path)
         logger.info(
             "dual_path activation key=%s/%s selected_path=%s store=%s "
-            "store_range=[%s,%s) reverse_range=[%s,%s) forward_range=[%s,%s)",
+            "store_range=[%s,%s) reverse_range=[%s,%s) forward_range=[%s,%s) admission_id=%s",
             state.request_key.decode_engine_instance_id,
             state.request_key.decode_request_id,
             result.path.value,
@@ -1583,6 +1591,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             reverse_end,
             binding.token_start,
             binding.token_end,
+            state.request_key.admission_id,
         )
 
     def _request_for_failed_job(self, job: JobRecord) -> str | None:

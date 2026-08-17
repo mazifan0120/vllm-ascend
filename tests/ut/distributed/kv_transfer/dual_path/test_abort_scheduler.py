@@ -86,6 +86,7 @@ def test_unknown_decode_abort_is_ignored(decode_scheduler_factory, decode_task04
     unknown_key = decision_model.DualPathRequestKey(
         decode_task04_seams.decode_coordinator.decode_engine_instance_id,
         "unknown-request",
+        0,
     )
 
     scheduler._handle_received_abort(_notice(unknown_key))

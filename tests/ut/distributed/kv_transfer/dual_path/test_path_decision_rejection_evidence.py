@@ -25,7 +25,7 @@ def test_store_full_request_construction_rejects_before_decider_policy_choice() 
     # Given
     policy = _SpyPolicy()
     decider = PathDecisionDecider(policy)
-    request_key = DualPathRequestKey("decode-engine", "store-full")
+    request_key = DualPathRequestKey("decode-engine", "store-full", 0)
 
     # When
     with pytest.raises(PathDecisionValidationError):
@@ -52,7 +52,7 @@ def test_store_full_rejection_does_not_advance_seeded_round_robin_first_choice()
     with pytest.raises(PathDecisionValidationError):
         decider.decide(
             PathDecisionRequest(
-                request_key=DualPathRequestKey("decode-engine", "store-full"),
+                request_key=DualPathRequestKey("decode-engine", "store-full", 0),
                 target_tokens=32,
                 decode_local_tokens=16,
                 decode_store_tokens=32,
@@ -61,7 +61,7 @@ def test_store_full_rejection_does_not_advance_seeded_round_robin_first_choice()
         )
     result = decider.decide(
         PathDecisionRequest(
-            request_key=DualPathRequestKey("decode-engine", "non-full"),
+            request_key=DualPathRequestKey("decode-engine", "non-full", 0),
             target_tokens=32,
             decode_local_tokens=16,
             decode_store_tokens=24,

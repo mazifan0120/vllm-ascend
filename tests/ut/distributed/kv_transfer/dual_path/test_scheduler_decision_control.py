@@ -123,6 +123,12 @@ def task04_seams():
         decode_coordinator = MagicMock(name="decode_coordinator")
         decode_coordinator.decode_engine_instance_id = _DECODE_INSTANCE_ID
         decode_coordinator.decode_control_endpoint = _CONTROL_ENDPOINT
+        admission_ids = iter(range(1_000_000))
+        decode_coordinator.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+            _DECODE_INSTANCE_ID,
+            request_id,
+            next(admission_ids),
+        )
         prefill_coordinator = MagicMock(name="prefill_coordinator")
         prefill_delivery_future = MagicMock(spec=Future, name="prefill_delivery_future")
         prefill_delivery_future.done.return_value = False
@@ -202,9 +208,13 @@ def _admit(scheduler, params: dict | None = None):
     return _admit_request(scheduler, request, (41, 42, 43, 44))
 
 
-def _result(request_id: str = "request-local-7", reverse_attempt_id: int = 0) -> PathDecisionResult:
+def _result(
+    request_id: str = "request-local-7",
+    reverse_attempt_id: int = 0,
+    admission_id: int = 0,
+) -> PathDecisionResult:
     return PathDecisionResult(
-        request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, request_id),
+        request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, request_id, admission_id),
         path=PathKind.DE_READ,
         reverse_attempt_id=reverse_attempt_id,
         prefill_local_tokens=16,
@@ -260,6 +270,7 @@ def _expected_dual_path_payload() -> dict:
             "request_key": {
                 "decode_engine_instance_id": _DECODE_INSTANCE_ID,
                 "decode_request_id": "request-local-7",
+                "admission_id": 0,
             },
             "target_tokens": 48,
             "decode_local_tokens": 16,
@@ -272,6 +283,7 @@ def _expected_dual_path_payload() -> dict:
 def _prefill_decision_payload(
     *,
     decode_request_id: str = "decode-request-7",
+    admission_id: int = 0,
     target_tokens: int = 48,
     decode_local_tokens: int = 16,
     decode_store_tokens: int = 32,
@@ -281,6 +293,7 @@ def _prefill_decision_payload(
             "request_key": {
                 "decode_engine_instance_id": _DECODE_INSTANCE_ID,
                 "decode_request_id": decode_request_id,
+                "admission_id": admission_id,
             },
             "target_tokens": target_tokens,
             "decode_local_tokens": decode_local_tokens,
@@ -404,7 +417,7 @@ class TestDecodeAdmissionControl:
         request, _ = _admit(decode_scheduler)
         state = decode_scheduler._decode_decision_states[request.request_id]
         snapshot = decode_scheduler._decode_kv_snapshots[request.request_id]
-        expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, request.request_id)
+        expected_key = DualPathRequestKey(_DECODE_INSTANCE_ID, request.request_id, 0)
         assert snapshot.transfer_tokens == 49
         assert snapshot.local_tokens == 16
         assert snapshot.external_tokens == 33
@@ -415,13 +428,37 @@ class TestDecodeAdmissionControl:
             decode_scheduler.executor.submit.call_args.kwargs["message"]["dual_path"] == _expected_dual_path_payload()
         )
 
+    def test_reused_local_request_id_gets_distinct_decode_admission_key(self, decode_scheduler):
+        first_request, _ = _admit(decode_scheduler)
+        first_key = decode_scheduler._decode_decision_states[first_request.request_id].request_key
+        decode_scheduler.request_finished(first_request, [41, 42, 43, 44])
+
+        second_request, _ = _admit(decode_scheduler)
+        second_key = decode_scheduler._decode_decision_states[second_request.request_id].request_key
+
+        assert first_key.decode_engine_instance_id == second_key.decode_engine_instance_id
+        assert first_key.decode_request_id == second_key.decode_request_id == first_request.request_id
+        assert (first_key.admission_id, second_key.admission_id) == (0, 1)
+        assert first_key != second_key
+
+    def test_consumed_decode_admission_does_not_mint_key_on_retry(self, decode_scheduler):
+        request, blocks = _admit(decode_scheduler)
+        coordinator = decode_scheduler._path_decision_coordinator
+        assert request.kv_transfer_params["do_remote_prefill"] is False
+        assert coordinator.new_request_key.call_count == 1
+
+        request.num_preemptions += 1
+        decode_scheduler.update_state_after_alloc(request, blocks, 0)
+
+        assert coordinator.new_request_key.call_count == 1
+
     def test_register_pending_precedes_executor_submission(self, decode_scheduler):
         ordered = MagicMock()
         ordered.attach_mock(decode_scheduler._path_decision_coordinator.register_pending, "register_pending")
         ordered.attach_mock(decode_scheduler.executor.submit, "submit")
         _admit(decode_scheduler)
         assert ordered.method_calls[:2] == [
-            call.register_pending(DualPathRequestKey(_DECODE_INSTANCE_ID, "request-local-7")),
+            call.register_pending(DualPathRequestKey(_DECODE_INSTANCE_ID, "request-local-7", 0)),
             call.submit(
                 decode_scheduler._access_metaserver,
                 url="http://proxy.example/v1/kv",
@@ -585,7 +622,7 @@ class TestPrefillDecisionHook:
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
-                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7"),
+                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
                 reason=PathAbortReason.DECISION_FAILED,
             ),
         )
@@ -952,7 +989,7 @@ class TestPrefillAbortTriggers:
     @staticmethod
     def _expected_notice(reason: PathAbortReason) -> PathAbortNotice:
         return PathAbortNotice(
-            request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7"),
+            request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
             reason=reason,
         )
 
@@ -1122,6 +1159,7 @@ class TestPrefillAbortTriggers:
 
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(_CONTROL_ENDPOINT, notice)
         assert abort_error in log_error.call_args.args
+        assert (log_error.call_args.args[0] % log_error.call_args.args[1:]).endswith("admission_id=0")
 
     @pytest.mark.parametrize(
         ("method_name", "block_ids"),
@@ -1390,7 +1428,7 @@ class TestCleanupAndShutdown:
         request = _make_prefill_request("prefill-inflight", _remote_decode_params())
         scheduler.get_num_new_matched_tokens(request, 0)
         _bind_prefill(scheduler, request)
-        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7")
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
         assert scheduler._path_decider is not None
 
         # When
@@ -1549,7 +1587,7 @@ class TestCleanupAndShutdown:
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
-                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7"),
+                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
                 reason=PathAbortReason.DELIVERY_EXHAUSTED,
             ),
         )
@@ -1611,7 +1649,7 @@ class TestCleanupAndShutdown:
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
-                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7"),
+                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
                 reason=PathAbortReason.DELIVERY_EXHAUSTED,
             ),
         )
@@ -1653,7 +1691,7 @@ class TestCleanupAndShutdown:
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
-                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7"),
+                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
                 reason=PathAbortReason.DELIVERY_EXHAUSTED,
             ),
         )
@@ -1689,7 +1727,7 @@ class TestCleanupAndShutdown:
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
-                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7"),
+                request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0),
                 reason=PathAbortReason.DELIVERY_EXHAUSTED,
             ),
         )
@@ -1774,6 +1812,7 @@ class TestCleanupAndShutdown:
         assert scheduler._prefill_request_keys[new_request.request_id] == DualPathRequestKey(
             _DECODE_INSTANCE_ID,
             "decode-request-new",
+            0,
         )
         assert policy.choose.call_count == 2
 
@@ -1820,13 +1859,19 @@ class TestCleanupAndShutdown:
         committed_prefill_request = _make_prefill_request(
             "prefill-committed",
             _remote_decode_params(
-                dual_path=_prefill_decision_payload(decode_request_id=committed_request.request_id),
+                dual_path=_prefill_decision_payload(
+                    decode_request_id=committed_request.request_id,
+                    admission_id=committed_state.request_key.admission_id,
+                ),
             ),
         )
         inflight_prefill_request = _make_prefill_request(
             "prefill-inflight",
             _remote_decode_params(
-                dual_path=_prefill_decision_payload(decode_request_id=aborted_request.request_id),
+                dual_path=_prefill_decision_payload(
+                    decode_request_id=aborted_request.request_id,
+                    admission_id=aborted_state.request_key.admission_id,
+                ),
             ),
         )
         prefill_scheduler.get_num_new_matched_tokens(committed_prefill_request, 0)
@@ -1836,7 +1881,12 @@ class TestCleanupAndShutdown:
         prefill_scheduler.request_finished(committed_prefill_request, [4, 5])
 
         task04_seams.decode_coordinator.take_received_decisions.return_value = [
-            _decision(_result(committed_request.request_id))
+            _decision(
+                _result(
+                    committed_request.request_id,
+                    admission_id=committed_state.request_key.admission_id,
+                )
+            )
         ]
         commit_metadata = decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
         reverse_send_job_id = commit_metadata.reverse_plans[0].reverse_send_job_id

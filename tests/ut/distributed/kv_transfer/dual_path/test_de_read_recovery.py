@@ -266,7 +266,9 @@ def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_job(
     assert refreshed_plan.reverse_send_job_id != first_job_id
     attempt_one = ReverseAttemptKey(
         DualPathRequestKey(
-            first_metadata.forward_receive_bindings[0].request_key.decode_engine_instance_id, "decode-request-7"
+            first_metadata.forward_receive_bindings[0].request_key.decode_engine_instance_id,
+            "decode-request-7",
+            0,
         ),
         1,
     )

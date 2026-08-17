@@ -34,7 +34,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 WIRE_REQUEST_ID = "wire-split-request"
 DECODE_REQUEST_ID = f"{WIRE_REQUEST_ID}123456789"
-REVERSE_ATTEMPT_KEY = ReverseAttemptKey(DualPathRequestKey("decode-instance", DECODE_REQUEST_ID), 0)
+REVERSE_ATTEMPT_KEY = ReverseAttemptKey(DualPathRequestKey("decode-instance", DECODE_REQUEST_ID, 0), 0)
 REVERSE_WIRE_REQUEST_ID = reverse_wire_id(REVERSE_ATTEMPT_KEY)
 DESTINATION_BLOCKS = ((10, 11, 20, 21, 30, 31, 40, 41),)
 REVERSE_DESTINATION_BLOCKS = ((70, 71, 80, 81),)
@@ -97,7 +97,7 @@ def _make_store_metadata(request_id: str = DECODE_REQUEST_ID) -> AscendConnector
 
 def _make_reverse_plan(reverse_send_job_id: int | None = None) -> ReversePlan:
     return ReversePlan(
-        request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID),
+        request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID, 0),
         wire_request_id=REVERSE_WIRE_REQUEST_ID,
         token_start=16,
         token_end=64,
@@ -123,7 +123,7 @@ def _make_reverse_receive_binding(
     reverse_completion_job_id: int = 0,
 ) -> ReverseReceiveBinding:
     return ReverseReceiveBinding(
-        request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID),
+        request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID, 0),
         wire_request_id=REVERSE_WIRE_REQUEST_ID,
         prefill_request_id=prefill_request_id,
         destination_block_ids=destination_block_ids,
@@ -139,7 +139,7 @@ def _make_split_metadata(*, include_store: bool = True, include_reverse: bool = 
     metadata = DualPathConnectorMetadata()
     metadata.forward_receive_bindings.append(
         ForwardReceiveBinding(
-            request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID),
+            request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID, 0),
             path=PathKind.DE_READ,
             wire_request_id=WIRE_REQUEST_ID,
             decode_request_id=DECODE_REQUEST_ID,

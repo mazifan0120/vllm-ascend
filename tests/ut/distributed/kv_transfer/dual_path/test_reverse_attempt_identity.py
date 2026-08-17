@@ -25,7 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
 )
 
-_KEY = DualPathRequestKey("decode-instance-1", "decode-request-1")
+_KEY = DualPathRequestKey("decode-instance-1", "decode-request-1", 0)
 _ATTEMPT_TOKENS = 16
 _COMPLETION_JOB_ID = 41
 
@@ -142,6 +142,21 @@ class TestAttemptKeySchema:
             token_end=64,
         )
         assert binding.wire_request_id == "decode-request-1"
+
+    def test_reverse_wire_id_separates_reused_request_admissions(self):
+        first_key = DualPathRequestKey("decode-instance-1", "decode-request-1", 0)
+        second_key = DualPathRequestKey("decode-instance-1", "decode-request-1", 1)
+
+        first_wire_id = path_decision_module.reverse_wire_id(
+            path_decision_module.ReverseAttemptKey(first_key, 0)
+        )
+        second_wire_id = path_decision_module.reverse_wire_id(
+            path_decision_module.ReverseAttemptKey(second_key, 0)
+        )
+
+        assert first_wire_id == "ra:decode-instance-1:decode-request-1:0:0"
+        assert second_wire_id == "ra:decode-instance-1:decode-request-1:1:0"
+        assert first_wire_id != second_wire_id
 
     def test_decider_stamps_attempt_identity_from_num_preemptions(self):
         request = PathDecisionRequest(

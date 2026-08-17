@@ -128,6 +128,12 @@ def scheduler_factory(monkeypatch):
             coordinator = MagicMock(name="decode_coordinator")
             coordinator.decode_engine_instance_id = _DECODE_INSTANCE_ID
             coordinator.decode_control_endpoint = _CONTROL_ENDPOINT
+            admission_ids = iter(range(1_000_000))
+            coordinator.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+                _DECODE_INSTANCE_ID,
+                request_id,
+                next(admission_ids),
+            )
             coordinator.take_received_decisions.return_value = []
             coordinator_cls.for_decode.return_value = coordinator
 
@@ -194,7 +200,7 @@ def _make_binding(
     destination_block_ids: tuple[tuple[int, ...], ...] = ((101, 102, 103, 104),),
 ) -> ForwardReceiveBinding:
     return ForwardReceiveBinding(
-        request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, decode_request_id),
+        request_key=DualPathRequestKey(_DECODE_INSTANCE_ID, decode_request_id, 0),
         path=PathKind.PE_READ,
         wire_request_id=get_external_request_id(decode_request_id),
         decode_request_id=decode_request_id,

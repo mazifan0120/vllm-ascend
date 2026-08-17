@@ -190,6 +190,11 @@ def production_harness_factory():
             decode_coordinator = MagicMock(name="decode_coordinator")
             decode_coordinator.decode_engine_instance_id = decode_helpers._DECODE_INSTANCE_ID
             decode_coordinator.decode_control_endpoint = DecodeControlEndpoint(host="192.0.2.44", port=24001)
+            decode_coordinator.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+                decode_helpers._DECODE_INSTANCE_ID,
+                request_id,
+                0,
+            )
             decode_coordinator.take_received_decisions.return_value = []
             prefill_coordinator = MagicMock(name="prefill_coordinator")
             prefill_coordinator.submit.return_value = _completed_future()
@@ -419,7 +424,7 @@ def test_production_metadata_failed_wins_over_late_done(production_harness_facto
 
 def test_request_finish_releases_all_task08_state_idempotently(production_harness_factory) -> None:
     harness = production_harness_factory()
-    unrelated_key = DualPathRequestKey("decode-instance", "unrelated")
+    unrelated_key = DualPathRequestKey("decode-instance", "unrelated", 0)
     harness.prefill_scheduler._prefill_local_tokens["unrelated"] = 7
     harness.prefill_scheduler._path_decider._decision_records[unrelated_key] = MagicMock()
 
@@ -505,6 +510,10 @@ def test_structured_logs_reconstruct_request_facts(production_harness_factory) -
     assert "delivery_terminal=SUCCEEDED" in messages
     assert "final_predicate=SUCCESS" in messages
     assert "PathDecision" not in messages
+    for prefix in ("dual_path decision", "dual_path activation", "dual_path delivery"):
+        matching = [line for line in messages.splitlines() if line.startswith(prefix)]
+        assert matching
+        assert all(line.endswith("admission_id=0") for line in matching)
 
 
 def test_pe_read_logs_store_as_not_authorized(production_harness_factory) -> None:

@@ -26,6 +26,7 @@ def _key() -> DualPathRequestKey:
     return DualPathRequestKey(
         decode_engine_instance_id="decode-engine-1",
         decode_request_id="decode-request-1",
+        admission_id=0,
     )
 
 
@@ -174,6 +175,7 @@ def test_reverse_plan_wire_round_trip() -> None:
         "request_key": {
             "decode_engine_instance_id": "decode-engine-1",
             "decode_request_id": "decode-request-1",
+            "admission_id": 0,
         },
         "wire_request_id": "wire-request-1",
         "token_start": 16,

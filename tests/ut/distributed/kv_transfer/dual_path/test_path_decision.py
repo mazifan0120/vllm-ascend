@@ -18,10 +18,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 )
 
 
-def _key(request_id: str = "request-1") -> DualPathRequestKey:
+def _key(request_id: str = "request-1", admission_id: int = 0) -> DualPathRequestKey:
     return DualPathRequestKey(
         decode_engine_instance_id="decode-engine-1",
         decode_request_id=request_id,
+        admission_id=admission_id,
     )
 
 
@@ -73,6 +74,39 @@ def test_request_key_equality_and_hash() -> None:
     assert len({first, equal_but_distinct, other}) == 2
 
 
+def test_request_key_round_trip_requires_exact_admission_identity() -> None:
+    key = DualPathRequestKey(
+        decode_engine_instance_id="decode-engine-1",
+        decode_request_id="request-1",
+        admission_id=7,
+    )
+
+    payload = {
+        "decode_engine_instance_id": "decode-engine-1",
+        "decode_request_id": "request-1",
+        "admission_id": 7,
+    }
+    assert key.to_dict() == payload
+    assert DualPathRequestKey.from_dict(payload) == key
+    with pytest.raises(PathDecisionValidationError):
+        DualPathRequestKey.from_dict(
+            {
+                "decode_engine_instance_id": "decode-engine-1",
+                "decode_request_id": "request-1",
+            }
+        )
+
+
+@pytest.mark.parametrize("admission_id", [True, -1, "0"])
+def test_request_key_rejects_invalid_admission_id(admission_id) -> None:
+    with pytest.raises(PathDecisionValidationError):
+        DualPathRequestKey(
+            decode_engine_instance_id="decode-engine-1",
+            decode_request_id="request-1",
+            admission_id=admission_id,
+        )
+
+
 @pytest.mark.parametrize(
     ("engine_id", "request_id"),
     [
@@ -89,6 +123,7 @@ def test_request_key_rejects_empty_identity_fields(engine_id, request_id) -> Non
         DualPathRequestKey(
             decode_engine_instance_id=engine_id,
             decode_request_id=request_id,
+            admission_id=0,
         )
 
 
@@ -374,6 +409,7 @@ def test_request_key_serialization_round_trips_both_directions() -> None:
     payload = {
         "decode_engine_instance_id": "decode-engine-1",
         "decode_request_id": "request-1",
+        "admission_id": 0,
     }
 
     assert DualPathRequestKey.from_dict(request_key.to_dict()) == request_key
@@ -399,6 +435,7 @@ def test_request_serialization_round_trips_both_directions(
         "request_key": {
             "decode_engine_instance_id": "decode-engine-1",
             "decode_request_id": "request-1",
+            "admission_id": 0,
         },
         "target_tokens": 32,
         "decode_local_tokens": decode_local_tokens,
@@ -421,6 +458,7 @@ def test_result_serialization_round_trips_both_directions(path: PathKind) -> Non
         "request_key": {
             "decode_engine_instance_id": "decode-engine-1",
             "decode_request_id": "request-1",
+            "admission_id": 0,
         },
         "path": path.value,
     }
@@ -437,6 +475,7 @@ def test_from_dict_rejects_unknown_path_value() -> None:
         "request_key": {
             "decode_engine_instance_id": "decode-engine-1",
             "decode_request_id": "request-1",
+            "admission_id": 0,
         },
         "path": "UNKNOWN",
     }
@@ -458,6 +497,7 @@ def test_from_dict_rejects_unknown_path_value() -> None:
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "target_tokens": 32,
                 "decode_local_tokens": 8,
@@ -469,6 +509,7 @@ def test_from_dict_rejects_unknown_path_value() -> None:
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 }
             },
         ),
@@ -487,6 +528,7 @@ def test_from_dict_rejects_missing_fields(protocol_type, payload) -> None:
             {
                 "decode_engine_instance_id": "decode-engine-1",
                 "decode_request_id": "request-1",
+                "admission_id": 0,
                 "extra": "value",
             },
         ),
@@ -496,6 +538,7 @@ def test_from_dict_rejects_missing_fields(protocol_type, payload) -> None:
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "target_tokens": 32,
                 "decode_local_tokens": 8,
@@ -509,6 +552,7 @@ def test_from_dict_rejects_missing_fields(protocol_type, payload) -> None:
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "path": "PE_READ",
                 "extra": "value",
@@ -534,6 +578,7 @@ def test_from_dict_rejects_empty_identity(engine_id: str, request_id: str) -> No
             {
                 "decode_engine_instance_id": engine_id,
                 "decode_request_id": request_id,
+                "admission_id": 0,
             }
         )
 
@@ -557,6 +602,7 @@ def test_from_dict_rejects_bool_for_int(
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "target_tokens": target_tokens,
                 "decode_local_tokens": decode_local_tokens,
@@ -589,6 +635,7 @@ def test_from_dict_rejects_invalid_token_ordering(
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "target_tokens": target_tokens,
                 "decode_local_tokens": decode_local_tokens,
@@ -618,6 +665,7 @@ def test_from_dict_rejects_non_dict_payload(protocol_type, payload) -> None:
             {
                 "decode_engine_instance_id": 1,
                 "decode_request_id": "request-1",
+                "admission_id": 0,
             },
         ),
         (
@@ -625,6 +673,7 @@ def test_from_dict_rejects_non_dict_payload(protocol_type, payload) -> None:
             {
                 "decode_engine_instance_id": "decode-engine-1",
                 "decode_request_id": 1,
+                "admission_id": 0,
             },
         ),
         (
@@ -642,6 +691,7 @@ def test_from_dict_rejects_non_dict_payload(protocol_type, payload) -> None:
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "target_tokens": "32",
                 "decode_local_tokens": 8,
@@ -654,6 +704,7 @@ def test_from_dict_rejects_non_dict_payload(protocol_type, payload) -> None:
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "target_tokens": 32,
                 "decode_local_tokens": 8.0,
@@ -673,6 +724,7 @@ def test_from_dict_rejects_non_dict_payload(protocol_type, payload) -> None:
                 "request_key": {
                     "decode_engine_instance_id": "decode-engine-1",
                     "decode_request_id": "request-1",
+                    "admission_id": 0,
                 },
                 "path": 1,
             },

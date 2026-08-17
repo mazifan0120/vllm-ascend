@@ -145,6 +145,12 @@ def decode_scheduler():
         coordinator = MagicMock(name="decode_coordinator")
         coordinator.decode_engine_instance_id = "test_engine:0:test-boot"
         coordinator.decode_control_endpoint = DecodeControlEndpoint(host="127.0.0.1", port=7100)
+        admission_ids = iter(range(1_000_000))
+        coordinator.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+            "test_engine:0:test-boot",
+            request_id,
+            next(admission_ids),
+        )
         coordinator_cls.for_decode.return_value = coordinator
         scheduler = DualPathConnectorScheduler(
             _make_vllm_config(),
@@ -186,6 +192,14 @@ def test_hybrid_full_and_non_full_share_boundary_but_not_route() -> None:
         coordinator_cls.for_decode.return_value.decode_engine_instance_id = "test_engine:0:test-boot"
         coordinator_cls.for_decode.return_value.decode_control_endpoint = DecodeControlEndpoint(
             host="127.0.0.1", port=7100
+        )
+        admission_ids = iter(range(1_000_000))
+        coordinator_cls.for_decode.return_value.new_request_key.side_effect = (
+            lambda request_id: DualPathRequestKey(
+                "test_engine:0:test-boot",
+                request_id,
+                next(admission_ids),
+            )
         )
         scheduler = DualPathConnectorScheduler(
             _make_vllm_config(),
@@ -697,7 +711,7 @@ def test_parent_failure_forward_and_store_completions_stay_isolated() -> None:
     failed_request_id = "failed-request"
     ordinary_wire_id = get_external_request_id(ordinary_request_id)
     binding = ForwardReceiveBinding(
-        request_key=DualPathRequestKey("decode-instance", forward_request_id),
+        request_key=DualPathRequestKey("decode-instance", forward_request_id, 0),
         path=PathKind.PE_READ,
         wire_request_id=get_external_request_id(forward_request_id),
         decode_request_id=forward_request_id,
