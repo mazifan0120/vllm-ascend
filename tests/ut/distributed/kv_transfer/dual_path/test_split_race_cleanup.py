@@ -568,6 +568,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_stage_prefill_activation_failure",
         "_reverse_destination_slice",
         "_send_abort_notice",
+        "_retain_prefill_admission_failure",
         "_decide_prefill_path_for_admission",
         "_discard_undelivered_prefill_decision",
         "_log_prefill_decision",

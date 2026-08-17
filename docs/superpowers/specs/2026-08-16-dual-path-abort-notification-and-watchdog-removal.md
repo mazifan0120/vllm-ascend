@@ -92,6 +92,10 @@ instance. The exact same `Request` may legitimately reparse its envelope during
 an allocation retry or preemption resume and continues with the frozen path. A
 different `Request` reusing the local ID is rejected while either the active
 owner or an unresolved delivery record still belongs to the earlier admission.
+A retained pre-submit invalid marker is installed atomically with the `Request`
+that encountered the failure. A successful Decision that has not yet been
+submitted installs no owner, so changed admission facts may still discard and
+re-decide that uncommitted Decision from a distinct replacement `Request`.
 
 Every terminally failed Decision delivery sends `DELIVERY_EXHAUSTED` ABORT for
 the delivery record's exact key and endpoint. Local Prefill failure staging is

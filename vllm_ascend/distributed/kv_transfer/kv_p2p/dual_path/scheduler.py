@@ -361,6 +361,17 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         delivery_future.add_done_callback(log_abort_delivery)
 
+    def _retain_prefill_admission_failure(self, request: Request) -> None:
+        request_id = request.request_id
+        active_owner = self._prefill_admission_owners.get(request_id)
+        if active_owner is not None and active_owner is not request:
+            raise RuntimeError(
+                f"DualPath Prefill request {request_id} has admission-scoped state owned by another Request; "
+                "request-id reuse is not safe yet"
+            )
+        self._prefill_admission_owners[request_id] = request
+        self._prefill_invalid_request_ids.add(request_id)
+
     def _reconcile_prefill_deliveries(self) -> None:
         """Detect failed deliveries, stage their control failures, and reclaim
         delivery futures of released requests once they complete."""
@@ -462,7 +473,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 request_id,
                 error,
             )
-            self._prefill_invalid_request_ids.add(request_id)
+            self._retain_prefill_admission_failure(request)
             return parent_result
         decision_request = metadata.decision_request
         if delivery_record is not None and (
@@ -481,7 +492,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 prefill_local_tokens,
                 effective_prefill_tokens,
             )
-            self._prefill_invalid_request_ids.add(request_id)
+            self._retain_prefill_admission_failure(request)
             self._send_abort_notice(
                 decision_request.request_key,
                 metadata.decode_control_endpoint,
@@ -515,7 +526,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     request_id,
                     error,
                 )
-                self._prefill_invalid_request_ids.add(request_id)
+                self._retain_prefill_admission_failure(request)
                 self._send_abort_notice(
                     decision_request.request_key,
                     metadata.decode_control_endpoint,
@@ -545,7 +556,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     request_id,
                     fresh_error,
                 )
-                self._prefill_invalid_request_ids.add(request_id)
+                self._retain_prefill_admission_failure(request)
                 self._send_abort_notice(
                     decision_request.request_key,
                     metadata.decode_control_endpoint,
@@ -554,7 +565,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 return parent_result
 
         self._prefill_request_keys[request_id] = request_key
-        self._prefill_admission_owners[request_id] = request
         self._prefill_decision_metadata[request_id] = metadata
         self._prefill_local_tokens.setdefault(request_id, prefill_local_tokens)
         self._prefill_path_results.setdefault(request_id, result)
@@ -1181,7 +1191,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._prefill_local_tokens[request_id],
                 decision_request.decode_store_tokens,
             )
-        self._prefill_invalid_request_ids.add(request_id)
+        self._retain_prefill_admission_failure(request)
         self._prefill_path_results.pop(request_id, None)
         if not discard_installed_plans:
             return
