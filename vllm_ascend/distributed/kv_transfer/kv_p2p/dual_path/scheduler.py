@@ -1660,6 +1660,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
     def _release_scheduler_request_state(self, request: Request) -> None:
         request_id = request.request_id
+        # Decode cleanup remains request-ID keyed because update_from_output()
+        # releases finished requests before the next schedule() can bind a
+        # same-ID replacement.
         self._lookup_results.pop(request_id, None)
         self._decode_kv_snapshots.pop(request_id, None)
         self._decode_control_failures.pop(request_id, None)
@@ -1683,9 +1686,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             except (KeyError, TypeError, PathDecisionValidationError):
                 metadata_key = None
             active_key = self._prefill_request_keys.get(request_id)
-            released_key = metadata_key if metadata_key is not None else active_key
-            releases_active_admission = active_key is not None and (metadata_key is None or metadata_key == active_key)
-            dropped_control_failure = False
+            released_key = metadata_key
+            releases_active_admission = active_key is not None and metadata_key == active_key
+            if metadata_key is None and active_key is not None:
+                logger.warning(
+                    "DualPath Prefill release metadata is unparseable for request %s; "
+                    "skipping cleanup of active admission %s",
+                    request_id,
+                    active_key,
+                )
             if releases_active_admission:
                 self._prefill_decision_metadata.pop(request_id, None)
                 self._prefill_local_tokens.pop(request_id, None)
@@ -1694,7 +1703,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._prefill_forward_plan_epochs.pop(request_id, None)
                 self._prefill_reverse_plans.pop(request_id, None)
                 self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
-                dropped_control_failure = self._prefill_control_failures.pop(request_id, None) is not None
+                self._prefill_control_failures.pop(request_id, None)
                 if forward_plan is not None:
                     self._reqs_need_send_layerwise.pop(request_id, None)
                 self._prefill_request_keys.pop(request_id, None)
@@ -1702,7 +1711,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._prefill_vacuous_reverse_request_ids.discard(request_id)
                 self._waiting_reverse_attempt_ids.pop(request_id, None)
             if released_key is not None:
-                if dropped_control_failure and released_key not in self._prefill_delivery_futures:
+                if released_key not in self._prefill_delivery_futures:
                     self._prefill_delivery_records.pop(released_key, None)
                 self._job_ledger.discard_closed_jobs(JobKind.REVERSE_COMPLETION, released_key)
                 assert self._path_decider is not None
@@ -1712,8 +1721,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._reconcile_prefill_deliveries()
         # Completion-job records remain owned by their job lifecycle across
         # request cleanup.
-        if self.dual_path_cfg.role == "decode":
-            self._waiting_reverse_attempt_ids.pop(request_id, None)
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         delay_free = self._delay_free_for_connector(request)

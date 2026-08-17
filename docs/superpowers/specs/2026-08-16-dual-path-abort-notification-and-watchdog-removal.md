@@ -131,6 +131,14 @@ may retain one explicit tripwire. Once release removes the active admission,
 its unresolved delivery state remains independently addressable by its full
 request key.
 
+Prefill release identifies the finishing admission only by parsing the key from
+the finishing `Request`. Unparseable metadata logs a warning and skips all
+DualPath cleanup; it never falls back to the active key for that local request
+ID. When the parsed finishing key differs from the active key, release performs
+only key-scoped cleanup for the finishing key. Request-ID-keyed state for the
+active replacement is left intact, and an unresolved delivery record remains
+until its existing Future lifecycle makes it terminal.
+
 Every terminally failed Decision delivery sends `DELIVERY_EXHAUSTED` ABORT for
 the delivery record's exact key and endpoint. Local Prefill failure staging is
 stricter: it occurs only while `_prefill_request_keys[request_id]` equals the
@@ -185,6 +193,10 @@ queued ABORT whose key differs from the current state's key is a no-op. A queued
 Decision with that mismatch is also discarded before validation, rather than
 falling through activation failure and terminating the newer admission. A
 genuine malformed Decision for the current key remains fail-closed.
+
+Decode request cleanup remains request-ID keyed. This relies on vLLM Scheduler
+ordering: `update_from_output()` invokes output-driven `request_finished`
+cleanup before the next `schedule()` call can bind a same-ID replacement.
 
 ## Direct failure staging
 

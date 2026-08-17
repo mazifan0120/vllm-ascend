@@ -1702,6 +1702,181 @@ class TestCleanupAndShutdown:
         assert result == (False, None)
         assert scheduler._prefill_invalid_request_keys == set()
 
+    @pytest.mark.parametrize(
+        "finishing_metadata",
+        ["malformed-dual-path", "missing-dual-path"],
+    )
+    def test_unparseable_old_release_preserves_live_reused_prefill_admission(
+        self,
+        finishing_metadata,
+        scheduler_factory,
+        task04_seams,
+    ):
+        delivery_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.return_value = delivery_future
+        policy = MagicMock(name="de_read_path_policy")
+        policy.choose.return_value = PathKind.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request_id = "prefill-unparseable-release"
+        live_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 1)
+        live_request = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+        assert scheduler.get_num_new_matched_tokens(live_request, 0) == (32, True)
+        _bind_prefill(scheduler, live_request, local_block_ids=(30, 31))
+
+        live_metadata = scheduler._prefill_decision_metadata[request_id]
+        live_result = scheduler._prefill_path_results[request_id]
+        live_reverse_plan = scheduler._prefill_reverse_plans[request_id]
+        live_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
+        live_attempt = ReverseAttemptKey(live_key, 0)
+        scheduler._prefill_deferred_deliveries.add(live_key)
+        scheduler._prefill_invalid_request_keys.add(live_key)
+        assert scheduler._path_decider is not None
+        assert set(scheduler._path_decider._decision_records) == {live_key}
+
+        if finishing_metadata == "malformed-dual-path":
+            finishing_params = _remote_decode_params(dual_path={"unexpected": "shape"})
+        else:
+            finishing_params = _remote_decode_params(include_dual_path=False)
+        finishing_request = _make_prefill_request(request_id, finishing_params)
+
+        with patch.object(scheduler_module.logger, "warning") as log_warning:
+            assert scheduler.request_finished(finishing_request, []) == (False, None)
+
+        assert scheduler._prefill_request_keys == {request_id: live_key}
+        assert scheduler._prefill_decision_metadata == {request_id: live_metadata}
+        assert scheduler._prefill_local_tokens == {request_id: 0}
+        assert scheduler._prefill_path_results == {request_id: live_result}
+        assert scheduler._prefill_reverse_plans == {request_id: live_reverse_plan}
+        assert scheduler._prefill_pending_reverse_receive_bindings == {
+            request_id: live_binding,
+        }
+        assert scheduler._prefill_delivered_reverse_attempts == {request_id: 0}
+        assert scheduler._waiting_reverse_attempt_ids == {request_id: live_attempt}
+        assert scheduler._prefill_delivery_futures == {live_key: delivery_future}
+        assert set(scheduler._prefill_delivery_records) == {live_key}
+        assert scheduler._prefill_deferred_deliveries == {live_key}
+        assert scheduler._prefill_invalid_request_keys == {live_key}
+        assert set(scheduler._path_decider._decision_records) == {live_key}
+        log_warning.assert_called_once()
+        warning_message = log_warning.call_args.args[0] % log_warning.call_args.args[1:]
+        assert request_id in warning_message
+        assert str(live_key) in warning_message
+
+    def test_unparseable_release_without_active_key_skips_request_id_cleanup(
+        self,
+        scheduler_factory,
+    ):
+        scheduler = scheduler_factory(role="prefill")
+        request_id = "prefill-unparseable-no-active"
+        orphan_result = MagicMock(name="orphan_path_result")
+        orphan_reverse_plan = MagicMock(name="orphan_reverse_plan")
+        scheduler._prefill_local_tokens[request_id] = 17
+        scheduler._prefill_path_results[request_id] = orphan_result
+        scheduler._prefill_reverse_plans[request_id] = orphan_reverse_plan
+        scheduler._prefill_vacuous_reverse_request_ids.add(request_id)
+        finishing_request = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path={"unexpected": "shape"}),
+        )
+
+        with patch.object(scheduler_module.logger, "warning") as log_warning:
+            assert scheduler.request_finished(finishing_request, []) == (False, None)
+
+        log_warning.assert_not_called()
+        assert scheduler._prefill_request_keys == {}
+        assert scheduler._prefill_local_tokens == {request_id: 17}
+        assert scheduler._prefill_path_results == {request_id: orphan_result}
+        assert scheduler._prefill_reverse_plans == {request_id: orphan_reverse_plan}
+        assert scheduler._prefill_vacuous_reverse_request_ids == {request_id}
+
+    @pytest.mark.parametrize(
+        "old_delivery_state",
+        ["terminal", "unresolved"],
+    )
+    def test_valid_old_release_cleans_only_old_key_scoped_state(
+        self,
+        old_delivery_state,
+        scheduler_factory,
+        task04_seams,
+    ):
+        old_future: Future[None] = Future()
+        live_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.side_effect = [old_future, live_future]
+        policy = MagicMock(name="de_read_path_policy")
+        policy.choose.return_value = PathKind.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request_id = "prefill-valid-old-release"
+        old_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        live_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 1)
+
+        old_request = _make_prefill_request(request_id, _remote_decode_params())
+        assert scheduler.get_num_new_matched_tokens(old_request, 0) == (32, True)
+        _bind_prefill(scheduler, old_request, local_block_ids=(10, 11))
+        old_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
+        old_job_id = old_binding.reverse_completion_job_id
+        assert scheduler._job_ledger.record_reports(old_job_id, scheduler._expected_worker_count) is True
+
+        # Arrange the scheduler race: the old admission's key-scoped artifacts
+        # remain while request-ID-keyed active state has been rebound to B.
+        scheduler._prefill_request_keys.pop(request_id)
+        scheduler._prefill_decision_metadata.pop(request_id)
+        scheduler._prefill_local_tokens.pop(request_id)
+        scheduler._prefill_path_results.pop(request_id)
+        scheduler._prefill_reverse_plans.pop(request_id)
+        scheduler._prefill_pending_reverse_receive_bindings.pop(request_id)
+        scheduler._prefill_delivered_reverse_attempts.pop(request_id)
+        scheduler._waiting_reverse_attempt_ids.pop(request_id)
+
+        live_request = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+        assert scheduler.get_num_new_matched_tokens(live_request, 0) == (32, True)
+        _bind_prefill(scheduler, live_request, local_block_ids=(30, 31))
+        live_metadata = scheduler._prefill_decision_metadata[request_id]
+        live_result = scheduler._prefill_path_results[request_id]
+        live_reverse_plan = scheduler._prefill_reverse_plans[request_id]
+        live_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
+        live_job_id = live_binding.reverse_completion_job_id
+        scheduler._prefill_deferred_deliveries.update({old_key, live_key})
+        scheduler._prefill_invalid_request_keys.update({old_key, live_key})
+        assert scheduler._path_decider is not None
+        assert set(scheduler._path_decider._decision_records) == {old_key, live_key}
+        if old_delivery_state == "terminal":
+            old_future.set_result(None)
+            assert scheduler._prefill_delivery_futures.pop(old_key) is old_future
+            assert old_key in scheduler._prefill_delivery_records
+
+        assert scheduler.request_finished(old_request, [10, 11]) == (False, None)
+
+        assert scheduler._prefill_request_keys == {request_id: live_key}
+        assert scheduler._prefill_decision_metadata == {request_id: live_metadata}
+        assert scheduler._prefill_local_tokens == {request_id: 0}
+        assert scheduler._prefill_path_results == {request_id: live_result}
+        assert scheduler._prefill_reverse_plans == {request_id: live_reverse_plan}
+        assert scheduler._prefill_pending_reverse_receive_bindings == {
+            request_id: live_binding,
+        }
+        assert scheduler._prefill_delivered_reverse_attempts == {request_id: 0}
+        assert scheduler._waiting_reverse_attempt_ids == {
+            request_id: ReverseAttemptKey(live_key, 0),
+        }
+        assert scheduler._job_ledger.get(old_job_id) is None
+        assert scheduler._job_ledger.get(live_job_id) is not None
+        assert scheduler._prefill_deferred_deliveries == {live_key}
+        assert scheduler._prefill_invalid_request_keys == {live_key}
+        assert set(scheduler._path_decider._decision_records) == {live_key}
+        assert live_key in scheduler._prefill_delivery_records
+        if old_delivery_state == "terminal":
+            assert old_key not in scheduler._prefill_delivery_futures
+            assert old_key not in scheduler._prefill_delivery_records
+        else:
+            assert scheduler._prefill_delivery_futures[old_key] is old_future
+            assert old_key in scheduler._prefill_delivery_records
+
     def test_pe_read_delivery_exhaustion_emits_peer_abort_on_next_decode_build(
         self,
         scheduler_factory,
