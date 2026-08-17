@@ -147,12 +147,8 @@ class TestAttemptKeySchema:
         first_key = DualPathRequestKey("decode-instance-1", "decode-request-1", 0)
         second_key = DualPathRequestKey("decode-instance-1", "decode-request-1", 1)
 
-        first_wire_id = path_decision_module.reverse_wire_id(
-            path_decision_module.ReverseAttemptKey(first_key, 0)
-        )
-        second_wire_id = path_decision_module.reverse_wire_id(
-            path_decision_module.ReverseAttemptKey(second_key, 0)
-        )
+        first_wire_id = path_decision_module.reverse_wire_id(path_decision_module.ReverseAttemptKey(first_key, 0))
+        second_wire_id = path_decision_module.reverse_wire_id(path_decision_module.ReverseAttemptKey(second_key, 0))
 
         assert first_wire_id == "ra:decode-instance-1:decode-request-1:0:0"
         assert second_wire_id == "ra:decode-instance-1:decode-request-1:1:0"

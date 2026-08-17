@@ -2200,10 +2200,6 @@ class TestCleanupAndShutdown:
         prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
         _bind_prefill(prefill_scheduler, prefill_request)
         prefill_key = prefill_scheduler._prefill_request_keys[prefill_request.request_id]
-        invalid_request = _make_prefill_request(
-            "prefill-invalid-shutdown",
-            _remote_decode_params(),
-        )
         invalid_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
         prefill_scheduler._prefill_invalid_request_keys.add(invalid_key)
         worker = _control_only_worker()

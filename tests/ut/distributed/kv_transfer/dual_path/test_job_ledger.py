@@ -219,9 +219,7 @@ class TestJobRecordReclamation:
         second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
 
         output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(
-                completed_jobs={first_binding.reverse_completion_job_id: 1}
-            )
+            kv_connector_worker_meta=make_worker_metadata(completed_jobs={first_binding.reverse_completion_job_id: 1})
         )
         scheduler.update_connector_output(output)
 
@@ -238,9 +236,7 @@ class TestJobRecordReclamation:
         second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
 
         output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(
-                failed_jobs={first_binding.reverse_completion_job_id: 1}
-            )
+            kv_connector_worker_meta=make_worker_metadata(failed_jobs={first_binding.reverse_completion_job_id: 1})
         )
         scheduler.update_connector_output(output)
 

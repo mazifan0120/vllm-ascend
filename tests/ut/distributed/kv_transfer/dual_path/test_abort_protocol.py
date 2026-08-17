@@ -45,9 +45,9 @@ def test_abort_notice_has_exact_reasons_and_round_trips() -> None:
     notice = _abort()
     payload = {
         "request_key": {
-                "decode_engine_instance_id": _KEY.decode_engine_instance_id,
-                "decode_request_id": _KEY.decode_request_id,
-                "admission_id": _KEY.admission_id,
+            "decode_engine_instance_id": _KEY.decode_engine_instance_id,
+            "decode_request_id": _KEY.decode_request_id,
+            "admission_id": _KEY.admission_id,
         },
         "reason": "DELIVERY_EXHAUSTED",
     }

@@ -194,12 +194,10 @@ def test_hybrid_full_and_non_full_share_boundary_but_not_route() -> None:
             host="127.0.0.1", port=7100
         )
         admission_ids = iter(range(1_000_000))
-        coordinator_cls.for_decode.return_value.new_request_key.side_effect = (
-            lambda request_id: DualPathRequestKey(
-                "test_engine:0:test-boot",
-                request_id,
-                next(admission_ids),
-            )
+        coordinator_cls.for_decode.return_value.new_request_key.side_effect = lambda request_id: DualPathRequestKey(
+            "test_engine:0:test-boot",
+            request_id,
+            next(admission_ids),
         )
         scheduler = DualPathConnectorScheduler(
             _make_vllm_config(),

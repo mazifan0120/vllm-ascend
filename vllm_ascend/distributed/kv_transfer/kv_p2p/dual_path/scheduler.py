@@ -1585,9 +1585,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def _handle_received_abort(self, notice: PathAbortNotice) -> None:
         request_id = notice.request_key.decode_request_id
         state = self._decode_decision_states.get(request_id)
-        if state is None or state.request_key != notice.request_key or state.status not in (
-            _DecodeDecisionStatus.PENDING,
-            _DecodeDecisionStatus.COMMITTED,
+        if (
+            state is None
+            or state.request_key != notice.request_key
+            or state.status
+            not in (
+                _DecodeDecisionStatus.PENDING,
+                _DecodeDecisionStatus.COMMITTED,
+            )
         ):
             return
         state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
@@ -1679,9 +1684,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 metadata_key = None
             active_key = self._prefill_request_keys.get(request_id)
             released_key = metadata_key if metadata_key is not None else active_key
-            releases_active_admission = active_key is not None and (
-                metadata_key is None or metadata_key == active_key
-            )
+            releases_active_admission = active_key is not None and (metadata_key is None or metadata_key == active_key)
             dropped_control_failure = False
             if releases_active_admission:
                 self._prefill_decision_metadata.pop(request_id, None)
