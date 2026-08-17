@@ -107,6 +107,30 @@ def test_already_terminal_decode_abort_is_ignored(decode_scheduler_factory, deco
     decode_task04_seams.decode_coordinator.unregister.assert_not_called()
 
 
+def test_queued_old_admission_abort_does_not_fail_reused_request_id(
+    decode_scheduler_factory,
+    decode_task04_seams,
+) -> None:
+    scheduler = decode_scheduler_factory()
+    first_request = _admit_decode_request(scheduler)
+    first_state = scheduler._decode_decision_states[first_request.request_id]
+    old_notice = _notice(first_state.request_key)
+    scheduler._release_scheduler_request_state(first_request)
+
+    second_request = _admit_decode_request(scheduler)
+    second_state = scheduler._decode_decision_states[second_request.request_id]
+    assert second_state.request_key.admission_id == first_state.request_key.admission_id + 1
+    decode_task04_seams.decode_coordinator.unregister.reset_mock()
+    decode_task04_seams.decode_coordinator.take_received_decisions.return_value = []
+    decode_task04_seams.decode_coordinator.take_received_aborts.return_value = [old_notice]
+
+    metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+    assert second_state.status is scheduler_module._DecodeDecisionStatus.PENDING
+    assert metadata.control_failures == []
+    decode_task04_seams.decode_coordinator.unregister.assert_not_called()
+
+
 def test_decode_abort_keeps_terminal_state_when_failure_metadata_cannot_be_built(
     decode_scheduler_factory,
     decode_task04_seams,

@@ -194,6 +194,62 @@ class TestJobRecordReclamation:
         assert scheduler._prefill_control_failures == {}
         assert output.finished_recving is None
 
+    @staticmethod
+    def _admit_reused_de_read(scheduler, admission_id: int):
+        request = _make_request(
+            target_tokens=48,
+            prompt_tokens=49,
+            local_tokens=16,
+            store_tokens=32,
+            destination_block_ids=[[20, 21, 22, 23]],
+            admission_id=admission_id,
+        )
+        assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+        scheduler.update_state_after_alloc(request, _blocks(([80, 81],)), 16)
+        binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
+        scheduler.build_connector_meta(MagicMock(name=f"scheduler_output_{admission_id}"))
+        return request, binding
+
+    def test_late_old_admission_completion_does_not_unpark_reused_request_id(self, pe_scheduler_factory):
+        scheduler, first_request = self._admit_de_read(pe_scheduler_factory)
+        first_binding = scheduler._prefill_pending_reverse_receive_bindings[first_request.request_id]
+        scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
+        scheduler._release_scheduler_request_state(first_request)
+        second_request, second_binding = self._admit_reused_de_read(scheduler, admission_id=1)
+        second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
+
+        output = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                completed_jobs={first_binding.reverse_completion_job_id: 1}
+            )
+        )
+        scheduler.update_connector_output(output)
+
+        assert output.finished_recving is None
+        assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
+        assert scheduler._job_ledger.get(second_binding.reverse_completion_job_id) is not None
+
+    def test_late_old_admission_failure_does_not_fail_reused_request_id(self, pe_scheduler_factory):
+        scheduler, first_request = self._admit_de_read(pe_scheduler_factory)
+        first_binding = scheduler._prefill_pending_reverse_receive_bindings[first_request.request_id]
+        scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
+        scheduler._release_scheduler_request_state(first_request)
+        second_request, second_binding = self._admit_reused_de_read(scheduler, admission_id=1)
+        second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
+
+        output = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                failed_jobs={first_binding.reverse_completion_job_id: 1}
+            )
+        )
+        scheduler.update_connector_output(output)
+
+        assert output.finished_recving is None
+        assert second_request.request_id not in scheduler._prefill_invalid_request_ids
+        assert scheduler._prefill_control_failures == {}
+        assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
+        assert scheduler._job_ledger.get(second_binding.reverse_completion_job_id) is not None
+
     def test_request_cleanup_reclaims_every_closed_completion_job_after_binding_delivery(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
         binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]

@@ -1249,6 +1249,31 @@ class TestDecodeResultConsumption:
         assert late_metadata.control_failures == []
         assert late_metadata.reverse_plans == []
 
+    def test_queued_old_admission_decision_does_not_fail_reused_request_id(
+        self,
+        decode_scheduler,
+        task04_seams,
+    ):
+        first_request, _ = _admit(decode_scheduler)
+        first_state = decode_scheduler._decode_decision_states[first_request.request_id]
+        old_decision = _decision(_result(admission_id=first_state.request_key.admission_id))
+        decode_scheduler._release_scheduler_request_state(first_request)
+
+        second_request, _ = _admit(decode_scheduler)
+        second_state = decode_scheduler._decode_decision_states[second_request.request_id]
+        assert second_state.request_key.admission_id == first_state.request_key.admission_id + 1
+        task04_seams.decode_coordinator.unregister.reset_mock()
+        task04_seams.decode_coordinator.take_received_decisions.return_value = [old_decision]
+        task04_seams.decode_coordinator.take_received_aborts.return_value = []
+
+        metadata = decode_scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
+
+        assert second_state.status is scheduler_module._DecodeDecisionStatus.PENDING
+        assert metadata.control_failures == []
+        assert metadata.forward_receive_bindings == []
+        assert metadata.reverse_plans == []
+        task04_seams.decode_coordinator.unregister.assert_not_called()
+
 
 class TestWorkerFailureRelay:
     def test_control_failure_metadata_starts_no_store_or_p2p_operation(self):

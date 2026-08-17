@@ -118,13 +118,13 @@ def scheduler_factory():
         scheduler.shutdown()
 
 
-def _decision_payload(*, target_tokens: int, local_tokens: int, store_tokens: int) -> dict:
+def _decision_payload(*, target_tokens: int, local_tokens: int, store_tokens: int, admission_id: int = 0) -> dict:
     return {
         "decision_request": {
             "request_key": {
                 "decode_engine_instance_id": _DECODE_INSTANCE_ID,
                 "decode_request_id": "decode-request-7",
-                "admission_id": 0,
+                "admission_id": admission_id,
             },
             "target_tokens": target_tokens,
             "decode_local_tokens": local_tokens,
@@ -142,6 +142,7 @@ def _make_request(
     local_tokens: int = 16,
     store_tokens: int = 16,
     destination_block_ids: list[list[int]] | None = None,
+    admission_id: int = 0,
 ) -> SimpleNamespace:
     prompt_token_ids = list(range(prompt_tokens))
     params = {
@@ -161,6 +162,7 @@ def _make_request(
             target_tokens=target_tokens,
             local_tokens=local_tokens,
             store_tokens=store_tokens,
+            admission_id=admission_id,
         ),
     }
     return SimpleNamespace(

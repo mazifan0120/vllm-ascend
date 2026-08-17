@@ -14,6 +14,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_c
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import ReversePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    PathAbortNotice,
+    PathAbortReason,
     PathDecisionResult,
     PathDecisionValidationError,
     PathKind,
@@ -31,17 +33,22 @@ _KEY = DualPathRequestKey(DECODE_TEST_INSTANCE_ID, "decode-request-9", 0)
 _ENDPOINT = DecodeControlEndpoint(host="192.0.2.10", port=24009)
 
 
-def _decision(attempt_id: int = 0, *, remote_port: int = 6000) -> PathDecision:
+def _decision(
+    attempt_id: int = 0,
+    *,
+    remote_port: int = 6000,
+    request_key: DualPathRequestKey = _KEY,
+) -> PathDecision:
     return PathDecision(
         result=PathDecisionResult(
-            request_key=_KEY,
+            request_key=request_key,
             path=PathKind.DE_READ,
             reverse_attempt_id=attempt_id,
             prefill_local_tokens=16,
         ),
         reverse_plan=ReversePlan(
-            request_key=_KEY,
-            wire_request_id=reverse_wire_id(ReverseAttemptKey(_KEY, attempt_id)),
+            request_key=request_key,
+            wire_request_id=reverse_wire_id(ReverseAttemptKey(request_key, attempt_id)),
             token_start=16,
             token_end=32,
             source_block_ids=((41, 42),),
@@ -80,6 +87,12 @@ def _deliver_frames(receiver: PathDecisionCoordinator, encoded: bytes) -> bytes 
 
 def _decision_reply(receiver: PathDecisionCoordinator, decision: PathDecision):
     reply = _deliver_frames(receiver, channel.encode_path_decision(decision))
+    assert reply is not None
+    return channel.decode_decision_reply(reply)
+
+
+def _abort_reply(receiver: PathDecisionCoordinator, notice: PathAbortNotice):
+    reply = _deliver_frames(receiver, channel.encode_path_abort(notice))
     assert reply is not None
     return channel.decode_decision_reply(reply)
 
@@ -191,6 +204,33 @@ class TestRegistryMatrix:
         assert receiver._accepted_decisions == {}
         assert receiver._closed_through_attempt_ids == {}
         assert receiver.take_received_decisions() == []
+
+    def test_old_admission_retransmission_is_unknown_while_reused_id_is_pending(self):
+        receiver = _make_receiver()
+        replacement_key = DualPathRequestKey(
+            _KEY.decode_engine_instance_id,
+            _KEY.decode_request_id,
+            _KEY.admission_id + 1,
+        )
+        receiver.register_pending(replacement_key)
+
+        assert _decision_reply(receiver, _decision(request_key=_KEY)) is channel.DecisionReplyStatus.UNKNOWN_REQUEST
+        assert receiver.take_received_decisions() == []
+        assert replacement_key in receiver._pending_keys
+
+    def test_old_unknown_abort_is_acknowledged_without_enqueueing_for_reused_id(self):
+        receiver = _make_receiver()
+        replacement_key = DualPathRequestKey(
+            _KEY.decode_engine_instance_id,
+            _KEY.decode_request_id,
+            _KEY.admission_id + 1,
+        )
+        receiver.register_pending(replacement_key)
+        notice = PathAbortNotice(request_key=_KEY, reason=PathAbortReason.REQUEST_ABORTED)
+
+        assert _abort_reply(receiver, notice) is channel.DecisionReplyStatus.ACK
+        assert receiver.take_received_aborts() == []
+        assert replacement_key in receiver._pending_keys
 
     def test_accepted_decisions_migration_preserves_legitimate_retries(self):
         receiver = _make_receiver()

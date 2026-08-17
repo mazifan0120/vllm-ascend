@@ -1485,6 +1485,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         state = self._decode_decision_states.get(request_id)
         if state is None:
             return
+        if state.request_key != result.request_key:
+            return
         is_attempt_refresh = False
         if not _is_open_decision_status(state.status):
             # A committed admission accepts only a greater-attempt refresh; the
@@ -1615,7 +1617,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def _handle_received_abort(self, notice: PathAbortNotice) -> None:
         request_id = notice.request_key.decode_request_id
         state = self._decode_decision_states.get(request_id)
-        if state is None or state.status not in (
+        if state is None or state.request_key != notice.request_key or state.status not in (
             _DecodeDecisionStatus.PENDING,
             _DecodeDecisionStatus.COMMITTED,
         ):
