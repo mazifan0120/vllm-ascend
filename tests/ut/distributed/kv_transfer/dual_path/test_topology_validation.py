@@ -65,7 +65,7 @@ class TestRemoteTopologyValidation:
 
         self._admit(scheduler, request)
 
-        assert request.request_id in scheduler._prefill_invalid_request_ids
+        assert scheduler._prefill_request_keys[request.request_id] in scheduler._prefill_invalid_request_keys
         assert coordinator.submit.call_count == 0
         assert scheduler._prefill_forward_plans == {}
 
@@ -78,7 +78,7 @@ class TestRemoteTopologyValidation:
 
         self._admit(scheduler, request)
 
-        assert request.request_id in scheduler._prefill_invalid_request_ids
+        assert scheduler._prefill_request_keys[request.request_id] in scheduler._prefill_invalid_request_keys
         assert coordinator.submit.call_count == 0
 
     def test_bootstrap_message_missing_topology_fields_rejected(self, pe_scheduler_factory):
@@ -91,7 +91,7 @@ class TestRemoteTopologyValidation:
 
         self._admit(scheduler, request)
 
-        assert request.request_id in scheduler._prefill_invalid_request_ids
+        assert scheduler._prefill_request_keys[request.request_id] in scheduler._prefill_invalid_request_keys
         assert coordinator.submit.call_count == 0
 
     def test_de_side_rejects_reverse_plan_topology_mismatch(self, decode_scheduler_factory, decode_task04_seams):
@@ -117,7 +117,7 @@ class TestRemoteTopologyValidation:
 
         self._admit(scheduler, request)
 
-        assert request.request_id not in scheduler._prefill_invalid_request_ids
+        assert scheduler._prefill_request_keys[request.request_id] not in scheduler._prefill_invalid_request_keys
         assert coordinator.submit.call_count == 1
         assert scheduler._prefill_forward_plans[request.request_id].source_block_ids == ((10, 11, 12),)
         assert scheduler._expected_worker_count == 2

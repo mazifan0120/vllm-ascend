@@ -245,7 +245,7 @@ class TestJobRecordReclamation:
         scheduler.update_connector_output(output)
 
         assert output.finished_recving is None
-        assert second_request.request_id not in scheduler._prefill_invalid_request_ids
+        assert second_binding.request_key not in scheduler._prefill_invalid_request_keys
         assert scheduler._prefill_control_failures == {}
         assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
         assert scheduler._job_ledger.get(second_binding.reverse_completion_job_id) is not None

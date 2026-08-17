@@ -164,7 +164,8 @@ def test_failed_old_delivery_after_i7_replacement_invalidates_current_attempt_bl
     attempt_zero_future: Future[None] = Future()
     coordinator.submit.return_value = attempt_zero_future
     request = _admit_de_read(scheduler)
-    attempt_zero_record = scheduler._prefill_delivery_records[request.request_id]
+    request_key = scheduler._prefill_path_results[request.request_id].request_key
+    attempt_zero_record = scheduler._prefill_delivery_records[request_key]
     assert attempt_zero_record.invalid_block_ids == (71, 72)
 
     assert _resume(scheduler, request, 32, _RESUME_BLOCKS) == (16, True)

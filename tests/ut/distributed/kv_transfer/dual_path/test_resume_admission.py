@@ -154,6 +154,6 @@ def test_invalid_set_convergence_no_longer_fires_for_delivered_decisions(pe_sche
     # A changed re-probed prefix must not converge into the invalid set: the
     # delivered decision resumes with its frozen path instead.
     assert scheduler.get_num_new_matched_tokens(request, 8) == (24, True)
-    assert request.request_id not in scheduler._prefill_invalid_request_ids
+    assert scheduler._prefill_request_keys[request.request_id] not in scheduler._prefill_invalid_request_keys
     assert scheduler._prefill_control_failures == {}
     assert coordinator.submit.call_count == 1

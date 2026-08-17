@@ -592,12 +592,13 @@ class TestPrefillDecisionHook:
         policy.choose.assert_called_once()
         assert scheduler._prefill_local_tokens == {request.request_id: 0}
 
-    def test_invalid_token_bounds_fence_same_id_reuse_by_request_identity(
+    def test_invalid_token_bounds_are_scoped_to_the_parsed_admission_key(
         self,
         scheduler_factory,
         task04_seams,
     ):
         policy = MagicMock(name="path_policy")
+        policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request("prefill-invalid-local", _remote_decode_params())
         replacement = _make_prefill_request(request.request_id, _remote_decode_params())
@@ -613,10 +614,9 @@ class TestPrefillDecisionHook:
             return_value=(0, False),
         ):
             result = scheduler.get_num_new_matched_tokens(request, 50)
-            with pytest.raises(RuntimeError, match="request-id reuse"):
-                scheduler.get_num_new_matched_tokens(replacement, 0)
+            replacement_result = scheduler.get_num_new_matched_tokens(replacement, 0)
 
-        assert result == (0, False)
+        assert result == replacement_result == (0, False)
         policy.choose.assert_not_called()
         task04_seams.prefill_coordinator.submit.assert_not_called()
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
@@ -626,7 +626,9 @@ class TestPrefillDecisionHook:
                 reason=PathAbortReason.DECISION_FAILED,
             ),
         )
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_invalid_request_keys == {
+            DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        }
         assert scheduler._prefill_local_tokens == {}
 
     def test_prefill_hook_passes_incoming_l_pe_to_forced_eligibility(
@@ -744,7 +746,9 @@ class TestPrefillDecisionHook:
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
         assert list(scheduler._prefill_forward_plans) == [request.request_id]
-        assert list(scheduler._prefill_delivery_futures) == [request.request_id]
+        assert list(scheduler._prefill_delivery_futures) == [
+            DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        ]
 
     def test_undelivered_conflicting_facts_discard_and_redecide(self, scheduler_factory, task04_seams):
         # An admission retry carrying changed facts before any delivery discards
@@ -767,7 +771,7 @@ class TestPrefillDecisionHook:
         assert second == (32, True)
         assert policy.choose.call_count == 2
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._prefill_invalid_request_ids == set()
+        assert scheduler._prefill_invalid_request_keys == set()
         assert scheduler._prefill_forward_plans == {}
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._reqs_need_send_layerwise == {}
@@ -801,7 +805,7 @@ class TestPrefillDecisionHook:
         assert second == (16, True)
         assert policy.choose.call_count == 2
         task04_seams.prefill_coordinator.submit.assert_not_called()
-        assert scheduler._prefill_invalid_request_ids == set()
+        assert scheduler._prefill_invalid_request_keys == set()
         assert scheduler._prefill_forward_plans == {}
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._reqs_need_send_layerwise == {}
@@ -832,11 +836,11 @@ class TestPrefillDecisionHook:
         assert second == (0, False)
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
-        assert scheduler._prefill_invalid_request_ids == set()
+        assert scheduler._prefill_invalid_request_keys == set()
         assert scheduler._prefill_path_results[request.request_id].path is PathKind.PE_READ
         assert list(scheduler._prefill_forward_plans) == [request.request_id]
 
-    def test_same_key_request_id_reuse_is_fenced_by_request_identity(
+    def test_same_key_distinct_request_object_resumes_the_same_admission(
         self,
         scheduler_factory,
         task04_seams,
@@ -852,8 +856,7 @@ class TestPrefillDecisionHook:
         assert scheduler.get_num_new_matched_tokens(old_request, 0) == (0, False)
         _bind_prefill(scheduler, old_request)
 
-        with pytest.raises(RuntimeError, match="request-id reuse"):
-            scheduler.get_num_new_matched_tokens(new_request, 0)
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
 
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
@@ -880,14 +883,15 @@ class TestPrefillDecisionHook:
         policy.choose.assert_not_called()
         task04_seams.prefill_coordinator.submit.assert_not_called()
         task04_seams.prefill_coordinator.submit_abort.assert_not_called()
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_invalid_request_keys == set()
 
-    def test_malformed_first_contact_fences_same_id_reuse_by_request_identity(
+    def test_malformed_first_contact_does_not_fence_a_valid_reparse(
         self,
         scheduler_factory,
         task04_seams,
     ):
         policy = MagicMock(name="path_policy")
+        policy.choose.return_value = PathKind.PE_READ
         scheduler = scheduler_factory(role="prefill", path_policy=policy)
         request = _make_prefill_request(
             "prefill-malformed-reused",
@@ -903,13 +907,12 @@ class TestPrefillDecisionHook:
             return_value=parent_result,
         ):
             assert scheduler.get_num_new_matched_tokens(request, 0) == parent_result
-            with pytest.raises(RuntimeError, match="request-id reuse"):
-                scheduler.get_num_new_matched_tokens(replacement, 0)
+            assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
 
-        policy.choose.assert_not_called()
+        policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_not_called()
 
-    def test_active_owner_alone_fences_request_id_reuse_after_delivery_reconciles(
+    def test_active_key_accepts_same_admission_after_delivery_reconciles(
         self,
         scheduler_factory,
         task04_seams,
@@ -925,10 +928,9 @@ class TestPrefillDecisionHook:
         _bind_prefill(scheduler, request)
         scheduler.build_connector_meta(MagicMock(name="reconcile_scheduler_output"))
 
-        assert request.request_id not in scheduler._prefill_delivery_records
-        assert scheduler._prefill_admission_owners[request.request_id] is request
-        with pytest.raises(RuntimeError, match="request-id reuse"):
-            scheduler.get_num_new_matched_tokens(replacement, 0)
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        assert request_key not in scheduler._prefill_delivery_records
+        assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
 
         policy.choose.assert_called_once()
         task04_seams.prefill_coordinator.submit.assert_called_once()
@@ -985,6 +987,194 @@ class TestPrefillDecisionHook:
             parent.metaserver_client.close()
 
 
+class TestAdmissionKeyedPrefillState:
+    @pytest.mark.parametrize("old_outcome", ["succeeded", "failed"])
+    def test_released_inflight_delivery_coexists_with_reused_admission(
+        self,
+        old_outcome,
+        scheduler_factory,
+        task04_seams,
+    ):
+        old_future: Future[None] = Future()
+        new_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.side_effect = [old_future, new_future]
+        task04_seams.prefill_coordinator.submit_abort.return_value = _completed_future()
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = PathKind.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request_id = "prefill-reused-inflight"
+        old_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        new_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 1)
+        old_request = _make_prefill_request(request_id, _remote_decode_params())
+
+        assert scheduler.get_num_new_matched_tokens(old_request, 0) == (0, False)
+        _bind_prefill(scheduler, old_request)
+        old_request.status = RequestStatus.FINISHED_STOPPED
+        scheduler.request_finished(old_request, [10, 11, 12, 13])
+
+        new_request = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
+        _bind_prefill(scheduler, new_request, local_block_ids=(30, 31, 32, 33))
+        assert scheduler._prefill_delivery_futures == {
+            old_key: old_future,
+            new_key: new_future,
+        }
+
+        if old_outcome == "succeeded":
+            old_future.set_result(None)
+        else:
+            old_future.set_exception(PathDecisionDeliveryError("old delivery exhausted"))
+        metadata = scheduler.build_connector_meta(MagicMock(name="reconcile_scheduler_output"))
+
+        assert metadata.control_failures == []
+        assert scheduler._prefill_request_keys[request_id] == new_key
+        assert scheduler._prefill_path_results[request_id].request_key == new_key
+        assert scheduler._prefill_delivery_futures == {new_key: new_future}
+        assert scheduler._prefill_invalid_request_keys == set()
+        if old_outcome == "failed":
+            task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
+                _CONTROL_ENDPOINT,
+                PathAbortNotice(request_key=old_key, reason=PathAbortReason.DELIVERY_EXHAUSTED),
+            )
+        else:
+            task04_seams.prefill_coordinator.submit_abort.assert_not_called()
+
+    def test_deferred_old_key_never_delivers_reused_admission_result(
+        self,
+        scheduler_factory,
+        task04_seams,
+    ):
+        old_future: Future[None] = Future()
+        new_future: Future[None] = Future()
+        task04_seams.prefill_coordinator.submit.side_effect = [old_future, new_future]
+        policy = MagicMock(name="path_policy")
+        policy.choose.side_effect = [PathKind.DE_READ, PathKind.PE_READ]
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request_id = "prefill-reused-deferred"
+        old_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        new_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 1)
+        old_request = _make_prefill_request(request_id, _remote_decode_params())
+
+        assert scheduler.get_num_new_matched_tokens(old_request, 0) == (32, True)
+        _bind_prefill(scheduler, old_request, local_block_ids=(10, 11))
+        old_request.num_preemptions = 1
+        assert scheduler.get_num_new_matched_tokens(old_request, 16) == (16, True)
+        _bind_prefill(scheduler, old_request, local_block_ids=(20, 21, 22, 23))
+        assert scheduler._prefill_deferred_deliveries == {old_key}
+
+        old_request.status = RequestStatus.FINISHED_STOPPED
+        scheduler.request_finished(old_request, [20, 21, 22, 23])
+        new_request = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
+        _bind_prefill(scheduler, new_request, local_block_ids=(30, 31, 32, 33))
+        submitted_before_stale_drain = task04_seams.prefill_coordinator.submit.call_count
+
+        scheduler._prefill_deferred_deliveries.add(old_key)
+        scheduler._deliver_prefill_decision(old_key)
+
+        assert task04_seams.prefill_coordinator.submit.call_count == submitted_before_stale_drain
+        assert scheduler._prefill_deferred_deliveries == set()
+        assert scheduler._prefill_delivery_futures == {
+            old_key: old_future,
+            new_key: new_future,
+        }
+        assert task04_seams.prefill_coordinator.submit.call_args_list[-1].args[1].result.request_key == new_key
+
+    def test_invalid_key_is_released_without_suppressing_reused_admission(
+        self,
+        scheduler_factory,
+    ):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = PathKind.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request_id = "prefill-reused-invalid"
+        old_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        new_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 1)
+        old_request = _make_prefill_request(request_id, _remote_decode_params())
+        parent_result = (7, True)
+
+        with patch.object(
+            MooncakeLayerwiseConnectorScheduler,
+            "get_num_new_matched_tokens",
+            autospec=True,
+            return_value=parent_result,
+        ):
+            assert scheduler.get_num_new_matched_tokens(old_request, 50) == parent_result
+        assert scheduler._prefill_invalid_request_keys == {old_key}
+        old_request.status = RequestStatus.FINISHED_STOPPED
+        scheduler.request_finished(old_request, [])
+        assert scheduler._prefill_invalid_request_keys == set()
+
+        new_request = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
+        assert scheduler._prefill_request_keys[request_id] == new_key
+        policy.choose.assert_called_once()
+
+    def test_malformed_bootstrap_reparses_without_retaining_an_owner_fence(
+        self,
+        scheduler_factory,
+        task04_seams,
+    ):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = PathKind.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request_id = "prefill-malformed-reused"
+        malformed = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path={"unexpected": "shape"}),
+        )
+        parent_result = (7, True)
+
+        with (
+            patch.object(
+                MooncakeLayerwiseConnectorScheduler,
+                "get_num_new_matched_tokens",
+                autospec=True,
+                return_value=parent_result,
+            ),
+            patch.object(scheduler_module.logger, "error") as log_error,
+        ):
+            assert scheduler.get_num_new_matched_tokens(malformed, 0) == parent_result
+            assert scheduler.get_num_new_matched_tokens(malformed, 0) == parent_result
+
+        assert log_error.call_count == 2
+        assert scheduler._prefill_invalid_request_keys == set()
+        replacement = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+        assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
+        assert scheduler._prefill_request_keys[request_id].admission_id == 1
+        task04_seams.prefill_coordinator.submit.assert_not_called()
+
+    def test_two_simultaneously_live_keys_for_one_local_id_tripwire(self, scheduler_factory):
+        policy = MagicMock(name="path_policy")
+        policy.choose.return_value = PathKind.PE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request_id = "prefill-live-collision"
+        old_request = _make_prefill_request(request_id, _remote_decode_params())
+        new_request = _make_prefill_request(
+            request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+
+        assert scheduler.get_num_new_matched_tokens(old_request, 0) == (0, False)
+        with pytest.raises(RuntimeError, match="two live DualPath admissions share the local request ID"):
+            scheduler.get_num_new_matched_tokens(new_request, 0)
+
+        assert scheduler._prefill_request_keys[request_id].admission_id == 0
+        policy.choose.assert_called_once()
+
+
 class TestPrefillAbortTriggers:
     @staticmethod
     def _expected_notice(reason: PathAbortReason) -> PathAbortNotice:
@@ -993,7 +1183,7 @@ class TestPrefillAbortTriggers:
             reason=reason,
         )
 
-    def test_initial_decision_failure_fences_same_id_reuse_by_request_identity(
+    def test_initial_decision_failure_marks_only_the_parsed_admission_key(
         self,
         scheduler_factory,
         task04_seams,
@@ -1014,10 +1204,11 @@ class TestPrefillAbortTriggers:
         ):
             scheduler.get_num_new_matched_tokens(request, 0)
 
-        with pytest.raises(RuntimeError, match="request-id reuse"):
-            scheduler.get_num_new_matched_tokens(replacement, 0)
+        assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
 
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_invalid_request_keys == {
+            DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        }
         assert scheduler._prefill_request_keys == {}
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
@@ -1053,8 +1244,9 @@ class TestPrefillAbortTriggers:
         ):
             scheduler.get_num_new_matched_tokens(conflicting, 0)
 
-        assert scheduler._prefill_invalid_request_ids == {original.request_id}
-        assert scheduler._prefill_admission_owners[original.request_id] is conflicting
+        assert scheduler._prefill_invalid_request_keys == {
+            DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        }
         assert scheduler._prefill_request_keys == {}
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
@@ -1079,11 +1271,11 @@ class TestPrefillAbortTriggers:
         ):
             _bind_prefill(scheduler, request)
 
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
-        assert scheduler._prefill_admission_owners[request.request_id] is request
+        assert scheduler._prefill_invalid_request_keys == {
+            DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        }
         replacement = _make_prefill_request(request.request_id, _remote_decode_params())
-        with pytest.raises(RuntimeError, match="request-id reuse"):
-            scheduler.get_num_new_matched_tokens(replacement, 0)
+        assert scheduler.get_num_new_matched_tokens(replacement, 0) == (0, False)
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             self._expected_notice(PathAbortReason.ACTIVATION_FAILED),
@@ -1115,7 +1307,9 @@ class TestPrefillAbortTriggers:
 
         scheduler.update_state_after_alloc(request, blocks, 0)
 
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_invalid_request_keys == {
+            DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        }
         assert scheduler._prefill_path_results == {}
         assert scheduler._prefill_forward_plans == {}
         task04_seams.prefill_coordinator.submit.assert_not_called()
@@ -1140,7 +1334,9 @@ class TestPrefillAbortTriggers:
         with patch.object(scheduler_module.logger, "error") as log_error:
             _bind_prefill(scheduler, request)
 
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        assert scheduler._prefill_invalid_request_keys == {
+            DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        }
         assert scheduler._prefill_forward_plans == {}
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
@@ -1465,7 +1661,7 @@ class TestCleanupAndShutdown:
             getattr(scheduler, method_name)(request, block_ids)
             assert request.request_id not in scheduler._prefill_request_keys
             assert request.request_id not in scheduler._prefill_local_tokens
-            assert scheduler._prefill_delivery_futures == {request.request_id: delivery_future}
+            assert scheduler._prefill_delivery_futures == {request_key: delivery_future}
             discard.assert_called_once_with(request_key)
 
             delivery_future.set_result(None)
@@ -1495,15 +1691,16 @@ class TestCleanupAndShutdown:
             "prefill-invalid-cleanup",
             _remote_decode_params(),
         )
-        scheduler._prefill_invalid_request_ids.add(request.request_id)
-        assert scheduler._prefill_invalid_request_ids == {request.request_id}
+        request_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        scheduler._prefill_invalid_request_keys.add(request_key)
+        assert scheduler._prefill_invalid_request_keys == {request_key}
 
         # When
         result = getattr(scheduler, method_name)(request, block_ids)
 
         # Then
         assert result == (False, None)
-        assert scheduler._prefill_invalid_request_ids == set()
+        assert scheduler._prefill_invalid_request_keys == set()
 
     def test_pe_read_delivery_exhaustion_emits_peer_abort_on_next_decode_build(
         self,
@@ -1566,7 +1763,7 @@ class TestCleanupAndShutdown:
                 reason=DualPathControlFailureReason.PEER_ABORT,
             )
         ]
-        assert prefill_request.request_id in prefill_scheduler._prefill_invalid_request_ids
+        assert decode_state.request_key in prefill_scheduler._prefill_invalid_request_keys
 
     @pytest.mark.parametrize("cancelled", [False, True])
     def test_de_read_delivery_exhaustion_fails_pe_reverse_destination_once(
@@ -1608,7 +1805,9 @@ class TestCleanupAndShutdown:
         assert metadata.reverse_receive_bindings == []
         assert metadata.control_failures == [expected_failure]
         assert scheduler._prefill_control_failures == {}
-        assert request.request_id in scheduler._prefill_invalid_request_ids
+        assert DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0) in (
+            scheduler._prefill_invalid_request_keys
+        )
         task04_seams.prefill_coordinator.submit_abort.assert_called_once_with(
             _CONTROL_ENDPOINT,
             PathAbortNotice(
@@ -1743,7 +1942,11 @@ class TestCleanupAndShutdown:
         assert scheduler._prefill_path_results == {}
 
         delivery_future.set_exception(PathDecisionDeliveryError("delivery exhausted"))
-        new_request = _make_prefill_request(old_request.request_id, _remote_decode_params())
+        new_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 1)
+        new_request = _make_prefill_request(
+            old_request.request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
         assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
         _bind_prefill(scheduler, new_request, local_block_ids=(30, 31, 32, 33))
         metadata = scheduler.build_connector_meta(MagicMock(name="new_scheduler_output"))
@@ -1756,13 +1959,12 @@ class TestCleanupAndShutdown:
                 reason=PathAbortReason.DELIVERY_EXHAUSTED,
             ),
         )
-        assert new_request.request_id not in scheduler._prefill_invalid_request_ids
-        assert scheduler._prefill_admission_owners[new_request.request_id] is new_request
+        assert new_key not in scheduler._prefill_invalid_request_keys
         assert scheduler._prefill_path_results[new_request.request_id].path is PathKind.PE_READ
         assert policy.choose.call_count == 2
-        assert scheduler._prefill_delivery_futures == {new_request.request_id: new_delivery_future}
+        assert scheduler._prefill_delivery_futures == {new_key: new_delivery_future}
 
-    def test_active_failed_delivery_fences_reuse_until_failure_is_published(
+    def test_active_failed_delivery_record_is_retained_until_failure_is_published(
         self,
         scheduler_factory,
         task04_seams,
@@ -1781,11 +1983,11 @@ class TestCleanupAndShutdown:
         delivery_future.set_exception(PathDecisionDeliveryError("delivery exhausted"))
         scheduler._reconcile_prefill_deliveries()
 
-        assert old_request.request_id not in scheduler._prefill_delivery_futures
-        assert old_request.request_id in scheduler._prefill_delivery_records
+        old_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        assert old_key not in scheduler._prefill_delivery_futures
+        assert old_key in scheduler._prefill_delivery_records
         new_request = _make_prefill_request(old_request.request_id, _remote_decode_params())
-        with pytest.raises(RuntimeError, match="request-id reuse"):
-            scheduler.get_num_new_matched_tokens(new_request, 0)
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
 
         metadata = scheduler.build_connector_meta(MagicMock(name="failure_scheduler_output"))
         assert metadata.control_failures == [
@@ -1795,15 +1997,19 @@ class TestCleanupAndShutdown:
                 reason=DualPathControlFailureReason.ACTIVATION_FAILED,
             )
         ]
-        assert old_request.request_id not in scheduler._prefill_delivery_records
+        assert old_key not in scheduler._prefill_delivery_records
         repeated_metadata = scheduler.build_connector_meta(MagicMock(name="repeated_scheduler_output"))
         assert repeated_metadata.control_failures == []
 
         old_request.status = RequestStatus.FINISHED_STOPPED
         scheduler.request_finished(old_request, [10, 11])
-        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (32, True)
+        replacement = _make_prefill_request(
+            old_request.request_id,
+            _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
+        )
+        assert scheduler.get_num_new_matched_tokens(replacement, 0) == (32, True)
 
-    def test_request_id_reuse_is_fenced_until_prior_delivery_resolves(
+    def test_request_id_reuse_is_not_blocked_by_prior_delivery_resolution(
         self,
         scheduler_factory,
         task04_seams,
@@ -1825,20 +2031,15 @@ class TestCleanupAndShutdown:
             ),
         )
 
-        with pytest.raises(RuntimeError, match="request-id reuse"):
-            scheduler.get_num_new_matched_tokens(new_request, 0)
-
-        assert scheduler._prefill_request_keys == {}
-        assert policy.choose.call_count == 1
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
+        new_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-new", 0)
+        assert scheduler._prefill_request_keys == {new_request.request_id: new_key}
+        assert policy.choose.call_count == 2
         delivery_future.set_result(None)
         scheduler.build_connector_meta(MagicMock(name="idle_scheduler_output"))
 
         assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
-        assert scheduler._prefill_request_keys[new_request.request_id] == DualPathRequestKey(
-            _DECODE_INSTANCE_ID,
-            "decode-request-new",
-            0,
-        )
+        assert scheduler._prefill_request_keys[new_request.request_id] == new_key
         assert policy.choose.call_count == 2
 
     def test_concurrent_requests_stay_isolated_across_outcomes(
@@ -1966,7 +2167,7 @@ class TestCleanupAndShutdown:
             inflight_prefill_request.request_id: aborted_state.request_key,
         }
         assert prefill_scheduler._prefill_delivery_futures == {
-            inflight_prefill_request.request_id: inflight_delivery_future,
+            aborted_state.request_key: inflight_delivery_future,
         }
         assert not inflight_delivery_future.done()
         assert prefill_scheduler._path_decider is not None
@@ -1998,11 +2199,13 @@ class TestCleanupAndShutdown:
         prefill_request = _make_prefill_request("prefill-shutdown", _remote_decode_params())
         prefill_scheduler.get_num_new_matched_tokens(prefill_request, 0)
         _bind_prefill(prefill_scheduler, prefill_request)
+        prefill_key = prefill_scheduler._prefill_request_keys[prefill_request.request_id]
         invalid_request = _make_prefill_request(
             "prefill-invalid-shutdown",
             _remote_decode_params(),
         )
-        prefill_scheduler._prefill_invalid_request_ids.add(invalid_request.request_id)
+        invalid_key = DualPathRequestKey(_DECODE_INSTANCE_ID, "decode-request-7", 0)
+        prefill_scheduler._prefill_invalid_request_keys.add(invalid_key)
         worker = _control_only_worker()
         worker._control_failed_recving.add("request-control-failure")
         events = []
@@ -2024,7 +2227,7 @@ class TestCleanupAndShutdown:
                     prefill_scheduler._accepting_decode_admission,
                     getattr(prefill_scheduler, "_accepting_prefill_decisions", None),
                     prefill_request.request_id in prefill_scheduler._prefill_request_keys,
-                    prefill_request.request_id in prefill_scheduler._prefill_delivery_futures,
+                    prefill_key in prefill_scheduler._prefill_delivery_futures,
                 )
             )
             delivery_future.cancel()
@@ -2069,7 +2272,7 @@ class TestCleanupAndShutdown:
         assert prefill_scheduler._prefill_request_keys == {}
         assert prefill_scheduler._prefill_local_tokens == {}
         assert prefill_scheduler._prefill_delivery_futures == {}
-        assert prefill_scheduler._prefill_invalid_request_ids == set()
+        assert prefill_scheduler._prefill_invalid_request_keys == set()
         assert prefill_scheduler._path_decider is not None
         assert prefill_scheduler._path_decider._decision_records == {}
         assert worker._control_failed_recving == set()

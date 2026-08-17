@@ -87,7 +87,7 @@ class TestBoundedCompletionJobs:
             kv_connector_worker_meta=make_worker_metadata(failed_jobs={binding.reverse_completion_job_id: 1})
         )
         scheduler.update_connector_output(output)
-        assert request.request_id in scheduler._prefill_invalid_request_ids
+        assert binding.request_key in scheduler._prefill_invalid_request_keys
         metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
 
         assert len(metadata.control_failures) == 1
@@ -112,7 +112,8 @@ class TestSingleUnresolvedDeliveryFuture:
 
         request = _admit_de_read(scheduler)
         assert coordinator.submit.call_count == 1
-        first_future = scheduler._prefill_delivery_futures[request.request_id]
+        request_key = scheduler._prefill_path_results[request.request_id].request_key
+        first_future = scheduler._prefill_delivery_futures[request_key]
 
         request.num_preemptions += 1
         assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
@@ -121,7 +122,7 @@ class TestSingleUnresolvedDeliveryFuture:
         # submit and no overwrite of the unresolved attempt-0 Future.
         assert scheduler._prefill_reverse_plans[request.request_id].reverse_attempt_id == 1
         assert coordinator.submit.call_count == 1
-        assert scheduler._prefill_delivery_futures[request.request_id] is first_future
+        assert scheduler._prefill_delivery_futures[request_key] is first_future
 
         # Once attempt 0's delivery resolves, the next build pass delivers.
         pending_future.done.return_value = True
@@ -129,7 +130,7 @@ class TestSingleUnresolvedDeliveryFuture:
         assert coordinator.submit.call_count == 2
         second_decision = coordinator.submit.call_args_list[1].args[1]
         assert second_decision.result.reverse_attempt_id == 1
-        assert scheduler._prefill_delivery_futures[request.request_id] is not first_future
+        assert scheduler._prefill_delivery_futures[request_key] is not first_future
 
 
 class TestFailedPriorFutureCancelsDeferredReplacement:
@@ -144,7 +145,8 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         request.num_preemptions += 1
         assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
         scheduler.update_state_after_alloc(request, _blocks(([80, 81, 82, 83],)), 16)
-        assert request.request_id in scheduler._prefill_deferred_deliveries
+        request_key = scheduler._prefill_path_results[request.request_id].request_key
+        assert request_key in scheduler._prefill_deferred_deliveries
         return request, pending_future
 
     def test_failed_prior_future_cancels_deferred_replacement(self, pe_scheduler_factory):
@@ -156,12 +158,13 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         pending_future.exception.return_value = RuntimeError("delivery exhausted")
         metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
 
+        request_key = scheduler._prefill_request_keys[request.request_id]
         assert coordinator.submit.call_count == 1
-        assert request.request_id in scheduler._prefill_invalid_request_ids
-        assert request.request_id not in scheduler._prefill_deferred_deliveries
+        assert request_key in scheduler._prefill_invalid_request_keys
+        assert request_key not in scheduler._prefill_deferred_deliveries
         assert len(metadata.control_failures) == 1
         # The invalid request can never be delivered later, even by a direct call.
-        scheduler._deliver_prefill_decision(request.request_id)
+        scheduler._deliver_prefill_decision(request_key)
         assert coordinator.submit.call_count == 1
 
     def test_cancelled_prior_future_cancels_deferred_replacement(self, pe_scheduler_factory):
@@ -173,9 +176,10 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         pending_future.cancelled.return_value = True
         metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
 
+        request_key = scheduler._prefill_request_keys[request.request_id]
         assert coordinator.submit.call_count == 1
-        assert request.request_id in scheduler._prefill_invalid_request_ids
-        assert request.request_id not in scheduler._prefill_deferred_deliveries
+        assert request_key in scheduler._prefill_invalid_request_keys
+        assert request_key not in scheduler._prefill_deferred_deliveries
         assert len(metadata.control_failures) == 1
 
 

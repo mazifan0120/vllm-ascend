@@ -191,6 +191,10 @@ def _decide(scheduler, request) -> None:
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
 
 
+def _request_key(scheduler, request) -> DualPathRequestKey:
+    return scheduler._prefill_request_keys[request.request_id]
+
+
 @pytest.fixture()
 def parent_forward_metadata_pair(scheduler_factory):
     dual_scheduler, _, _ = scheduler_factory()
@@ -306,7 +310,7 @@ def test_successful_allocation_installs_before_creating_one_future(scheduler_fac
     assert list(scheduler._prefill_forward_plans) == [request.request_id]
     assert policy.calls == 1
     coordinator.submit.assert_called_once()
-    assert list(scheduler._prefill_delivery_futures) == [request.request_id]
+    assert list(scheduler._prefill_delivery_futures) == [_request_key(scheduler, request)]
 
 
 def test_pe_read_freezes_forward_range_with_final_tables(scheduler_factory):
@@ -384,7 +388,7 @@ def test_conflicting_duplicate_alloc_fails_locally_preserving_first_plan(schedul
     scheduler.update_state_after_alloc(request, _blocks(([13, 14, 15],)), 0)
 
     assert scheduler._prefill_forward_plans[request.request_id] is first_plan
-    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert _request_key(scheduler, request) in scheduler._prefill_invalid_request_keys
     assert request.request_id not in scheduler._prefill_path_results
 
 
@@ -403,10 +407,10 @@ def test_conflicting_forward_plan_raises_within_epoch_and_replaces_after_preempt
     # Same epoch: the conflicting reallocation raises and preserves the plan.
     scheduler.update_state_after_alloc(request, _blocks(([13, 14, 15],)), 0)
     assert scheduler._prefill_forward_plans[request.request_id] is first_plan
-    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert _request_key(scheduler, request) in scheduler._prefill_invalid_request_keys
 
     # After a preemption a fresh request replaces its plan legally.
-    resumed_request = _make_request(request_id="prefill-request-resumed")
+    resumed_request = _make_request(request_id="prefill-request-resumed", admission_id=1)
     _decide(scheduler, resumed_request)
     scheduler.update_state_after_alloc(resumed_request, _blocks(([10, 11, 12],)), 0)
     first_resumed_plan = scheduler._prefill_forward_plans[resumed_request.request_id]
@@ -432,7 +436,7 @@ def test_post_install_validation_failure_preserves_first_plan_and_send_state(sch
 
     assert scheduler._prefill_forward_plans[request.request_id] is first_plan
     assert scheduler._reqs_need_send_layerwise[request.request_id] is first_send
-    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert _request_key(scheduler, request) in scheduler._prefill_invalid_request_keys
     assert request.request_id not in scheduler._prefill_path_results
 
 
@@ -512,7 +516,7 @@ def test_scheduler_defers_plan_while_source_table_short_of_T(scheduler_factory):
     assert request.request_id in scheduler._prefill_path_results
     assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
-    assert request.request_id not in scheduler._prefill_invalid_request_ids
+    assert _request_key(scheduler, request) not in scheduler._prefill_invalid_request_keys
 
     scheduler.update_state_after_alloc(request, _blocks(([10, 11],)), 0)
 
@@ -903,7 +907,7 @@ def test_scheduler_rejects_invalid_forward_plan_without_send_state(scheduler_fac
 
     scheduler.update_state_after_alloc(request, blocks, 0)
 
-    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert _request_key(scheduler, request) in scheduler._prefill_invalid_request_keys
     assert request.request_id not in scheduler._prefill_path_results
     assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
@@ -918,7 +922,7 @@ def test_scheduler_rejects_missing_forward_topology_without_send_state(scheduler
 
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
-    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert _request_key(scheduler, request) in scheduler._prefill_invalid_request_keys
     assert request.request_id not in scheduler._prefill_path_results
     assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
@@ -938,7 +942,7 @@ def test_scheduler_rejects_invalid_forward_topology_without_send_state(
 
     scheduler.update_state_after_alloc(request, _blocks(([10, 11, 12],)), 0)
 
-    assert request.request_id in scheduler._prefill_invalid_request_ids
+    assert _request_key(scheduler, request) in scheduler._prefill_invalid_request_keys
     assert request.request_id not in scheduler._prefill_path_results
     assert request.request_id not in scheduler._prefill_forward_plans
     assert request.request_id not in scheduler._reqs_need_send_layerwise
