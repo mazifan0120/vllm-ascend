@@ -127,13 +127,13 @@ class TestReverseDestinationNotPinned:
             def aggregate(self, other):
                 return self
 
-        metadata = make_worker_metadata(completed_jobs={1: 1})
+        metadata = make_worker_metadata(completion_reports={1: 1})
         with pytest.raises(AssertionError):
             metadata.aggregate(ForeignWorkerMetadata())
 
-        merged = metadata.aggregate(make_worker_metadata(completed_jobs={1: 1, 2: 1}, failed_jobs={3: 1}))
-        assert merged.completed_jobs == {1: 2, 2: 1}
-        assert merged.failed_jobs == {3: 1}
+        merged = metadata.aggregate(make_worker_metadata(completion_reports={1: 1, 2: 1}, failure_reports={3: 1}))
+        assert merged.completion_reports == {1: 2, 2: 1}
+        assert merged.failure_reports == {3: 1}
 
 
 class TestJobRecordReclamation:
@@ -155,10 +155,10 @@ class TestJobRecordReclamation:
     def test_failed_completion_job_record_is_reclaimed_with_the_request(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
         completion_id = (
-            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_receive_completion_id
         )
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_id
+        assert metadata.reverse_receive_bindings[0].reverse_receive_completion_id == completion_id
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._completion_tracker.fail_completion(completion_id) is True
 
@@ -169,10 +169,10 @@ class TestJobRecordReclamation:
     def test_open_completion_job_record_survives_request_cleanup(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
         completion_id = (
-            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_receive_completion_id
         )
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_id
+        assert metadata.reverse_receive_bindings[0].reverse_receive_completion_id == completion_id
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
         scheduler._release_scheduler_request_state(request)
@@ -185,15 +185,15 @@ class TestJobRecordReclamation:
     ):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
         completion_id = (
-            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_receive_completion_id
         )
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_id
+        assert metadata.reverse_receive_bindings[0].reverse_receive_completion_id == completion_id
         request.status = RequestStatus.FINISHED_STOPPED
         assert scheduler.request_finished(request, [70, 71]) == (False, None)
         assert scheduler._completion_tracker.get(completion_id) is not None
 
-        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failed_jobs={completion_id: 1}))
+        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failure_reports={completion_id: 1}))
         scheduler.update_connector_output(output)
 
         assert scheduler._completion_tracker.get(completion_id) is None
@@ -225,13 +225,15 @@ class TestJobRecordReclamation:
         second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
 
         output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(completed_jobs={first_binding.reverse_completion_job_id: 1})
+            kv_connector_worker_meta=make_worker_metadata(
+                completion_reports={first_binding.reverse_receive_completion_id: 1}
+            )
         )
         scheduler.update_connector_output(output)
 
         assert output.finished_recving is None
         assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
-        assert scheduler._completion_tracker.get(second_binding.reverse_completion_job_id) is not None
+        assert scheduler._completion_tracker.get(second_binding.reverse_receive_completion_id) is not None
 
     def test_late_old_admission_failure_does_not_fail_reused_request_id(self, pe_scheduler_factory):
         scheduler, first_request = self._admit_de_read(pe_scheduler_factory)
@@ -242,7 +244,9 @@ class TestJobRecordReclamation:
         second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
 
         output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(failed_jobs={first_binding.reverse_completion_job_id: 1})
+            kv_connector_worker_meta=make_worker_metadata(
+                failure_reports={first_binding.reverse_receive_completion_id: 1}
+            )
         )
         scheduler.update_connector_output(output)
 
@@ -250,14 +254,14 @@ class TestJobRecordReclamation:
         assert second_binding.request_key not in scheduler._prefill_invalid_request_keys
         assert scheduler._prefill_control_failures == {}
         assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
-        assert scheduler._completion_tracker.get(second_binding.reverse_completion_job_id) is not None
+        assert scheduler._completion_tracker.get(second_binding.reverse_receive_completion_id) is not None
 
     def test_request_cleanup_reclaims_every_closed_completion_job_after_binding_delivery(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
         binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
-        successful_job_id = binding.reverse_completion_job_id
+        successful_job_id = binding.reverse_receive_completion_id
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == successful_job_id
+        assert metadata.reverse_receive_bindings[0].reverse_receive_completion_id == successful_job_id
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
         ledgers = _ledgers()
@@ -288,8 +292,8 @@ class TestJobRecordReclamation:
         request = _admit_decode_request(scheduler)
         first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
         second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
-        old_job_id = first_metadata.reverse_plans[0].reverse_send_job_id
-        latest_job_id = second_metadata.reverse_plans[0].reverse_send_job_id
+        old_job_id = first_metadata.reverse_plans[0].reverse_send_completion_id
+        latest_job_id = second_metadata.reverse_plans[0].reverse_send_completion_id
         assert old_job_id is not None
         assert latest_job_id is not None
         state = scheduler._decode_decision_states[request.request_id]

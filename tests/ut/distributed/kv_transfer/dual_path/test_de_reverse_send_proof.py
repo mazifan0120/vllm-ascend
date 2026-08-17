@@ -92,7 +92,7 @@ def _de_read_decision(reverse_attempt_id: int = 0, remote_tp_size: int = 1) -> P
             remote_dcp_size=1,
             reverse_attempt_id=reverse_attempt_id,
             prefill_local_tokens=16,
-            reverse_send_job_id=None,
+            reverse_send_completion_id=None,
         ),
     )
 
@@ -102,9 +102,11 @@ def _activate_decision(scheduler, decode_task04_seams, decision: PathDecision):
     return scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
 
-def _seed_reverse_send_tracker(worker, reverse_send_job_id: int, reverse_attempt_id: int = 0):
+def _seed_reverse_send_tracker(worker, reverse_send_completion_id: int, reverse_attempt_id: int = 0):
     attempt_key = _attempt_key(reverse_attempt_id, _REQUEST_KEY)
-    plan = _make_reverse_plan(reverse_attempt_id=reverse_attempt_id, reverse_send_job_id=reverse_send_job_id)
+    plan = _make_reverse_plan(
+        reverse_attempt_id=reverse_attempt_id, reverse_send_completion_id=reverse_send_completion_id
+    )
     tracker = worker_module._SplitTracker(
         store_phase=worker_module._SplitPhase.SKIPPED,
         reverse_phase=worker_module._SplitPhase.PENDING,
@@ -124,21 +126,21 @@ def _activate_two_reverse_attempts(scheduler, decode_task04_seams):
     request = _admit_decode_request(scheduler)
     first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
     second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
-    first_job_id = first_metadata.reverse_plans[0].reverse_send_job_id
-    second_job_id = second_metadata.reverse_plans[0].reverse_send_job_id
+    first_job_id = first_metadata.reverse_plans[0].reverse_send_completion_id
+    second_job_id = second_metadata.reverse_plans[0].reverse_send_completion_id
     assert first_job_id is not None
     assert second_job_id is not None
     return request, first_job_id, second_job_id
 
 
 def _close_send_job(scheduler, completion_id: int) -> KVConnectorOutput:
-    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_id: 1}))
+    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_id: 1}))
     scheduler.update_connector_output(output)
     return output
 
 
 def _fail_send_job(scheduler, completion_id: int) -> KVConnectorOutput:
-    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failed_jobs={completion_id: 1}))
+    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failure_reports={completion_id: 1}))
     scheduler.update_connector_output(output)
     return output
 
@@ -153,9 +155,9 @@ def test_reverse_send_job_allocated_at_attempt_creation_and_carried_on_plan(
 
     assert len(metadata.reverse_plans) == 1
     carried_plan = metadata.reverse_plans[0]
-    assert carried_plan.reverse_send_job_id is not None
+    assert carried_plan.reverse_send_completion_id is not None
     attempt_key = _attempt_key(0, _REQUEST_KEY)
-    completion = scheduler._completion_tracker.get(carried_plan.reverse_send_job_id)
+    completion = scheduler._completion_tracker.get(carried_plan.reverse_send_completion_id)
     assert completion.completion_kind.name == "REVERSE_SEND"
     assert completion.reverse_attempt_key == attempt_key
     assert completion.expected_worker_count == 1
@@ -168,10 +170,10 @@ def test_partial_tp_completion_never_sender_complete(decode_scheduler_factory, d
     scheduler = decode_scheduler_factory(world_size=2)
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0, remote_tp_size=2))
-    completion_id = metadata.reverse_plans[0].reverse_send_job_id
+    completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
-    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_id: 1}))
+    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_id: 1}))
     scheduler.update_connector_output(output)
 
     completion = scheduler._completion_tracker.get(completion_id)
@@ -185,7 +187,7 @@ def test_terminal_ack_failure_marks_job_failed_never_success(decode_scheduler_fa
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
-    completion_id = metadata.reverse_plans[0].reverse_send_job_id
+    completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
     worker = _make_worker()
@@ -199,8 +201,8 @@ def test_terminal_ack_failure_marks_job_failed_never_success(decode_scheduler_fa
     assert worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), {_REQUEST_ID})
     assert worker._split_trackers[_REQUEST_ID].reverse_phase is worker_module._SplitPhase.FAILED
     worker_metadata = worker.build_connector_worker_meta()
-    assert worker_metadata.failed_jobs == {completion_id: 1}
-    assert worker_metadata.completed_jobs == {}
+    assert worker_metadata.failure_reports == {completion_id: 1}
+    assert worker_metadata.completion_reports == {}
 
     output = KVConnectorOutput(kv_connector_worker_meta=worker_metadata)
     scheduler.update_connector_output(output)
@@ -213,7 +215,7 @@ def test_abort_before_final_layer_leaves_job_incomplete(decode_scheduler_factory
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
-    completion_id = metadata.reverse_plans[0].reverse_send_job_id
+    completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
     # The abort lands before the final layer: send_done_send_signal never
@@ -233,7 +235,7 @@ def test_job_close_marks_the_send_job_closed_and_not_failed(decode_scheduler_fac
     scheduler = decode_scheduler_factory()
     _admit_decode_request(scheduler)
     metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision())
-    completion_id = metadata.reverse_plans[0].reverse_send_job_id
+    completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     attempt_key = _attempt_key(0, _REQUEST_KEY)
 
     worker = _make_worker()
@@ -243,8 +245,8 @@ def test_job_close_marks_the_send_job_closed_and_not_failed(decode_scheduler_fac
         worker.send_done_send_signal(_REQUEST_ID, make_sender_req_meta(), 0, trans_flag=True)
 
     worker_metadata = worker.build_connector_worker_meta()
-    assert worker_metadata.completed_jobs == {completion_id: 1}
-    assert worker_metadata.failed_jobs == {}
+    assert worker_metadata.completion_reports == {completion_id: 1}
+    assert worker_metadata.failure_reports == {}
 
     output = KVConnectorOutput(kv_connector_worker_meta=worker_metadata)
     scheduler.update_connector_output(output)
@@ -254,7 +256,7 @@ def test_job_close_marks_the_send_job_closed_and_not_failed(decode_scheduler_fac
 
 def test_reverse_terminal_is_not_visible_while_terminal_ack_is_blocked():
     worker = _make_worker()
-    tracker = _seed_reverse_send_tracker(worker, reverse_send_job_id=17)
+    tracker = _seed_reverse_send_tracker(worker, reverse_send_completion_id=17)
     ack_entered = threading.Event()
     release_ack = threading.Event()
 
@@ -284,8 +286,8 @@ def test_reverse_terminal_is_not_visible_while_terminal_ack_is_blocked():
     assert worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), set())
     assert tracker.reverse_phase is worker_module._SplitPhase.DONE
     worker_metadata = worker.build_connector_worker_meta()
-    assert worker_metadata.completed_jobs == {17: 1}
-    assert worker_metadata.failed_jobs == {}
+    assert worker_metadata.completion_reports == {17: 1}
+    assert worker_metadata.failure_reports == {}
 
 
 def test_old_reverse_send_attempt_closes_without_releasing_open_latest_attempt(
@@ -424,7 +426,7 @@ def test_active_request_retains_closed_attempt_epoch_for_later_refresh(decode_sc
     scheduler = decode_scheduler_factory()
     request = _admit_decode_request(scheduler)
     first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
-    first_job_id = first_metadata.reverse_plans[0].reverse_send_job_id
+    first_job_id = first_metadata.reverse_plans[0].reverse_send_completion_id
     assert first_job_id is not None
     assert request.request_id not in scheduler._pending_finished_sending
 
@@ -435,7 +437,7 @@ def test_active_request_retains_closed_attempt_epoch_for_later_refresh(decode_sc
 
     second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
     assert len(second_metadata.reverse_plans) == 1
-    second_job_id = second_metadata.reverse_plans[0].reverse_send_job_id
+    second_job_id = second_metadata.reverse_plans[0].reverse_send_completion_id
     assert second_job_id is not None
     assert second_job_id != first_job_id
     assert scheduler._latest_reverse_attempt_ids[request.request_id] == 1

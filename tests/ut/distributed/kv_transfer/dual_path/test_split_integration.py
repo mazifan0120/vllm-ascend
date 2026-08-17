@@ -222,7 +222,7 @@ def test_injected_split_success_with_non_empty_store_and_reverse() -> None:
     assert de_reverse == (set(), set())
     assert pe_reverse == (set(), set())
     pe_jobs = harness.pe_worker.build_connector_worker_meta()
-    assert pe_jobs.completed_jobs == {pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id: 1}
+    assert pe_jobs.completion_reports == {pe_metadata.reverse_receive_bindings[0].reverse_receive_completion_id: 1}
     forward_metadata = harness.run_forward()
     _assert_forward_tasks(harness, forward_metadata)
 
@@ -294,7 +294,7 @@ def test_injected_reverse_failure_end_to_end() -> None:
     assert de_failed == (set(), {lifecycle.DECODE_REQUEST_ID})
     assert pe_failed == (set(), set())
     pe_jobs = harness.pe_worker.build_connector_worker_meta()
-    assert pe_jobs.failed_jobs == {pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id: 1}
+    assert pe_jobs.failure_reports == {pe_metadata.reverse_receive_bindings[0].reverse_receive_completion_id: 1}
     assert harness.de_worker.get_block_ids_with_load_errors() == FORWARD_DE_BLOCKS
     assert harness.pe_worker.get_block_ids_with_load_errors() == REVERSE_PE_BLOCKS
     assert harness.pe_worker.kv_send_layer_thread.send_queue.put.call_count == 0
@@ -345,11 +345,11 @@ def test_injected_early_terminal_race(failed: bool) -> None:
     expected_pe_invalid = REVERSE_PE_BLOCKS if failed else set()
     assert harness.poll_pe(pe_metadata) == (set(), set())
     pe_jobs = harness.pe_worker.build_connector_worker_meta()
-    pe_completion_job_id = pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id
+    pe_completion_job_id = pe_metadata.reverse_receive_bindings[0].reverse_receive_completion_id
     if failed:
-        assert pe_jobs.failed_jobs == {pe_completion_job_id: 1}
+        assert pe_jobs.failure_reports == {pe_completion_job_id: 1}
     else:
-        assert pe_jobs.completed_jobs == {pe_completion_job_id: 1}
+        assert pe_jobs.completion_reports == {pe_completion_job_id: 1}
     assert harness.poll_de(de_metadata) == (set(), {lifecycle.DECODE_REQUEST_ID})
     assert harness.de_worker.get_block_ids_with_load_errors() == expected_de_invalid
     assert harness.pe_worker.get_block_ids_with_load_errors() == expected_pe_invalid
@@ -385,7 +385,7 @@ def test_injected_duplicate_and_replay_safety() -> None:
     harness.inject_reverse_receive(harness.pe_worker)
     assert harness.poll_pe(pe_metadata) == (set(), set())
     pe_jobs = harness.pe_worker.build_connector_worker_meta()
-    assert pe_jobs.completed_jobs == {pe_binding.reverse_completion_job_id: 1}
+    assert pe_jobs.completion_reports == {pe_binding.reverse_receive_completion_id: 1}
     assert harness.poll_pe(pe_metadata) == (set(), set())
     assert harness.poll_de(de_metadata) == (set(), set())
 

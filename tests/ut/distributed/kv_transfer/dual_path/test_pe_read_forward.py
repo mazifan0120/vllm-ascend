@@ -762,7 +762,7 @@ def test_pe_metadata_emits_binding_and_control_failure_once(scheduler_factory):
         token_end=32,
         reverse_attempt_id=0,
         prefill_local_tokens=16,
-        reverse_completion_job_id=0,
+        reverse_receive_completion_id=0,
     )
     failure = DualPathControlFailureMetadata(
         request_id="prefill-failed",

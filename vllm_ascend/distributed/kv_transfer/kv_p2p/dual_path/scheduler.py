@@ -819,7 +819,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_end=token_split,
                 reverse_attempt_id=result.reverse_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_completion_job_id=completion_job.completion_id,
+                reverse_receive_completion_id=completion_job.completion_id,
             )
             parallel_config = self.vllm_config.parallel_config
             reverse_plan = ReversePlan(
@@ -838,7 +838,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 remote_dcp_size=parallel_config.decode_context_parallel_size,
                 reverse_attempt_id=result.reverse_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_send_job_id=None,
+                reverse_send_completion_id=None,
             )
             existing_binding = self._prefill_pending_reverse_receive_bindings.get(request_id)
             if existing_binding is not None and existing_binding != binding:
@@ -868,7 +868,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_end=token_split,
                 reverse_attempt_id=replacement_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_completion_job_id=completion_job.completion_id,
+                reverse_receive_completion_id=completion_job.completion_id,
             )
             parallel_config = self.vllm_config.parallel_config
             reverse_plan = ReversePlan(
@@ -887,7 +887,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 remote_dcp_size=parallel_config.decode_context_parallel_size,
                 reverse_attempt_id=replacement_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_send_job_id=None,
+                reverse_send_completion_id=None,
             )
             self._prefill_pending_reverse_receive_bindings[request_id] = binding
             self._prefill_reverse_plans[request_id] = reverse_plan
@@ -1517,7 +1517,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 expected_worker_count=self._expected_worker_count,
                 reverse_attempt_key=attempt_key,
             )
-            reverse_plan = replace(reverse_plan, reverse_send_job_id=send_completion.completion_id)
+            reverse_plan = replace(reverse_plan, reverse_send_completion_id=send_completion.completion_id)
             self._reverse_send_completion_ids[attempt_key] = send_completion.completion_id
             metadata.reverse_plans.append(reverse_plan)
         if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
@@ -1812,7 +1812,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def _aggregate_worker_completion_facts(self, worker_metadata: DualPathWorkerMetadata) -> tuple[set[str], set[str]]:
         finished_sending_injection: set[str] = set()
         finished_recving_injection: set[str] = set()
-        for completion_id, report_count in worker_metadata.completed_jobs.items():
+        for completion_id, report_count in worker_metadata.completion_reports.items():
             completion = self._completion_tracker.get(completion_id)
             if completion is None:
                 continue
@@ -1820,7 +1820,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 sending, recving = self._run_completion_close_action(completion)
                 finished_sending_injection.update(sending)
                 finished_recving_injection.update(recving)
-        for completion_id in worker_metadata.failed_jobs:
+        for completion_id in worker_metadata.failure_reports:
             completion = self._completion_tracker.get(completion_id)
             if completion is None:
                 continue

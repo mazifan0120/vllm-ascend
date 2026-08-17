@@ -233,10 +233,12 @@ def make_empty_scheduler_output(preempted_req_ids: set[str] | None = None) -> Si
     )
 
 
-def make_worker_metadata(completed_jobs: dict[int, int] | None = None, failed_jobs: dict[int, int] | None = None):
+def make_worker_metadata(
+    completion_reports: dict[int, int] | None = None, failure_reports: dict[int, int] | None = None
+):
     return metadata_module.DualPathWorkerMetadata(
-        completed_jobs=completed_jobs or {},
-        failed_jobs=failed_jobs or {},
+        completion_reports=completion_reports or {},
+        failure_reports=failure_reports or {},
     )
 
 

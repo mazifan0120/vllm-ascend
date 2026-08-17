@@ -47,7 +47,7 @@ class _ReversePlanInput:
     remote_dcp_size: int
     reverse_attempt_id: int
     prefill_local_tokens: int
-    reverse_send_job_id: int | None
+    reverse_send_completion_id: int | None
 
     def build(self) -> metadata_module.ReversePlan:
         return metadata_module.ReversePlan(
@@ -66,7 +66,7 @@ class _ReversePlanInput:
             remote_dcp_size=self.remote_dcp_size,
             reverse_attempt_id=self.reverse_attempt_id,
             prefill_local_tokens=self.prefill_local_tokens,
-            reverse_send_job_id=self.reverse_send_job_id,
+            reverse_send_completion_id=self.reverse_send_completion_id,
         )
 
 
@@ -87,7 +87,7 @@ def _valid_reverse_plan_input() -> _ReversePlanInput:
         remote_dcp_size=1,
         reverse_attempt_id=0,
         prefill_local_tokens=16,
-        reverse_send_job_id=None,
+        reverse_send_completion_id=None,
     )
 
 
@@ -105,7 +105,7 @@ def _make_reverse_binding(
         token_end=token_end,
         reverse_attempt_id=0,
         prefill_local_tokens=token_start,
-        reverse_completion_job_id=0,
+        reverse_receive_completion_id=0,
     )
 
 
@@ -191,7 +191,7 @@ def test_reverse_plan_wire_round_trip() -> None:
         "remote_dcp_size": 1,
         "reverse_attempt_id": 0,
         "prefill_local_tokens": 16,
-        "reverse_send_job_id": None,
+        "reverse_send_completion_id": None,
     }
     expected = _valid_reverse_plan_input().build()
 
@@ -314,7 +314,7 @@ def test_reverse_contracts_carry_no_runtime_or_mutable_state() -> None:
             "remote_dcp_size",
             "reverse_attempt_id",
             "prefill_local_tokens",
-            "reverse_send_job_id",
+            "reverse_send_completion_id",
         },
         "ReverseReceiveBinding": {
             "request_key",
@@ -325,7 +325,7 @@ def test_reverse_contracts_carry_no_runtime_or_mutable_state() -> None:
             "token_end",
             "reverse_attempt_id",
             "prefill_local_tokens",
-            "reverse_completion_job_id",
+            "reverse_receive_completion_id",
         },
     }
     forbidden_type_fragments = (

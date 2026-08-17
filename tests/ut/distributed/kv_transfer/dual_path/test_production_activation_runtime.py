@@ -107,8 +107,8 @@ class ProductionHarness:
         return self.pe_metadata.reverse_receive_bindings[0].wire_request_id
 
     @property
-    def reverse_completion_job_id(self) -> int:
-        return self.pe_metadata.reverse_receive_bindings[0].reverse_completion_job_id
+    def reverse_receive_completion_id(self) -> int:
+        return self.pe_metadata.reverse_receive_bindings[0].reverse_receive_completion_id
 
     def finish_store(self, *, failed: bool = False) -> tuple[set[str], set[str]]:
         self.de_worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})
@@ -331,7 +331,7 @@ def test_pe_execution_blocked_until_final_reverse_done(production_harness_factor
 
     assert pe_finished == (set(), set())
     worker_metadata = harness.pe_worker.build_connector_worker_meta()
-    assert worker_metadata.completed_jobs == {harness.reverse_completion_job_id: 1}
+    assert worker_metadata.completion_reports == {harness.reverse_receive_completion_id: 1}
 
 
 def test_pe_uses_inherited_layerwise_forward_after_reverse(production_harness_factory) -> None:
@@ -405,9 +405,9 @@ def test_production_metadata_reconciles_early_terminals(production_harness_facto
     assert early.pe_worker.get_finished(set(), harness.pe_metadata) == (set(), set())
     worker_metadata = early.pe_worker.build_connector_worker_meta()
     if failed:
-        assert worker_metadata.failed_jobs == {harness.reverse_completion_job_id: 1}
+        assert worker_metadata.failure_reports == {harness.reverse_receive_completion_id: 1}
     else:
-        assert worker_metadata.completed_jobs == {harness.reverse_completion_job_id: 1}
+        assert worker_metadata.completion_reports == {harness.reverse_receive_completion_id: 1}
 
 
 def test_production_metadata_failed_wins_over_late_done(production_harness_factory) -> None:

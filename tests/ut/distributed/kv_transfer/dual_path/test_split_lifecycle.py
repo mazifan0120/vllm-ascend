@@ -95,7 +95,7 @@ def _make_store_metadata(request_id: str = DECODE_REQUEST_ID) -> AscendConnector
     return store_metadata
 
 
-def _make_reverse_plan(reverse_send_job_id: int | None = None) -> ReversePlan:
+def _make_reverse_plan(reverse_send_completion_id: int | None = None) -> ReversePlan:
     return ReversePlan(
         request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID, 0),
         wire_request_id=REVERSE_WIRE_REQUEST_ID,
@@ -112,7 +112,7 @@ def _make_reverse_plan(reverse_send_job_id: int | None = None) -> ReversePlan:
         remote_dcp_size=1,
         reverse_attempt_id=0,
         prefill_local_tokens=16,
-        reverse_send_job_id=reverse_send_job_id,
+        reverse_send_completion_id=reverse_send_completion_id,
     )
 
 
@@ -120,7 +120,7 @@ def _make_reverse_receive_binding(
     *,
     prefill_request_id: str = f"{WIRE_REQUEST_ID}prefill-local",
     destination_block_ids: tuple[tuple[int, ...], ...] = REVERSE_DESTINATION_BLOCKS,
-    reverse_completion_job_id: int = 0,
+    reverse_receive_completion_id: int = 0,
 ) -> ReverseReceiveBinding:
     return ReverseReceiveBinding(
         request_key=DualPathRequestKey("decode-instance", DECODE_REQUEST_ID, 0),
@@ -131,7 +131,7 @@ def _make_reverse_receive_binding(
         token_end=64,
         reverse_attempt_id=0,
         prefill_local_tokens=16,
-        reverse_completion_job_id=reverse_completion_job_id,
+        reverse_receive_completion_id=reverse_receive_completion_id,
     )
 
 
@@ -346,7 +346,7 @@ def test_after_reverse_done_prefill_executes_inherited_layerwise_forward() -> No
     # The Reverse terminal leaves the worker only as a completion id (I4).
     assert worker.get_finished(set(), reverse_metadata) == (set(), set())
     worker_metadata = worker.build_connector_worker_meta()
-    assert worker_metadata.completed_jobs == {binding.reverse_completion_job_id: 1}
+    assert worker_metadata.completion_reports == {binding.reverse_receive_completion_id: 1}
 
     forward_metadata = layerwise_module.MooncakeLayerwiseConnectorMetadata()
     forward_metadata.add_new_req(

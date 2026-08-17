@@ -42,7 +42,7 @@ def _admit_de_read_request(scheduler, request=None):
     return request
 
 
-def test_worker_emits_only_reverse_completion_job_id():
+def test_worker_emits_only_reverse_receive_completion_id():
     worker = _make_prefill_worker()
     binding = _make_reverse_binding(reverse_attempt_id=0)
     worker._install_reverse_receive_binding(binding)
@@ -54,8 +54,8 @@ def test_worker_emits_only_reverse_completion_job_id():
     assert binding.prefill_request_id not in done_recving
     assert done_recving == set()
     worker_metadata = worker.build_connector_worker_meta()
-    assert worker_metadata.completed_jobs == {binding.reverse_completion_job_id: 1}
-    assert worker_metadata.failed_jobs == {}
+    assert worker_metadata.completion_reports == {binding.reverse_receive_completion_id: 1}
+    assert worker_metadata.failure_reports == {}
 
 
 def test_stale_attempt_job_absorbed_never_reaches_finished_recving(pe_scheduler_factory):
@@ -63,15 +63,15 @@ def test_stale_attempt_job_absorbed_never_reaches_finished_recving(pe_scheduler_
     scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     request = _admit_de_read_request(scheduler)
     binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
-    completion_job_id = binding.reverse_completion_job_id
+    completion_job_id = binding.reverse_receive_completion_id
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-    assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_job_id
+    assert metadata.reverse_receive_bindings[0].reverse_receive_completion_id == completion_job_id
     assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
     # The logical request has re-parked at a newer attempt: the old attempt's
     # completion report is stale and must be absorbed.
     scheduler._waiting_reverse_attempt_ids[request.request_id] = _attempt_key(1, binding.request_key)
-    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_job_id: 1}))
+    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_job_id: 1}))
     scheduler.update_connector_output(output)
 
     assert output.finished_recving is None
@@ -84,10 +84,10 @@ def test_current_attempt_job_inserts_req_id_only_while_waiting(pe_scheduler_fact
     scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     request = _admit_de_read_request(scheduler)
     binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
-    completion_job_id = binding.reverse_completion_job_id
+    completion_job_id = binding.reverse_receive_completion_id
     assert scheduler._waiting_reverse_attempt_ids[request.request_id] == _attempt_key(0, binding.request_key)
 
-    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_job_id: 1}))
+    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_job_id: 1}))
     scheduler.update_connector_output(output)
 
     # I4 gate passes: the request id enters the mutable finished_recving.
@@ -97,7 +97,7 @@ def test_current_attempt_job_inserts_req_id_only_while_waiting(pe_scheduler_fact
 
     # A late duplicate report hits the closed completion and is ignored.
     late_output = KVConnectorOutput(
-        kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_job_id: 1})
+        kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_job_id: 1})
     )
     scheduler.update_connector_output(late_output)
     assert late_output.finished_recving is None
@@ -108,13 +108,13 @@ def test_current_attempt_job_for_running_request_does_not_insert(pe_scheduler_fa
     scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     request = _admit_de_read_request(scheduler)
     binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
-    completion_job_id = binding.reverse_completion_job_id
+    completion_job_id = binding.reverse_receive_completion_id
 
     # The request already left WAITING_FOR_REMOTE_KVS (it is RUNNING): the
     # gate finds no waiting entry and absorbs the report, avoiding the
     # upstream finished-status assertion crash.
     del scheduler._waiting_reverse_attempt_ids[request.request_id]
-    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_job_id: 1}))
+    output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_job_id: 1}))
     scheduler.update_connector_output(output)
 
     assert output.finished_recving is None

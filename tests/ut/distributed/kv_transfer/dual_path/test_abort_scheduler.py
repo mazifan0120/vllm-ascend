@@ -63,7 +63,7 @@ def test_same_drain_commits_decision_then_aborts_without_touching_job_ledger(
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     assert len(metadata.reverse_plans) == 1
-    completion_id = metadata.reverse_plans[0].reverse_send_job_id
+    completion_id = metadata.reverse_plans[0].reverse_send_completion_id
     assert completion_id is not None
     completion = scheduler._completion_tracker.get(completion_id)
     assert completion is not None

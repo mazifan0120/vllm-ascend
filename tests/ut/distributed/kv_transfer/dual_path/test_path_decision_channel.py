@@ -119,7 +119,7 @@ def _reverse_plan(key: DualPathRequestKey) -> ReversePlan:
         remote_dcp_size=1,
         reverse_attempt_id=0,
         prefill_local_tokens=0,
-        reverse_send_job_id=None,
+        reverse_send_completion_id=None,
     )
 
 

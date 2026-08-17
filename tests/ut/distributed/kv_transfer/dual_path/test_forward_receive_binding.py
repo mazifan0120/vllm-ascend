@@ -69,7 +69,7 @@ def _de_read_decision(state, snapshot, **plan_overrides) -> PathDecision:
         remote_dcp_size=1,
         reverse_attempt_id=0,
         prefill_local_tokens=token_start,
-        reverse_send_job_id=None,
+        reverse_send_completion_id=None,
     )
     if plan_overrides:
         plan = dataclasses.replace(plan, **plan_overrides)
@@ -373,9 +373,9 @@ def test_store_miss_commits_nothing_and_enters_skipped(scheduler_factory):
 
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
     assert metadata.decode_store_metadata is None
-    reverse_send_job_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
+    reverse_send_completion_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
     assert metadata.reverse_plans == [
-        dataclasses.replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)
+        dataclasses.replace(decision.reverse_plan, reverse_send_completion_id=reverse_send_completion_id)
     ]
     assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
 
@@ -446,9 +446,9 @@ def test_de_read_activation_emits_plan_binding_store_in_one_lifecycle(scheduler_
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    reverse_send_job_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
+    reverse_send_completion_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
     assert metadata.reverse_plans == [
-        dataclasses.replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)
+        dataclasses.replace(decision.reverse_plan, reverse_send_completion_id=reverse_send_completion_id)
     ]
     assert metadata.forward_receive_bindings == [
         ForwardReceiveBinding(

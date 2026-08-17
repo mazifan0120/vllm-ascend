@@ -243,7 +243,7 @@ def _decision(result: PathDecisionResult | None = None) -> PathDecision:
             remote_dcp_size=1,
             reverse_attempt_id=retained_result.reverse_attempt_id,
             prefill_local_tokens=16,
-            reverse_send_job_id=None,
+            reverse_send_completion_id=None,
         ),
     )
 
@@ -1592,9 +1592,11 @@ class TestCleanupAndShutdown:
 
         # Then
         assert result == (True, None)
-        reverse_send_job_id = commit_metadata.reverse_plans[0].reverse_send_job_id
+        reverse_send_completion_id = commit_metadata.reverse_plans[0].reverse_send_completion_id
         decode_scheduler.update_connector_output(
-            KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={reverse_send_job_id: 2}))
+            KVConnectorOutput(
+                kv_connector_worker_meta=make_worker_metadata(completion_reports={reverse_send_completion_id: 2})
+            )
         )
         result_after = decode_scheduler.request_finished(request, [41, 42, 43, 44])
         assert result_after == (False, None)
@@ -1816,7 +1818,7 @@ class TestCleanupAndShutdown:
         assert scheduler.get_num_new_matched_tokens(old_request, 0) == (32, True)
         _bind_prefill(scheduler, old_request, local_block_ids=(10, 11))
         old_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
-        old_job_id = old_binding.reverse_completion_job_id
+        old_job_id = old_binding.reverse_receive_completion_id
         assert scheduler._completion_tracker.tally_reports(old_job_id, scheduler._expected_worker_count) is True
 
         # Arrange the scheduler race: the old admission's key-scoped artifacts
@@ -1840,7 +1842,7 @@ class TestCleanupAndShutdown:
         live_result = scheduler._prefill_path_results[request_id]
         live_reverse_plan = scheduler._prefill_reverse_plans[request_id]
         live_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
-        live_job_id = live_binding.reverse_completion_job_id
+        live_job_id = live_binding.reverse_receive_completion_id
         scheduler._prefill_deferred_deliveries.update({old_key, live_key})
         scheduler._prefill_invalid_request_keys.update({old_key, live_key})
         assert scheduler._path_decider is not None
@@ -2290,9 +2292,11 @@ class TestCleanupAndShutdown:
             )
         ]
         commit_metadata = decode_scheduler.build_connector_meta(MagicMock(name="commit_scheduler_output"))
-        reverse_send_job_id = commit_metadata.reverse_plans[0].reverse_send_job_id
+        reverse_send_completion_id = commit_metadata.reverse_plans[0].reverse_send_completion_id
         decode_scheduler.update_connector_output(
-            KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={reverse_send_job_id: 2}))
+            KVConnectorOutput(
+                kv_connector_worker_meta=make_worker_metadata(completion_reports={reverse_send_completion_id: 2})
+            )
         )
 
         # When

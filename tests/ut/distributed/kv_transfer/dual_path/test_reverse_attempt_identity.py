@@ -44,7 +44,7 @@ def _make_reverse_binding(
     prefill_request_id: str = "prefill-request-1",
     token_start: int = _ATTEMPT_TOKENS,
     token_end: int = 64,
-    reverse_completion_job_id: int = _COMPLETION_JOB_ID,
+    reverse_receive_completion_id: int = _COMPLETION_JOB_ID,
 ):
     return metadata_module.ReverseReceiveBinding(
         request_key=_KEY,
@@ -55,11 +55,11 @@ def _make_reverse_binding(
         token_end=token_end,
         reverse_attempt_id=reverse_attempt_id,
         prefill_local_tokens=token_start,
-        reverse_completion_job_id=reverse_completion_job_id,
+        reverse_receive_completion_id=reverse_receive_completion_id,
     )
 
 
-def _make_reverse_plan(*, reverse_attempt_id: int = 0, reverse_send_job_id: int | None = None):
+def _make_reverse_plan(*, reverse_attempt_id: int = 0, reverse_send_completion_id: int | None = None):
     return metadata_module.ReversePlan(
         request_key=_KEY,
         wire_request_id=_reverse_wire_id(reverse_attempt_id),
@@ -76,7 +76,7 @@ def _make_reverse_plan(*, reverse_attempt_id: int = 0, reverse_send_job_id: int 
         remote_dcp_size=1,
         reverse_attempt_id=reverse_attempt_id,
         prefill_local_tokens=_ATTEMPT_TOKENS,
-        reverse_send_job_id=reverse_send_job_id,
+        reverse_send_completion_id=reverse_send_completion_id,
     )
 
 
@@ -192,7 +192,7 @@ class TestAttemptKeyedInstallers:
         assert binding_n.wire_request_id in worker._consumed_reverse_terminal_wire_ids
 
         # A greater attempt installs alongside; attempt 0's tombstone survives.
-        binding_m = _make_reverse_binding(reverse_attempt_id=1, reverse_completion_job_id=42)
+        binding_m = _make_reverse_binding(reverse_attempt_id=1, reverse_receive_completion_id=42)
         worker._install_reverse_receive_binding(binding_m)
         assert worker._reverse_receive_bindings[_attempt_key(1)] == binding_m
         assert worker._consumed_reverse_terminal_wire_ids[binding_n.wire_request_id] == _attempt_key(0)
@@ -244,7 +244,7 @@ class TestAttemptKeyedInstallers:
 
     def test_tp_gt1_reverse_mapping_assertion_holds_attempt_keyed(self):
         worker = _make_worker()
-        plan = _make_reverse_plan(reverse_attempt_id=0, reverse_send_job_id=7)
+        plan = _make_reverse_plan(reverse_attempt_id=0, reverse_send_completion_id=7)
 
         def two_mappings(*args):
             return {

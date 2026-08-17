@@ -66,7 +66,7 @@ def _admit_de_read(scheduler, request=None):
 def _complete_reverse_attempt_zero(scheduler, request) -> None:
     binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
     output = KVConnectorOutput(
-        kv_connector_worker_meta=make_worker_metadata(completed_jobs={binding.reverse_completion_job_id: 1})
+        kv_connector_worker_meta=make_worker_metadata(completion_reports={binding.reverse_receive_completion_id: 1})
     )
     scheduler.update_connector_output(output)
     assert output.finished_recving == {request.request_id}
@@ -189,7 +189,7 @@ def test_fresh_tracker_and_latch_for_new_attempt_old_plan_never_resubmitted():
     worker = _make_worker()
     decode_request_id = _KEY.decode_request_id
     attempt_zero = ReverseAttemptKey(_KEY, 0)
-    plan_zero = _make_reverse_plan(reverse_attempt_id=0, reverse_send_job_id=5)
+    plan_zero = _make_reverse_plan(reverse_attempt_id=0, reverse_send_completion_id=5)
     tracker = worker_module._SplitTracker(
         store_phase=worker_module._SplitPhase.DONE,
         reverse_phase=worker_module._SplitPhase.DONE,
@@ -207,7 +207,7 @@ def test_fresh_tracker_and_latch_for_new_attempt_old_plan_never_resubmitted():
     binding.token_start = 64
     worker._forward_receive_bindings[decode_request_id] = binding
 
-    plan_one = _make_reverse_plan(reverse_attempt_id=1, reverse_send_job_id=6)
+    plan_one = _make_reverse_plan(reverse_attempt_id=1, reverse_send_completion_id=6)
     worker._registered_kv_caches = {"model.layer.0": [MagicMock(), MagicMock()]}
     worker._registered_layer_order = ((0, "model.layer.0"),)
     with (
@@ -253,18 +253,18 @@ def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_job(
     _admit_decode_request(scheduler)
     first_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
     assert len(first_metadata.forward_receive_bindings) == 1
-    first_job_id = first_metadata.reverse_plans[0].reverse_send_job_id
+    first_job_id = first_metadata.reverse_plans[0].reverse_send_completion_id
 
     second_metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(1))
 
     # The logical Forward binding is neither replaced nor reinstalled; a fresh
-    # Reverse plan with a new reverse_send_job_id is installed.
+    # Reverse plan with a new reverse_send_completion_id is installed.
     assert second_metadata.forward_receive_bindings == []
     assert len(second_metadata.reverse_plans) == 1
     refreshed_plan = second_metadata.reverse_plans[0]
     assert refreshed_plan.reverse_attempt_id == 1
-    assert refreshed_plan.reverse_send_job_id is not None
-    assert refreshed_plan.reverse_send_job_id != first_job_id
+    assert refreshed_plan.reverse_send_completion_id is not None
+    assert refreshed_plan.reverse_send_completion_id != first_job_id
     attempt_one = ReverseAttemptKey(
         DualPathRequestKey(
             first_metadata.forward_receive_bindings[0].request_key.decode_engine_instance_id,
@@ -273,4 +273,4 @@ def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_job(
         ),
         1,
     )
-    assert scheduler._reverse_send_completion_ids[attempt_one] == refreshed_plan.reverse_send_job_id
+    assert scheduler._reverse_send_completion_ids[attempt_one] == refreshed_plan.reverse_send_completion_id

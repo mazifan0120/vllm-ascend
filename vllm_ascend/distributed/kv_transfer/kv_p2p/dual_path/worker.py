@@ -297,7 +297,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         the §5 removal rule."""
         self._consumed_reverse_terminal_wire_ids[binding.wire_request_id] = attempt_key
         self._reverse_request_map.pop(binding.wire_request_id, None)
-        self._record_sender_job(binding.reverse_completion_job_id, succeeded=terminal_flag)
+        self._record_sender_job(binding.reverse_receive_completion_id, succeeded=terminal_flag)
 
     def _record_sender_job(self, completion_id: int, *, succeeded: bool) -> None:
         with self._sender_job_facts_lock:
@@ -562,18 +562,18 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         return published_store_terminals
 
     def build_connector_worker_meta(self) -> DualPathWorkerMetadata | None:
-        completed_jobs: dict[int, int] = {}
-        failed_jobs: dict[int, int] = {}
+        completion_reports: dict[int, int] = {}
+        failure_reports: dict[int, int] = {}
         with self._sender_job_facts_lock:
             for completion_id, count in self._completed_sender_jobs.items():
-                completed_jobs[completion_id] = completed_jobs.get(completion_id, 0) + count
+                completion_reports[completion_id] = completion_reports.get(completion_id, 0) + count
             self._completed_sender_jobs.clear()
             for completion_id, count in self._failed_sender_jobs.items():
-                failed_jobs[completion_id] = failed_jobs.get(completion_id, 0) + count
+                failure_reports[completion_id] = failure_reports.get(completion_id, 0) + count
             self._failed_sender_jobs.clear()
-        if not completed_jobs and not failed_jobs:
+        if not completion_reports and not failure_reports:
             return None
-        return DualPathWorkerMetadata(completed_jobs=completed_jobs, failed_jobs=failed_jobs)
+        return DualPathWorkerMetadata(completion_reports=completion_reports, failure_reports=failure_reports)
 
     def start_load_kv(self, metadata: DualPathConnectorMetadata) -> None:
         store_metadata = metadata.decode_store_metadata
@@ -614,14 +614,14 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
         submitted_attempt = None
-        reverse_send_job_id = None
+        reverse_send_completion_id = None
         if self.dual_path_cfg.role == "decode":
             with self._reverse_terminal_lock:
                 tracker = self._split_trackers.get(req_id)
                 if tracker is not None and tracker.reverse_submitted_attempt is not None:
                     submitted_attempt = tracker.reverse_submitted_attempt
                     if tracker.reverse_plan is not None:
-                        reverse_send_job_id = tracker.reverse_plan.reverse_send_job_id
+                        reverse_send_completion_id = tracker.reverse_plan.reverse_send_completion_id
         # The parent's return value is the single outcome source: True only
         # after a successful terminal ACK.
         ack_succeeded = super().send_done_send_signal(req_id, req_meta, group_idx, trans_flag)
@@ -636,11 +636,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             self._pending_local_reverse_terminals[submitted_attempt] = (
                 self._pending_local_reverse_terminals.get(submitted_attempt, True) and terminal_succeeded
             )
-        if reverse_send_job_id is None:
+        if reverse_send_completion_id is None:
             return
         # The reverse-send proof is recorded only after the final synchronous
         # write AND a successful terminal ACK.
-        self._record_sender_job(reverse_send_job_id, succeeded=terminal_succeeded)
+        self._record_sender_job(reverse_send_completion_id, succeeded=terminal_succeeded)
 
     def get_finished(
         self,

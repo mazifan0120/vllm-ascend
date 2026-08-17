@@ -47,7 +47,7 @@ def test_facade_forwards_every_safety_hook():
     connector.update_connector_output(output)
     scheduler.update_connector_output.assert_called_once_with(output)
 
-    worker_metadata = DualPathWorkerMetadata(completed_jobs={1: 1})
+    worker_metadata = DualPathWorkerMetadata(completion_reports={1: 1})
     worker.build_connector_worker_meta.return_value = worker_metadata
     assert connector.build_connector_worker_meta() is worker_metadata
 
@@ -68,11 +68,11 @@ def test_multiconnector_aggregation_preserves_dual_path_worker_metadata_type():
         MultiKVConnectorWorkerMetadata,
     )
 
-    first = MultiKVConnectorWorkerMetadata(metadata=(None, make_worker_metadata(completed_jobs={1: 1})))
-    second = MultiKVConnectorWorkerMetadata(metadata=(None, make_worker_metadata(completed_jobs={1: 1, 2: 1})))
+    first = MultiKVConnectorWorkerMetadata(metadata=(None, make_worker_metadata(completion_reports={1: 1})))
+    second = MultiKVConnectorWorkerMetadata(metadata=(None, make_worker_metadata(completion_reports={1: 1, 2: 1})))
 
     merged = first.aggregate(second)
 
     dual_path_slot = merged.metadata[1]
     assert type(dual_path_slot) is DualPathWorkerMetadata
-    assert dual_path_slot.completed_jobs == {1: 2, 2: 1}
+    assert dual_path_slot.completion_reports == {1: 2, 2: 1}

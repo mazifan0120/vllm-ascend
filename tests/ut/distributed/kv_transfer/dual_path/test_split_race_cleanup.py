@@ -138,7 +138,7 @@ def test_reverse_done_before_binding_is_retained_and_reconciled() -> None:
     worker.start_load_kv(metadata)
 
     assert worker.get_finished(set(), metadata) == (set(), set())
-    assert worker.build_connector_worker_meta().completed_jobs == {binding.reverse_completion_job_id: 1}
+    assert worker.build_connector_worker_meta().completion_reports == {binding.reverse_receive_completion_id: 1}
     assert worker.get_finished(set(), metadata) == (set(), set())
     assert worker._pending_reverse_done_wire_ids == set()
     assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: REVERSE_ATTEMPT_KEY}
@@ -158,7 +158,7 @@ def test_reverse_failed_before_binding_is_retained_and_reconciled() -> None:
     worker.start_load_kv(metadata)
 
     assert worker.get_finished(set(), metadata) == (set(), set())
-    assert worker.build_connector_worker_meta().failed_jobs == {binding.reverse_completion_job_id: 1}
+    assert worker.build_connector_worker_meta().failure_reports == {binding.reverse_receive_completion_id: 1}
     assert worker.get_block_ids_with_load_errors() == {71, 80, 81}
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
     assert worker.get_finished(set(), metadata) == (set(), set())
@@ -550,8 +550,10 @@ def test_production_de_read_result_creates_plan_binding_store_without_scheduler_
 
         assert len(metadata.forward_receive_bindings) == 1
         assert metadata.forward_receive_bindings[0].path is PathKind.DE_READ
-        reverse_send_job_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
-        assert metadata.reverse_plans == [replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)]
+        reverse_send_completion_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
+        assert metadata.reverse_plans == [
+            replace(decision.reverse_plan, reverse_send_completion_id=reverse_send_completion_id)
+        ]
         assert metadata.reverse_receive_bindings == []
         assert metadata.decode_store_metadata is store_metadata
         assert scheduler._reqs_need_recv == {}

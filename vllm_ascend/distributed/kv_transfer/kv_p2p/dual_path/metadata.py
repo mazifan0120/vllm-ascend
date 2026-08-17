@@ -137,7 +137,7 @@ class ReversePlan:
     remote_dcp_size: int
     reverse_attempt_id: int
     prefill_local_tokens: int
-    reverse_send_job_id: int | None
+    reverse_send_completion_id: int | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
@@ -156,8 +156,8 @@ class ReversePlan:
                 ("prefill_local_tokens", self.prefill_local_tokens),
             )
         )
-        if self.reverse_send_job_id is not None:
-            _validate_non_negative_integers((("reverse_send_job_id", self.reverse_send_job_id),))
+        if self.reverse_send_completion_id is not None:
+            _validate_non_negative_integers((("reverse_send_completion_id", self.reverse_send_completion_id),))
 
         source_block_ids = _freeze_block_table(self.source_block_ids)
         destination_block_ids = _freeze_block_table(self.destination_block_ids)
@@ -219,7 +219,7 @@ class ReversePlan:
             "remote_dcp_size": self.remote_dcp_size,
             "reverse_attempt_id": self.reverse_attempt_id,
             "prefill_local_tokens": self.prefill_local_tokens,
-            "reverse_send_job_id": self.reverse_send_job_id,
+            "reverse_send_completion_id": self.reverse_send_completion_id,
         }
 
     @classmethod
@@ -243,7 +243,7 @@ class ReversePlan:
                     "remote_dcp_size",
                     "reverse_attempt_id",
                     "prefill_local_tokens",
-                    "reverse_send_job_id",
+                    "reverse_send_completion_id",
                 }
             ),
         )
@@ -264,7 +264,7 @@ class ReversePlan:
                 remote_dcp_size=data["remote_dcp_size"],
                 reverse_attempt_id=data["reverse_attempt_id"],
                 prefill_local_tokens=data["prefill_local_tokens"],
-                reverse_send_job_id=data["reverse_send_job_id"],
+                reverse_send_completion_id=data["reverse_send_completion_id"],
             )
         except TypeError as error:
             raise PathDecisionValidationError("serialized ReversePlan fields have invalid types") from error
@@ -280,7 +280,7 @@ class ReverseReceiveBinding:
     token_end: int
     reverse_attempt_id: int
     prefill_local_tokens: int
-    reverse_completion_job_id: int
+    reverse_receive_completion_id: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
@@ -296,7 +296,7 @@ class ReverseReceiveBinding:
             (
                 ("reverse_attempt_id", self.reverse_attempt_id),
                 ("prefill_local_tokens", self.prefill_local_tokens),
-                ("reverse_completion_job_id", self.reverse_completion_job_id),
+                ("reverse_receive_completion_id", self.reverse_receive_completion_id),
             )
         )
         destination_block_ids = _freeze_block_table(self.destination_block_ids)
@@ -333,22 +333,22 @@ class DualPathControlFailureMetadata:
 @dataclass
 class DualPathWorkerMetadata(KVConnectorWorkerMetadata):
     """Worker-to-scheduler completion facts: each worker emits ``{completion_id: 1}``
-    at most once per job; the upstream executor-level fold performs no type
+    at most once per completion; the upstream executor-level fold performs no type
     check, so ``aggregate`` asserts the concrete type itself."""
 
-    completed_jobs: dict[int, int] = field(default_factory=dict)
-    failed_jobs: dict[int, int] = field(default_factory=dict)
+    completion_reports: dict[int, int] = field(default_factory=dict)
+    failure_reports: dict[int, int] = field(default_factory=dict)
 
     def aggregate(self, other: KVConnectorWorkerMetadata) -> DualPathWorkerMetadata:
         assert isinstance(other, DualPathWorkerMetadata)
         merged = DualPathWorkerMetadata(
-            completed_jobs=dict(self.completed_jobs),
-            failed_jobs=dict(self.failed_jobs),
+            completion_reports=dict(self.completion_reports),
+            failure_reports=dict(self.failure_reports),
         )
-        for completion_id, count in other.completed_jobs.items():
-            merged.completed_jobs[completion_id] = merged.completed_jobs.get(completion_id, 0) + count
-        for completion_id, count in other.failed_jobs.items():
-            merged.failed_jobs[completion_id] = merged.failed_jobs.get(completion_id, 0) + count
+        for completion_id, count in other.completion_reports.items():
+            merged.completion_reports[completion_id] = merged.completion_reports.get(completion_id, 0) + count
+        for completion_id, count in other.failure_reports.items():
+            merged.failure_reports[completion_id] = merged.failure_reports.get(completion_id, 0) + count
         return merged
 
 

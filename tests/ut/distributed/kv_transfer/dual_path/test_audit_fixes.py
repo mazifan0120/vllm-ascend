@@ -44,7 +44,7 @@ class TestDecodeEngineProgress:
         scheduler = decode_scheduler_factory()
         request = _admit_decode_request(scheduler)
         metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
-        completion_id = metadata.reverse_plans[0].reverse_send_job_id
+        completion_id = metadata.reverse_plans[0].reverse_send_completion_id
 
         # The final Decode request finishes with its reverse-send completion open:
         # the connector delays the free so zero-token steps keep harvesting.
@@ -57,7 +57,7 @@ class TestDecodeEngineProgress:
         assert idle_output.finished_sending is None
 
         harvest_output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_id: 1})
+            kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_id: 1})
         )
         scheduler.update_connector_output(harvest_output)
         assert harvest_output.finished_sending == {request.request_id}
@@ -86,7 +86,7 @@ class TestBoundedCompletionJobs:
         binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
 
         output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(failed_jobs={binding.reverse_completion_job_id: 1})
+            kv_connector_worker_meta=make_worker_metadata(failure_reports={binding.reverse_receive_completion_id: 1})
         )
         scheduler.update_connector_output(output)
         assert binding.request_key in scheduler._prefill_invalid_request_keys
@@ -193,12 +193,12 @@ class TestJobLedgerRetirementWiring:
         binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
 
         output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(completed_jobs={binding.reverse_completion_job_id: 1})
+            kv_connector_worker_meta=make_worker_metadata(completion_reports={binding.reverse_receive_completion_id: 1})
         )
         scheduler.update_connector_output(output)
 
         assert output.finished_recving == {request.request_id}
-        assert scheduler._completion_tracker.get(binding.reverse_completion_job_id) is None
+        assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
 
     def test_failed_job_record_is_retained(self, pe_scheduler_factory):
         pool = make_block_pool()
@@ -207,11 +207,11 @@ class TestJobLedgerRetirementWiring:
         binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
 
         output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(failed_jobs={binding.reverse_completion_job_id: 1})
+            kv_connector_worker_meta=make_worker_metadata(failure_reports={binding.reverse_receive_completion_id: 1})
         )
         scheduler.update_connector_output(output)
 
-        assert scheduler._completion_tracker.get(binding.reverse_completion_job_id).failed is True
+        assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id).failed is True
 
 
 def _deliver_decision_to(receiver, attempt_id: int) -> None:
@@ -237,7 +237,7 @@ class TestReverseSendJobRetirement:
         request = _admit_decode_request(scheduler)
         _deliver_decision_to(receiver, 0)
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        completion_id = metadata.reverse_plans[0].reverse_send_job_id
+        completion_id = metadata.reverse_plans[0].reverse_send_completion_id
 
         # Delayed-free flow: release runs while the completion is open and skips its
         # retirement; the completion close must retire the record itself.
@@ -246,7 +246,7 @@ class TestReverseSendJobRetirement:
         assert delay_free is True
         assert scheduler._completion_tracker.get(completion_id) is not None
 
-        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_id: 1}))
+        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_id: 1}))
         scheduler.update_connector_output(output)
 
         assert output.finished_sending == {request.request_id}
@@ -258,7 +258,7 @@ class TestReverseSendJobRetirement:
         scheduler = decode_scheduler_factory()
         request = _admit_decode_request(scheduler)
         metadata = _activate_decision(scheduler, decode_task04_seams, _de_read_decision(0))
-        completion_id = metadata.reverse_plans[0].reverse_send_job_id
+        completion_id = metadata.reverse_plans[0].reverse_send_completion_id
         attempt_key = ReverseAttemptKey(
             DualPathRequestKey(
                 scheduler._path_decision_coordinator.decode_engine_instance_id,
@@ -268,7 +268,7 @@ class TestReverseSendJobRetirement:
             0,
         )
 
-        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_id: 1}))
+        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completion_reports={completion_id: 1}))
         scheduler.update_connector_output(output)
 
         assert output.finished_sending is None
