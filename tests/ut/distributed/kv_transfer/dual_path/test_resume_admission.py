@@ -109,7 +109,7 @@ def test_de_read_vacuous_reverse_returns_zero_false_and_skips_reverse_machinery(
     assert scheduler.get_num_new_matched_tokens(request, 40) == (0, False)
 
     # A vacuous Reverse bypasses the Reverse machinery entirely: no new
-    # completion completion and no waiting-attempt entry (the request goes straight
+    # completion and no waiting-attempt entry (the request goes straight
     # back to RUNNING, never parks).
     assert len(scheduler._completion_tracker._records) == job_records_before
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids

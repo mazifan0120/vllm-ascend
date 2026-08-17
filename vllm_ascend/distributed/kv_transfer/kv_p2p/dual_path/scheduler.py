@@ -1837,7 +1837,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                         snapshot = self._decode_kv_snapshots.get(failed_request_id)
                         if state is None or snapshot is None:
                             logger.error(
-                                "DualPath failed completion %s has no Decode state or snapshot for request %s",
+                                "DualPath failed job %s has no Decode state or snapshot for request %s",
                                 completion_id,
                                 failed_request_id,
                             )
@@ -1852,8 +1852,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                 )
                             except RuntimeError as error:
                                 logger.error(
-                                    "DualPath failed completion %s could not build Decode control failure "
-                                    "for request %s: %s",
+                                    "DualPath failed job %s could not build Decode control failure for request %s: %s",
                                     completion_id,
                                     failed_request_id,
                                     error,

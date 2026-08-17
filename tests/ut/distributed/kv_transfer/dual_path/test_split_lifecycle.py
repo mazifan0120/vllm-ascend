@@ -343,7 +343,7 @@ def test_after_reverse_done_prefill_executes_inherited_layerwise_forward() -> No
     reverse_metadata.reverse_receive_bindings.append(binding)
     worker.start_load_kv(reverse_metadata)
     worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = {binding.wire_request_id}
-    # The Reverse terminal leaves the worker only as a completion completion id (I4).
+    # The Reverse terminal leaves the worker only as a completion id (I4).
     assert worker.get_finished(set(), reverse_metadata) == (set(), set())
     worker_metadata = worker.build_connector_worker_meta()
     assert worker_metadata.completed_jobs == {binding.reverse_completion_job_id: 1}

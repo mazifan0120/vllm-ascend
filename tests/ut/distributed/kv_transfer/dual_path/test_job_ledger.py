@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W2: completion-completion ledger accounting and the no-pinning contract."""
+"""Stage-2 W2: completion tracker accounting and the no-pinning contract."""
 
 from __future__ import annotations
 
