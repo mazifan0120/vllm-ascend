@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W3: DE Reverse sender completion proof via the completion ledger."""
+"""Stage-2 W3: DE Reverse sender completion proof via the completion tracker."""
 
 from __future__ import annotations
 

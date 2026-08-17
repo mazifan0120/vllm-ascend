@@ -292,7 +292,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         attempt_key: ReverseAttemptKey,
         terminal_flag: bool,
     ) -> None:
-        """Tombstone the terminal, drop the wire mapping, and report the
+        """Tombstone the terminal, drop the wire mapping, and publish the
         attempt's reverse completion; the binding itself is retained for
         the §5 removal rule."""
         self._consumed_reverse_terminal_wire_ids[binding.wire_request_id] = attempt_key

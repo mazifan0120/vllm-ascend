@@ -36,47 +36,47 @@ def _completion_tracker():
 class TestTransferCompletionTracker:
     def test_all_worker_rule_closes_only_on_the_last_report(self):
         completion_tracker = _completion_tracker()
-        ledger = completion_tracker.TransferCompletionTracker()
-        completion = ledger.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
+        tracker = completion_tracker.TransferCompletionTracker()
+        completion = tracker.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert ledger.tally_reports(completion.completion_id, 1) is False
+        assert tracker.tally_reports(completion.completion_id, 1) is False
         assert completion.completed_worker_count == 1
         assert completion.closed is False
 
-        assert ledger.tally_reports(completion.completion_id, 1) is True
+        assert tracker.tally_reports(completion.completion_id, 1) is True
         assert completion.completed_worker_count == 2
         assert completion.closed is True
 
     def test_duplicate_reports_are_capped_at_the_expected_count(self):
         completion_tracker = _completion_tracker()
-        ledger = completion_tracker.TransferCompletionTracker()
-        completion = ledger.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
+        tracker = completion_tracker.TransferCompletionTracker()
+        completion = tracker.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert ledger.tally_reports(completion.completion_id, 5) is True
+        assert tracker.tally_reports(completion.completion_id, 5) is True
         assert completion.completed_worker_count == 2
 
         # Post-close reports are ignored entirely and never re-close the completion.
-        assert ledger.tally_reports(completion.completion_id, 1) is False
+        assert tracker.tally_reports(completion.completion_id, 1) is False
         assert completion.completed_worker_count == 2
 
     def test_failure_closes_the_completion_as_failed(self):
         completion_tracker = _completion_tracker()
-        ledger = completion_tracker.TransferCompletionTracker()
-        completion = ledger.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
+        tracker = completion_tracker.TransferCompletionTracker()
+        completion = tracker.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert ledger.fail_completion(completion.completion_id) is True
+        assert tracker.fail_completion(completion.completion_id) is True
         assert completion.closed is True
         assert completion.failed is True
         # A second failure report is absorbed.
-        assert ledger.fail_completion(completion.completion_id) is False
+        assert tracker.fail_completion(completion.completion_id) is False
 
     def test_invalid_expected_worker_count_rejected(self):
         completion_tracker = _completion_tracker()
-        ledger = completion_tracker.TransferCompletionTracker()
+        tracker = completion_tracker.TransferCompletionTracker()
         with pytest.raises(TypeError):
-            ledger.open_completion(completion_tracker.CompletionKind.REVERSE_SEND, expected_worker_count=True)
+            tracker.open_completion(completion_tracker.CompletionKind.REVERSE_SEND, expected_worker_count=True)
         with pytest.raises(ValueError):
-            ledger.open_completion(completion_tracker.CompletionKind.REVERSE_SEND, expected_worker_count=0)
+            tracker.open_completion(completion_tracker.CompletionKind.REVERSE_SEND, expected_worker_count=0)
 
 
 class TestReverseDestinationNotPinned:
