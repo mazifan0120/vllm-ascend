@@ -2,7 +2,7 @@
 """The Forward direction retains nothing on abort, normal finish, or preemption.
 
 Forward is the ordinary Layerwise push: it pins no block and delays no free, so
-none of these paths may leave a hold or a gating job behind.
+none of these paths may leave a hold or a gating completion behind.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def _admit_pe_read(scheduler):
 
 def _assert_nothing_retained(scheduler, pool):
     assert not hasattr(scheduler, "_hold_ledger")
-    assert scheduler._job_ledger.open_count() == 0
+    assert scheduler._completion_tracker.open_count() == 0
     assert scheduler._pending_finished_sending == set()
     # The PE_READ Forward range [16, 33) covers source blocks 11 and 12.
     assert pool.blocks[11].ref_cnt == 0
@@ -62,7 +62,7 @@ class TestForwardRetainsNothing:
 
         metadata = scheduler.build_connector_meta(make_empty_scheduler_output(preempted_req_ids={request.request_id}))
 
-        # A preempting pass carries no fence job and pins nothing, so the
+        # A preempting pass carries no fence completion and pins nothing, so the
         # worker has no barrier to drain before the next forward pass.
         assert not hasattr(metadata, "barrier_jobs")
         _assert_nothing_retained(scheduler, pool)

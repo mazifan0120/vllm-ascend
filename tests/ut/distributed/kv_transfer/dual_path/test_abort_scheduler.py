@@ -63,14 +63,14 @@ def test_same_drain_commits_decision_then_aborts_without_touching_job_ledger(
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     assert len(metadata.reverse_plans) == 1
-    job_id = metadata.reverse_plans[0].reverse_send_job_id
-    assert job_id is not None
-    job = scheduler._job_ledger.get(job_id)
-    assert job is not None
-    assert job.closed is False
-    assert job.failed is False
-    assert scheduler._job_ledger.open_count() == 1
-    assert len(scheduler._reverse_send_job_ids) == 1
+    completion_id = metadata.reverse_plans[0].reverse_send_job_id
+    assert completion_id is not None
+    completion = scheduler._completion_tracker.get(completion_id)
+    assert completion is not None
+    assert completion.closed is False
+    assert completion.failed is False
+    assert scheduler._completion_tracker.open_count() == 1
+    assert len(scheduler._reverse_send_completion_ids) == 1
     assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
     assert metadata.control_failures == [
         DualPathControlFailureMetadata(

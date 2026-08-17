@@ -21,9 +21,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.kvpool_adapter import 
     KVPoolSchedulerAdapter,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.ledgers import (
-    JobKind,
-    JobLedger,
-    JobRecord,
+    CompletionKind,
+    TransferCompletionTracker,
+    CompletionRecord,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     BlockIdGroups,
@@ -240,11 +240,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_delivery_records: dict[DualPathRequestKey, _PrefillDecisionDelivery] = {}
         self._prefill_invalid_request_keys: set[DualPathRequestKey] = set()
         self._block_pool: BlockPool | None = None
-        self._job_ledger = JobLedger()
+        self._completion_tracker = TransferCompletionTracker()
         self._expected_worker_count: int = vllm_config.parallel_config.world_size
         self._pending_finished_sending: set[str] = set()
         self._waiting_reverse_attempt_ids: dict[str, ReverseAttemptKey] = {}
-        self._reverse_send_job_ids: dict[ReverseAttemptKey, int] = {}
+        self._reverse_send_completion_ids: dict[ReverseAttemptKey, int] = {}
         self._prefill_delivered_reverse_attempts: dict[str, int] = {}
         self._prefill_deferred_deliveries: set[DualPathRequestKey] = set()
         self._prefill_vacuous_reverse_request_ids: set[str] = set()
@@ -805,8 +805,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         if retained_reverse_plan is None:
             attempt_key = ReverseAttemptKey(result.request_key, result.reverse_attempt_id)
-            completion_job = self._job_ledger.create_job(
-                JobKind.REVERSE_COMPLETION,
+            completion_job = self._completion_tracker.open_completion(
+                CompletionKind.REVERSE_RECEIVE,
                 expected_worker_count=self._expected_worker_count,
                 reverse_attempt_key=attempt_key,
             )
@@ -819,7 +819,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_end=token_split,
                 reverse_attempt_id=result.reverse_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_completion_job_id=completion_job.job_id,
+                reverse_completion_job_id=completion_job.completion_id,
             )
             parallel_config = self.vllm_config.parallel_config
             reverse_plan = ReversePlan(
@@ -854,8 +854,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # table change. The new attempt re-parks the request under the I4
             # gate.
             attempt_key = ReverseAttemptKey(result.request_key, replacement_attempt_id)
-            completion_job = self._job_ledger.create_job(
-                JobKind.REVERSE_COMPLETION,
+            completion_job = self._completion_tracker.open_completion(
+                CompletionKind.REVERSE_RECEIVE,
                 expected_worker_count=self._expected_worker_count,
                 reverse_attempt_key=attempt_key,
             )
@@ -868,7 +868,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_end=token_split,
                 reverse_attempt_id=replacement_attempt_id,
                 prefill_local_tokens=token_start,
-                reverse_completion_job_id=completion_job.job_id,
+                reverse_completion_job_id=completion_job.completion_id,
             )
             parallel_config = self.vllm_config.parallel_config
             reverse_plan = ReversePlan(
@@ -998,7 +998,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             and request_id not in self._prefill_vacuous_reverse_request_ids
         ):
             # Parking in WAITING_FOR_REMOTE_KVS: the I4 gate only admits the
-            # Reverse completion job of exactly this attempt.
+            # Reverse-receive completion of exactly this attempt.
             self._waiting_reverse_attempt_ids.setdefault(
                 request_id,
                 ReverseAttemptKey(result.request_key, result.reverse_attempt_id),
@@ -1512,13 +1512,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # acceptance, before any layer can enter the sender queue, and is
             # carried unchanged on the plan to every DE worker.
             attempt_key = ReverseAttemptKey(state.request_key, result.reverse_attempt_id)
-            send_job = self._job_ledger.create_job(
-                JobKind.REVERSE_SEND,
+            send_completion = self._completion_tracker.open_completion(
+                CompletionKind.REVERSE_SEND,
                 expected_worker_count=self._expected_worker_count,
                 reverse_attempt_key=attempt_key,
             )
-            reverse_plan = replace(reverse_plan, reverse_send_job_id=send_job.job_id)
-            self._reverse_send_job_ids[attempt_key] = send_job.job_id
+            reverse_plan = replace(reverse_plan, reverse_send_job_id=send_completion.completion_id)
+            self._reverse_send_completion_ids[attempt_key] = send_completion.completion_id
             metadata.reverse_plans.append(reverse_plan)
         if result.path is PathKind.DE_READ and result.reverse_attempt_id is not None:
             self._latest_reverse_attempt_ids[request_id] = result.reverse_attempt_id
@@ -1567,13 +1567,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             state.request_key.admission_id,
         )
 
-    def _request_for_failed_job(self, job: JobRecord) -> str | None:
-        if job.job_kind is JobKind.REVERSE_COMPLETION:
+    def _request_for_failed_completion(self, completion: CompletionRecord) -> str | None:
+        if completion.completion_kind is CompletionKind.REVERSE_RECEIVE:
             for request_id, attempt_key in self._waiting_reverse_attempt_ids.items():
-                if attempt_key == job.reverse_attempt_key:
+                if attempt_key == completion.reverse_attempt_key:
                     return request_id
-        if job.job_kind is JobKind.REVERSE_SEND and job.reverse_attempt_key is not None:
-            return job.reverse_attempt_key.request_key.decode_request_id
+        if completion.completion_kind is CompletionKind.REVERSE_SEND and completion.reverse_attempt_key is not None:
+            return completion.reverse_attempt_key.request_key.decode_request_id
         return None
 
     def _recovery_invalid_block_ids(self, request_id: str) -> tuple[int, ...]:
@@ -1670,13 +1670,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if state is not None:
             self._path_decision_coordinator.unregister(state.request_key)
         if state is not None:
-            for attempt_key in [key for key in self._reverse_send_job_ids if key.request_key == state.request_key]:
-                send_job = self._job_ledger.get(self._reverse_send_job_ids[attempt_key])
-                if send_job is None or send_job.closed:
-                    self._reverse_send_job_ids.pop(attempt_key, None)
-                if send_job is not None and send_job.closed:
-                    self._job_ledger.discard(send_job.job_id)
-            if not self._has_open_reverse_send_job(state.request_key):
+            for attempt_key in [
+                key for key in self._reverse_send_completion_ids if key.request_key == state.request_key
+            ]:
+                send_completion = self._completion_tracker.get(self._reverse_send_completion_ids[attempt_key])
+                if send_completion is None or send_completion.closed:
+                    self._reverse_send_completion_ids.pop(attempt_key, None)
+                if send_completion is not None and send_completion.closed:
+                    self._completion_tracker.discard(send_completion.completion_id)
+            if not self._has_open_reverse_send_completion(state.request_key):
                 self._latest_reverse_attempt_ids.pop(request_id, None)
         if self.dual_path_cfg.role == "prefill":
             try:
@@ -1713,13 +1715,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if released_key is not None:
                 if released_key not in self._prefill_delivery_futures:
                     self._prefill_delivery_records.pop(released_key, None)
-                self._job_ledger.discard_closed_jobs(JobKind.REVERSE_COMPLETION, released_key)
+                self._completion_tracker.discard_closed_completions(CompletionKind.REVERSE_RECEIVE, released_key)
                 assert self._path_decider is not None
                 self._path_decider.discard(released_key)
                 self._prefill_invalid_request_keys.discard(released_key)
                 self._prefill_deferred_deliveries.discard(released_key)
             self._reconcile_prefill_deliveries()
-        # Completion-job records remain owned by their job lifecycle across
+        # Completion records remain owned by their completion lifecycle across
         # request cleanup.
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
@@ -1764,26 +1766,26 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         # Neither direction delays the free on the Prefill side: Forward is the
         # ordinary Layerwise push, and an aborted Reverse destination follows
         # the parent's immediate-free semantics. Only a Decode request with an
-        # open reverse-send job is held back, so the engine keeps stepping
-        # until the send job reports.
+        # open reverse-send completion is held back, so the engine keeps stepping
+        # until the send completion reports.
         request_id = request.request_id
         if self.dual_path_cfg.role == "decode":
             # A final Decode request with any open reverse-send attempt must keep
             # the engine stepping: the delayed free retains it upstream so
-            # zero-token steps keep harvesting the job report.
+            # zero-token steps keep harvesting the completion report.
             state = self._decode_decision_states.get(request_id)
-            if state is None or not self._has_open_reverse_send_job(state.request_key):
+            if state is None or not self._has_open_reverse_send_completion(state.request_key):
                 return False
             self._pending_finished_sending.add(request_id)
             return True
         return False
 
-    def _has_open_reverse_send_job(self, request_key: DualPathRequestKey) -> bool:
-        for attempt_key, job_id in self._reverse_send_job_ids.items():
+    def _has_open_reverse_send_completion(self, request_key: DualPathRequestKey) -> bool:
+        for attempt_key, completion_id in self._reverse_send_completion_ids.items():
             if attempt_key.request_key != request_key:
                 continue
-            job = self._job_ledger.get(job_id)
-            if job is not None and not job.closed:
+            completion = self._completion_tracker.get(completion_id)
+            if completion is not None and not completion.closed:
                 return True
         return False
 
@@ -1795,7 +1797,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             assert isinstance(worker_metadata, DualPathWorkerMetadata), (
                 f"DualPath scheduler requires DualPathWorkerMetadata, got {type(worker_metadata).__name__}"
             )
-            finished_sending_injection, finished_recving_injection = self._aggregate_worker_job_facts(worker_metadata)
+            finished_sending_injection, finished_recving_injection = (
+                self._aggregate_worker_completion_facts(worker_metadata)
+            )
         if finished_sending_injection:
             if connector_output.finished_sending is None:
                 connector_output.finished_sending = set()
@@ -1805,36 +1809,36 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 connector_output.finished_recving = set()
             connector_output.finished_recving.update(finished_recving_injection)
 
-    def _aggregate_worker_job_facts(self, worker_metadata: DualPathWorkerMetadata) -> tuple[set[str], set[str]]:
+    def _aggregate_worker_completion_facts(self, worker_metadata: DualPathWorkerMetadata) -> tuple[set[str], set[str]]:
         finished_sending_injection: set[str] = set()
         finished_recving_injection: set[str] = set()
-        for job_id, report_count in worker_metadata.completed_jobs.items():
-            job = self._job_ledger.get(job_id)
-            if job is None:
+        for completion_id, report_count in worker_metadata.completed_jobs.items():
+            completion = self._completion_tracker.get(completion_id)
+            if completion is None:
                 continue
-            if self._job_ledger.record_reports(job_id, report_count):
-                sending, recving = self._run_job_close_action(job)
+            if self._completion_tracker.tally_reports(completion_id, report_count):
+                sending, recving = self._run_completion_close_action(completion)
                 finished_sending_injection.update(sending)
                 finished_recving_injection.update(recving)
-        for job_id in worker_metadata.failed_jobs:
-            job = self._job_ledger.get(job_id)
-            if job is None:
+        for completion_id in worker_metadata.failed_jobs:
+            completion = self._completion_tracker.get(completion_id)
+            if completion is None:
                 continue
-            if self._job_ledger.record_failure(job_id):
+            if self._completion_tracker.fail_completion(completion_id):
                 logger.error(
                     "DualPath job %s (kind=%s) reported failed; the owning request is failed closed",
-                    job_id,
-                    job.job_kind.value,
+                    completion_id,
+                    completion.completion_kind.value,
                 )
-                failed_request_id = self._request_for_failed_job(job)
+                failed_request_id = self._request_for_failed_completion(completion)
                 if failed_request_id is not None:
                     if self.dual_path_cfg.role == "decode":
                         state = self._decode_decision_states.get(failed_request_id)
                         snapshot = self._decode_kv_snapshots.get(failed_request_id)
                         if state is None or snapshot is None:
                             logger.error(
-                                "DualPath failed job %s has no Decode state or snapshot for request %s",
-                                job_id,
+                                "DualPath failed completion %s has no Decode state or snapshot for request %s",
+                                completion_id,
                                 failed_request_id,
                             )
                         else:
@@ -1848,14 +1852,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                 )
                             except RuntimeError as error:
                                 logger.error(
-                                    "DualPath failed job %s could not build Decode control failure for request %s: %s",
-                                    job_id,
+                                    "DualPath failed completion %s could not build Decode control failure "
+                                    "for request %s: %s",
+                                    completion_id,
                                     failed_request_id,
                                     error,
                                 )
                     else:
-                        assert job.reverse_attempt_key is not None
-                        self._prefill_invalid_request_keys.add(job.reverse_attempt_key.request_key)
+                        assert completion.reverse_attempt_key is not None
+                        self._prefill_invalid_request_keys.add(completion.reverse_attempt_key.request_key)
                         invalid_block_ids = self._recovery_invalid_block_ids(failed_request_id)
                         if invalid_block_ids:
                             self._prefill_control_failures[failed_request_id] = DualPathControlFailureMetadata(
@@ -1863,39 +1868,42 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                 invalid_block_ids=invalid_block_ids,
                                 reason=DualPathControlFailureReason.REVERSE_JOB_FAILED,
                             )
-                if job.job_kind is JobKind.REVERSE_SEND and job.reverse_attempt_key is not None:
-                    attempt_key = job.reverse_attempt_key
+                if (
+                    completion.completion_kind is CompletionKind.REVERSE_SEND
+                    and completion.reverse_attempt_key is not None
+                ):
+                    attempt_key = completion.reverse_attempt_key
                     request_key = attempt_key.request_key
                     request_id = request_key.decode_request_id
-                    self._reverse_send_job_ids.pop(attempt_key, None)
-                    self._job_ledger.discard(job.job_id)
-                    if not self._has_open_reverse_send_job(request_key):
+                    self._reverse_send_completion_ids.pop(attempt_key, None)
+                    self._completion_tracker.discard(completion.completion_id)
+                    if not self._has_open_reverse_send_completion(request_key):
                         self._latest_reverse_attempt_ids.pop(request_id, None)
                         if request_id in self._pending_finished_sending:
                             self._pending_finished_sending.discard(request_id)
                             finished_sending_injection.add(request_id)
-                elif job.job_kind is JobKind.REVERSE_COMPLETION and failed_request_id is None:
+                elif completion.completion_kind is CompletionKind.REVERSE_RECEIVE and failed_request_id is None:
                     # Request cleanup removes the exact-attempt owner mapping but
                     # deliberately leaves an open completion record reportable.
                     # A late failure closes that orphaned record without staging
                     # a request failure or publishing generic finished_recving.
-                    self._job_ledger.discard(job.job_id)
+                    self._completion_tracker.discard(completion.completion_id)
         return finished_sending_injection, finished_recving_injection
 
-    def _run_job_close_action(self, job: JobRecord) -> tuple[set[str], set[str]]:
-        if job.job_kind is JobKind.REVERSE_COMPLETION:
-            return set(), self._close_reverse_completion_job(job)
-        if job.job_kind is JobKind.REVERSE_SEND:
-            attempt_key = job.reverse_attempt_key
+    def _run_completion_close_action(self, completion: CompletionRecord) -> tuple[set[str], set[str]]:
+        if completion.completion_kind is CompletionKind.REVERSE_RECEIVE:
+            return set(), self._close_reverse_receive_completion(completion)
+        if completion.completion_kind is CompletionKind.REVERSE_SEND:
+            attempt_key = completion.reverse_attempt_key
             if attempt_key is None:
                 return set(), set()
             request_key = attempt_key.request_key
             request_id = request_key.decode_request_id
             # Each attempt owns exactly one mapping and record. Closing one
             # attempt retires only those attempt-scoped facts.
-            self._reverse_send_job_ids.pop(attempt_key, None)
-            self._job_ledger.discard(job.job_id)
-            if self._has_open_reverse_send_job(request_key):
+            self._reverse_send_completion_ids.pop(attempt_key, None)
+            self._completion_tracker.discard(completion.completion_id)
+            if self._has_open_reverse_send_completion(request_key):
                 return set(), set()
 
             # Request-level release is authorized only after every send attempt
@@ -1908,11 +1916,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return finished_sending, set()
         return set(), set()
 
-    def _close_reverse_completion_job(self, job: JobRecord) -> set[str]:
+    def _close_reverse_receive_completion(self, completion: CompletionRecord) -> set[str]:
         # I4: only the current waiting attempt's completion may publish the
-        # request id; stale-attempt jobs are absorbed without touching the
-        # generic finished sets.
-        attempt_key = job.reverse_attempt_key
+        # request id; stale-attempt completions are absorbed without touching
+        # the generic finished sets.
+        attempt_key = completion.reverse_attempt_key
         request_id = next(
             (
                 waiting_request_id
@@ -1922,10 +1930,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             None,
         )
         if request_id is None:
-            self._job_ledger.discard(job.job_id)
+            self._completion_tracker.discard(completion.completion_id)
             return set()
         del self._waiting_reverse_attempt_ids[request_id]
-        self._job_ledger.discard(job.job_id)
+        self._completion_tracker.discard(completion.completion_id)
         return {request_id}
 
     def shutdown(self) -> None:

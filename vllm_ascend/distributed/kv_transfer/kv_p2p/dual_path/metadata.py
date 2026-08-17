@@ -332,7 +332,7 @@ class DualPathControlFailureMetadata:
 
 @dataclass
 class DualPathWorkerMetadata(KVConnectorWorkerMetadata):
-    """Worker-to-scheduler completion facts: each worker emits ``{job_id: 1}``
+    """Worker-to-scheduler completion facts: each worker emits ``{completion_id: 1}``
     at most once per job; the upstream executor-level fold performs no type
     check, so ``aggregate`` asserts the concrete type itself."""
 
@@ -345,10 +345,10 @@ class DualPathWorkerMetadata(KVConnectorWorkerMetadata):
             completed_jobs=dict(self.completed_jobs),
             failed_jobs=dict(self.failed_jobs),
         )
-        for job_id, count in other.completed_jobs.items():
-            merged.completed_jobs[job_id] = merged.completed_jobs.get(job_id, 0) + count
-        for job_id, count in other.failed_jobs.items():
-            merged.failed_jobs[job_id] = merged.failed_jobs.get(job_id, 0) + count
+        for completion_id, count in other.completed_jobs.items():
+            merged.completed_jobs[completion_id] = merged.completed_jobs.get(completion_id, 0) + count
+        for completion_id, count in other.failed_jobs.items():
+            merged.failed_jobs[completion_id] = merged.failed_jobs.get(completion_id, 0) + count
         return merged
 
 

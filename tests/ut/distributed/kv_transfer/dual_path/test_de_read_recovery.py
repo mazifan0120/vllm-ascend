@@ -273,4 +273,4 @@ def test_de_read_refresh_keeps_forward_binding_and_installs_fresh_send_job(
         ),
         1,
     )
-    assert scheduler._reverse_send_job_ids[attempt_one] == refreshed_plan.reverse_send_job_id
+    assert scheduler._reverse_send_completion_ids[attempt_one] == refreshed_plan.reverse_send_job_id

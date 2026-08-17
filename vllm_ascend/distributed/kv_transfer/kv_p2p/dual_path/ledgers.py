@@ -1,15 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Completion-job ledger for DualPath Stage-2.
+"""Per-attempt transfer completion tracking for DualPath Stage-2.
 
-Both roles aggregate all-worker completion proofs through this ledger: the PE
-role gates a parked DE_READ request on its Reverse completion job, and the DE
-role gates the source blocks of a finishing request on its Reverse-send job.
-Reports are counted exactly once per worker and capped at the expected count,
-so a duplicated report can never close a job early or twice.
+Each reverse attempt opens one completion on the Scheduler; every
+participating worker reports it exactly once through
+``DualPathWorkerMetadata``; at ``expected_worker_count`` the close action
+runs exactly once. Reports arriving for a closed completion are ignored,
+and a failure report closes the completion as failed.
 
-No KV block is pinned here. Both directions follow the parent's immediate-free
-semantics: Forward is the ordinary Layerwise push, and an aborted Reverse
-destination is released with the request.
+Why this lives on the Scheduler: only the Scheduler sees every worker's
+reports (the per-step worker-metadata fold is the sole cross-worker
+aggregation point), and only it owns the close actions — unparking a
+parked request via ``finished_recving``, authorizing the delayed free of
+source blocks via ``finished_sending``, and failing the owning request.
+
+Phase coupling makes per-worker epoch serialization structural: a
+worker's completion report and its local reverse DONE latch drain in the
+same step boundary, while replacement plans install at step start, so a
+worker cannot hold an unfinished attempt alongside a replacement (it
+raises instead). Tolerating concurrently open completions on the
+Scheduler is defense in depth, not a normal-path state.
+
+In-tree precedent: ascend_store's ``sending_events`` is the same counting
+pattern without attempt identity; the upstream ``KVOutputAggregator``
+cannot express attempt-scoped identity, failure closure, or closed-report
+dedup (its per-request counting reopens on late duplicates).
 """
 
 from __future__ import annotations
@@ -23,21 +37,21 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
 )
 
 __all__ = [
-    "JobKind",
-    "JobLedger",
-    "JobRecord",
+    "CompletionKind",
+    "TransferCompletionTracker",
+    "CompletionRecord",
 ]
 
 
-class JobKind(str, Enum):
-    REVERSE_COMPLETION = "REVERSE_COMPLETION"
+class CompletionKind(str, Enum):
+    REVERSE_RECEIVE = "REVERSE_RECEIVE"
     REVERSE_SEND = "REVERSE_SEND"
 
 
 @dataclass
-class JobRecord:
-    job_id: int
-    job_kind: JobKind
+class CompletionRecord:
+    completion_id: int
+    completion_kind: CompletionKind
     expected_worker_count: int
     reverse_attempt_key: ReverseAttemptKey | None = None
     completed_worker_count: int = 0
@@ -46,69 +60,69 @@ class JobRecord:
 
 
 @dataclass
-class JobLedger:
-    """Monotonic job-id allocator with the all-worker completion rule.
+class TransferCompletionTracker:
+    """Monotonic completion-id allocator with the all-worker completion rule.
 
-    Each worker contributes at most one report per job; aggregated counts are
-    capped at ``expected_worker_count`` so a duplicated report can never
-    overshoot, and the kind-specific close action runs exactly once. Reports
-    arriving for a ``closed`` job are ignored. A failure report closes the job
-    as ``failed``.
+    Each worker contributes at most one report per completion; aggregated
+    counts are capped at ``expected_worker_count`` so a duplicated report can
+    never overshoot, and the kind-specific close action runs exactly once.
+    Reports arriving for a ``closed`` completion are ignored. A failure
+    report closes the completion as ``failed``.
     """
 
-    _records: dict[int, JobRecord] = field(default_factory=dict)
-    _next_job_id: int = 0
+    _records: dict[int, CompletionRecord] = field(default_factory=dict)
+    _next_completion_id: int = 0
 
-    def create_job(
+    def open_completion(
         self,
-        job_kind: JobKind,
+        completion_kind: CompletionKind,
         *,
         expected_worker_count: int,
         reverse_attempt_key: ReverseAttemptKey | None = None,
-    ) -> JobRecord:
+    ) -> CompletionRecord:
         if isinstance(expected_worker_count, bool) or not isinstance(expected_worker_count, int):
             raise TypeError("expected_worker_count must be an integer")
         if expected_worker_count <= 0:
             raise ValueError("expected_worker_count must be greater than zero")
-        record = JobRecord(
-            job_id=self._next_job_id,
-            job_kind=job_kind,
+        record = CompletionRecord(
+            completion_id=self._next_completion_id,
+            completion_kind=completion_kind,
             expected_worker_count=expected_worker_count,
             reverse_attempt_key=reverse_attempt_key,
         )
-        self._next_job_id += 1
-        self._records[record.job_id] = record
+        self._next_completion_id += 1
+        self._records[record.completion_id] = record
         return record
 
-    def get(self, job_id: int) -> JobRecord | None:
-        return self._records.get(job_id)
+    def get(self, completion_id: int) -> CompletionRecord | None:
+        return self._records.get(completion_id)
 
-    def discard(self, job_id: int) -> bool:
-        """Retire a closed record with its owning attempt; open jobs stay."""
-        record = self._records.get(job_id)
+    def discard(self, completion_id: int) -> bool:
+        """Retire a closed record with its owning attempt; open completions stay."""
+        record = self._records.get(completion_id)
         if record is None or not record.closed:
             return False
-        del self._records[job_id]
+        del self._records[completion_id]
         return True
 
-    def discard_closed_jobs(self, job_kind: JobKind, request_key: DualPathRequestKey) -> None:
-        """Retire every closed job of ``job_kind`` owned by ``request_key``."""
-        for job_id, record in list(self._records.items()):
+    def discard_closed_completions(self, completion_kind: CompletionKind, request_key: DualPathRequestKey) -> None:
+        """Retire every closed completion of ``completion_kind`` owned by ``request_key``."""
+        for completion_id, record in list(self._records.items()):
             attempt_key = record.reverse_attempt_key
             if (
-                record.job_kind is job_kind
+                record.completion_kind is completion_kind
                 and attempt_key is not None
                 and attempt_key.request_key == request_key
                 and record.closed
             ):
-                del self._records[job_id]
+                del self._records[completion_id]
 
     def open_count(self) -> int:
         return sum(1 for record in self._records.values() if not record.closed)
 
-    def record_reports(self, job_id: int, report_count: int) -> bool:
-        """Accumulate worker reports; returns True iff the job closes now."""
-        record = self._records.get(job_id)
+    def tally_reports(self, completion_id: int, report_count: int) -> bool:
+        """Accumulate worker reports; returns True iff the completion closes now."""
+        record = self._records.get(completion_id)
         if record is None or record.closed or report_count <= 0:
             return False
         record.completed_worker_count = min(
@@ -120,9 +134,9 @@ class JobLedger:
         record.closed = True
         return True
 
-    def record_failure(self, job_id: int) -> bool:
-        """Close the job as failed; True iff newly closed."""
-        record = self._records.get(job_id)
+    def fail_completion(self, completion_id: int) -> bool:
+        """Close the completion as failed; True iff newly closed."""
+        record = self._records.get(completion_id)
         if record is None or record.closed:
             return False
         record.failed = True

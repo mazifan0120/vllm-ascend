@@ -299,12 +299,12 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._reverse_request_map.pop(binding.wire_request_id, None)
         self._record_sender_job(binding.reverse_completion_job_id, succeeded=terminal_flag)
 
-    def _record_sender_job(self, job_id: int, *, succeeded: bool) -> None:
+    def _record_sender_job(self, completion_id: int, *, succeeded: bool) -> None:
         with self._sender_job_facts_lock:
             if succeeded:
-                self._completed_sender_jobs[job_id] = 1
+                self._completed_sender_jobs[completion_id] = 1
             else:
-                self._failed_sender_jobs[job_id] = 1
+                self._failed_sender_jobs[completion_id] = 1
 
     def _consume_forward_receive_binding(self, binding: ForwardReceiveBinding) -> None:
         """Record the terminal and pop the binding eagerly: unlike the Reverse
@@ -565,11 +565,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         completed_jobs: dict[int, int] = {}
         failed_jobs: dict[int, int] = {}
         with self._sender_job_facts_lock:
-            for job_id, count in self._completed_sender_jobs.items():
-                completed_jobs[job_id] = completed_jobs.get(job_id, 0) + count
+            for completion_id, count in self._completed_sender_jobs.items():
+                completed_jobs[completion_id] = completed_jobs.get(completion_id, 0) + count
             self._completed_sender_jobs.clear()
-            for job_id, count in self._failed_sender_jobs.items():
-                failed_jobs[job_id] = failed_jobs.get(job_id, 0) + count
+            for completion_id, count in self._failed_sender_jobs.items():
+                failed_jobs[completion_id] = failed_jobs.get(completion_id, 0) + count
             self._failed_sender_jobs.clear()
         if not completed_jobs and not failed_jobs:
             return None

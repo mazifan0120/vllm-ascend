@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-2 W2: completion-job ledger accounting and the no-pinning contract."""
+"""Stage-2 W2: completion-completion ledger accounting and the no-pinning contract."""
 
 from __future__ import annotations
 
@@ -36,47 +36,47 @@ def _ledgers():
 class TestJobLedger:
     def test_all_worker_rule_closes_only_on_the_last_report(self):
         ledgers = _ledgers()
-        ledger = ledgers.JobLedger()
-        job = ledger.create_job(ledgers.JobKind.REVERSE_COMPLETION, expected_worker_count=2)
+        ledger = ledgers.TransferCompletionTracker()
+        completion = ledger.open_completion(ledgers.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert ledger.record_reports(job.job_id, 1) is False
-        assert job.completed_worker_count == 1
-        assert job.closed is False
+        assert ledger.tally_reports(completion.completion_id, 1) is False
+        assert completion.completed_worker_count == 1
+        assert completion.closed is False
 
-        assert ledger.record_reports(job.job_id, 1) is True
-        assert job.completed_worker_count == 2
-        assert job.closed is True
+        assert ledger.tally_reports(completion.completion_id, 1) is True
+        assert completion.completed_worker_count == 2
+        assert completion.closed is True
 
     def test_duplicate_reports_are_capped_at_the_expected_count(self):
         ledgers = _ledgers()
-        ledger = ledgers.JobLedger()
-        job = ledger.create_job(ledgers.JobKind.REVERSE_COMPLETION, expected_worker_count=2)
+        ledger = ledgers.TransferCompletionTracker()
+        completion = ledger.open_completion(ledgers.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert ledger.record_reports(job.job_id, 5) is True
-        assert job.completed_worker_count == 2
+        assert ledger.tally_reports(completion.completion_id, 5) is True
+        assert completion.completed_worker_count == 2
 
-        # Post-close reports are ignored entirely and never re-close the job.
-        assert ledger.record_reports(job.job_id, 1) is False
-        assert job.completed_worker_count == 2
+        # Post-close reports are ignored entirely and never re-close the completion.
+        assert ledger.tally_reports(completion.completion_id, 1) is False
+        assert completion.completed_worker_count == 2
 
     def test_failure_closes_the_job_as_failed(self):
         ledgers = _ledgers()
-        ledger = ledgers.JobLedger()
-        job = ledger.create_job(ledgers.JobKind.REVERSE_COMPLETION, expected_worker_count=2)
+        ledger = ledgers.TransferCompletionTracker()
+        completion = ledger.open_completion(ledgers.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert ledger.record_failure(job.job_id) is True
-        assert job.closed is True
-        assert job.failed is True
+        assert ledger.fail_completion(completion.completion_id) is True
+        assert completion.closed is True
+        assert completion.failed is True
         # A second failure report is absorbed.
-        assert ledger.record_failure(job.job_id) is False
+        assert ledger.fail_completion(completion.completion_id) is False
 
     def test_invalid_expected_worker_count_rejected(self):
         ledgers = _ledgers()
-        ledger = ledgers.JobLedger()
+        ledger = ledgers.TransferCompletionTracker()
         with pytest.raises(TypeError):
-            ledger.create_job(ledgers.JobKind.REVERSE_SEND, expected_worker_count=True)
+            ledger.open_completion(ledgers.CompletionKind.REVERSE_SEND, expected_worker_count=True)
         with pytest.raises(ValueError):
-            ledger.create_job(ledgers.JobKind.REVERSE_SEND, expected_worker_count=0)
+            ledger.open_completion(ledgers.CompletionKind.REVERSE_SEND, expected_worker_count=0)
 
 
 class TestReverseDestinationNotPinned:
@@ -110,9 +110,9 @@ class TestReverseDestinationNotPinned:
 
         # The PE_READ Forward range [16, 33) covers source blocks 11 and 12;
         # the Forward direction follows the parent's immediate-free semantics,
-        # so no hold and no gating job exist for them.
+        # so no hold and no gating completion exist for them.
         assert not hasattr(scheduler, "_hold_ledger")
-        assert scheduler._job_ledger.open_count() == 0
+        assert scheduler._completion_tracker.open_count() == 0
         assert pool.blocks[11].ref_cnt == 0
         assert pool.blocks[12].ref_cnt == 0
 
@@ -154,43 +154,49 @@ class TestJobRecordReclamation:
 
     def test_failed_completion_job_record_is_reclaimed_with_the_request(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
-        job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        completion_id = (
+            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        )
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == job_id
+        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_id
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
-        assert scheduler._job_ledger.record_failure(job_id) is True
+        assert scheduler._completion_tracker.fail_completion(completion_id) is True
 
         scheduler._release_scheduler_request_state(request)
 
-        assert scheduler._job_ledger.get(job_id) is None
+        assert scheduler._completion_tracker.get(completion_id) is None
 
     def test_open_completion_job_record_survives_request_cleanup(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
-        job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        completion_id = (
+            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        )
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == job_id
+        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_id
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
         scheduler._release_scheduler_request_state(request)
 
-        assert scheduler._job_ledger.get(job_id) is not None
+        assert scheduler._completion_tracker.get(completion_id) is not None
 
     def test_late_completion_failure_after_request_finished_discards_orphan_without_side_effects(
         self,
         pe_scheduler_factory,
     ):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
-        job_id = scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        completion_id = (
+            scheduler._prefill_pending_reverse_receive_bindings[request.request_id].reverse_completion_job_id
+        )
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
-        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == job_id
+        assert metadata.reverse_receive_bindings[0].reverse_completion_job_id == completion_id
         request.status = RequestStatus.FINISHED_STOPPED
         assert scheduler.request_finished(request, [70, 71]) == (False, None)
-        assert scheduler._job_ledger.get(job_id) is not None
+        assert scheduler._completion_tracker.get(completion_id) is not None
 
-        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failed_jobs={job_id: 1}))
+        output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failed_jobs={completion_id: 1}))
         scheduler.update_connector_output(output)
 
-        assert scheduler._job_ledger.get(job_id) is None
+        assert scheduler._completion_tracker.get(completion_id) is None
         assert scheduler._prefill_control_failures == {}
         assert output.finished_recving is None
 
@@ -225,7 +231,7 @@ class TestJobRecordReclamation:
 
         assert output.finished_recving is None
         assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
-        assert scheduler._job_ledger.get(second_binding.reverse_completion_job_id) is not None
+        assert scheduler._completion_tracker.get(second_binding.reverse_completion_job_id) is not None
 
     def test_late_old_admission_failure_does_not_fail_reused_request_id(self, pe_scheduler_factory):
         scheduler, first_request = self._admit_de_read(pe_scheduler_factory)
@@ -244,7 +250,7 @@ class TestJobRecordReclamation:
         assert second_binding.request_key not in scheduler._prefill_invalid_request_keys
         assert scheduler._prefill_control_failures == {}
         assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
-        assert scheduler._job_ledger.get(second_binding.reverse_completion_job_id) is not None
+        assert scheduler._completion_tracker.get(second_binding.reverse_completion_job_id) is not None
 
     def test_request_cleanup_reclaims_every_closed_completion_job_after_binding_delivery(self, pe_scheduler_factory):
         scheduler, request = self._admit_de_read(pe_scheduler_factory)
@@ -255,24 +261,24 @@ class TestJobRecordReclamation:
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
         ledgers = _ledgers()
-        failed_job = scheduler._job_ledger.create_job(
-            ledgers.JobKind.REVERSE_COMPLETION,
+        failed_job = scheduler._completion_tracker.open_completion(
+            ledgers.CompletionKind.REVERSE_RECEIVE,
             expected_worker_count=1,
             reverse_attempt_key=ReverseAttemptKey(binding.request_key, 1),
         )
-        open_job = scheduler._job_ledger.create_job(
-            ledgers.JobKind.REVERSE_COMPLETION,
+        open_job = scheduler._completion_tracker.open_completion(
+            ledgers.CompletionKind.REVERSE_RECEIVE,
             expected_worker_count=1,
             reverse_attempt_key=ReverseAttemptKey(binding.request_key, 2),
         )
-        assert scheduler._job_ledger.record_reports(successful_job_id, 1) is True
-        assert scheduler._job_ledger.record_failure(failed_job.job_id) is True
+        assert scheduler._completion_tracker.tally_reports(successful_job_id, 1) is True
+        assert scheduler._completion_tracker.fail_completion(failed_job.completion_id) is True
 
         scheduler._release_scheduler_request_state(request)
 
-        assert scheduler._job_ledger.get(successful_job_id) is None
-        assert scheduler._job_ledger.get(failed_job.job_id) is None
-        assert scheduler._job_ledger.get(open_job.job_id) is open_job
+        assert scheduler._completion_tracker.get(successful_job_id) is None
+        assert scheduler._completion_tracker.get(failed_job.completion_id) is None
+        assert scheduler._completion_tracker.get(open_job.completion_id) is open_job
 
     @pytest.mark.parametrize("latest_closed", [False, True], ids=["latest-open", "latest-closed"])
     def test_request_cleanup_reclaims_closed_superseded_send_jobs_and_preserves_latest_state(
@@ -289,19 +295,19 @@ class TestJobRecordReclamation:
         state = scheduler._decode_decision_states[request.request_id]
         old_attempt = ReverseAttemptKey(state.request_key, 0)
         latest_attempt = ReverseAttemptKey(state.request_key, 1)
-        assert scheduler._job_ledger.record_reports(old_job_id, 1) is True
+        assert scheduler._completion_tracker.tally_reports(old_job_id, 1) is True
         if latest_closed:
-            assert scheduler._job_ledger.record_reports(latest_job_id, 1) is True
+            assert scheduler._completion_tracker.tally_reports(latest_job_id, 1) is True
 
         scheduler._release_scheduler_request_state(request)
 
-        assert old_attempt not in scheduler._reverse_send_job_ids
-        assert scheduler._job_ledger.get(old_job_id) is None
+        assert old_attempt not in scheduler._reverse_send_completion_ids
+        assert scheduler._completion_tracker.get(old_job_id) is None
         if latest_closed:
-            assert latest_attempt not in scheduler._reverse_send_job_ids
-            assert scheduler._job_ledger.get(latest_job_id) is None
+            assert latest_attempt not in scheduler._reverse_send_completion_ids
+            assert scheduler._completion_tracker.get(latest_job_id) is None
             assert request.request_id not in scheduler._latest_reverse_attempt_ids
         else:
-            assert scheduler._reverse_send_job_ids[latest_attempt] == latest_job_id
-            assert scheduler._job_ledger.get(latest_job_id) is not None
+            assert scheduler._reverse_send_completion_ids[latest_attempt] == latest_job_id
+            assert scheduler._completion_tracker.get(latest_job_id) is not None
             assert scheduler._latest_reverse_attempt_ids[request.request_id] == 1

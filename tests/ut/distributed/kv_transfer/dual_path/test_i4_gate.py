@@ -69,14 +69,14 @@ def test_stale_attempt_job_absorbed_never_reaches_finished_recving(pe_scheduler_
     assert scheduler._prefill_pending_reverse_receive_bindings == {}
 
     # The logical request has re-parked at a newer attempt: the old attempt's
-    # job report is stale and must be absorbed.
+    # completion report is stale and must be absorbed.
     scheduler._waiting_reverse_attempt_ids[request.request_id] = _attempt_key(1, binding.request_key)
     output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_job_id: 1}))
     scheduler.update_connector_output(output)
 
     assert output.finished_recving is None
     assert output.finished_sending is None
-    assert scheduler._job_ledger.get(completion_job_id) is None
+    assert scheduler._completion_tracker.get(completion_job_id) is None
 
 
 def test_current_attempt_job_inserts_req_id_only_while_waiting(pe_scheduler_factory):
@@ -95,7 +95,7 @@ def test_current_attempt_job_inserts_req_id_only_while_waiting(pe_scheduler_fact
     assert pool.blocks[71].ref_cnt == 0
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids
 
-    # A late duplicate report hits the closed job and is ignored.
+    # A late duplicate report hits the closed completion and is ignored.
     late_output = KVConnectorOutput(
         kv_connector_worker_meta=make_worker_metadata(completed_jobs={completion_job_id: 1})
     )

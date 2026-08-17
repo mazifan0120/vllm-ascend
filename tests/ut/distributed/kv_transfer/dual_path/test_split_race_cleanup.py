@@ -550,7 +550,7 @@ def test_production_de_read_result_creates_plan_binding_store_without_scheduler_
 
         assert len(metadata.forward_receive_bindings) == 1
         assert metadata.forward_receive_bindings[0].path is PathKind.DE_READ
-        reverse_send_job_id = scheduler._reverse_send_job_ids[ReverseAttemptKey(state.request_key, 0)]
+        reverse_send_job_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
         assert metadata.reverse_plans == [replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)]
         assert metadata.reverse_receive_bindings == []
         assert metadata.decode_store_metadata is store_metadata
@@ -588,15 +588,15 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_release_scheduler_request_state",
         "_may_install_forward_plan",
         "_delay_free_for_connector",
-        "_has_open_reverse_send_job",
+        "_has_open_reverse_send_completion",
         "_resume_delivered_prefill_decision",
         "_deliver_prefill_decision",
-        "_request_for_failed_job",
+        "_request_for_failed_completion",
         "_handle_received_abort",
         "_recovery_invalid_block_ids",
-        "_aggregate_worker_job_facts",
-        "_run_job_close_action",
-        "_close_reverse_completion_job",
+        "_aggregate_worker_completion_facts",
+        "_run_completion_close_action",
+        "_close_reverse_receive_completion",
         "bind_gpu_block_pool",
         "update_connector_output",
         "get_num_new_matched_tokens",

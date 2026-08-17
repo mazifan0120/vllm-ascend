@@ -373,7 +373,7 @@ def test_store_miss_commits_nothing_and_enters_skipped(scheduler_factory):
 
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
     assert metadata.decode_store_metadata is None
-    reverse_send_job_id = scheduler._reverse_send_job_ids[ReverseAttemptKey(state.request_key, 0)]
+    reverse_send_job_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
     assert metadata.reverse_plans == [
         dataclasses.replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)
     ]
@@ -446,7 +446,7 @@ def test_de_read_activation_emits_plan_binding_store_in_one_lifecycle(scheduler_
 
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
-    reverse_send_job_id = scheduler._reverse_send_job_ids[ReverseAttemptKey(state.request_key, 0)]
+    reverse_send_job_id = scheduler._reverse_send_completion_ids[ReverseAttemptKey(state.request_key, 0)]
     assert metadata.reverse_plans == [
         dataclasses.replace(decision.reverse_plan, reverse_send_job_id=reverse_send_job_id)
     ]

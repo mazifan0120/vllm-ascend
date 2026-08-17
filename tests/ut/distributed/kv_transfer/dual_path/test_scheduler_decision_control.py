@@ -1586,8 +1586,8 @@ class TestCleanupAndShutdown:
         assert state.status is scheduler_module._DecodeDecisionStatus.COMMITTED
         task04_seams.decode_coordinator.unregister.assert_not_called()
 
-        # When: the reverse-send job is still open, so the finish is delayed
-        # (engine progress) until the job closes.
+        # When: the reverse-send completion is still open, so the finish is delayed
+        # (engine progress) until the completion closes.
         result = decode_scheduler.request_finished(request, [41, 42, 43, 44])
 
         # Then
@@ -1817,7 +1817,7 @@ class TestCleanupAndShutdown:
         _bind_prefill(scheduler, old_request, local_block_ids=(10, 11))
         old_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
         old_job_id = old_binding.reverse_completion_job_id
-        assert scheduler._job_ledger.record_reports(old_job_id, scheduler._expected_worker_count) is True
+        assert scheduler._completion_tracker.tally_reports(old_job_id, scheduler._expected_worker_count) is True
 
         # Arrange the scheduler race: the old admission's key-scoped artifacts
         # remain while request-ID-keyed active state has been rebound to B.
@@ -1864,8 +1864,8 @@ class TestCleanupAndShutdown:
         assert scheduler._waiting_reverse_attempt_ids == {
             request_id: ReverseAttemptKey(live_key, 0),
         }
-        assert scheduler._job_ledger.get(old_job_id) is None
-        assert scheduler._job_ledger.get(live_job_id) is not None
+        assert scheduler._completion_tracker.get(old_job_id) is None
+        assert scheduler._completion_tracker.get(live_job_id) is not None
         assert scheduler._prefill_deferred_deliveries == {live_key}
         assert scheduler._prefill_invalid_request_keys == {live_key}
         assert set(scheduler._path_decider._decision_records) == {live_key}
