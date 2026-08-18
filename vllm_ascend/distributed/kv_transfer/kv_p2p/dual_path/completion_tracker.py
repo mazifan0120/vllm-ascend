@@ -4,8 +4,9 @@
 Each reverse attempt opens one completion on the Scheduler; every
 participating worker reports it exactly once through
 ``DualPathWorkerMetadata``; at ``expected_worker_count`` the close action
-runs exactly once. Reports arriving for a closed completion are ignored,
-and a failure report closes the completion as failed.
+runs exactly once. Reports arriving for a closed completion are ignored.
+Failure is latched immediately, but does not close the completion before every
+worker has reported a terminal result.
 
 Close actions run on the Scheduler: they unpark via ``finished_recving``,
 authorize delayed free via ``finished_sending``, or fail the owning request.
@@ -50,10 +51,10 @@ class TransferCompletionTracker:
     """Monotonic completion-id allocator with the all-worker completion rule.
 
     Each worker contributes at most one report per completion; aggregated
-    counts are capped at ``expected_worker_count`` so a duplicated report can
-    never overshoot, and the kind-specific close action runs exactly once.
-    Reports arriving for a ``closed`` completion are ignored. A failure
-    report closes the completion as ``failed``.
+    counts must not exceed ``expected_worker_count``, and the kind-specific
+    close action runs exactly once. Reports arriving for a ``closed``
+    completion are ignored. Failure is latched while all-worker closure is
+    still enforced.
     """
 
     _records: dict[int, CompletionRecord] = field(default_factory=dict)
@@ -91,6 +92,28 @@ class TransferCompletionTracker:
         del self._records[completion_id]
         return True
 
+    def discard_unstarted(
+        self,
+        completion_id: int,
+        *,
+        expected_kind: CompletionKind,
+        expected_attempt_key: ReverseAttemptKey,
+    ) -> bool:
+        """Discard one exact completion that provably never reached a worker.
+
+        This is a close-without-action operation: it removes the record without
+        marking it closed, running a close action, or producing a core terminal.
+        """
+        record = self._records.get(completion_id)
+        if record is None or record.closed:
+            return False
+        if record.completion_kind is not expected_kind or record.reverse_attempt_key != expected_attempt_key:
+            raise RuntimeError("completion identity mismatch while discarding unstarted attempt")
+        if record.completed_worker_count != 0:
+            raise RuntimeError("cannot discard completion that already received terminal reports")
+        del self._records[completion_id]
+        return True
+
     def discard_closed_completions(self, completion_kind: CompletionKind, request_key: DualPathRequestKey) -> None:
         """Retire every closed completion of ``completion_kind`` owned by ``request_key``."""
         for completion_id, record in list(self._records.items()):
@@ -106,25 +129,32 @@ class TransferCompletionTracker:
     def open_count(self) -> int:
         return sum(1 for record in self._records.values() if not record.closed)
 
-    def tally_reports(self, completion_id: int, report_count: int) -> bool:
-        """Accumulate worker reports; returns True iff the completion closes now."""
+    def tally_reports(
+        self,
+        completion_id: int,
+        success_count: int = 0,
+        failure_count: int = 0,
+    ) -> bool:
+        """Accumulate worker terminals; return True iff closure happens now."""
         record = self._records.get(completion_id)
-        if record is None or record.closed or report_count <= 0:
+        if record is None or record.closed:
             return False
-        record.completed_worker_count = min(
-            record.completed_worker_count + report_count,
-            record.expected_worker_count,
-        )
+        if success_count < 0 or failure_count < 0:
+            raise ValueError("completion report counts must be non-negative")
+        report_count = success_count + failure_count
+        if report_count == 0:
+            return False
+        completed_worker_count = record.completed_worker_count + report_count
+        if completed_worker_count > record.expected_worker_count:
+            raise RuntimeError("completion reports exceed expected worker count")
+        record.completed_worker_count = completed_worker_count
+        if failure_count:
+            record.failed = True
         if record.completed_worker_count < record.expected_worker_count:
             return False
         record.closed = True
         return True
 
     def fail_completion(self, completion_id: int) -> bool:
-        """Close the completion as failed; True iff newly closed."""
-        record = self._records.get(completion_id)
-        if record is None or record.closed:
-            return False
-        record.failed = True
-        record.closed = True
-        return True
+        """Record one failed worker terminal; True iff this closes the record."""
+        return self.tally_reports(completion_id, failure_count=1)

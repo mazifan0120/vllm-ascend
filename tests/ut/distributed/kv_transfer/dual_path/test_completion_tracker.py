@@ -24,6 +24,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion imp
     _de_read_decision,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
+    DualPathRequestKey,
     PathKind,
     ReverseAttemptKey,
 )
@@ -47,28 +48,99 @@ class TestTransferCompletionTracker:
         assert completion.completed_worker_count == 2
         assert completion.closed is True
 
-    def test_duplicate_reports_are_capped_at_the_expected_count(self):
+    def test_over_reporting_is_rejected(self):
         completion_tracker = _completion_tracker()
         tracker = completion_tracker.TransferCompletionTracker()
         completion = tracker.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert tracker.tally_reports(completion.completion_id, 5) is True
-        assert completion.completed_worker_count == 2
+        with pytest.raises(RuntimeError, match="exceed expected worker count"):
+            tracker.tally_reports(completion.completion_id, success_count=3)
+        assert completion.completed_worker_count == 0
+        assert completion.closed is False
 
-        # Post-close reports are ignored entirely and never re-close the completion.
-        assert tracker.tally_reports(completion.completion_id, 1) is False
-        assert completion.completed_worker_count == 2
-
-    def test_failure_closes_the_completion_as_failed(self):
+    def test_failure_latches_but_waits_for_all_worker_terminals(self):
         completion_tracker = _completion_tracker()
         tracker = completion_tracker.TransferCompletionTracker()
         completion = tracker.open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, expected_worker_count=2)
 
-        assert tracker.fail_completion(completion.completion_id) is True
+        assert tracker.tally_reports(completion.completion_id, failure_count=1) is False
+        assert completion.completed_worker_count == 1
+        assert completion.closed is False
+        assert completion.failed is True
+
+        assert tracker.tally_reports(completion.completion_id, success_count=1) is True
+        assert completion.completed_worker_count == 2
         assert completion.closed is True
         assert completion.failed is True
-        # A second failure report is absorbed.
-        assert tracker.fail_completion(completion.completion_id) is False
+
+    def test_mixed_reports_close_once(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        completion = tracker.open_completion(completion_tracker.CompletionKind.REVERSE_SEND, expected_worker_count=3)
+
+        assert tracker.tally_reports(completion.completion_id, success_count=1, failure_count=1) is False
+        assert tracker.tally_reports(completion.completion_id, success_count=1) is True
+        assert tracker.tally_reports(completion.completion_id, failure_count=1) is False
+
+    def test_discard_unstarted_is_exact_and_idempotent(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 0)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=2,
+            reverse_attempt_key=attempt_key,
+        )
+
+        assert (
+            tracker.discard_unstarted(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is True
+        )
+        assert tracker.get(completion.completion_id) is None
+        assert (
+            tracker.discard_unstarted(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is False
+        )
+
+    def test_discard_unstarted_rejects_identity_mismatch_or_reported_record(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 0)
+        other_attempt = ReverseAttemptKey(attempt_key.request_key, 1)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=2,
+            reverse_attempt_key=attempt_key,
+        )
+
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            tracker.discard_unstarted(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_SEND,
+                expected_attempt_key=attempt_key,
+            )
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            tracker.discard_unstarted(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=other_attempt,
+            )
+
+        assert tracker.tally_reports(completion.completion_id, success_count=1) is False
+        with pytest.raises(RuntimeError, match="already received terminal reports"):
+            tracker.discard_unstarted(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
 
     def test_invalid_expected_worker_count_rejected(self):
         completion_tracker = _completion_tracker()
