@@ -151,6 +151,16 @@ class _PrefillReverseActivationSnapshot:
     send_req_info: SendReqInfo | None
 
 
+@dataclass(frozen=True, slots=True)
+class _DeferredPrefillActivation:
+    """Exact local activation held behind an unresolved prior delivery."""
+
+    request: Request = field(compare=False, repr=False)
+    blocks: KVCacheBlocks = field(compare=False, repr=False)
+    result: PathDecisionResult
+    reverse_snapshot: _PrefillReverseActivationSnapshot
+
+
 def _decode_ready_token_count(num_tokens: int) -> int:
     """Tokens Decode can receive: the last token is always computed locally."""
     return max(num_tokens - 1, 0)
@@ -260,6 +270,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._reverse_send_completion_ids: dict[ReverseAttemptKey, int] = {}
         self._prefill_delivered_reverse_attempts: dict[str, int] = {}
         self._prefill_deferred_deliveries: set[DualPathRequestKey] = set()
+        self._prefill_deferred_activations: dict[DualPathRequestKey, _DeferredPrefillActivation] = {}
         self._prefill_empty_reverse_request_ids: set[str] = set()
         self._latest_reverse_attempt_ids: dict[str, int] = {}
         _validate_local_topology(vllm_config)
@@ -394,8 +405,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     # A failed prior delivery cancels its deferred replacement
                     # for good: the request converges to the failure path.
                     self._prefill_deferred_deliveries.discard(request_key)
+                    deferred_activation = self._prefill_deferred_activations.pop(request_key, None)
                     same_admission = self._prefill_request_keys.get(request_id) == request_key
                     if same_admission:
+                        if deferred_activation is not None:
+                            self._rollback_prefill_reverse_activation(
+                                request_id,
+                                deferred_activation.reverse_snapshot,
+                            )
                         self._prefill_invalid_request_keys.add(request_key)
                         if delivery_record.path is PathKind.DE_READ:
                             invalid_block_ids = delivery_record.invalid_block_ids
@@ -1102,6 +1119,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         reverse_snapshot: _PrefillReverseActivationSnapshot | None = None,
     ) -> None:
         self._reconcile_prefill_deliveries()
+        deferred_activation = self._prefill_deferred_activations.get(request_key)
+        if request is None and deferred_activation is not None:
+            request = deferred_activation.request
+            blocks = deferred_activation.blocks
+            reverse_snapshot = deferred_activation.reverse_snapshot
         if request is not None:
             request_id = request.request_id
         else:
@@ -1115,14 +1137,19 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
         if request_id is None or self._prefill_request_keys.get(request_id) != request_key:
             self._prefill_deferred_deliveries.discard(request_key)
+            self._prefill_deferred_activations.pop(request_key, None)
             return
         if request_key in self._prefill_invalid_request_keys:
             self._prefill_deferred_deliveries.discard(request_key)
+            self._prefill_deferred_activations.pop(request_key, None)
             return
         result = self._prefill_path_results.get(request_id)
         if result is None or result.request_key != request_key:
             self._prefill_deferred_deliveries.discard(request_key)
+            self._prefill_deferred_activations.pop(request_key, None)
             return
+        if deferred_activation is not None and deferred_activation.result != result:
+            raise RuntimeError(f"DualPath Prefill request {request_id} has mismatched deferred activation state")
         reverse_plan: ReversePlan | None = None
         if result.path is PathKind.PE_READ:
             if request_key in self._prefill_delivery_futures:
@@ -1141,6 +1168,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 and self._prefill_delivered_reverse_attempts.get(request_id) == reverse_plan.reverse_attempt_id
             ):
                 self._prefill_deferred_deliveries.discard(request_key)
+                self._prefill_deferred_activations.pop(request_key, None)
                 return
         else:
             assert_never(result.path)
@@ -1150,6 +1178,13 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # replacement delivery defers (never overwrites) and the next
             # build pass retries once the earlier Future resolves.
             self._prefill_deferred_deliveries.add(request_key)
+            if request is not None and blocks is not None and reverse_snapshot is not None:
+                self._prefill_deferred_activations[request_key] = _DeferredPrefillActivation(
+                    request=request,
+                    blocks=blocks,
+                    result=result,
+                    reverse_snapshot=reverse_snapshot,
+                )
             return
         metadata = self._prefill_decision_metadata[request_id]
         decision_result = result
@@ -1181,6 +1216,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 else:
                     self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
                 self._prefill_deferred_deliveries.discard(request_key)
+                self._prefill_deferred_activations.pop(request_key, None)
             return
         self._prefill_delivery_futures[request_key] = delivery_future
         if reverse_plan is None:
@@ -1197,6 +1233,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             future=delivery_future,
         )
         self._prefill_deferred_deliveries.discard(request_key)
+        self._prefill_deferred_activations.pop(request_key, None)
         if reverse_plan is not None:
             self._prefill_delivered_reverse_attempts[request_id] = reverse_plan.reverse_attempt_id
 
@@ -1727,10 +1764,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             self._reconcile_prefill_deliveries()
             for deferred_request_key in list(self._prefill_deferred_deliveries):
                 self._deliver_prefill_decision(deferred_request_key)
-            metadata.reverse_receive_bindings.extend(self._prefill_pending_reverse_receive_bindings.values())
+            for request_id, binding in list(self._prefill_pending_reverse_receive_bindings.items()):
+                if binding.request_key in self._prefill_deferred_deliveries:
+                    continue
+                metadata.reverse_receive_bindings.append(binding)
+                if self._prefill_pending_reverse_receive_bindings.get(request_id) == binding:
+                    self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
             reported_failure_request_ids = tuple(self._prefill_control_failures)
             metadata.control_failures.extend(self._prefill_control_failures.values())
-            self._prefill_pending_reverse_receive_bindings.clear()
             self._prefill_control_failures.clear()
             for request_id in reported_failure_request_ids:
                 request_key = self._prefill_request_keys.get(request_id)
@@ -1825,6 +1866,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._path_decider.discard(released_key)
                 self._prefill_invalid_request_keys.discard(released_key)
                 self._prefill_deferred_deliveries.discard(released_key)
+                self._prefill_deferred_activations.pop(released_key, None)
             self._reconcile_prefill_deliveries()
         # Completion records remain owned by their completion lifecycle across
         # request cleanup.
@@ -2075,6 +2117,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_delivery_records.clear()
         self._prefill_delivered_reverse_attempts.clear()
         self._prefill_deferred_deliveries.clear()
+        self._prefill_deferred_activations.clear()
         self._prefill_empty_reverse_request_ids.clear()
         self._prefill_invalid_request_keys.clear()
         self._pending_finished_sending.clear()

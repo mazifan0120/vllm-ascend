@@ -105,7 +105,13 @@ not-yet-submitted attempt. The exact new completion is removed with
 `discard_unstarted()`.
 
 Synchronous submit failure removes the exact current pending attempt and its
-unstarted completion. Asynchronous Future failure never uses this operation.
+unstarted completion. A replacement held behind an unresolved earlier delivery
+keeps its activation snapshot and withholds its binding from Worker metadata
+until its own `submit()` returns a Future. If that synchronous retry fails, or
+if the earlier Future fails before the replacement is submitted, only the
+provably-unstarted replacement is discarded and the prior attempt is restored.
+An asynchronous failure never discards the completion belonging to the Future
+that actually failed, because its remote writer may already have started.
 
 ### Finish and terminal
 
@@ -164,6 +170,8 @@ Tests must cover:
 - initial and replacement activation exceptions cancel only the newly opened
   completion and restore prior attempt state;
 - synchronous submit failure cancels the unstarted attempt;
+- deferred replacement binding is withheld until submission and its exact
+  activation rolls back if the retry never starts;
 - asynchronous failure before the first metadata build sends binding plus
   control failure and produces no synthetic receive completion;
 - PE finish retains blocks and attempt ownership until real DONE/FAILED;

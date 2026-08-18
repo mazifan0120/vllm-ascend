@@ -699,6 +699,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
             "_reverse_send_completion_ids",
             "_prefill_delivered_reverse_attempts",
             "_prefill_deferred_deliveries",
+            "_prefill_deferred_activations",
             "_prefill_empty_reverse_request_ids",
             "_latest_reverse_attempt_ids",
         }

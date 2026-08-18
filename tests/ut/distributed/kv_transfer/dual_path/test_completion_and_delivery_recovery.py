@@ -197,6 +197,36 @@ class TestReplacementActivationRollback:
 
         self._assert_attempt_zero_restored(scheduler, request, old_plan, old_waiting)
 
+    def test_deferred_submit_failure_restores_previous_attempt_without_binding(self, pe_scheduler_factory):
+        pending_future = MagicMock(name="delivery_future_attempt_0")
+        pending_future.done.return_value = False
+        pending_future.cancelled.return_value = False
+        pending_future.exception.return_value = None
+        scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=make_block_pool())
+        coordinator.submit.side_effect = [pending_future, RuntimeError("coordinator closed")]
+
+        request, old_plan, old_waiting = self._install_attempt_zero(scheduler)
+        request_id = request.request_id
+        old_forward_plan = scheduler._prefill_forward_plans[request_id]
+        old_forward_epoch = scheduler._prefill_forward_plan_epochs[request_id]
+        old_send_info = scheduler._reqs_need_send_layerwise[request_id]
+
+        request.num_preemptions += 1
+        assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+        scheduler.update_state_after_alloc(request, _blocks(([80, 81, 82, 83],)), 16)
+        assert coordinator.submit.call_count == 1
+        assert scheduler._prefill_reverse_plans[request_id].reverse_attempt_id == 1
+
+        pending_future.done.return_value = True
+        metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
+
+        assert coordinator.submit.call_count == 2
+        self._assert_attempt_zero_restored(scheduler, request, old_plan, old_waiting)
+        assert scheduler._prefill_forward_plans[request_id] is old_forward_plan
+        assert scheduler._prefill_forward_plan_epochs[request_id] == old_forward_epoch
+        assert scheduler._reqs_need_send_layerwise[request_id] is old_send_info
+        assert metadata.reverse_receive_bindings == []
+
 
 class TestFailedPriorFutureCancelsDeferredReplacement:
     def _defer_replacement(self, scheduler, coordinator):
@@ -212,6 +242,8 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         scheduler.update_state_after_alloc(request, _blocks(([80, 81, 82, 83],)), 16)
         request_key = scheduler._prefill_path_results[request.request_id].request_key
         assert request_key in scheduler._prefill_deferred_deliveries
+        metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
+        assert metadata.reverse_receive_bindings == []
         return request, pending_future
 
     def test_failed_prior_future_cancels_deferred_replacement(self, pe_scheduler_factory):
@@ -227,6 +259,7 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         assert coordinator.submit.call_count == 1
         assert request_key in scheduler._prefill_invalid_request_keys
         assert request_key not in scheduler._prefill_deferred_deliveries
+        assert request_key not in scheduler._prefill_deferred_activations
         assert len(metadata.control_failures) == 1
         # The invalid request can never be delivered later, even by a direct call.
         scheduler._deliver_prefill_decision(request_key)
@@ -245,6 +278,7 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         assert coordinator.submit.call_count == 1
         assert request_key in scheduler._prefill_invalid_request_keys
         assert request_key not in scheduler._prefill_deferred_deliveries
+        assert request_key not in scheduler._prefill_deferred_activations
         assert len(metadata.control_failures) == 1
 
 

@@ -55,6 +55,7 @@
    - preserve the pending binding after asynchronous decision failure so metadata installs it before control failure;
    - make DE_READ activation transactional and cancel only the exact newly opened, provably unstarted completion on activation exception;
    - cancel the exact unstarted attempt on synchronous coordinator submission rejection;
+   - retain an exact activation snapshot while a replacement is deferred, and withhold its binding until `submit()` returns a Future;
    - never synthesize data-plane completion from control-plane failure.
 4. Re-run the focused tests and confirm green.
 5. Commit with sign-off as `fix(dual_path): hold reverse receive blocks to terminal`.

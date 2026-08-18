@@ -158,12 +158,14 @@ def test_attempt_n_plus_1_created_on_resume_allocation(pe_scheduler_factory):
     assert second_decision.reverse_plan == new_reverse_plan
 
 
-def test_failed_old_delivery_after_attempt_refresh_invalidates_current_attempt_blocks(pe_scheduler_factory):
+def test_failed_old_delivery_rolls_back_deferred_refresh_and_invalidates_old_blocks(pe_scheduler_factory):
     pool = make_block_pool()
     scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
     attempt_zero_future: Future[None] = Future()
     coordinator.submit.return_value = attempt_zero_future
     request = _admit_de_read(scheduler)
+    old_plan = scheduler._prefill_reverse_plans[request.request_id]
+    old_binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
     request_key = scheduler._prefill_path_results[request.request_id].request_key
     attempt_zero_record = scheduler._prefill_delivery_records[request_key]
     assert attempt_zero_record.invalid_block_ids == (71, 72)
@@ -179,8 +181,11 @@ def test_failed_old_delivery_after_attempt_refresh_invalidates_current_attempt_b
     assert len(metadata.control_failures) == 1
     failure = metadata.control_failures[0]
     assert failure.request_id == request.request_id
-    assert failure.invalid_block_ids == (82,)
-    assert set(failure.invalid_block_ids).isdisjoint(attempt_zero_record.invalid_block_ids)
+    assert failure.invalid_block_ids == attempt_zero_record.invalid_block_ids
+    assert scheduler._prefill_reverse_plans[request.request_id] is old_plan
+    # Attempt 1 was never submitted, so only the attempt-0 binding may be
+    # installed beside its fail-closed control terminal.
+    assert metadata.reverse_receive_bindings == [old_binding]
 
 
 def test_fresh_tracker_and_latch_for_new_attempt_old_plan_never_resubmitted():
