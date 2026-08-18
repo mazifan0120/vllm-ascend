@@ -386,6 +386,19 @@ class TestDecodeAdmission(unittest.TestCase):
             self.scheduler.update_state_after_alloc(request, _make_blocks(((9, 9),)), 32)
         self.assertIs(self.scheduler._decode_kv_snapshots["req-conflict"], first)
 
+    def test_zero_token_duplicate_bind_fails_closed_without_reading_blocks(self):
+        request = _make_request("req-zero-conflict", 48, _selected_params())
+        self._admit(request, 16, block_ids_by_group=((7, 8),))
+        first = self.scheduler._decode_kv_snapshots[request.request_id]
+        request.kv_transfer_params["do_remote_prefill"] = True
+        blocks = _make_blocks(((9, 9),))
+
+        with self.assertRaisesRegex(RuntimeError, "conflicting duplicate"):
+            self.scheduler.update_state_after_alloc(request, blocks, 0)
+
+        blocks.get_block_ids.assert_not_called()
+        self.assertIs(self.scheduler._decode_kv_snapshots[request.request_id], first)
+
     def test_resumed_after_async_load_delegates_without_conflicting_bind(self):
         # After DONE promotes the request back to WAITING, vLLM allocates the
         # final recompute token with num_external_tokens=0 while the admission
@@ -454,7 +467,9 @@ class TestDecodeAdmission(unittest.TestCase):
     def test_hbm_complete_alloc_callback_creates_no_state_and_skips_parent(self):
         request = _make_request("req-zero-ext", 48, _selected_params())
         self.assertEqual(self.scheduler.get_num_new_matched_tokens(request, 47), (0, False))
-        self.scheduler.update_state_after_alloc(request, _make_blocks(((1, 2, 3),)), 0)
+        blocks = _make_blocks(((1, 2, 3),))
+        self.scheduler.update_state_after_alloc(request, blocks, 0)
+        blocks.get_block_ids.assert_not_called()
         self.assertEqual(self.scheduler._decode_kv_snapshots, {})
         self.assertEqual(self.scheduler._decode_decision_states, {})
         self.assertEqual(self.scheduler._lookup_results, {})

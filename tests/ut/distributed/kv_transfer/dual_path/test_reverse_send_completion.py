@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,9 +23,9 @@ from tests.ut.distributed.kv_transfer.dual_path.conftest import (
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_reverse_attempt_identity import (
     _attempt_key,
-    _make_reverse_plan,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
+    _make_prefill_worker,
     _make_worker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision as path_decision_module
@@ -31,6 +33,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import worker as worke
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
     DualPathControlFailureReason,
+    ReverseReceiveBinding,
     ReversePlan,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
@@ -104,8 +107,9 @@ def _activate_decision(scheduler, decode_control_seams, decision: PathDecision):
 
 def _seed_reverse_send_tracker(worker, reverse_send_completion_id: int, reverse_attempt_id: int = 0):
     attempt_key = _attempt_key(reverse_attempt_id, _REQUEST_KEY)
-    plan = _make_reverse_plan(
-        reverse_attempt_id=reverse_attempt_id, reverse_send_completion_id=reverse_send_completion_id
+    plan = replace(
+        _de_read_decision(reverse_attempt_id).reverse_plan,
+        reverse_send_completion_id=reverse_send_completion_id,
     )
     tracker = worker_module._SplitTracker(
         store_phase=worker_module._SplitPhase.SKIPPED,
@@ -252,6 +256,68 @@ def test_close_marks_the_send_completion_closed_and_not_failed(decode_scheduler_
     scheduler.update_connector_output(output)
     assert attempt_key not in scheduler._reverse_send_completion_ids
     assert scheduler._completion_tracker.get(completion_id) is None
+
+
+@pytest.mark.parametrize(
+    ("trans_flag", "expected_message_type"),
+    [
+        (True, layerwise_module.DONE_SENDING_MSG),
+        (False, layerwise_module.FAILED_SENDING_MSG),
+    ],
+)
+def test_reverse_terminal_wire_payload_closes_prefill_receive_attempt(
+    trans_flag: bool,
+    expected_message_type: bytes,
+):
+    reverse_receive_completion_id = 91
+    expected_wire_id = "ra:decode-engine:2:boot-7:decode-request-7:0:0"
+    worker = _make_worker()
+    _seed_reverse_send_tracker(worker, reverse_send_completion_id=17)
+    sockets = []
+
+    @contextlib.contextmanager
+    def capture_terminal_socket(_socket_type, _addr):
+        sock = MagicMock(name="terminal_ack_socket")
+        sock.poll.return_value = True
+        sock.recv.return_value = b"ACK"
+        sockets.append(sock)
+        yield sock
+
+    with patch.object(layerwise_module, "zmq_ctx", capture_terminal_socket):
+        worker.send_done_send_signal(_REQUEST_ID, make_sender_req_meta(), 0, trans_flag=trans_flag)
+
+    encoded_payload = sockets[0].send.call_args.args[0]
+    terminal = layerwise_module.msgspec.msgpack.Decoder(type=tuple).decode(encoded_payload)
+    assert terminal[0] == expected_message_type
+    assert terminal[1] == expected_wire_id
+
+    prefill_worker = _make_prefill_worker()
+    binding = ReverseReceiveBinding(
+        request_key=_REQUEST_KEY,
+        wire_request_id=expected_wire_id,
+        prefill_request_id="prefill-request-7",
+        destination_block_ids=((71, 72, 73, 74),),
+        token_start=16,
+        token_end=32,
+        reverse_attempt_id=0,
+        prefill_local_tokens=16,
+        reverse_receive_completion_id=reverse_receive_completion_id,
+    )
+    prefill_worker._install_reverse_receive_binding(binding)
+    prefill_worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = (
+        {terminal[1]} if trans_flag else set()
+    )
+    prefill_worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = (
+        set() if trans_flag else {terminal[1]}
+    )
+
+    assert prefill_worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), set())
+    worker_metadata = prefill_worker.build_connector_worker_meta()
+    expected_report = {reverse_receive_completion_id: 1}
+    assert worker_metadata.completion_reports == (expected_report if trans_flag else {})
+    assert worker_metadata.failure_reports == ({} if trans_flag else expected_report)
+    assert prefill_worker._pending_forward_done_wire_ids == set()
+    assert prefill_worker._pending_forward_failed_wire_ids == set()
 
 
 def test_reverse_terminal_is_not_visible_while_terminal_ack_is_blocked():

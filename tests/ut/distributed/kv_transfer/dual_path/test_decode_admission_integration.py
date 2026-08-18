@@ -434,6 +434,38 @@ def test_hbm_complete_schedules_normally_without_dual_path_state(_constrain_kvpo
     assert scheduler_output.num_scheduled_tokens[request.request_id] == 1
     assert request.status == RequestStatus.RUNNING
 
+    metadata = scheduler_output.kv_connector_metadata
+    assert isinstance(metadata, DualPathConnectorMetadata)
+    assert metadata.requests == {}
+    assert metadata.send_task.send_request == {}
+    assert metadata.decode_store_metadata is None
+    assert metadata.control_failures == []
+    assert metadata.forward_receive_bindings == []
+    assert metadata.reverse_plans == []
+    assert metadata.reverse_receive_bindings == []
+
+    worker, adapter, backend = _make_bare_worker(None)
+    worker.engine.reset_mock()
+    backend.reset_mock()
+    with patch.object(adapter, "start_load_kv", wraps=adapter.start_load_kv) as store_load:
+        worker.start_load_kv(metadata)
+    store_load.assert_not_called()
+    assert worker.request_map == {}
+    assert worker.virtual_request == set()
+    assert worker._recving_metadata == {}
+    assert worker._split_trackers == {}
+    assert worker._forward_receive_bindings == {}
+    assert worker._reverse_receive_bindings == {}
+    assert worker.engine.method_calls == []
+    assert backend.method_calls == []
+
+    request.status = RequestStatus.FINISHED_STOPPED
+    assert dual.request_finished_all_groups(request, ([],)) == (False, None)
+    assert dual.request_finished_all_groups(request, ([],)) == (False, None)
+    assert dual._lookup_results == {}
+    assert dual._decode_kv_snapshots == {}
+    assert dual._decode_decision_states == {}
+
 
 def test_store_full_success_completes_locally_and_recomputes_last_token(
     _constrain_kvpool_seams,

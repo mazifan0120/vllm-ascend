@@ -49,6 +49,18 @@ if TYPE_CHECKING:
 __all__ = ["DualPathConnectorWorker"]
 
 
+def _adapt_wire_id_for_parent_terminal(request_id: str, wire_request_id: str) -> str:
+    """Wrap an opaque wire id with the EngineCore suffix the parent removes."""
+    external_request_id = get_external_request_id(request_id)
+    if not request_id.startswith(external_request_id):
+        raise RuntimeError("Layerwise external request-id conversion no longer preserves a request prefix")
+    engine_core_suffix = request_id[len(external_request_id) :]
+    parent_request_id = f"{wire_request_id}{engine_core_suffix}"
+    if get_external_request_id(parent_request_id) != wire_request_id:
+        raise RuntimeError("Layerwise external request-id conversion cannot carry the DualPath Reverse wire id")
+    return parent_request_id
+
+
 class _SplitPhase(str, Enum):
     SKIPPED = "SKIPPED"
     PENDING = "PENDING"
@@ -616,6 +628,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
         submitted_attempt = None
         reverse_send_completion_id = None
+        parent_request_id = req_id
         if self.dual_path_cfg.role == "decode":
             with self._reverse_terminal_lock:
                 tracker = self._split_trackers.get(req_id)
@@ -623,9 +636,15 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     submitted_attempt = tracker.reverse_submitted_attempt
                     if tracker.reverse_plan is not None:
                         reverse_send_completion_id = tracker.reverse_plan.reverse_send_completion_id
+                        parent_request_id = _adapt_wire_id_for_parent_terminal(
+                            req_id,
+                            tracker.reverse_plan.wire_request_id,
+                        )
         # The parent's return value is the single outcome source: True only
-        # after a successful terminal ACK.
-        ack_succeeded = super().send_done_send_signal(req_id, req_meta, group_idx, trans_flag)
+        # after a successful terminal ACK. Reverse keeps its Decode-local
+        # callback id above, but presents the attempt-unique wire id through
+        # the EngineCore suffix contract consumed by the parent.
+        ack_succeeded = super().send_done_send_signal(parent_request_id, req_meta, group_idx, trans_flag)
         terminal_succeeded = trans_flag and ack_succeeded
         # Only the Reverse direction reports to the local scheduler; a Forward
         # send reaches its peer over the control channel like the parent's.

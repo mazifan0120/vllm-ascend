@@ -1188,14 +1188,29 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def _bind_decode_admission_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ) -> None:
-        # Decode role: freeze the allocation into the admission snapshot, then
-        # either commit a Store-full load locally or register the pending path
-        # decision and notify the proxy.
+        # Decode role: bypass HBM-complete admission without materializing the
+        # block table. Otherwise freeze the allocation into the admission
+        # snapshot, then either commit Store-full locally or register the
+        # pending path decision and notify the proxy.
         request_id = request.request_id
+        existing = self._decode_kv_snapshots.get(request_id)
+        if num_external_tokens == 0:
+            if existing is not None:
+                raise RuntimeError(
+                    f"DualPath request {request_id} got a conflicting duplicate admission bind; "
+                    "this is a bug and the engine cannot continue safely"
+                )
+            # HBM-complete admission returned (0, False): no KVPool admission
+            # state exists to bind, and the parent must not fire its remote-
+            # prefill/metaserver flow. Intentionally keep do_remote_prefill:
+            # allocation retry or preemption re-admission must re-evaluate HBM
+            # coverage and may fall through to Store lookup.
+            self._lookup_results.pop(request_id, None)
+            return
+
         allocated_block_ids = blocks.get_block_ids()
         frozen_block_ids = tuple(tuple(group) for group in allocated_block_ids)
 
-        existing = self._decode_kv_snapshots.get(request_id)
         if existing is not None:
             if self._is_identical_duplicate_admission(request, existing, frozen_block_ids, num_external_tokens):
                 return
@@ -1203,12 +1218,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 f"DualPath request {request_id} got a conflicting duplicate admission bind; "
                 "this is a bug and the engine cannot continue safely"
             )
-
-        if num_external_tokens == 0:
-            # HBM-complete admission returned (0, False): no KVPool admission
-            # state to bind, and the parent must not fire its remote-prefill/metaserver flow.
-            self._lookup_results.pop(request_id, None)
-            return
 
         entry = self._lookup_results.pop(request_id, None)
         if entry is None:
