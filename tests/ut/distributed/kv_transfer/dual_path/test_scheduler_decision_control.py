@@ -2035,7 +2035,7 @@ class TestCleanupAndShutdown:
         worker = _make_prefill_worker()
         worker.start_load_kv(binding_metadata)
         worker.start_load_kv(metadata)
-        assert worker.get_finished(set(), metadata) == (set(), {request.request_id})
+        assert worker.get_finished(set(), metadata) == (set(), set())
         assert worker.get_block_ids_with_load_errors() == {10, 11}
         assert worker.get_finished(set(), metadata) == (set(), set())
 
@@ -2101,7 +2101,7 @@ class TestCleanupAndShutdown:
         assert set(worker._reverse_receive_bindings) == {
             ReverseAttemptKey(binding.request_key, binding.reverse_attempt_id)
         }
-        assert worker.get_finished(set(), metadata) == (set(), {request.request_id})
+        assert worker.get_finished(set(), metadata) == (set(), set())
 
     def test_de_read_delivery_failure_after_binding_drain_without_forward_plan_uses_delivery_context(
         self,

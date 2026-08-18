@@ -81,6 +81,7 @@ class _SplitTracker:
     reverse_submitted_attempt: ReverseAttemptKey | None
     store_load_failed: bool
     terminal_reported: bool
+    core_request_finished: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,13 +274,18 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 tracker = self._split_trackers.get(request_id)
                 if tracker is None:
                     continue
-                if tracker.reverse_phase in (_SplitPhase.SKIPPED, _SplitPhase.DONE):
+                if tracker.reverse_phase in (_SplitPhase.SKIPPED, _SplitPhase.DONE, _SplitPhase.FAILED):
                     # Remove the tracker and consumed-terminal record together
                     # once the attempt is complete.
                     submitted_attempt = tracker.reverse_submitted_attempt
                     self._split_trackers.pop(request_id, None)
                     if submitted_attempt is not None:
                         self._pending_local_reverse_terminals.pop(submitted_attempt, None)
+                else:
+                    # The core has finished, but an already submitted Reverse
+                    # send may still write its peer. Retain only the attempt
+                    # lifecycle; its terminal report must not emit done_recving.
+                    tracker.core_request_finished = True
         return finished_wire_ids, finished_reverse_wire_ids
 
     def _release_finished_reverse_terminals(self, finished_req_ids: set[str]) -> set[str]:
@@ -559,9 +565,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     "dual_path data_terminal key=%s failure_source=STORE status=FAILED",
                     request_id,
                 )
-                if not tracker.terminal_reported:
-                    tracker.terminal_reported = True
-                    reported_store_terminals.add(request_id)
+                self._report_split_terminal(request_id, tracker, reported_store_terminals)
             else:
                 tracker.store_phase = _SplitPhase.DONE
                 self._submit_reverse(request_id)
@@ -570,9 +574,34 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     and tracker.reverse_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
                     and tracker.forward_phase is _SplitPhase.DONE
                 ):
-                    tracker.terminal_reported = True
-                    reported_store_terminals.add(request_id)
+                    self._report_split_terminal(request_id, tracker, reported_store_terminals)
         return reported_store_terminals
+
+    @staticmethod
+    def _report_split_terminal(
+        request_id: str,
+        tracker: _SplitTracker,
+        finished: set[str],
+    ) -> None:
+        """Record one request terminal without reviving a core-finished request."""
+        if tracker.terminal_reported:
+            return
+        tracker.terminal_reported = True
+        if not tracker.core_request_finished:
+            finished.add(request_id)
+
+    def _has_open_reverse_transfer(self, request_id: str) -> bool:
+        if self.dual_path_cfg.role == "prefill":
+            return any(
+                binding.prefill_request_id == request_id
+                for binding in self._reverse_receive_bindings.values()
+            )
+        tracker = self._split_trackers.get(request_id)
+        return (
+            tracker is not None
+            and tracker.reverse_plan is not None
+            and tracker.reverse_phase is _SplitPhase.PENDING
+        )
 
     def build_connector_worker_meta(self) -> DualPathWorkerMetadata | None:
         completion_reports: dict[int, int] = {}
@@ -605,7 +634,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             for plan in metadata.reverse_plans:
                 self._install_reverse_plan(plan)
         for failure in metadata.control_failures:
-            self._control_failed_recving.add(failure.request_id)
+            # A control-plane terminal cannot prove that an installed Reverse
+            # transfer has stopped writing. Its real data-plane terminal owns
+            # the completion report and eventual block release.
+            if not self._has_open_reverse_transfer(failure.request_id):
+                self._control_failed_recving.add(failure.request_id)
             self._invalid_block_ids.update(failure.invalid_block_ids)
             logger.warning(
                 "dual_path control_terminal key=%s failure_source=%s status=FAILED",
@@ -730,8 +763,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     and tracker.store_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
                     and tracker.forward_phase is _SplitPhase.DONE
                 ):
-                    tracker.terminal_reported = True
-                    finished.add(request_id)
+                    self._report_split_terminal(request_id, tracker, finished)
             else:
                 tracker.reverse_phase = _SplitPhase.FAILED
                 self._invalid_block_ids.update(tracker.forward_destination_slice)
@@ -739,9 +771,11 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                     "dual_path data_terminal key=%s failure_source=REVERSE status=FAILED",
                     request_id,
                 )
-                if not tracker.terminal_reported:
-                    tracker.terminal_reported = True
-                    finished.add(request_id)
+                self._report_split_terminal(request_id, tracker, finished)
+            if tracker.core_request_finished:
+                with self._reverse_terminal_lock:
+                    if self._split_trackers.get(request_id) is tracker:
+                        self._split_trackers.pop(request_id, None)
         return finished
 
     def _consume_reverse_wire_terminals(
@@ -845,9 +879,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                         "dual_path data_terminal key=%s failure_source=FORWARD status=FAILED",
                         decode_request_id,
                     )
-                    if not tracker.terminal_reported:
-                        tracker.terminal_reported = True
-                        forward_finished.add(decode_request_id)
+                    self._report_split_terminal(decode_request_id, tracker, forward_finished)
             else:
                 assert_never(binding.path)
             self._consume_forward_receive_binding(binding)
@@ -872,8 +904,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                         and tracker.store_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
                         and tracker.reverse_phase in {_SplitPhase.SKIPPED, _SplitPhase.DONE}
                     ):
-                        tracker.terminal_reported = True
-                        forward_finished.add(decode_request_id)
+                        self._report_split_terminal(decode_request_id, tracker, forward_finished)
             else:
                 assert_never(binding.path)
             self._consume_forward_receive_binding(binding)

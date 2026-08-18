@@ -305,6 +305,33 @@ def test_decode_emits_completion_only_when_all_phases_finish() -> None:
     assert worker.get_block_ids_with_load_errors() == set()
 
 
+def test_core_finished_tracker_suppresses_forward_failure_done_recving() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    worker.start_load_kv(metadata)
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+    tracker.core_request_finished = True
+
+    _set_forward_terminal(worker, failed=True)
+    assert worker.get_finished(set(), metadata) == (set(), set())
+    assert tracker.forward_phase.value == "FAILED"
+    assert tracker.terminal_reported is True
+
+
+def test_core_finished_tracker_suppresses_store_failure_done_recving() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    worker.start_load_kv(metadata)
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+    tracker.core_request_finished = True
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = {20}
+
+    assert worker.get_finished(set(), metadata) == (set(), set())
+    assert tracker.store_phase.value == "FAILED"
+    assert tracker.terminal_reported is True
+
+
 def test_empty_reverse_creates_no_p2p_task_and_prefill_gate_starts_satisfied() -> None:
     worker = _make_worker()
     metadata = _make_split_metadata(include_store=False)

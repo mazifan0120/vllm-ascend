@@ -200,10 +200,11 @@ def test_terminal_ack_failure_marks_completion_failed_never_success(decode_sched
     with patch.object(layerwise_module, "zmq_ctx", side_effect=RuntimeError("no route to host")):
         worker.send_done_send_signal(_REQUEST_ID, make_sender_req_meta(), 0, trans_flag=True)
 
-    # The failed ACK closes the split through the failure path; it never turns
-    # the Reverse phase into DONE.
-    assert worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), {_REQUEST_ID})
-    assert worker._split_trackers[_REQUEST_ID].reverse_phase is worker_module._SplitPhase.FAILED
+    # Core finish lands before the failed Reverse terminal is drained. The
+    # attempt report still closes, but request-level done_recving must not race
+    # the scheduler's finished_sending release.
+    assert worker.get_finished({_REQUEST_ID}, DualPathConnectorMetadata()) == (set(), set())
+    assert _REQUEST_ID not in worker._split_trackers
     worker_metadata = worker.build_connector_worker_meta()
     assert worker_metadata.failure_reports == {completion_id: 1}
     assert worker_metadata.completion_reports == {}
@@ -213,6 +214,24 @@ def test_terminal_ack_failure_marks_completion_failed_never_success(decode_sched
     completion = scheduler._completion_tracker.get(completion_id)
     assert completion is None
     assert attempt_key not in scheduler._reverse_send_completion_ids
+
+
+def test_reverse_success_after_core_finish_reports_completion_without_done_recving():
+    worker = _make_worker()
+    completion_id = 17
+    _seed_reverse_send_tracker(worker, completion_id)
+    with patch.object(
+        layerwise_module.MooncakeLayerwiseConnectorWorker,
+        "send_done_send_signal",
+        return_value=True,
+    ):
+        worker.send_done_send_signal(_REQUEST_ID, make_sender_req_meta(), 0, trans_flag=True)
+
+    assert worker.get_finished({_REQUEST_ID}, DualPathConnectorMetadata()) == (set(), set())
+    assert _REQUEST_ID not in worker._split_trackers
+    worker_metadata = worker.build_connector_worker_meta()
+    assert worker_metadata.completion_reports == {completion_id: 1}
+    assert worker_metadata.failure_reports == {}
 
 
 def test_abort_before_final_layer_leaves_completion_incomplete(decode_scheduler_factory, decode_control_seams):
