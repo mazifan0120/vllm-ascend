@@ -97,6 +97,25 @@ class TestBoundedCompletions:
         assert failure.request_id == request.request_id
         assert failure.reason is DualPathControlFailureReason.REVERSE_JOB_FAILED
 
+    def test_mixed_worker_terminals_close_failed_reverse_receive_once(self, pe_scheduler_factory):
+        pool = make_block_pool()
+        scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
+        scheduler._expected_worker_count = 2
+        request = _admit_de_read_request(scheduler)
+        binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
+
+        output = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                completion_reports={binding.reverse_receive_completion_id: 1},
+                failure_reports={binding.reverse_receive_completion_id: 1},
+            )
+        )
+        scheduler.update_connector_output(output)
+
+        assert output.finished_recving == {request.request_id}
+        assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
+        assert binding.request_key in scheduler._prefill_invalid_request_keys
+
 
 class TestSingleUnresolvedDeliveryFuture:
     def test_replacement_delivery_defers_until_prior_future_resolves(self, pe_scheduler_factory):
@@ -200,7 +219,7 @@ class TestCompletionTrackerRetirementWiring:
         assert output.finished_recving == {request.request_id}
         assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
 
-    def test_failed_completion_record_is_retained(self, pe_scheduler_factory):
+    def test_failed_completion_closes_and_retires_tracker_record(self, pe_scheduler_factory):
         pool = make_block_pool()
         scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=pool)
         request = _admit_de_read_request(scheduler)
@@ -211,7 +230,8 @@ class TestCompletionTrackerRetirementWiring:
         )
         scheduler.update_connector_output(output)
 
-        assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id).failed is True
+        assert output.finished_recving == {request.request_id}
+        assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
 
 
 def _deliver_decision_to(receiver, attempt_id: int) -> None:

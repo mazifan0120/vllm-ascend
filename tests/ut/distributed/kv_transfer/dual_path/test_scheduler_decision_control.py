@@ -1344,6 +1344,45 @@ class TestPrefillAbortTriggers:
         )
         assert log_error.call_count == 2
 
+    def test_closed_coordinator_discards_exact_unstarted_reverse_completion(
+        self,
+        scheduler_factory,
+        control_seams,
+    ):
+        policy = MagicMock(name="de_read_path_policy")
+        policy.choose.return_value = PathKind.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-de-read-submit-failure", _remote_decode_params())
+        scheduler.get_num_new_matched_tokens(request, 0)
+        control_seams.prefill_coordinator.submit.side_effect = RuntimeError("coordinator closed")
+
+        _bind_prefill(scheduler, request)
+
+        assert scheduler._completion_tracker.open_count() == 0
+        assert scheduler._prefill_reverse_plans == {}
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
+        assert scheduler._waiting_reverse_attempt_ids == {}
+
+    def test_reverse_plan_construction_failure_discards_new_completion(
+        self,
+        scheduler_factory,
+        control_seams,
+    ):
+        policy = MagicMock(name="de_read_path_policy")
+        policy.choose.return_value = PathKind.DE_READ
+        scheduler = scheduler_factory(role="prefill", path_policy=policy)
+        request = _make_prefill_request("prefill-de-read-activation-failure", _remote_decode_params())
+        scheduler.get_num_new_matched_tokens(request, 0)
+
+        with patch.object(scheduler_module, "ReversePlan", side_effect=RuntimeError("invalid reverse plan")):
+            _bind_prefill(scheduler, request)
+
+        assert scheduler._completion_tracker.open_count() == 0
+        assert scheduler._prefill_reverse_plans == {}
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
+        assert scheduler._waiting_reverse_attempt_ids == {}
+        control_seams.prefill_coordinator.submit.assert_not_called()
+
     def test_exhausted_abort_delivery_is_logged_asynchronously(self, scheduler_factory, control_seams):
         scheduler = scheduler_factory(role="prefill")
         abort_error = PathDecisionDeliveryError("abort delivery exhausted")
@@ -2015,7 +2054,7 @@ class TestCleanupAndShutdown:
         assert scheduler._prefill_pending_reverse_receive_bindings == {}
         assert scheduler._prefill_control_failures == {}
 
-    def test_de_read_delivery_failure_before_first_build_emits_control_only(
+    def test_de_read_delivery_failure_before_first_build_emits_binding_then_control(
         self,
         scheduler_factory,
         control_seams,
@@ -2039,7 +2078,9 @@ class TestCleanupAndShutdown:
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
         # Then
-        assert metadata.reverse_receive_bindings == []
+        assert len(metadata.reverse_receive_bindings) == 1
+        binding = metadata.reverse_receive_bindings[0]
+        assert binding.prefill_request_id == request.request_id
         assert metadata.control_failures == [
             DualPathControlFailureMetadata(
                 request_id=request.request_id,
@@ -2057,7 +2098,9 @@ class TestCleanupAndShutdown:
         worker = _make_prefill_worker()
         worker.start_load_kv(metadata)
         assert worker.request_map == {}
-        assert worker._reverse_receive_bindings == {}
+        assert set(worker._reverse_receive_bindings) == {
+            ReverseAttemptKey(binding.request_key, binding.reverse_attempt_id)
+        }
         assert worker.get_finished(set(), metadata) == (set(), {request.request_id})
 
     def test_de_read_delivery_failure_after_binding_drain_without_forward_plan_uses_delivery_context(

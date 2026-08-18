@@ -84,6 +84,23 @@ class TransferCompletionTracker:
     def get(self, completion_id: int) -> CompletionRecord | None:
         return self._records.get(completion_id)
 
+    def find_open_completion(
+        self,
+        completion_kind: CompletionKind,
+        reverse_attempt_key: ReverseAttemptKey,
+    ) -> CompletionRecord | None:
+        """Return the unique open completion for one exact Reverse attempt."""
+        matches = [
+            record
+            for record in self._records.values()
+            if not record.closed
+            and record.completion_kind is completion_kind
+            and record.reverse_attempt_key == reverse_attempt_key
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("multiple open completions exist for one Reverse attempt")
+        return matches[0] if matches else None
+
     def discard(self, completion_id: int) -> bool:
         """Retire a closed record with its owning attempt; open completions stay."""
         record = self._records.get(completion_id)

@@ -251,7 +251,7 @@ class TestCompletionRecordReclamation:
 
         assert scheduler._completion_tracker.get(completion_id) is not None
 
-    def test_late_completion_failure_after_request_finished_discards_orphan_without_side_effects(
+    def test_late_completion_failure_after_request_finished_releases_held_request(
         self,
         pe_scheduler_factory,
     ):
@@ -262,15 +262,17 @@ class TestCompletionRecordReclamation:
         metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
         assert metadata.reverse_receive_bindings[0].reverse_receive_completion_id == completion_id
         request.status = RequestStatus.FINISHED_STOPPED
-        assert scheduler.request_finished(request, [70, 71]) == (False, None)
+        assert scheduler.request_finished(request, [70, 71]) == (True, None)
         assert scheduler._completion_tracker.get(completion_id) is not None
+        assert request.request_id in scheduler._waiting_reverse_attempt_ids
 
         output = KVConnectorOutput(kv_connector_worker_meta=make_worker_metadata(failure_reports={completion_id: 1}))
         scheduler.update_connector_output(output)
 
         assert scheduler._completion_tracker.get(completion_id) is None
         assert scheduler._prefill_control_failures == {}
-        assert output.finished_recving is None
+        assert output.finished_recving == {request.request_id}
+        assert request.request_id not in scheduler._waiting_reverse_attempt_ids
 
     @staticmethod
     def _admit_reused_de_read(scheduler, admission_id: int):
