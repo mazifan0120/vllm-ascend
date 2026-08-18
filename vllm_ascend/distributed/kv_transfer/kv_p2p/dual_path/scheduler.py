@@ -139,6 +139,18 @@ class _PrefillDecisionDelivery:
     future: Future[None] = field(compare=False, repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class _PrefillReverseActivationSnapshot:
+    """Attempt-owned Prefill state to restore when local submission never starts."""
+
+    binding: ReverseReceiveBinding | None
+    reverse_plan: ReversePlan | None
+    waiting_attempt: ReverseAttemptKey | None
+    forward_plan: ForwardPlan | None
+    forward_plan_epoch: int | None
+    send_req_info: SendReqInfo | None
+
+
 def _decode_ready_token_count(num_tokens: int) -> int:
     """Tokens Decode can receive: the last token is always computed locally."""
     return max(num_tokens - 1, 0)
@@ -930,32 +942,36 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._reqs_need_send_layerwise[request_id] = send_req_info
         return self._prefill_reverse_plans[request_id]
 
-    def _discard_pending_unstarted_reverse_receive(self, request_id: str) -> bool:
-        """Rollback the exact pending Reverse attempt before remote submission."""
+    def _rollback_prefill_reverse_activation(
+        self,
+        request_id: str,
+        snapshot: _PrefillReverseActivationSnapshot,
+    ) -> None:
+        """Discard the exact unstarted attempt and restore its predecessor."""
         binding = self._prefill_pending_reverse_receive_bindings.get(request_id)
-        if binding is None:
-            return False
-        if self._prefill_delivered_reverse_attempts.get(request_id) == binding.reverse_attempt_id:
-            return False
-        attempt_key = ReverseAttemptKey(binding.request_key, binding.reverse_attempt_id)
-        if not self._completion_tracker.discard_unstarted(
-            binding.reverse_receive_completion_id,
-            expected_kind=CompletionKind.REVERSE_RECEIVE,
-            expected_attempt_key=attempt_key,
+        if binding != snapshot.binding and binding is not None:
+            if self._prefill_delivered_reverse_attempts.get(request_id) == binding.reverse_attempt_id:
+                raise RuntimeError("cannot roll back a Reverse attempt after Decision submission")
+            attempt_key = ReverseAttemptKey(binding.request_key, binding.reverse_attempt_id)
+            if not self._completion_tracker.discard_unstarted(
+                binding.reverse_receive_completion_id,
+                expected_kind=CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            ):
+                raise RuntimeError("cannot roll back a Reverse attempt whose completion already started")
+
+        for state, value in (
+            (self._prefill_pending_reverse_receive_bindings, snapshot.binding),
+            (self._prefill_reverse_plans, snapshot.reverse_plan),
+            (self._waiting_reverse_attempt_ids, snapshot.waiting_attempt),
+            (self._prefill_forward_plans, snapshot.forward_plan),
+            (self._prefill_forward_plan_epochs, snapshot.forward_plan_epoch),
+            (self._reqs_need_send_layerwise, snapshot.send_req_info),
         ):
-            return False
-        if self._prefill_pending_reverse_receive_bindings.get(request_id) == binding:
-            self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
-        reverse_plan = self._prefill_reverse_plans.get(request_id)
-        if (
-            reverse_plan is not None
-            and reverse_plan.request_key == binding.request_key
-            and reverse_plan.reverse_attempt_id == binding.reverse_attempt_id
-        ):
-            self._prefill_reverse_plans.pop(request_id, None)
-        if self._waiting_reverse_attempt_ids.get(request_id) == attempt_key:
-            self._waiting_reverse_attempt_ids.pop(request_id, None)
-        return True
+            if value is None:
+                state.pop(request_id, None)
+            else:
+                state[request_id] = value
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
         if not self._is_dual_path_decode_admission(request):
@@ -1025,6 +1041,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         if result is None or result.request_key in self._prefill_invalid_request_keys:
             return
 
+        reverse_snapshot = _PrefillReverseActivationSnapshot(
+            binding=self._prefill_pending_reverse_receive_bindings.get(request_id),
+            reverse_plan=self._prefill_reverse_plans.get(request_id),
+            waiting_attempt=self._waiting_reverse_attempt_ids.get(request_id),
+            forward_plan=self._prefill_forward_plans.get(request_id),
+            forward_plan_epoch=self._prefill_forward_plan_epochs.get(request_id),
+            send_req_info=self._reqs_need_send_layerwise.get(request_id),
+        )
+
         try:
             if result.path is PathKind.DE_READ:
                 self._activate_de_read_path(request, blocks, result)
@@ -1042,7 +1067,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             # activation and has not reached coordinator.submit(). Roll it back
             # without a completion close action. Earlier delivered attempts are
             # deliberately left untouched.
-            self._discard_pending_unstarted_reverse_receive(request_id)
+            if result.path is PathKind.DE_READ:
+                self._rollback_prefill_reverse_activation(request_id, reverse_snapshot)
             self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=False)
             return
 
@@ -1060,7 +1086,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 request_id,
                 ReverseAttemptKey(result.request_key, result.reverse_attempt_id),
             )
-        self._deliver_prefill_decision(result.request_key, request=request, blocks=blocks)
+        self._deliver_prefill_decision(
+            result.request_key,
+            request=request,
+            blocks=blocks,
+            reverse_snapshot=reverse_snapshot,
+        )
 
     def _deliver_prefill_decision(
         self,
@@ -1068,6 +1099,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         *,
         request: Request | None = None,
         blocks: KVCacheBlocks | None = None,
+        reverse_snapshot: _PrefillReverseActivationSnapshot | None = None,
     ) -> None:
         self._reconcile_prefill_deliveries()
         if request is not None:
@@ -1143,7 +1175,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 error,
             )
             if request is not None and blocks is not None:
-                self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
+                if result.path is PathKind.DE_READ and reverse_snapshot is not None:
+                    self._rollback_prefill_reverse_activation(request_id, reverse_snapshot)
+                    self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=False)
+                else:
+                    self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
                 self._prefill_deferred_deliveries.discard(request_key)
             return
         self._prefill_delivery_futures[request_key] = delivery_future
@@ -1231,7 +1267,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_path_results.pop(request_id, None)
         if not discard_installed_plans:
             return
-        self._discard_pending_unstarted_reverse_receive(request_id)
         self._prefill_reverse_plans.pop(request_id, None)
         self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
         self._prefill_forward_plan_epochs.pop(request_id, None)

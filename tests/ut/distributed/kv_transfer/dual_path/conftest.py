@@ -87,6 +87,7 @@ def init_dual_path_worker_state(worker: DualPathConnectorWorker, role: str = "de
     worker._completion_reports_lock = threading.Lock()
     worker._pending_completion_reports = {}
     worker._pending_failure_reports = {}
+    worker._completion_report_outcomes = {}
     return worker
 
 

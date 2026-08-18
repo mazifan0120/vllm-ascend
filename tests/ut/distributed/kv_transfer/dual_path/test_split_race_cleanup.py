@@ -111,6 +111,7 @@ def test_reverse_plan_install_rejects_wire_and_split_boundary_mismatch() -> None
 def test_decode_send_callback_records_failed_wins_and_always_delegates_parent_signal() -> None:
     worker = _make_worker()
     worker.start_load_kv(_make_split_metadata(include_store=False))
+    worker._split_trackers[DECODE_REQUEST_ID].reverse_plan = _make_reverse_plan(reverse_send_completion_id=17)
     worker._split_trackers[DECODE_REQUEST_ID].reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
     req_meta = MagicMock()
 
@@ -122,6 +123,14 @@ def test_decode_send_callback_records_failed_wins_and_always_delegates_parent_si
 
     assert worker._pending_local_reverse_terminals == {REVERSE_ATTEMPT_KEY: False}
     assert parent_signal.call_count == 4
+    worker_metadata = worker.build_connector_worker_meta()
+    assert worker_metadata.completion_reports == {}
+    assert worker_metadata.failure_reports == {17: 1}
+
+    # Once this worker emits its one terminal, replayed callbacks cannot make
+    # it contribute a second worker count.
+    worker.send_done_send_signal(DECODE_REQUEST_ID, req_meta, 0, True)
+    assert worker.build_connector_worker_meta() is None
 
 
 def test_reverse_done_before_binding_is_retained_and_reconciled() -> None:
@@ -577,7 +586,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_prepare_forward_plan",
         "_try_install_forward_plan",
         "_activate_de_read_path",
-        "_discard_pending_unstarted_reverse_receive",
+        "_rollback_prefill_reverse_activation",
         "_activate_received_decision",
         "_validate_committed_decision",
         "_log_decision_activation",

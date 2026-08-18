@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from tests.ut.distributed.kv_transfer.dual_path.conftest import (
     make_block_pool,
+    make_completed_future,
     make_empty_scheduler_output,
     make_worker_metadata,
 )
@@ -152,6 +153,49 @@ class TestSingleUnresolvedDeliveryFuture:
         second_decision = coordinator.submit.call_args_list[1].args[1]
         assert second_decision.result.reverse_attempt_id == 1
         assert scheduler._prefill_delivery_futures[request_key] is not first_future
+
+
+class TestReplacementActivationRollback:
+    @staticmethod
+    def _install_attempt_zero(scheduler):
+        request = _admit_de_read(scheduler)
+        scheduler.build_connector_meta(make_empty_scheduler_output())
+        request_id = request.request_id
+        return (
+            request,
+            scheduler._prefill_reverse_plans[request_id],
+            scheduler._waiting_reverse_attempt_ids[request_id],
+        )
+
+    @staticmethod
+    def _assert_attempt_zero_restored(scheduler, request, old_plan, old_waiting):
+        request_id = request.request_id
+        assert scheduler._prefill_reverse_plans[request_id] is old_plan
+        assert scheduler._waiting_reverse_attempt_ids[request_id] == old_waiting
+        assert scheduler._prefill_pending_reverse_receive_bindings == {}
+        assert scheduler._completion_tracker.open_count() == 1
+
+    def test_sync_replacement_submit_failure_restores_previous_attempt(self, pe_scheduler_factory):
+        scheduler, coordinator = pe_scheduler_factory(PathKind.DE_READ, pool=make_block_pool())
+        coordinator.submit.side_effect = [make_completed_future(), RuntimeError("coordinator closed")]
+        request, old_plan, old_waiting = self._install_attempt_zero(scheduler)
+
+        request.num_preemptions += 1
+        assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+        scheduler.update_state_after_alloc(request, _blocks(([80, 81, 82, 83],)), 16)
+
+        self._assert_attempt_zero_restored(scheduler, request, old_plan, old_waiting)
+
+    def test_post_install_activation_failure_restores_previous_attempt(self, pe_scheduler_factory):
+        scheduler, _ = pe_scheduler_factory(PathKind.DE_READ, pool=make_block_pool())
+        request, old_plan, old_waiting = self._install_attempt_zero(scheduler)
+
+        request.num_preemptions += 1
+        assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+        with patch.object(scheduler, "_may_install_forward_plan", side_effect=RuntimeError("forward conflict")):
+            scheduler.update_state_after_alloc(request, _blocks(([80, 81, 82, 83],)), 16)
+
+        self._assert_attempt_zero_restored(scheduler, request, old_plan, old_waiting)
 
 
 class TestFailedPriorFutureCancelsDeferredReplacement:

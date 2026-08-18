@@ -131,6 +131,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._completion_reports_lock = threading.Lock()
         self._pending_completion_reports: dict[int, int] = {}
         self._pending_failure_reports: dict[int, int] = {}
+        self._completion_report_outcomes: dict[int, bool] = {}
         if dual_path_cfg.role == "decode":
             self._kvpool_worker_adapter = KVPoolWorkerAdapter(vllm_config, kv_cache_config)
         logger.info(
@@ -320,6 +321,19 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
     def _record_completion_report(self, completion_id: int, *, succeeded: bool) -> None:
         with self._completion_reports_lock:
+            previous = self._completion_report_outcomes.get(completion_id)
+            if previous is not None:
+                # Failure wins only while the first terminal is still pending.
+                # Once emitted, this worker has already contributed its single
+                # all-worker-barrier count and replayed callbacks are ignored.
+                if previous or succeeded:
+                    if not succeeded and completion_id in self._pending_completion_reports:
+                        self._completion_report_outcomes[completion_id] = False
+                        self._pending_completion_reports.pop(completion_id, None)
+                        self._pending_failure_reports[completion_id] = 1
+                    return
+                return
+            self._completion_report_outcomes[completion_id] = succeeded
             if succeeded:
                 self._pending_completion_reports[completion_id] = 1
             else:
@@ -965,3 +979,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
         self._pending_reverse_failed_wire_ids.clear()
         self._consumed_reverse_terminal_wire_ids.clear()
         self._control_failed_recving.clear()
+        with self._completion_reports_lock:
+            self._pending_completion_reports.clear()
+            self._pending_failure_reports.clear()
+            self._completion_report_outcomes.clear()

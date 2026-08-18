@@ -730,6 +730,7 @@ class TestDualPathConstructionParity(unittest.TestCase):
                 "_completion_reports_lock",
                 "_pending_completion_reports",
                 "_pending_failure_reports",
+                "_completion_report_outcomes",
             },
         )
 
@@ -1538,7 +1539,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_prepare_forward_plan",
                 "_try_install_forward_plan",
                 "_activate_de_read_path",
-                "_discard_pending_unstarted_reverse_receive",
+                "_rollback_prefill_reverse_activation",
                 "_activate_received_decision",
                 "_validate_committed_decision",
                 "_log_decision_activation",
