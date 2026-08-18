@@ -33,8 +33,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import worker as worke
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathConnectorMetadata,
     DualPathControlFailureReason,
-    ReverseReceiveBinding,
     ReversePlan,
+    ReverseReceiveBinding,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,

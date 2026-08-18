@@ -367,9 +367,10 @@ def test_finished_req_ids_and_shutdown_release_all_split_state_idempotently() ->
         set(),
     )
 
-    # Section-5 removal rule: the local reverse terminal is drained during the
-    # first finish pass, so the tracker is removed on the next one.
-    assert DECODE_REQUEST_ID in decode_worker._split_trackers
+    # The local Reverse terminal is drained in the same finish pass. Its
+    # completion report survives, while the core-finished tracker retires
+    # without emitting request-level done_recving.
+    assert DECODE_REQUEST_ID not in decode_worker._split_trackers
     assert DECODE_REQUEST_ID not in decode_worker._forward_receive_bindings
     assert WIRE_REQUEST_ID not in decode_worker.request_map
     assert REVERSE_ATTEMPT_KEY not in decode_worker._pending_local_reverse_terminals
@@ -576,6 +577,7 @@ def test_scheduler_method_set_is_pinned_and_has_no_blocking_hooks() -> None:
         "_prepare_forward_plan",
         "_try_install_forward_plan",
         "_activate_de_read_path",
+        "_discard_pending_unstarted_reverse_receive",
         "_activate_received_decision",
         "_validate_committed_decision",
         "_log_decision_activation",

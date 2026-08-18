@@ -592,16 +592,9 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
 
     def _has_open_reverse_transfer(self, request_id: str) -> bool:
         if self.dual_path_cfg.role == "prefill":
-            return any(
-                binding.prefill_request_id == request_id
-                for binding in self._reverse_receive_bindings.values()
-            )
+            return any(binding.prefill_request_id == request_id for binding in self._reverse_receive_bindings.values())
         tracker = self._split_trackers.get(request_id)
-        return (
-            tracker is not None
-            and tracker.reverse_plan is not None
-            and tracker.reverse_phase is _SplitPhase.PENDING
-        )
+        return tracker is not None and tracker.reverse_plan is not None and tracker.reverse_phase is _SplitPhase.PENDING
 
     def build_connector_worker_meta(self) -> DualPathWorkerMetadata | None:
         completion_reports: dict[int, int] = {}
