@@ -250,6 +250,7 @@ def test_prefill_peer_abort_does_not_bypass_started_worker_barrier(pe_scheduler_
     assert completion.completed_worker_count == 1
     assert completion.failed is True
     assert completion.closed is False
+    assert binding.request_key in scheduler._prefill_invalid_request_keys
     assert scheduler._scheduler_side_finished_recving == set()
     assert scheduler._waiting_reverse_attempt_ids[request.request_id].request_key == binding.request_key
 
@@ -278,6 +279,7 @@ def test_prefill_abort_after_request_finished_still_finds_delayed_completion(pe_
     assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
     assert scheduler._scheduler_side_finished_recving == {request.request_id}
     assert scheduler._prefill_abort_request_ids == {}
+    assert request_key not in scheduler._prefill_invalid_request_keys
     coordinator.unregister_prefill_abort_key.assert_called_once_with(request_key)
 
 
@@ -290,6 +292,7 @@ def test_prefill_abort_registry_retires_only_after_request_release_and_last_comp
     scheduler._handle_received_peer_abort(_notice(request_key, "ACTIVATION_FAILED"))
 
     assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
+    assert request_key in scheduler._prefill_invalid_request_keys
     assert scheduler._prefill_abort_request_ids == {request_key: request.request_id}
     coordinator.unregister_prefill_abort_key.assert_not_called()
 

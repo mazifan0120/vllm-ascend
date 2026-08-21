@@ -1859,6 +1859,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         ):
             return
         self._unregister_prefill_abort_key(request_key)
+        self._prefill_invalid_request_keys.discard(request_key)
 
     def _handle_received_peer_abort(self, notice: PathAbortNotice) -> None:
         """Fail-close one exact Prefill Reverse receive after a peer ABORT."""
