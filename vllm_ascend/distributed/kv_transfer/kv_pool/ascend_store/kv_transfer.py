@@ -886,6 +886,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 for index in batch:
                     results[index] = 1
             else:
+                if len(sub_ret) != len(batch):
+                    logger.error(
+                        "KV pool async recv get protocol error: received %d statuses for %d keys; "
+                        "marking submitted batch failed",
+                        len(sub_ret),
+                        len(batch),
+                    )
+                    for index in batch:
+                        results[index] = 1
+                    continue
                 for index, code in zip(batch, sub_ret, strict=True):
                     results[index] = code
         if len(batches) > 1 or oversized:

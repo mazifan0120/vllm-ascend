@@ -117,6 +117,44 @@ def test_chunked_store_get_oversized_key_failed_without_issuing():
     assert "big" not in backend.get.call_args.args[0]
 
 
+def test_chunked_store_get_marks_short_status_batch_failed_and_continues():
+    backend = MagicMock()
+    backend.get.side_effect = [[0], [0]]
+    thread = _make_thread(backend)
+    sizes = [[1 * 1024**2]] * 3
+    usable = 2 * _estimate_get_staging_bytes(sizes[0])
+
+    ret = thread._chunked_store_get(
+        ["k0", "k1", "k2"],
+        [[0]] * 3,
+        sizes,
+        usable_budget_bytes=usable,
+        raw_budget_bytes=4 * 1024**2,
+    )
+
+    assert ret == [1, 1, 0]
+    assert backend.get.call_count == 2
+
+
+def test_chunked_store_get_marks_long_status_batch_failed_and_continues():
+    backend = MagicMock()
+    backend.get.side_effect = [[0, 0, 0], [0]]
+    thread = _make_thread(backend)
+    sizes = [[1 * 1024**2]] * 3
+    usable = 2 * _estimate_get_staging_bytes(sizes[0])
+
+    ret = thread._chunked_store_get(
+        ["k0", "k1", "k2"],
+        [[0]] * 3,
+        sizes,
+        usable_budget_bytes=usable,
+        raw_budget_bytes=4 * 1024**2,
+    )
+
+    assert ret == [1, 1, 0]
+    assert backend.get.call_count == 2
+
+
 def test_staging_get_budgets_uses_fixed_reserve_fraction():
     backend = MagicMock()
     backend.staging_buffer_bytes.return_value = 10_000

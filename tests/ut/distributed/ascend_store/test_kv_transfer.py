@@ -487,6 +487,66 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         self.assertEqual(store.get.call_count, 2)
         self.assertEqual(invalid_block_ids, {12})
 
+    def test_handle_request_marks_short_status_batch_failed_and_completes(self):
+        invalid_block_ids: set[int] = set()
+        store = FakeStore(staging_bytes=30_000)
+        store.get = MagicMock(side_effect=[[0], [0]])
+        thread = KVCacheStoreRecvingThread(
+            m_store=store,
+            token_database=FakeTokenDatabase(),
+            block_size=16,
+            tp_rank=0,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_ids_lock=threading.Lock(),
+        )
+        request = ReqMeta(
+            req_id="short-status-request",
+            token_len_chunk=48,
+            block_ids=[10, 11, 12],
+            block_hashes=[b"h0", b"h1", b"h2"],  # type: ignore[arg-type]
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=48, can_load=True, token_len=48),
+        )
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(store.get.call_count, 2)
+        self.assertEqual(invalid_block_ids, {10, 11})
+        self.assertEqual(thread.get_and_clear_finished_requests(), {"short-status-request"})
+        self.assertEqual(thread.request_queue.unfinished_tasks, 0)
+
+    def test_handle_request_marks_long_status_batch_failed_and_completes(self):
+        invalid_block_ids: set[int] = set()
+        store = FakeStore(staging_bytes=30_000)
+        store.get = MagicMock(side_effect=[[0, 0, 0], [0]])
+        thread = KVCacheStoreRecvingThread(
+            m_store=store,
+            token_database=FakeTokenDatabase(),
+            block_size=16,
+            tp_rank=0,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_ids_lock=threading.Lock(),
+        )
+        request = ReqMeta(
+            req_id="long-status-request",
+            token_len_chunk=48,
+            block_ids=[10, 11, 12],
+            block_hashes=[b"h0", b"h1", b"h2"],  # type: ignore[arg-type]
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=48, can_load=True, token_len=48),
+        )
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(store.get.call_count, 2)
+        self.assertEqual(invalid_block_ids, {10, 11})
+        self.assertEqual(thread.get_and_clear_finished_requests(), {"long-status-request"})
+        self.assertEqual(thread.request_queue.unfinished_tasks, 0)
+
 
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
 class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
