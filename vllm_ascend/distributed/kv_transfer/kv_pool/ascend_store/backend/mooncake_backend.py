@@ -278,6 +278,11 @@ class MooncakeBackend(Backend):
             )
             return None
 
+    def staging_buffer_bytes(self) -> int | None:
+        if self._use_fabric_mem or not self._contribute_memory:
+            return None
+        return int(self.config.local_buffer_size)
+
 
 @dataclass
 class MooncakeStoreConfig:

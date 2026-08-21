@@ -54,3 +54,9 @@ class Backend(ABC):
     @abstractmethod
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         pass
+
+    def staging_buffer_bytes(self) -> int | None:
+        """Largest total byte volume one get batch may occupy in this backend's
+        client-side staging buffer, or None when the backend has no staging
+        constraint (e.g. address-direct backends)."""
+        return None
