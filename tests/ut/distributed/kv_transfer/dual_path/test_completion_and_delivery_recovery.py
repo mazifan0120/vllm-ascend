@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 from vllm.v1.outputs import KVConnectorOutput
@@ -24,6 +25,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_resume_admission import (
     _admit_de_read,
 )
 from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion import (
+    _REQUEST_KEY,
     _activate_decision,
     _admit_decode_request,
     _de_read_decision,
@@ -33,9 +35,18 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    PathAbortNotice,
+    PathAbortReason,
     PathKind,
     ReverseAttemptKey,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DecodeControlEndpoint,
+)
+
+
+_PREFILL_ENDPOINT_A = DecodeControlEndpoint(host="198.51.100.41", port=24041)
+_PREFILL_ENDPOINT_B = DecodeControlEndpoint(host="198.51.100.42", port=24042)
 
 
 class TestDecodeEngineProgress:
@@ -77,6 +88,260 @@ class TestDecodeEngineProgress:
         )
         assert attempt_key not in scheduler._reverse_send_completion_ids
         assert request.request_id not in scheduler._latest_reverse_attempt_ids
+
+
+class TestDecodeFailureRelay:
+    @staticmethod
+    def _decision_with_endpoint(
+        attempt_id: int,
+        endpoint: DecodeControlEndpoint | None,
+        *,
+        remote_tp_size: int = 1,
+    ):
+        return replace(
+            _de_read_decision(attempt_id, remote_tp_size=remote_tp_size),
+            prefill_control_endpoint=endpoint,
+        )
+
+    @staticmethod
+    def _expected_abort() -> PathAbortNotice:
+        return PathAbortNotice(
+            request_key=_REQUEST_KEY,
+            reason=PathAbortReason.ACTIVATION_FAILED,
+        )
+
+    def test_decode_activation_validation_failure_sends_abort_without_persisting_untrusted_endpoint(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        state = scheduler._decode_decision_states[request.request_id]
+
+        metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A, remote_tp_size=2),
+        )
+
+        assert state.status.value == "ACTIVATION_FAILED"
+        assert state.prefill_control_endpoint is None
+        decode_control_seams.decode_coordinator.unregister.assert_called_with(state.request_key)
+        assert [failure.reason for failure in metadata.control_failures] == [
+            DualPathControlFailureReason.ACTIVATION_FAILED
+        ]
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(),
+        )
+
+    def test_decode_worker_failure_uses_persisted_prefill_endpoint(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        state = scheduler._decode_decision_states[request.request_id]
+        metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A),
+        )
+        completion_id = metadata.reverse_plans[0].reverse_send_completion_id
+
+        assert state.prefill_control_endpoint == _PREFILL_ENDPOINT_A
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=make_worker_metadata(
+                    failure_reports={completion_id: 1}
+                )
+            )
+        )
+
+        assert state.status.value == "ACTIVATION_FAILED"
+        assert scheduler._decode_control_failures[request.request_id].reason is (
+            DualPathControlFailureReason.REVERSE_JOB_FAILED
+        )
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(),
+        )
+
+    def test_decode_failure_still_sends_abort_when_control_failure_build_raises(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        state = scheduler._decode_decision_states[request.request_id]
+
+        with patch.object(
+            scheduler,
+            "_build_decode_control_failure",
+            side_effect=RuntimeError("control failure unavailable"),
+        ):
+            metadata = _activate_decision(
+                scheduler,
+                decode_control_seams,
+                self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A, remote_tp_size=2),
+            )
+
+        assert metadata.control_failures == []
+        assert state.status.value == "ACTIVATION_FAILED"
+        decode_control_seams.decode_coordinator.unregister.assert_called_with(state.request_key)
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(),
+        )
+
+    def test_decode_failure_without_endpoint_is_local_only(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        state = scheduler._decode_decision_states[request.request_id]
+
+        metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, None, remote_tp_size=2),
+        )
+
+        assert state.status.value == "ACTIVATION_FAILED"
+        assert state.prefill_control_endpoint is None
+        assert [failure.reason for failure in metadata.control_failures] == [
+            DualPathControlFailureReason.ACTIVATION_FAILED
+        ]
+        decode_control_seams.decode_coordinator.submit_abort.assert_not_called()
+
+    def test_failed_attempt_refresh_does_not_force_close_older_inflight_attempt(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory(world_size=2)
+        request = _admit_decode_request(scheduler)
+        first_metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A, remote_tp_size=2),
+        )
+        completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
+
+        refresh_metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(1, _PREFILL_ENDPOINT_A, remote_tp_size=1),
+        )
+
+        state = scheduler._decode_decision_states[request.request_id]
+        completion = scheduler._completion_tracker.get(completion_id)
+        assert state.status.value == "ACTIVATION_FAILED"
+        assert refresh_metadata.reverse_plans == []
+        assert completion is not None and completion.closed is False
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(),
+        )
+        request.status = RequestStatus.FINISHED_STOPPED
+        assert scheduler.request_finished(request, []) == (True, None)
+
+        first_report = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                completion_reports={completion_id: 1}
+            )
+        )
+        scheduler.update_connector_output(first_report)
+        assert first_report.finished_sending is None
+        completion = scheduler._completion_tracker.get(completion_id)
+        assert completion is not None and completion.closed is False
+
+        second_report = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                completion_reports={completion_id: 1}
+            )
+        )
+        scheduler.update_connector_output(second_report)
+        assert second_report.finished_sending == {request.request_id}
+        assert scheduler._completion_tracker.get(completion_id) is None
+
+    def test_attempt_refresh_endpoint_mismatch_fails_closed_to_original_endpoint(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A),
+        )
+
+        refresh_metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(1, _PREFILL_ENDPOINT_B),
+        )
+
+        state = scheduler._decode_decision_states[request.request_id]
+        assert state.status.value == "ACTIVATION_FAILED"
+        assert state.prefill_control_endpoint == _PREFILL_ENDPOINT_A
+        assert refresh_metadata.reverse_plans == []
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(),
+        )
+
+    def test_decode_late_worker_failure_after_request_finish_still_notifies_prefill(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        first_metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A),
+        )
+        second_metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(1, _PREFILL_ENDPOINT_A),
+        )
+        first_completion_id = first_metadata.reverse_plans[0].reverse_send_completion_id
+        second_completion_id = second_metadata.reverse_plans[0].reverse_send_completion_id
+        request_key = scheduler._decode_decision_states[request.request_id].request_key
+        request.status = RequestStatus.FINISHED_STOPPED
+
+        assert scheduler.request_finished(request, []) == (True, None)
+        assert scheduler._decode_late_abort_endpoints == {
+            request_key: _PREFILL_ENDPOINT_A
+        }
+
+        with (
+            patch.object(scheduler, "_build_decode_control_failure") as build_failure,
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.logger"
+            ) as scheduler_logger,
+        ):
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=make_worker_metadata(
+                        failure_reports={first_completion_id: 1}
+                    )
+                )
+            )
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=make_worker_metadata(
+                        failure_reports={second_completion_id: 1}
+                    )
+                )
+            )
+
+        build_failure.assert_not_called()
+        assert request_key not in scheduler._decode_late_abort_endpoints
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(),
+        )
+        assert any(
+            "has no Decode state or snapshot" in str(call)
+            for call in scheduler_logger.error.call_args_list
+        )
 
 
 class TestBoundedCompletions:
