@@ -344,10 +344,12 @@ class PathDecisionCoordinator:
         self._closed = False
         self._decode_engine_instance_id: str | None = None
         self._decode_control_endpoint: DecodeControlEndpoint | None = None
+        self._bind_endpoint: DecodeControlEndpoint | None = None
         self._next_admission_id = 0
         self._pending_keys: set[DualPathRequestKey] = set()
         self._accepted_decisions: dict[DualPathRequestKey, PathDecision] = {}
         self._closed_through_attempt_ids: dict[DualPathRequestKey, int] = {}
+        self._prefill_abort_keys: set[DualPathRequestKey] = set()
         self._received_decisions: queue.SimpleQueue[PathDecision] = queue.SimpleQueue()
         self._received_aborts: queue.SimpleQueue[PathAbortNotice] = queue.SimpleQueue()
         self._registry_lock = threading.Lock()
@@ -376,28 +378,19 @@ class PathDecisionCoordinator:
         incarnation = boot_id if boot_id is not None else uuid.uuid4().hex
         coordinator._decode_engine_instance_id = f"{engine_id}:{data_parallel_rank}:{incarnation}"
         coordinator._decode_control_endpoint = control_endpoint
-        coordinator._context = zmq.Context()
-        ready_event = threading.Event()
-        coordinator._receiver_thread = threading.Thread(
-            target=coordinator._receive_decisions,
-            args=(ready_event,),
-            name=f"path-decision-result-receiver-{data_parallel_rank}",
-            daemon=True,
+        coordinator._bind_endpoint = control_endpoint
+        coordinator._executor = ThreadPoolExecutor(
+            max_workers=_PATH_DECISION_SEND_WORKERS,
+            thread_name_prefix="path-abort-sender",
         )
-        coordinator._receiver_thread.start()
-        if not ready_event.wait(timeout=_RECEIVER_READY_TIMEOUT_S):
-            coordinator.close()
-            raise RuntimeError("path decision result receiver did not become ready")
-        if coordinator._receiver_error is not None:
-            error = coordinator._receiver_error
-            coordinator.close()
-            raise error
+        coordinator._start_receiver(f"path-decision-result-receiver-{data_parallel_rank}")
         return coordinator
 
     @classmethod
     def for_prefill(
         cls,
         *,
+        control_endpoint: DecodeControlEndpoint | None = None,
         socket_opener: _SocketOpener | None = None,
         sleep: _Sleep | None = None,
         send_timeout_ms: int = _SEND_TIMEOUT_MS,
@@ -415,7 +408,28 @@ class PathDecisionCoordinator:
             max_workers=_PATH_DECISION_SEND_WORKERS,
             thread_name_prefix="path-decision-sender",
         )
+        if control_endpoint is not None:
+            coordinator._bind_endpoint = control_endpoint
+            coordinator._start_receiver("path-abort-receiver")
         return coordinator
+
+    def _start_receiver(self, name: str) -> None:
+        self._context = zmq.Context()
+        ready_event = threading.Event()
+        self._receiver_thread = threading.Thread(
+            target=self._receive_decisions,
+            args=(ready_event,),
+            name=name,
+            daemon=True,
+        )
+        self._receiver_thread.start()
+        if not ready_event.wait(timeout=_RECEIVER_READY_TIMEOUT_S):
+            self.close()
+            raise RuntimeError("path decision result receiver did not become ready")
+        if self._receiver_error is not None:
+            error = self._receiver_error
+            self.close()
+            raise error
 
     @property
     def decode_engine_instance_id(self) -> str:
@@ -450,6 +464,20 @@ class PathDecisionCoordinator:
             self._pending_keys.discard(key)
             self._accepted_decisions.pop(key, None)
             self._closed_through_attempt_ids.pop(key, None)
+
+    def register_prefill_abort_key(self, key: DualPathRequestKey) -> None:
+        if self._role != "prefill":
+            raise RuntimeError("only a Prefill coordinator can register abort keys")
+        with self._lifecycle_lock, self._registry_lock:
+            if self._closed:
+                raise RuntimeError("path decision coordinator is closed")
+            self._prefill_abort_keys.add(key)
+
+    def unregister_prefill_abort_key(self, key: DualPathRequestKey) -> None:
+        if self._role != "prefill":
+            raise RuntimeError("only a Prefill coordinator can unregister abort keys")
+        with self._registry_lock:
+            self._prefill_abort_keys.discard(key)
 
     def take_received_decisions(self) -> list[PathDecision]:
         if self._closed:
@@ -524,29 +552,28 @@ class PathDecisionCoordinator:
             if self._closed:
                 return
             self._closed = True
-        if self._role == "decode":
+        if self._receiver_thread is not None:
             assert self._context is not None
-            assert self._receiver_thread is not None
             self._context.term()
             self._receiver_thread.join()
-            with self._registry_lock:
-                self._pending_keys.clear()
-                self._accepted_decisions.clear()
-                self._closed_through_attempt_ids.clear()
-            self._drain_received_decisions()
-            self._drain_received_aborts()
-        elif self._role == "prefill":
-            assert self._executor is not None
+        if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
+        with self._registry_lock:
+            self._pending_keys.clear()
+            self._accepted_decisions.clear()
+            self._closed_through_attempt_ids.clear()
+            self._prefill_abort_keys.clear()
+        self._drain_received_decisions()
+        self._drain_received_aborts()
 
     def _receive_decisions(self, ready_event: threading.Event) -> None:
         assert self._context is not None
-        assert self._decode_control_endpoint is not None
+        assert self._bind_endpoint is not None
         socket: zmq.Socket | None = None
         try:
             socket = self._context.socket(zmq.ROUTER)
             socket.setsockopt(zmq.LINGER, 0)
-            endpoint = self._decode_control_endpoint
+            endpoint = self._bind_endpoint
             socket.bind(f"tcp://{endpoint.host}:{endpoint.port}")
             ready_event.set()
             while not self._closed:
@@ -589,6 +616,10 @@ class PathDecisionCoordinator:
             assert_never(kind)
 
     def _handle_decision_frame(self, socket: zmq.Socket, identity: bytes, payload: JsonObject) -> None:
+        if self._role != "decode":
+            logger.warning("Prefill control receiver rejected Decision payload")
+            self._reply_decision(socket, identity, DecisionReplyStatus.PROTOCOL_ERROR)
+            return
         try:
             decision = PathDecision.from_dict(payload)
         except PathDecisionValidationError:
@@ -626,6 +657,14 @@ class PathDecisionCoordinator:
             self._reply_decision(socket, identity, DecisionReplyStatus.PROTOCOL_ERROR)
             return
         key = notice.request_key
+        if self._role == "prefill":
+            with self._registry_lock:
+                if key in self._prefill_abort_keys:
+                    self._prefill_abort_keys.discard(key)
+                    self._received_aborts.put(notice)
+            self._reply_decision(socket, identity, DecisionReplyStatus.ACK)
+            return
+        assert self._role == "decode"
         if key.decode_engine_instance_id != self.decode_engine_instance_id:
             logger.warning("path decision result receiver rejected wrong-incarnation Abort key")
             self._reply_decision(socket, identity, DecisionReplyStatus.UNKNOWN_REQUEST)

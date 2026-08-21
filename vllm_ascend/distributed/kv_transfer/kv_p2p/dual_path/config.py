@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Configuration parsing and validation for ``DualPathConnector``.
 
-``DualPathConfig`` carries the connector role and ``dual_path_control_port``.
+``DualPathConfig`` carries the connector role and role-owned control ports.
 KVPool and Mooncake settings are read directly from
 ``kv_connector_extra_config`` by their owning components.
 """
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from vllm.config import KVTransferConfig
 
 # Accepted connector extra-config keys. ``role`` and
-# ``dual_path_control_port`` are stored on ``DualPathConfig``. KVPool keys are
+# control ports are stored on ``DualPathConfig``. KVPool keys are
 # type-checked here; ``tls_config`` is only let through for its owning
 # component, which reads it directly from ``kv_connector_extra_config``.
 # Decode Store loads require ``load_async`` so synchronous Store I/O never
@@ -32,6 +32,7 @@ ALLOWED_EXTRA_CONFIG_KEYS: frozenset[str] = frozenset(
         "mooncake_rpc_port",
         "discard_partial_chunks",
         "dual_path_control_port",
+        "prefill_control_port",
     }
 )
 
@@ -47,10 +48,11 @@ MAX_TCP_PORT: int = 65535
 
 @dataclass(frozen=True)
 class DualPathConfig:
-    """Connector role and optional Decode control port."""
+    """Connector role and its optional role-owned control ports."""
 
     role: Literal["prefill", "decode"]
     dual_path_control_port: int | None = None
+    prefill_control_port: int | None = None
 
     @classmethod
     def from_extra_config(
@@ -84,7 +86,12 @@ class DualPathConfig:
         _validate_decode_local_load_async(extra, role)
         _validate_role_capability(role, kv_transfer_config)
         dual_path_control_port = _validate_dual_path_control_port(extra, role)
-        return cls(role=role, dual_path_control_port=dual_path_control_port)
+        prefill_control_port = _validate_prefill_control_port(extra, role)
+        return cls(
+            role=role,
+            dual_path_control_port=dual_path_control_port,
+            prefill_control_port=prefill_control_port,
+        )
 
 
 def _validate_kvpool_passthrough(extra: dict[str, Any]) -> None:
@@ -161,5 +168,22 @@ def _validate_dual_path_control_port(extra: dict[str, Any], role: str) -> int | 
     if isinstance(port, bool) or not isinstance(port, int) or not MIN_TCP_PORT <= port <= MAX_TCP_PORT:
         raise ValueError(
             f"DualPathConnector 'dual_path_control_port' must be an integer between 1 and 65535; got {port!r}."
+        )
+    return port
+
+
+def _validate_prefill_control_port(extra: dict[str, Any], role: str) -> int | None:
+    """Validate and return the optional Prefill ABORT receiver port."""
+    port = extra.get("prefill_control_port")
+    if role != "prefill" and port is not None:
+        raise ValueError(
+            "DualPathConnector 'prefill_control_port' is only consumed by role='prefill'; "
+            "remove it from the decode-side configuration."
+        )
+    if port is None:
+        return None
+    if isinstance(port, bool) or not isinstance(port, int) or not MIN_TCP_PORT <= port <= MAX_TCP_PORT:
+        raise ValueError(
+            f"DualPathConnector 'prefill_control_port' must be an integer between 1 and 65535; got {port!r}."
         )
     return port

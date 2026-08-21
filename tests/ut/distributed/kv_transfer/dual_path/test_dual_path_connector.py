@@ -287,6 +287,40 @@ class TestDualPathConfig(unittest.TestCase):
         )
         self.assertEqual(config, DualPathConfig(role="decode", dual_path_control_port=7100))
 
+    def test_prefill_control_port_is_role_strict(self):
+        self.assertEqual(
+            DualPathConfig.from_extra_config(
+                {"role": "prefill", "prefill_control_port": 7200},
+                make_kv_transfer_config("kv_producer"),
+            ),
+            DualPathConfig(role="prefill", prefill_control_port=7200),
+        )
+        with self.assertRaisesRegex(ValueError, "only consumed by role='prefill'"):
+            DualPathConfig.from_extra_config(
+                {
+                    "role": "decode",
+                    "dual_path_control_port": 7100,
+                    "prefill_control_port": 7200,
+                },
+                make_kv_transfer_config("kv_consumer"),
+            )
+        with self.assertRaisesRegex(ValueError, "only consumed by role='decode'"):
+            DualPathConfig.from_extra_config(
+                {"role": "prefill", "dual_path_control_port": 7100},
+                make_kv_transfer_config("kv_producer"),
+            )
+
+    def test_prefill_control_port_rejects_bool_out_of_range_and_non_int(self):
+        for value in (True, 0, 65536, "7200"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "integer between 1 and 65535"),
+            ):
+                DualPathConfig.from_extra_config(
+                    {"role": "prefill", "prefill_control_port": value},
+                    make_kv_transfer_config("kv_producer"),
+                )
+
     def test_valid_prefill_with_kv_both(self):
         config = DualPathConfig.from_extra_config({"role": "prefill"}, make_kv_transfer_config("kv_both"))
         self.assertEqual(config.role, "prefill")
@@ -336,7 +370,14 @@ class TestDualPathConfig(unittest.TestCase):
             },
             make_kv_transfer_config("kv_producer"),
         )
-        self.assertEqual(vars(config), {"role": "prefill", "dual_path_control_port": None})
+        self.assertEqual(
+            vars(config),
+            {
+                "role": "prefill",
+                "dual_path_control_port": None,
+                "prefill_control_port": None,
+            },
+        )
         self.assertEqual(
             ALLOWED_EXTRA_CONFIG_KEYS,
             frozenset(
@@ -350,6 +391,7 @@ class TestDualPathConfig(unittest.TestCase):
                     "mooncake_rpc_port",
                     "discard_partial_chunks",
                     "dual_path_control_port",
+                    "prefill_control_port",
                 }
             ),
         )
@@ -403,7 +445,14 @@ class TestDualPathConfig(unittest.TestCase):
             make_kv_transfer_config("kv_both"),
         )
         self.assertEqual(combined, DualPathConfig(role="decode", dual_path_control_port=7100))
-        self.assertEqual(vars(combined), {"role": "decode", "dual_path_control_port": 7100})
+        self.assertEqual(
+            vars(combined),
+            {
+                "role": "decode",
+                "dual_path_control_port": 7100,
+                "prefill_control_port": None,
+            },
+        )
 
     def test_config_rejects_invalid_consumer_is_to_load_type(self):
         with self.assertRaisesRegex(ValueError, r"(?=.*consumer_is_to_load)(?=.*boolean)"):
@@ -1585,6 +1634,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_install_reverse_plan",
                 "_build_reverse_send_metadata",
                 "_submit_reverse",
+                "_fail_unsubmitted_reverse",
                 "_release_finished_forward_terminals",
                 "_consume_forward_receive_binding",
                 "_consume_store_completions",

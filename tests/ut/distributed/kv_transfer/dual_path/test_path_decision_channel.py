@@ -408,6 +408,18 @@ def test_prefill_coordinator_cannot_mint_decode_admission_key() -> None:
         coordinator.close()
 
 
+def test_decode_coordinator_cannot_access_prefill_abort_registry() -> None:
+    coordinator = _coordinator(_free_control_endpoint())
+    key = _request().request_key
+    try:
+        with pytest.raises(RuntimeError, match="Prefill coordinator"):
+            coordinator.register_prefill_abort_key(key)
+        with pytest.raises(RuntimeError, match="Prefill coordinator"):
+            coordinator.unregister_prefill_abort_key(key)
+    finally:
+        coordinator.close()
+
+
 def test_injected_boot_id_produces_deterministic_instance_id() -> None:
     coordinator = _coordinator(_free_control_endpoint(), boot_id="known-boot")
     try:
@@ -494,6 +506,82 @@ def test_result_delivery_round_trip_enqueues_once_and_returns_ack() -> None:
     finally:
         sender.close()
         receiver.close()
+
+
+def test_prefill_coordinator_receives_abort_on_control_endpoint() -> None:
+    prefill_endpoint = _free_control_endpoint()
+    prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
+    sender = PathDecisionCoordinator.for_prefill()
+    key = _request().request_key
+    notice = PathAbortNotice(
+        request_key=key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+    )
+    try:
+        prefill.register_prefill_abort_key(key)
+        assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == [notice]
+        assert prefill.take_received_aborts() == []
+    finally:
+        sender.close()
+        prefill.close()
+
+
+def test_prefill_coordinator_acks_but_drops_unknown_or_unregistered_abort() -> None:
+    prefill_endpoint = _free_control_endpoint()
+    prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
+    sender = PathDecisionCoordinator.for_prefill()
+    unknown_key = DualPathRequestKey("decode-engine-1:0:boot-1", "stale", 9)
+    unregistered_key = _request().request_key
+    try:
+        prefill.register_prefill_abort_key(unregistered_key)
+        prefill.unregister_prefill_abort_key(unregistered_key)
+        for key in (unknown_key, unregistered_key):
+            notice = PathAbortNotice(
+                request_key=key,
+                reason=PathAbortReason.ACTIVATION_FAILED,
+            )
+            assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == []
+    finally:
+        sender.close()
+        prefill.close()
+
+
+def test_prefill_receiver_rejects_decision_frames_as_protocol_error() -> None:
+    prefill_endpoint = _free_control_endpoint()
+    prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
+    try:
+        assert (
+            _raw_request(
+                prefill_endpoint,
+                encode_path_decision(_decision(_request().request_key)),
+            )
+            == _PROTOCOL_ERROR_BYTES
+        )
+        assert prefill.take_received_decisions() == []
+        assert prefill.take_received_aborts() == []
+    finally:
+        prefill.close()
+
+
+def test_decode_coordinator_can_deliver_abort_to_registered_prefill_receiver() -> None:
+    decode = _coordinator(_free_control_endpoint())
+    prefill_endpoint = _free_control_endpoint()
+    prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
+    key = _request().request_key
+    notice = PathAbortNotice(
+        request_key=key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+    )
+    try:
+        prefill.register_prefill_abort_key(key)
+        assert decode.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == [notice]
+    finally:
+        decode.close()
+        prefill.close()
 
 
 def test_queue_returns_complete_path_decision() -> None:
@@ -861,6 +949,38 @@ def test_close_is_idempotent() -> None:
     receiver.close()
     sender.close()
     sender.close()
+
+
+def test_prefill_receiver_close_clears_registry_queues_and_releases_endpoint() -> None:
+    endpoint = _free_control_endpoint()
+    coordinator = PathDecisionCoordinator.for_prefill(control_endpoint=endpoint)
+    sender = PathDecisionCoordinator.for_prefill()
+    key = _request().request_key
+    notice = PathAbortNotice(
+        request_key=key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+    )
+    coordinator.register_prefill_abort_key(key)
+    assert sender.submit_abort(endpoint, notice).result(timeout=5) is None
+
+    sender.close()
+    coordinator.close()
+
+    assert coordinator._receiver_thread is not None
+    assert not coordinator._receiver_thread.is_alive()
+    assert coordinator._prefill_abort_keys == set()
+    assert coordinator._received_decisions.empty()
+    assert coordinator._received_aborts.empty()
+    with pytest.raises(RuntimeError, match="closed"):
+        coordinator.register_prefill_abort_key(key)
+    context = zmq.Context()
+    socket = context.socket(zmq.ROUTER)
+    socket.setsockopt(zmq.LINGER, 0)
+    try:
+        socket.bind(f"tcp://{endpoint.host}:{endpoint.port}")
+    finally:
+        socket.close(linger=0)
+        context.term()
 
 
 def test_close_leaves_no_threads_sockets_futures_or_retained_state() -> None:
