@@ -843,6 +843,63 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
 
+    def _staging_get_budgets(self) -> tuple[int, int] | None:
+        raw_budget_bytes = self.m_store.staging_buffer_bytes()
+        if raw_budget_bytes is None:
+            return None
+        if raw_budget_bytes <= 0:
+            raise ValueError("backend raw staging budget must be positive")
+        usable_budget_bytes = max(
+            1,
+            int(raw_budget_bytes * _GET_STAGING_USABLE_FRACTION),
+        )
+        return raw_budget_bytes, usable_budget_bytes
+
+    def _chunked_store_get(
+        self,
+        key_list: list[str],
+        addr_list: list,
+        size_list: list[list[int]],
+        *,
+        usable_budget_bytes: int,
+        raw_budget_bytes: int,
+    ) -> list[int]:
+        """Run one whole-request get as staging-budget-sized key subsets."""
+        batches, oversized = _plan_get_batches(
+            size_list,
+            usable_budget_bytes=usable_budget_bytes,
+            raw_budget_bytes=raw_budget_bytes,
+        )
+        results: dict[int, int] = {index: 1 for index in oversized}
+        if oversized:
+            logger.warning(
+                "KV pool async recv skipping %d single keys larger than raw staging budget %d",
+                len(oversized),
+                raw_budget_bytes,
+            )
+        for batch in batches:
+            sub_keys = [key_list[i] for i in batch]
+            sub_addrs = [addr_list[i] for i in batch]
+            sub_sizes = [size_list[i] for i in batch]
+            sub_ret = self.m_store.get(sub_keys, sub_addrs, sub_sizes)
+            if sub_ret is None:
+                for index in batch:
+                    results[index] = 1
+            else:
+                for index, code in zip(batch, sub_ret, strict=True):
+                    results[index] = code
+        if len(batches) > 1 or oversized:
+            logger.info(
+                "KV pool async recv chunked get: keys=%d batches=%d oversized=%d "
+                "usable_budget=%d raw_budget=%d",
+                len(key_list),
+                len(batches),
+                len(oversized),
+                usable_budget_bytes,
+                raw_budget_bytes,
+            )
+        return [results[i] for i in range(len(key_list))]
+
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
@@ -899,7 +956,18 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             len(key_list_c),
             key_list_c[:3],
         )
-        ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        budgets = self._staging_get_budgets()
+        if budgets is None:
+            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        else:
+            raw_budget_bytes, usable_budget_bytes = budgets
+            ret = self._chunked_store_get(
+                key_list_c,
+                addr_list_c,
+                size_list_c,
+                usable_budget_bytes=usable_budget_bytes,
+                raw_budget_bytes=raw_budget_bytes,
+            )
         if ret is not None and any(r != 0 for r in ret):
             missing_block_ids = record_failed_blocks(
                 block_id_list_c,
@@ -1551,6 +1619,56 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         transfer_tasks.clear()
         self.request_queue.task_done()
         self.get_event.set()
+
+
+_GET_STAGING_ALIGNMENT_BYTES = 4096
+_GET_STAGING_PADDING_BYTES = 2 * _GET_STAGING_ALIGNMENT_BYTES
+# Match the upstream staging reserve without adding a user-facing tuning knob.
+_GET_STAGING_USABLE_FRACTION = 0.9
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _estimate_get_staging_bytes(key_sizes: list[int]) -> int:
+    return _align_up(sum(key_sizes), _GET_STAGING_ALIGNMENT_BYTES) + _GET_STAGING_PADDING_BYTES
+
+
+def _plan_get_batches(
+    sizes_per_key: list[list[int]],
+    *,
+    usable_budget_bytes: int,
+    raw_budget_bytes: int,
+) -> tuple[list[list[int]], set[int]]:
+    """Plan key-subset gets under usable and raw staging budgets."""
+    if usable_budget_bytes <= 0 or raw_budget_bytes <= 0:
+        raise ValueError("staging budgets must be positive")
+    if usable_budget_bytes > raw_budget_bytes:
+        raise ValueError("usable staging budget must not exceed raw budget")
+    batches: list[list[int]] = []
+    oversized: set[int] = set()
+    current: list[int] = []
+    current_bytes = 0
+    for index, key_sizes in enumerate(sizes_per_key):
+        key_bytes = _estimate_get_staging_bytes(key_sizes)
+        if key_bytes > raw_budget_bytes:
+            oversized.add(index)
+            continue
+        if key_bytes > usable_budget_bytes:
+            if current:
+                batches.append(current)
+                current, current_bytes = [], 0
+            batches.append([index])
+            continue
+        if current and current_bytes + key_bytes > usable_budget_bytes:
+            batches.append(current)
+            current, current_bytes = [], 0
+        current.append(index)
+        current_bytes += key_bytes
+    if current:
+        batches.append(current)
+    return batches, oversized
 
 
 def record_failed_blocks(

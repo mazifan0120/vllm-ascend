@@ -43,8 +43,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
 
 
 class FakeStore:
-    def __init__(self, exists_result=None):
+    def __init__(self, exists_result=None, staging_bytes: int | None = None):
         self.exists_result = exists_result or []
+        self.staging_bytes = staging_bytes
         self.put_calls = []
         self.get_calls = []
 
@@ -59,6 +60,9 @@ class FakeStore:
 
     def get(self, keys, addrs, sizes):
         self.get_calls.append((list(keys), list(addrs), list(sizes)))
+
+    def staging_buffer_bytes(self):
+        return self.staging_bytes
 
 
 class FakeKey:
@@ -454,6 +458,34 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         self.assertEqual(invalid_block_ids, {10, 11})
         self.assertEqual(thread.get_and_clear_finished_requests(), {"failed-request"})
         self.assertEqual(invalid_block_ids, {10, 11})
+
+    def test_handle_request_chunks_finite_staging_and_records_failed_blocks(self):
+        invalid_block_ids: set[int] = set()
+        store = FakeStore(staging_bytes=30_000)
+        store.get = MagicMock(side_effect=[[0, 0], None])
+        thread = KVCacheStoreRecvingThread(
+            m_store=store,
+            token_database=FakeTokenDatabase(),
+            block_size=16,
+            tp_rank=0,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_ids_lock=threading.Lock(),
+        )
+        request = ReqMeta(
+            req_id="chunked-request",
+            token_len_chunk=48,
+            block_ids=[10, 11, 12],
+            block_hashes=[b"h0", b"h1", b"h2"],  # type: ignore[arg-type]
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=48, can_load=True, token_len=48),
+        )
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(store.get.call_count, 2)
+        self.assertEqual(invalid_block_ids, {12})
 
 
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
