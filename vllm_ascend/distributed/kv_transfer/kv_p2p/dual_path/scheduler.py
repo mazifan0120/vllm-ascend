@@ -258,6 +258,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_reverse_plans: dict[str, ReversePlan] = {}
         self._prefill_pending_reverse_receive_bindings: dict[str, ReverseReceiveBinding] = {}
         self._prefill_control_failures: dict[str, DualPathControlFailureMetadata] = {}
+        self._prefill_control_endpoint: DecodeControlEndpoint | None = None
+        self._prefill_abort_request_ids: dict[DualPathRequestKey, str] = {}
+        self._scheduler_side_finished_recving: set[str] = set()
         self._decode_control_failures: dict[str, DualPathControlFailureMetadata] = {}
         self._decode_late_abort_endpoints: dict[DualPathRequestKey, DecodeControlEndpoint] = {}
         self._prefill_delivery_futures: dict[DualPathRequestKey, Future[None]] = {}
@@ -299,7 +302,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         else:
             policy = path_policy if path_policy is not None else RoundRobinPathPolicy()
             self._path_decider = PathDecisionDecider(policy)
-            self._path_decision_coordinator = PathDecisionCoordinator.for_prefill()
+            if dual_path_cfg.prefill_control_port is not None:
+                self._prefill_control_endpoint = DecodeControlEndpoint(
+                    host=get_ip(),
+                    port=dual_path_cfg.prefill_control_port,
+                )
+            self._path_decision_coordinator = PathDecisionCoordinator.for_prefill(
+                control_endpoint=self._prefill_control_endpoint,
+            )
         logger.info(
             "Initializing DualPath Scheduler %s (role=%s)",
             engine_id,
@@ -571,6 +581,18 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 return parent_result
 
         self._prefill_request_keys[request_id] = request_key
+        if self._prefill_control_endpoint is not None and request_key not in self._prefill_abort_request_ids:
+            self._prefill_abort_request_ids[request_key] = request_id
+            try:
+                self._path_decision_coordinator.register_prefill_abort_key(request_key)
+            except RuntimeError as error:
+                logger.error(
+                    "DualPath Prefill abort registration failed locally for request %s: %s",
+                    request_id,
+                    error,
+                )
+                self._discard_undelivered_prefill_decision(request_id, request_key)
+                return parent_result
         self._prefill_decision_metadata[request_id] = metadata
         self._prefill_local_tokens.setdefault(request_id, prefill_local_tokens)
         self._prefill_path_results.setdefault(request_id, result)
@@ -629,6 +651,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_path_results.pop(request_id, None)
         assert self._path_decider is not None
         self._path_decider.discard(request_key)
+        self._maybe_retire_prefill_abort_key(request_id, request_key)
 
     def _log_prefill_decision(
         self,
@@ -1089,6 +1112,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if result.path is PathKind.DE_READ:
                 self._rollback_prefill_reverse_activation(request_id, reverse_snapshot)
             self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=False)
+            if (
+                result.request_key not in self._prefill_delivery_futures
+                and result.request_key not in self._prefill_delivery_records
+            ):
+                self._unregister_prefill_abort_key(result.request_key)
             return
 
         result = self._prefill_path_results.get(request_id)
@@ -1199,6 +1227,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         decision = PathDecision(
             result=decision_result,
             reverse_plan=reverse_plan,
+            prefill_control_endpoint=self._prefill_control_endpoint,
         )
         try:
             delivery_future = self._path_decision_coordinator.submit(
@@ -1219,6 +1248,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     self._invalidate_prefill_activation(request, blocks, result, discard_installed_plans=True)
                 self._prefill_deferred_deliveries.discard(request_key)
                 self._prefill_deferred_activations.pop(request_key, None)
+            if existing_future is None:
+                # No Decision Future was created for this admission, so the
+                # peer cannot have accepted it. A refresh may still have an
+                # older delivered attempt under the same exact request key;
+                # retain that key until its completion lifecycle closes.
+                self._unregister_prefill_abort_key(request_key)
             return
         self._prefill_delivery_futures[request_key] = delivery_future
         if reverse_plan is None:
@@ -1804,6 +1839,62 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 error,
             )
 
+    def _unregister_prefill_abort_key(self, request_key: DualPathRequestKey) -> None:
+        if self._prefill_abort_request_ids.pop(request_key, None) is None:
+            return
+        self._path_decision_coordinator.unregister_prefill_abort_key(request_key)
+
+    def _maybe_retire_prefill_abort_key(
+        self,
+        request_id: str,
+        request_key: DualPathRequestKey,
+    ) -> None:
+        if self._prefill_abort_request_ids.get(request_key) != request_id:
+            return
+        if self._prefill_request_keys.get(request_id) == request_key:
+            return
+        if self._completion_tracker.has_open_completion(
+            CompletionKind.REVERSE_RECEIVE,
+            request_key,
+        ):
+            return
+        self._unregister_prefill_abort_key(request_key)
+
+    def _handle_received_peer_abort(self, notice: PathAbortNotice) -> None:
+        """Fail-close one exact Prefill Reverse receive after a peer ABORT."""
+        request_id = self._prefill_abort_request_ids.get(notice.request_key)
+        if request_id is None:
+            return
+        logger.warning(
+            "dual_path peer_abort key=%s reason=%s: fail-closing reverse receive",
+            notice.request_key.decode_request_id,
+            notice.reason.value,
+        )
+        self._prefill_invalid_request_keys.add(notice.request_key)
+        waiting_attempt = self._waiting_reverse_attempt_ids.get(request_id)
+        if waiting_attempt is not None and waiting_attempt.request_key == notice.request_key:
+            completion = self._completion_tracker.find_open_completion(
+                CompletionKind.REVERSE_RECEIVE,
+                waiting_attempt,
+            )
+            if completion is not None and self._completion_tracker.force_fail_completion(
+                completion.completion_id,
+                expected_kind=CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=waiting_attempt,
+            ):
+                _, finished_recving = self._run_completion_close_action(completion)
+                self._scheduler_side_finished_recving.update(finished_recving)
+
+        active_exact_admission = self._prefill_request_keys.get(request_id) == notice.request_key
+        invalid_block_ids = self._recovery_invalid_block_ids(request_id) if active_exact_admission else ()
+        if invalid_block_ids:
+            self._prefill_control_failures[request_id] = DualPathControlFailureMetadata(
+                request_id=request_id,
+                invalid_block_ids=invalid_block_ids,
+                reason=DualPathControlFailureReason.REVERSE_JOB_FAILED,
+            )
+        self._maybe_retire_prefill_abort_key(request_id, notice.request_key)
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -1815,6 +1906,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         metadata.requests = parent_metadata.requests
         metadata.send_task = parent_metadata.send_task
         if self.dual_path_cfg.role != "decode":
+            for notice in self._path_decision_coordinator.take_received_aborts():
+                self._handle_received_peer_abort(notice)
             self._reconcile_prefill_deliveries()
             for deferred_request_key in list(self._prefill_deferred_deliveries):
                 self._deliver_prefill_decision(deferred_request_key)
@@ -1925,6 +2018,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 self._prefill_invalid_request_keys.discard(released_key)
                 self._prefill_deferred_deliveries.discard(released_key)
                 self._prefill_deferred_activations.pop(released_key, None)
+                self._maybe_retire_prefill_abort_key(request_id, released_key)
             self._reconcile_prefill_deliveries()
         # Completion records remain owned by their completion lifecycle across
         # request cleanup.
@@ -2030,6 +2124,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if connector_output.finished_recving is None:
                 connector_output.finished_recving = set()
             connector_output.finished_recving.update(finished_recving_injection)
+        if self._scheduler_side_finished_recving:
+            if connector_output.finished_recving is None:
+                connector_output.finished_recving = set()
+            connector_output.finished_recving.update(self._scheduler_side_finished_recving)
+            self._scheduler_side_finished_recving.clear()
 
     def _aggregate_worker_completion_reports(
         self, worker_metadata: DualPathWorkerMetadata
@@ -2143,6 +2242,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         # stale-attempt completions are absorbed without touching the generic
         # finished sets.
         attempt_key = completion.reverse_attempt_key
+        completion_request_key = None if attempt_key is None else attempt_key.request_key
+        abort_request_id = (
+            None
+            if completion_request_key is None
+            else self._prefill_abort_request_ids.get(completion_request_key)
+        )
         request_id = next(
             (
                 waiting_request_id
@@ -2153,10 +2258,30 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         )
         if request_id is None:
             self._completion_tracker.discard(completion.completion_id)
+            if abort_request_id is not None and completion_request_key is not None:
+                self._maybe_retire_prefill_abort_key(
+                    abort_request_id,
+                    completion_request_key,
+                )
             return set()
         del self._waiting_reverse_attempt_ids[request_id]
         self._pending_finished_recving.discard(request_id)
+        pending_binding = self._prefill_pending_reverse_receive_bindings.get(request_id)
+        if (
+            pending_binding is not None
+            and attempt_key
+            == ReverseAttemptKey(
+                pending_binding.request_key,
+                pending_binding.reverse_attempt_id,
+            )
+        ):
+            self._prefill_pending_reverse_receive_bindings.pop(request_id, None)
         self._completion_tracker.discard(completion.completion_id)
+        if abort_request_id is not None and completion_request_key is not None:
+            self._maybe_retire_prefill_abort_key(
+                abort_request_id,
+                completion_request_key,
+            )
         return {request_id}
 
     def shutdown(self) -> None:
@@ -2185,6 +2310,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_reverse_plans.clear()
         self._prefill_pending_reverse_receive_bindings.clear()
         self._prefill_control_failures.clear()
+        self._prefill_abort_request_ids.clear()
+        self._scheduler_side_finished_recving.clear()
+        self._prefill_control_endpoint = None
         self._prefill_delivery_futures.clear()
         self._prefill_delivery_records.clear()
         self._prefill_delivered_reverse_attempts.clear()

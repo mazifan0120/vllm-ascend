@@ -322,6 +322,7 @@ def pe_scheduler_factory():
     ):
         coordinator = MagicMock(name="prefill_coordinator")
         coordinator.submit.return_value = make_completed_future()
+        coordinator.take_received_aborts.return_value = []
         coordinator_cls.for_prefill.return_value = coordinator
 
         def make(
@@ -330,12 +331,16 @@ def pe_scheduler_factory():
             world_size: int = 1,
             pool: BlockPool | None = None,
             policy=None,
+            prefill_control_port: int | None = None,
         ):
             scheduler = connector_module.DualPathConnectorScheduler(
                 make_prefill_vllm_config(world_size),
                 make_prefill_kv_cache_config(),
                 "prefill-engine",
-                DualPathConfig(role="prefill"),
+                DualPathConfig(
+                    role="prefill",
+                    prefill_control_port=prefill_control_port,
+                ),
                 path_policy=policy if policy is not None else FixedPathPolicy(path),
             )
             scheduler.executor.shutdown(wait=False)
