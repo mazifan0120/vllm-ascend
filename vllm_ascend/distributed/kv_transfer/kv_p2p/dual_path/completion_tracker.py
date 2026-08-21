@@ -42,6 +42,7 @@ class CompletionRecord:
     expected_worker_count: int
     reverse_attempt_key: ReverseAttemptKey | None = None
     completed_worker_count: int = 0
+    dispatched: bool = False
     failed: bool = False
     closed: bool = False
 
@@ -128,7 +129,28 @@ class TransferCompletionTracker:
             raise RuntimeError("completion identity mismatch while discarding unstarted attempt")
         if record.completed_worker_count != 0:
             raise RuntimeError("cannot discard completion that already received terminal reports")
+        if record.dispatched:
+            raise RuntimeError("cannot discard completion that was already dispatched")
         del self._records[completion_id]
+        return True
+
+    def mark_dispatched(
+        self,
+        completion_id: int,
+        *,
+        expected_kind: CompletionKind,
+        expected_attempt_key: ReverseAttemptKey,
+    ) -> bool:
+        """Latch that one exact completion has been submitted to workers."""
+        record = self._records.get(completion_id)
+        if record is None or record.closed:
+            return False
+        if (
+            record.completion_kind is not expected_kind
+            or record.reverse_attempt_key != expected_attempt_key
+        ):
+            raise RuntimeError("completion identity mismatch while marking dispatch")
+        record.dispatched = True
         return True
 
     def discard_closed_completions(self, completion_kind: CompletionKind, request_key: DualPathRequestKey) -> None:
@@ -164,6 +186,7 @@ class TransferCompletionTracker:
         completed_worker_count = record.completed_worker_count + report_count
         if completed_worker_count > record.expected_worker_count:
             raise RuntimeError("completion reports exceed expected worker count")
+        record.dispatched = True
         record.completed_worker_count = completed_worker_count
         if failure_count:
             record.failed = True
@@ -183,12 +206,12 @@ class TransferCompletionTracker:
         expected_kind: CompletionKind,
         expected_attempt_key: ReverseAttemptKey,
     ) -> bool:
-        """Fail an exact completion, closing only if no worker ever started.
+        """Fail an exact completion, closing only before worker dispatch.
 
-        Used when the peer reports a failure out of band. If the transfer never
-        started, no worker terminal can fill the barrier. Once a worker has
-        reported, preserve the all-worker barrier and only latch failure; the
-        remaining workers own closure.
+        Used when the peer reports a failure out of band. Before dispatch, no
+        worker terminal can fill the barrier. Once the exact binding has been
+        dispatched, preserve the all-worker barrier even if no report has
+        arrived yet; the workers own closure.
         """
         record = self._records.get(completion_id)
         if record is None or record.closed:
@@ -199,7 +222,7 @@ class TransferCompletionTracker:
         ):
             raise RuntimeError("completion identity mismatch while force-failing attempt")
         record.failed = True
-        if record.completed_worker_count != 0:
+        if record.dispatched or record.completed_worker_count != 0:
             return False
         record.closed = True
         return True

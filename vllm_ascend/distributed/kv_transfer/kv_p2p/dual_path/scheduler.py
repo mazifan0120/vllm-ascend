@@ -1016,13 +1016,28 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 state[request_id] = value
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
-        if not self._is_dual_path_decode_admission(request):
+        request_id = request.request_id
+        is_decode_admission = self._is_dual_path_decode_admission(request)
+        if is_decode_admission and request_id in self._pending_finished_sending:
+            return None, True
+        if self.dual_path_cfg.role == "prefill" and (
+            request_id in self._pending_finished_recving
+            or request_id in self._scheduler_side_finished_recving
+        ):
+            params = request.kv_transfer_params
+            if (
+                params is not None
+                and params.get("do_remote_decode") is True
+                and "dual_path" in params
+            ):
+                return None, True
+
+        if not is_decode_admission:
             parent_result = super().get_num_new_matched_tokens(request, num_computed_tokens)
             if self.dual_path_cfg.role == "prefill":
                 return self._decide_prefill_path_for_admission(request, parent_result, num_computed_tokens)
             return parent_result
 
-        request_id = request.request_id
         transfer_tokens = self._hybrid_prefill_token_count(request.num_tokens)
         ready_tokens = _decode_ready_token_count(request.num_tokens)
         local_tokens = num_computed_tokens
@@ -1915,6 +1930,19 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             for request_id, binding in list(self._prefill_pending_reverse_receive_bindings.items()):
                 if binding.request_key in self._prefill_deferred_deliveries:
                     continue
+                attempt_key = ReverseAttemptKey(
+                    binding.request_key,
+                    binding.reverse_attempt_id,
+                )
+                if not self._completion_tracker.mark_dispatched(
+                    binding.reverse_receive_completion_id,
+                    expected_kind=CompletionKind.REVERSE_RECEIVE,
+                    expected_attempt_key=attempt_key,
+                ):
+                    raise RuntimeError(
+                        f"cannot dispatch closed Reverse receive completion "
+                        f"{binding.reverse_receive_completion_id}"
+                    )
                 metadata.reverse_receive_bindings.append(binding)
                 if self._prefill_pending_reverse_receive_bindings.get(request_id) == binding:
                     self._prefill_pending_reverse_receive_bindings.pop(request_id, None)

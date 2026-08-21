@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from vllm.v1.outputs import KVConnectorOutput
@@ -343,7 +344,7 @@ class TestDecodeFailureRelay:
             for call in scheduler_logger.error.call_args_list
         )
 
-    def test_late_failure_for_old_admission_does_not_fail_same_id_replacement(
+    def test_late_failure_retires_old_admission_before_same_id_replacement(
         self, decode_scheduler_factory, decode_control_seams
     ):
         scheduler = decode_scheduler_factory()
@@ -362,30 +363,32 @@ class TestDecodeFailureRelay:
             old_key: _PREFILL_ENDPOINT_A
         }
 
-        replacement = _admit_decode_request(scheduler)
-        replacement_state = scheduler._decode_decision_states[replacement.request_id]
-        replacement_key = replacement_state.request_key
-        assert replacement_key != old_key
-        assert replacement_state.status.value == "PENDING"
-        decode_control_seams.decode_coordinator.register_pending.assert_called_with(
-            replacement_key
+        replacement = SimpleNamespace(
+            request_id=old_request.request_id,
+            num_tokens=49,
+            prompt_token_ids=list(range(49)),
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "metaserver": "http://proxy.example/v1/kv",
+            },
         )
+        assert scheduler.get_num_new_matched_tokens(replacement, 16) == (None, True)
+        assert replacement.request_id not in scheduler._decode_decision_states
         decode_control_seams.decode_coordinator.unregister.reset_mock()
 
         with patch.object(
             scheduler,
             "_build_decode_control_failure",
         ) as build_failure:
-            scheduler.update_connector_output(
-                KVConnectorOutput(
-                    kv_connector_worker_meta=make_worker_metadata(
-                        failure_reports={completion_id: 1}
-                    )
+            old_terminal = KVConnectorOutput(
+                kv_connector_worker_meta=make_worker_metadata(
+                    failure_reports={completion_id: 1}
                 )
             )
+            scheduler.update_connector_output(old_terminal)
 
-        assert replacement_state.status.value == "PENDING"
-        assert scheduler._decode_decision_states[replacement.request_id] is replacement_state
+        assert old_terminal.finished_sending == {old_request.request_id}
+        assert replacement.request_id not in scheduler._decode_decision_states
         decode_control_seams.decode_coordinator.unregister.assert_not_called()
         build_failure.assert_not_called()
         assert replacement.request_id not in scheduler._decode_control_failures
@@ -396,6 +399,17 @@ class TestDecodeFailureRelay:
                 request_key=old_key,
                 reason=PathAbortReason.ACTIVATION_FAILED,
             ),
+        )
+
+        assert scheduler.get_num_new_matched_tokens(replacement, 16) == (33, True)
+        blocks = MagicMock(name="replacement_admission_blocks")
+        blocks.get_block_ids.return_value = ([51, 52, 53, 54],)
+        scheduler.update_state_after_alloc(replacement, blocks, 33)
+        replacement_state = scheduler._decode_decision_states[replacement.request_id]
+        assert replacement_state.request_key != old_key
+        assert replacement_state.status.value == "PENDING"
+        decode_control_seams.decode_coordinator.register_pending.assert_called_with(
+            replacement_state.request_key
         )
 
 

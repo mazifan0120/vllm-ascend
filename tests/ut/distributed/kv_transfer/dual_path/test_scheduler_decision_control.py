@@ -1064,6 +1064,7 @@ class TestAdmissionKeyedPrefillState:
         assert scheduler.get_num_new_matched_tokens(old_request, 16) == (16, True)
         _bind_prefill(scheduler, old_request, local_block_ids=(20, 21, 22, 23))
         assert scheduler._prefill_deferred_deliveries == {old_key}
+        current_binding = scheduler._prefill_pending_reverse_receive_bindings[request_id]
 
         old_request.status = RequestStatus.FINISHED_STOPPED
         scheduler.request_finished(old_request, [20, 21, 22, 23])
@@ -1071,6 +1072,15 @@ class TestAdmissionKeyedPrefillState:
             request_id,
             _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
         )
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (None, True)
+        old_terminal = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                completion_reports={current_binding.reverse_receive_completion_id: 2},
+            )
+        )
+        scheduler.update_connector_output(old_terminal)
+        assert old_terminal.finished_recving == {request_id}
+
         assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
         _bind_prefill(scheduler, new_request, local_block_ids=(30, 31, 32, 33))
         submitted_before_stale_drain = control_seams.prefill_coordinator.submit.call_count
@@ -2155,6 +2165,7 @@ class TestCleanupAndShutdown:
         old_request = _make_prefill_request("prefill-de-read-finished", _remote_decode_params())
         scheduler.get_num_new_matched_tokens(old_request, 0)
         _bind_prefill(scheduler, old_request, local_block_ids=(10, 11))
+        old_binding = scheduler._prefill_pending_reverse_receive_bindings[old_request.request_id]
         scheduler.build_connector_meta(MagicMock(name="binding_scheduler_output"))
         old_request.status = RequestStatus.FINISHED_STOPPED
         scheduler.request_finished(old_request, [10, 11])
@@ -2167,6 +2178,19 @@ class TestCleanupAndShutdown:
             old_request.request_id,
             _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
         )
+        assert scheduler.get_num_new_matched_tokens(new_request, 0) == (None, True)
+        old_failure_metadata = scheduler.build_connector_meta(
+            MagicMock(name="old_failure_scheduler_output")
+        )
+        assert old_failure_metadata.control_failures == []
+        old_terminal = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                completion_reports={old_binding.reverse_receive_completion_id: 2},
+            )
+        )
+        scheduler.update_connector_output(old_terminal)
+        assert old_terminal.finished_recving == {old_request.request_id}
+
         assert scheduler.get_num_new_matched_tokens(new_request, 0) == (0, False)
         _bind_prefill(scheduler, new_request, local_block_ids=(30, 31, 32, 33))
         metadata = scheduler.build_connector_meta(MagicMock(name="new_scheduler_output"))
@@ -2198,6 +2222,7 @@ class TestCleanupAndShutdown:
         old_request = _make_prefill_request("prefill-active-failure", _remote_decode_params())
         scheduler.get_num_new_matched_tokens(old_request, 0)
         _bind_prefill(scheduler, old_request, local_block_ids=(10, 11))
+        old_binding = scheduler._prefill_pending_reverse_receive_bindings[old_request.request_id]
         scheduler.build_connector_meta(MagicMock(name="binding_scheduler_output"))
 
         delivery_future.set_exception(PathDecisionDeliveryError("delivery exhausted"))
@@ -2227,6 +2252,15 @@ class TestCleanupAndShutdown:
             old_request.request_id,
             _remote_decode_params(dual_path=_prefill_decision_payload(admission_id=1)),
         )
+        assert scheduler.get_num_new_matched_tokens(replacement, 0) == (None, True)
+        old_terminal = KVConnectorOutput(
+            kv_connector_worker_meta=make_worker_metadata(
+                completion_reports={old_binding.reverse_receive_completion_id: 2},
+            )
+        )
+        scheduler.update_connector_output(old_terminal)
+        assert old_terminal.finished_recving == {old_request.request_id}
+
         assert scheduler.get_num_new_matched_tokens(replacement, 0) == (32, True)
 
     def test_request_id_reuse_is_not_blocked_by_prior_delivery_resolution(

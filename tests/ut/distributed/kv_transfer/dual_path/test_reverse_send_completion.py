@@ -459,6 +459,54 @@ def test_request_finished_retains_delayed_free_until_last_exact_send_attempt_fai
     assert request.request_id not in scheduler._pending_finished_sending
 
 
+@pytest.mark.parametrize("failed", [False, True], ids=["success", "failure"])
+def test_decode_defers_same_id_replacement_until_old_completion_terminal(
+    decode_scheduler_factory,
+    decode_control_seams,
+    failed,
+):
+    scheduler = decode_scheduler_factory()
+    first_request = _admit_decode_request(scheduler)
+    first_state = scheduler._decode_decision_states[first_request.request_id]
+    metadata = _activate_decision(scheduler, decode_control_seams, _de_read_decision())
+    completion_id = metadata.reverse_plans[0].reverse_send_completion_id
+    assert completion_id is not None
+    first_request.status = RequestStatus.FINISHED_STOPPED
+    assert scheduler.request_finished(first_request, []) == (True, None)
+    second_request = SimpleNamespace(
+        request_id=first_request.request_id,
+        num_tokens=49,
+        prompt_token_ids=list(range(49)),
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "metaserver": "http://proxy.example/v1/kv",
+        },
+    )
+
+    assert scheduler.get_num_new_matched_tokens(second_request, 16) == (None, True)
+    assert second_request.request_id not in scheduler._lookup_results
+    assert second_request.request_id not in scheduler._decode_decision_states
+    assert decode_control_seams.decode_coordinator.new_request_key.call_count == 1
+
+    output = KVConnectorOutput(
+        kv_connector_worker_meta=make_worker_metadata(
+            failure_reports={completion_id: 1} if failed else {},
+            completion_reports={} if failed else {completion_id: 1},
+        )
+    )
+    scheduler.update_connector_output(output)
+
+    assert output.finished_sending == {first_request.request_id}
+    assert second_request.request_id not in scheduler._decode_decision_states
+
+    assert scheduler.get_num_new_matched_tokens(second_request, 16) == (33, True)
+    blocks = MagicMock(name="replacement_admission_blocks")
+    blocks.get_block_ids.return_value = ([51, 52, 53, 54],)
+    scheduler.update_state_after_alloc(second_request, blocks, 33)
+    second_state = scheduler._decode_decision_states[second_request.request_id]
+    assert second_state.request_key.admission_id == first_state.request_key.admission_id + 1
+
+
 def test_failed_reverse_send_releases_delayed_free_only_after_every_attempt_closes(
     decode_scheduler_factory, decode_control_seams
 ):

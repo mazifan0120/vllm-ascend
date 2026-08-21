@@ -142,6 +142,32 @@ class TestTransferCompletionTracker:
                 expected_attempt_key=attempt_key,
             )
 
+    def test_discard_unstarted_rejects_dispatched_record_without_reports(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 0)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=2,
+            reverse_attempt_key=attempt_key,
+        )
+        tracker.mark_dispatched(
+            completion.completion_id,
+            expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_attempt_key=attempt_key,
+        )
+
+        with pytest.raises(RuntimeError, match="already dispatched"):
+            tracker.discard_unstarted(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+
+        assert tracker.get(completion.completion_id) is completion
+        assert completion.completed_worker_count == 0
+        assert completion.closed is False
+
     def test_force_fail_completion_closes_exact_unstarted_record(self):
         completion_tracker = _completion_tracker()
         tracker = completion_tracker.TransferCompletionTracker()
@@ -182,6 +208,34 @@ class TestTransferCompletionTracker:
             is False
         )
         assert completion.failed and not completion.closed
+
+    def test_force_fail_completion_latches_dispatched_zero_report_record(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 2)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=2,
+            reverse_attempt_key=attempt_key,
+        )
+        tracker.mark_dispatched(
+            completion.completion_id,
+            expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_attempt_key=attempt_key,
+        )
+
+        assert (
+            tracker.force_fail_completion(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is False
+        )
+        assert completion.dispatched is True
+        assert completion.completed_worker_count == 0
+        assert completion.failed is True
+        assert completion.closed is False
 
     def test_force_fail_completion_rejects_identity_mismatch(self):
         completion_tracker = _completion_tracker()
@@ -401,8 +455,8 @@ class TestCompletionRecordReclamation:
         assert request.request_id not in scheduler._waiting_reverse_attempt_ids
 
     @staticmethod
-    def _admit_reused_de_read(scheduler, admission_id: int):
-        request = _make_request(
+    def _make_reused_de_read(admission_id: int):
+        return _make_request(
             target_tokens=48,
             prompt_tokens=49,
             local_tokens=16,
@@ -410,50 +464,54 @@ class TestCompletionRecordReclamation:
             destination_block_ids=[[20, 21, 22, 23]],
             admission_id=admission_id,
         )
-        assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
-        scheduler.update_state_after_alloc(request, _blocks(([80, 81],)), 16)
-        binding = scheduler._prefill_pending_reverse_receive_bindings[request.request_id]
-        scheduler.build_connector_meta(MagicMock(name=f"scheduler_output_{admission_id}"))
-        return request, binding
 
-    def test_late_old_admission_completion_does_not_unpark_reused_request_id(self, pe_scheduler_factory):
+    @pytest.mark.parametrize("failed", [False, True], ids=["success", "failure"])
+    def test_prefill_defers_same_id_replacement_until_old_completion_terminal(
+        self,
+        pe_scheduler_factory,
+        failed,
+    ):
         scheduler, first_request = self._admit_de_read(pe_scheduler_factory)
         first_binding = scheduler._prefill_pending_reverse_receive_bindings[first_request.request_id]
         scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
-        scheduler._release_scheduler_request_state(first_request)
-        second_request, second_binding = self._admit_reused_de_read(scheduler, admission_id=1)
-        second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
-
-        output = KVConnectorOutput(
-            kv_connector_worker_meta=make_worker_metadata(
-                completion_reports={first_binding.reverse_receive_completion_id: 1}
-            )
-        )
-        scheduler.update_connector_output(output)
-
-        assert output.finished_recving is None
-        assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
-        assert scheduler._completion_tracker.get(second_binding.reverse_receive_completion_id) is not None
-
-    def test_late_old_admission_failure_does_not_fail_reused_request_id(self, pe_scheduler_factory):
-        scheduler, first_request = self._admit_de_read(pe_scheduler_factory)
-        first_binding = scheduler._prefill_pending_reverse_receive_bindings[first_request.request_id]
-        scheduler.build_connector_meta(MagicMock(name="first_scheduler_output"))
-        scheduler._release_scheduler_request_state(first_request)
-        second_request, second_binding = self._admit_reused_de_read(scheduler, admission_id=1)
-        second_attempt = ReverseAttemptKey(second_binding.request_key, 0)
+        first_request.status = RequestStatus.FINISHED_STOPPED
+        assert scheduler.request_finished(first_request, [70, 71]) == (True, None)
+        second_request = self._make_reused_de_read(admission_id=1)
 
         output = KVConnectorOutput(
             kv_connector_worker_meta=make_worker_metadata(
                 failure_reports={first_binding.reverse_receive_completion_id: 1}
+                if failed
+                else {},
+                completion_reports={}
+                if failed
+                else {first_binding.reverse_receive_completion_id: 1},
             )
         )
+
+        assert scheduler.get_num_new_matched_tokens(second_request, 16) == (None, True)
+        assert second_request.request_id not in scheduler._prefill_request_keys
+        assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == ReverseAttemptKey(
+            first_binding.request_key,
+            first_binding.reverse_attempt_id,
+        )
+
         scheduler.update_connector_output(output)
 
-        assert output.finished_recving is None
-        assert second_binding.request_key not in scheduler._prefill_invalid_request_keys
+        assert output.finished_recving == {first_request.request_id}
         assert scheduler._prefill_control_failures == {}
-        assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == second_attempt
+        assert second_request.request_id not in scheduler._prefill_request_keys
+
+        assert scheduler.get_num_new_matched_tokens(second_request, 16) == (16, True)
+        second_key = scheduler._prefill_request_keys[second_request.request_id]
+        assert second_key.admission_id == 1
+        scheduler.update_state_after_alloc(second_request, _blocks(([80, 81],)), 16)
+        second_binding = scheduler._prefill_pending_reverse_receive_bindings[second_request.request_id]
+        assert second_binding.request_key == second_key
+        assert scheduler._waiting_reverse_attempt_ids[second_request.request_id] == ReverseAttemptKey(
+            second_key,
+            second_binding.reverse_attempt_id,
+        )
         assert scheduler._completion_tracker.get(second_binding.reverse_receive_completion_id) is not None
 
     def test_request_cleanup_reclaims_every_closed_completion_after_binding_delivery(self, pe_scheduler_factory):
