@@ -167,6 +167,7 @@ def test_path_decision_msgpack_round_trip_result() -> None:
             "payload": {
                 "result": _result_payload(),
                 "reverse_plan": None,
+                "prefill_control_endpoint": None,
             },
         }
     )
@@ -192,17 +193,46 @@ def test_decision_request_and_result_round_trip() -> None:
         "decision_request",
         "decode_control_endpoint",
     }
-    assert set(decision.to_dict()) == {"result", "reverse_plan"}
+    assert set(decision.to_dict()) == {
+        "result",
+        "reverse_plan",
+        "prefill_control_endpoint",
+    }
     assert decode_path_decision(encode_path_decision(decision)) == decision
 
 
-def test_pe_read_serializes_none_reverse_plan() -> None:
+def test_path_decision_round_trip_with_prefill_endpoint() -> None:
+    endpoint = DecodeControlEndpoint(host="192.0.2.88", port=24999)
+    decision = PathDecision(
+        result=PathDecisionResult(request_key=_request().request_key, path=PathKind.PE_READ),
+        reverse_plan=None,
+        prefill_control_endpoint=endpoint,
+    )
+
+    assert PathDecision.from_dict(decision.to_dict()) == decision
+
+
+def test_path_decision_round_trip_without_prefill_endpoint_defaults_none() -> None:
     decision = PathDecision(
         result=PathDecisionResult(request_key=_request().request_key, path=PathKind.PE_READ),
         reverse_plan=None,
     )
 
     assert decision.to_dict()["reverse_plan"] is None
+    assert decision.to_dict()["prefill_control_endpoint"] is None
+    assert PathDecision.from_dict(decision.to_dict()).prefill_control_endpoint is None
+
+
+def test_path_decision_wire_rejects_unknown_keys() -> None:
+    decision = PathDecision(
+        result=PathDecisionResult(request_key=_request().request_key, path=PathKind.PE_READ),
+        reverse_plan=None,
+    )
+    payload = decision.to_dict()
+    payload["surprise"] = 1
+
+    with pytest.raises(PathDecisionValidationError):
+        PathDecision.from_dict(payload)
 
 
 def test_decode_path_decision_rejects_malformed_msgpack() -> None:

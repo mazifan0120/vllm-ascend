@@ -116,26 +116,47 @@ class DualPathDecisionMetadata:
 class PathDecision:
     result: PathDecisionResult
     reverse_plan: ReversePlan | None
+    # Optional reverse-direction control endpoint; the Decode side sends
+    # terminal failure notices (ABORT) here when an activated request dies
+    # before its reverse transfer could start.
+    prefill_control_endpoint: DecodeControlEndpoint | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.result, PathDecisionResult):
             raise PathDecisionValidationError("result must be a PathDecisionResult")
         if self.reverse_plan is not None and not isinstance(self.reverse_plan, ReversePlan):
             raise PathDecisionValidationError("reverse_plan must be a ReversePlan or None")
+        if self.prefill_control_endpoint is not None and not isinstance(
+            self.prefill_control_endpoint,
+            DecodeControlEndpoint,
+        ):
+            raise PathDecisionValidationError(
+                "prefill_control_endpoint must be a DecodeControlEndpoint or None"
+            )
 
     def to_dict(self) -> JsonObject:
         return {
             "result": self.result.to_dict(),
             "reverse_plan": None if self.reverse_plan is None else self.reverse_plan.to_dict(),
+            "prefill_control_endpoint": (
+                None if self.prefill_control_endpoint is None else self.prefill_control_endpoint.to_dict()
+            ),
         }
 
     @classmethod
     def from_dict(cls, payload: JsonValue) -> PathDecision:
-        data = require_exact_payload(payload, frozenset({"result", "reverse_plan"}))
+        data = require_exact_payload(
+            payload,
+            frozenset({"result", "reverse_plan", "prefill_control_endpoint"}),
+        )
         reverse_plan_payload = data["reverse_plan"]
+        endpoint_payload = data["prefill_control_endpoint"]
         return cls(
             result=PathDecisionResult.from_dict(data["result"]),
             reverse_plan=None if reverse_plan_payload is None else ReversePlan.from_dict(reverse_plan_payload),
+            prefill_control_endpoint=(
+                None if endpoint_payload is None else DecodeControlEndpoint.from_dict(endpoint_payload)
+            ),
         )
 
 
