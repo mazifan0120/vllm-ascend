@@ -575,6 +575,7 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
             if tracker.store_load_failed:
                 tracker.store_phase = _SplitPhase.FAILED
                 self._invalid_block_ids.update(tracker.store_destination_slice)
+                self._fail_unsubmitted_reverse(request_id, tracker)
                 logger.warning(
                     "dual_path data_terminal key=%s failure_source=STORE status=FAILED",
                     request_id,
@@ -590,6 +591,28 @@ class DualPathConnectorWorker(MooncakeLayerwiseConnectorWorker):
                 ):
                     self._report_split_terminal(request_id, tracker, reported_store_terminals)
         return reported_store_terminals
+
+    def _fail_unsubmitted_reverse(self, request_id: str, tracker: _SplitTracker) -> None:
+        """Fail-close Reverse completion when Store fails before submission.
+
+        The scheduler opens REVERSE_SEND during activation, but the reverse
+        transfer is submitted only after Store load completes. A Store failure
+        before submission must still contribute this worker's failure report to
+        the all-worker completion barrier. Submitted attempts remain owned by
+        their wire terminal path.
+        """
+        if tracker.reverse_phase is not _SplitPhase.PENDING:
+            return
+        if tracker.reverse_plan is None or tracker.reverse_plan.reverse_send_completion_id is None:
+            return
+        if tracker.reverse_submitted_attempt is not None:
+            return
+        tracker.reverse_phase = _SplitPhase.FAILED
+        self._record_completion_report(tracker.reverse_plan.reverse_send_completion_id, succeeded=False)
+        if tracker.core_request_finished:
+            with self._reverse_terminal_lock:
+                if self._split_trackers.get(request_id) is tracker:
+                    self._split_trackers.pop(request_id, None)
 
     @staticmethod
     def _report_split_terminal(

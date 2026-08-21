@@ -7,6 +7,7 @@ from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     REVERSE_ATTEMPT_KEY,
     _make_prefill_worker,
     _make_reverse_receive_binding,
+    _make_reverse_plan,
     _make_split_metadata,
     _make_worker,
     _set_forward_terminal,
@@ -187,3 +188,50 @@ def test_failure_block_ranges_match_expected_transfer_slices() -> None:
     assert prefill_worker.get_block_ids_with_load_errors() == {71, 80, 81}
     assert reverse_decode_worker.get_block_ids_with_load_errors() == {30, 31, 40, 41}
     assert forward_worker.get_block_ids_with_load_errors() == {30, 31, 40, 41}
+
+
+def test_store_failure_before_reverse_submission_synthesizes_failure_report() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    metadata.reverse_plans[0] = _make_reverse_plan(reverse_send_completion_id=77)
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = {20}
+
+    worker.start_load_kv(metadata)
+    worker.get_finished(set(), metadata)
+
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+    assert tracker.reverse_phase.value == "FAILED"
+    assert tracker.reverse_submitted_attempt is None
+    assert worker.build_connector_worker_meta().failure_reports == {77: 1}
+
+
+def test_store_failure_after_reverse_submission_keeps_wire_terminal_path() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    metadata.reverse_plans[0] = _make_reverse_plan(reverse_send_completion_id=88)
+
+    worker.start_load_kv(metadata)
+    tracker = worker._split_trackers[DECODE_REQUEST_ID]
+    tracker.store_load_failed = True
+    tracker.reverse_submitted_attempt = REVERSE_ATTEMPT_KEY
+
+    worker._consume_store_completions({DECODE_REQUEST_ID}, set())
+
+    assert tracker.reverse_phase.value == "PENDING"
+    assert worker.build_connector_worker_meta() is None
+
+
+def test_store_failure_releases_core_finished_unsubmitted_reverse_tracker() -> None:
+    worker = _make_worker()
+    metadata = _make_split_metadata(include_reverse=True)
+    metadata.reverse_plans[0] = _make_reverse_plan(reverse_send_completion_id=99)
+    worker._kvpool_worker_adapter.get_finished.return_value = (set(), {DECODE_REQUEST_ID})
+    worker._kvpool_worker_adapter.get_block_ids_with_load_errors.return_value = {20}
+
+    worker.start_load_kv(metadata)
+    assert worker.get_finished({DECODE_REQUEST_ID}, metadata) == (set(), set())
+
+    assert DECODE_REQUEST_ID not in worker._split_trackers
+    assert worker.build_connector_worker_meta().failure_reports == {99: 1}
+    assert worker.build_connector_worker_meta() is None
