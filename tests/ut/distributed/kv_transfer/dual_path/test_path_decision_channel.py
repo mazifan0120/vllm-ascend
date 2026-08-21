@@ -366,6 +366,29 @@ class _FakeDeliverySocket:
         self.closed = True
 
 
+class _GatedRegistryLock:
+    def __init__(
+        self,
+        gated_thread_name: str,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._gated_thread_name = gated_thread_name
+        self._entered = entered
+        self._release = release
+
+    def __enter__(self) -> "_GatedRegistryLock":
+        self._lock.acquire()
+        if threading.current_thread().name == self._gated_thread_name:
+            self._entered.set()
+            assert self._release.wait(timeout=5)
+        return self
+
+    def __exit__(self, *args) -> None:
+        self._lock.release()
+
+
 def test_boot_id_differs_across_coordinator_constructions() -> None:
     first = _coordinator(_free_control_endpoint(), boot_id=None)
     second = _coordinator(_free_control_endpoint(), boot_id=None)
@@ -903,6 +926,62 @@ def test_register_pending_is_idempotent() -> None:
         assert coordinator._pending_keys == {key}
     finally:
         coordinator.close()
+
+
+def test_register_pending_after_close_raises_without_retaining_key() -> None:
+    coordinator = PathDecisionCoordinator()
+    key = _request().request_key
+
+    coordinator.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        coordinator.register_pending(key)
+    assert coordinator._pending_keys == set()
+
+
+@pytest.mark.parametrize("first_operation", ["register", "close"])
+def test_register_pending_and_close_linearize_without_retained_key(first_operation: str) -> None:
+    coordinator = PathDecisionCoordinator()
+    key = _request().request_key
+    gate_entered = threading.Event()
+    release_gate = threading.Event()
+    register_errors: list[BaseException] = []
+    coordinator._registry_lock = _GatedRegistryLock(
+        gated_thread_name=first_operation,
+        entered=gate_entered,
+        release=release_gate,
+    )
+
+    def register() -> None:
+        try:
+            coordinator.register_pending(key)
+        except BaseException as error:  # noqa: BLE001
+            register_errors.append(error)
+
+    register_thread = threading.Thread(target=register, name="register")
+    close_thread = threading.Thread(target=coordinator.close, name="close")
+    first_thread, second_thread = (
+        (register_thread, close_thread)
+        if first_operation == "register"
+        else (close_thread, register_thread)
+    )
+
+    first_thread.start()
+    assert gate_entered.wait(timeout=5)
+    second_thread.start()
+    release_gate.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert coordinator._pending_keys == set()
+    if first_operation == "register":
+        assert register_errors == []
+    else:
+        assert len(register_errors) == 1
+        assert isinstance(register_errors[0], RuntimeError)
+        assert "closed" in str(register_errors[0])
 
 
 def test_unregister_removes_key_from_pending_and_accepted_registries() -> None:

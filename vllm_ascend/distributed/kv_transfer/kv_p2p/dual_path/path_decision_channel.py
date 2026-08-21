@@ -457,6 +457,8 @@ class PathDecisionCoordinator:
         # Unlike unregister, this also takes _lifecycle_lock so close() cannot
         # clear pending state and then observe a fresh registration.
         with self._lifecycle_lock, self._registry_lock:
+            if self._closed:
+                raise RuntimeError("path decision coordinator is closed")
             self._pending_keys.add(key)
 
     def unregister(self, key: DualPathRequestKey) -> None:
