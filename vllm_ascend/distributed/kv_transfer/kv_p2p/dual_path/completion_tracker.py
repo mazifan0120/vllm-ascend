@@ -175,3 +175,45 @@ class TransferCompletionTracker:
     def fail_completion(self, completion_id: int) -> bool:
         """Record one failed worker terminal; True iff this closes the record."""
         return self.tally_reports(completion_id, failure_count=1)
+
+    def force_fail_completion(
+        self,
+        completion_id: int,
+        *,
+        expected_kind: CompletionKind,
+        expected_attempt_key: ReverseAttemptKey,
+    ) -> bool:
+        """Fail an exact completion, closing only if no worker ever started.
+
+        Used when the peer reports a failure out of band. If the transfer never
+        started, no worker terminal can fill the barrier. Once a worker has
+        reported, preserve the all-worker barrier and only latch failure; the
+        remaining workers own closure.
+        """
+        record = self._records.get(completion_id)
+        if record is None or record.closed:
+            return False
+        if (
+            record.completion_kind is not expected_kind
+            or record.reverse_attempt_key != expected_attempt_key
+        ):
+            raise RuntimeError("completion identity mismatch while force-failing attempt")
+        record.failed = True
+        if record.completed_worker_count != 0:
+            return False
+        record.closed = True
+        return True
+
+    def has_open_completion(
+        self,
+        completion_kind: CompletionKind,
+        request_key: DualPathRequestKey,
+    ) -> bool:
+        """Whether an open completion of ``completion_kind`` owns ``request_key``."""
+        return any(
+            not record.closed
+            and record.completion_kind is completion_kind
+            and record.reverse_attempt_key is not None
+            and record.reverse_attempt_key.request_key == request_key
+            for record in self._records.values()
+        )

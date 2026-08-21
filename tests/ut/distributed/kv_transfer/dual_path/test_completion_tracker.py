@@ -142,6 +142,132 @@ class TestTransferCompletionTracker:
                 expected_attempt_key=attempt_key,
             )
 
+    def test_force_fail_completion_closes_exact_unstarted_record(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 2)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=3,
+            reverse_attempt_key=attempt_key,
+        )
+
+        assert (
+            tracker.force_fail_completion(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is True
+        )
+        assert completion.closed and completion.failed
+
+    def test_force_fail_completion_latches_but_preserves_started_worker_barrier(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 2)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=2,
+            reverse_attempt_key=attempt_key,
+        )
+        assert tracker.tally_reports(completion.completion_id, success_count=1) is False
+
+        assert (
+            tracker.force_fail_completion(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is False
+        )
+        assert completion.failed and not completion.closed
+
+    def test_force_fail_completion_rejects_identity_mismatch(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 2)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=1,
+            reverse_attempt_key=attempt_key,
+        )
+
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            tracker.force_fail_completion(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_SEND,
+                expected_attempt_key=attempt_key,
+            )
+
+    def test_force_fail_completion_ignores_unknown_or_closed_record(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        attempt_key = ReverseAttemptKey(DualPathRequestKey("decode", "request", 0), 2)
+        completion = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=1,
+            reverse_attempt_key=attempt_key,
+        )
+
+        assert (
+            tracker.force_fail_completion(
+                completion.completion_id + 1,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is False
+        )
+        assert (
+            tracker.force_fail_completion(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is True
+        )
+        assert (
+            tracker.force_fail_completion(
+                completion.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt_key,
+            )
+            is False
+        )
+
+    def test_has_open_completion_for_exact_request_key(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        request_key = DualPathRequestKey("decode", "request", 0)
+        attempt_0 = ReverseAttemptKey(request_key, 0)
+        attempt_1 = ReverseAttemptKey(request_key, 1)
+        records = [
+            tracker.open_completion(
+                completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_worker_count=1,
+                reverse_attempt_key=attempt,
+            )
+            for attempt in (attempt_0, attempt_1)
+        ]
+        tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=1,
+            reverse_attempt_key=ReverseAttemptKey(
+                DualPathRequestKey("decode", "request", 1),
+                0,
+            ),
+        )
+
+        assert tracker.has_open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, request_key)
+        for record, attempt in zip(records, (attempt_0, attempt_1), strict=True):
+            tracker.force_fail_completion(
+                record.completion_id,
+                expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+                expected_attempt_key=attempt,
+            )
+        assert not tracker.has_open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, request_key)
+        assert tracker.open_count() == 1
+
     def test_invalid_expected_worker_count_rejected(self):
         completion_tracker = _completion_tracker()
         tracker = completion_tracker.TransferCompletionTracker()
