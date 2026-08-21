@@ -343,6 +343,61 @@ class TestDecodeFailureRelay:
             for call in scheduler_logger.error.call_args_list
         )
 
+    def test_late_failure_for_old_admission_does_not_fail_same_id_replacement(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        old_request = _admit_decode_request(scheduler)
+        old_state = scheduler._decode_decision_states[old_request.request_id]
+        old_key = old_state.request_key
+        activation_metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A),
+        )
+        completion_id = activation_metadata.reverse_plans[0].reverse_send_completion_id
+        old_request.status = RequestStatus.FINISHED_STOPPED
+        assert scheduler.request_finished(old_request, []) == (True, None)
+        assert scheduler._decode_late_abort_endpoints == {
+            old_key: _PREFILL_ENDPOINT_A
+        }
+
+        replacement = _admit_decode_request(scheduler)
+        replacement_state = scheduler._decode_decision_states[replacement.request_id]
+        replacement_key = replacement_state.request_key
+        assert replacement_key != old_key
+        assert replacement_state.status.value == "PENDING"
+        decode_control_seams.decode_coordinator.register_pending.assert_called_with(
+            replacement_key
+        )
+        decode_control_seams.decode_coordinator.unregister.reset_mock()
+
+        with patch.object(
+            scheduler,
+            "_build_decode_control_failure",
+        ) as build_failure:
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=make_worker_metadata(
+                        failure_reports={completion_id: 1}
+                    )
+                )
+            )
+
+        assert replacement_state.status.value == "PENDING"
+        assert scheduler._decode_decision_states[replacement.request_id] is replacement_state
+        decode_control_seams.decode_coordinator.unregister.assert_not_called()
+        build_failure.assert_not_called()
+        assert replacement.request_id not in scheduler._decode_control_failures
+        assert old_key not in scheduler._decode_late_abort_endpoints
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            PathAbortNotice(
+                request_key=old_key,
+                reason=PathAbortReason.ACTIVATION_FAILED,
+            ),
+        )
+
 
 class TestBoundedCompletions:
     def test_failed_reverse_completion_surfaces_control_failure(self, pe_scheduler_factory):

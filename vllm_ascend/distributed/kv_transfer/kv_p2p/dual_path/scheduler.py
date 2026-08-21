@@ -2056,14 +2056,20 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 failed_request_id = self._request_for_failed_completion(completion)
                 if failed_request_id is not None:
                     if self.dual_path_cfg.role == "decode":
+                        attempt_key = completion.reverse_attempt_key
+                        failed_key = None if attempt_key is None else attempt_key.request_key
                         state = self._decode_decision_states.get(failed_request_id)
                         snapshot = self._decode_kv_snapshots.get(failed_request_id)
-                        if state is None or snapshot is None:
-                            attempt_key = completion.reverse_attempt_key
+                        if (
+                            failed_key is None
+                            or state is None
+                            or state.request_key != failed_key
+                            or snapshot is None
+                        ):
                             endpoint = (
                                 None
-                                if attempt_key is None
-                                else self._decode_late_abort_endpoints.pop(attempt_key.request_key, None)
+                                if failed_key is None
+                                else self._decode_late_abort_endpoints.pop(failed_key, None)
                             )
                             if endpoint is None:
                                 logger.error(
@@ -2072,9 +2078,8 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                                     failed_request_id,
                                 )
                             else:
-                                assert attempt_key is not None
                                 self._send_abort_notice(
-                                    attempt_key.request_key,
+                                    failed_key,
                                     endpoint,
                                     PathAbortReason.ACTIVATION_FAILED,
                                 )
