@@ -379,6 +379,36 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
 
 
 class TestKVCacheStoreRecvingThread(unittest.TestCase):
+    def _assert_unbounded_malformed_status_fails_all(self, status, request_id):
+        invalid_block_ids: set[int] = set()
+        store = FakeStore()
+        store.get = MagicMock(return_value=status)
+        thread = KVCacheStoreRecvingThread(
+            m_store=store,
+            token_database=FakeTokenDatabase(),
+            block_size=16,
+            tp_rank=0,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_ids_lock=threading.Lock(),
+        )
+        request = ReqMeta(
+            req_id=request_id,
+            token_len_chunk=48,
+            block_ids=[10, 11, 12],
+            block_hashes=[b"h0", b"h1", b"h2"],  # type: ignore[arg-type]
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=48, can_load=True, token_len=48),
+        )
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(store.get.call_count, 1)
+        self.assertEqual(invalid_block_ids, {10, 11, 12})
+        self.assertEqual(thread.get_and_clear_finished_requests(), {request_id})
+        self.assertEqual(thread.request_queue.unfinished_tasks, 0)
+
     def test_handle_request(self):
         store = FakeStore()
         db = FakeTokenDatabase()
@@ -546,6 +576,36 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         self.assertEqual(invalid_block_ids, {10, 11})
         self.assertEqual(thread.get_and_clear_finished_requests(), {"long-status-request"})
         self.assertEqual(thread.request_queue.unfinished_tasks, 0)
+
+    def test_handle_request_marks_unbounded_short_zero_status_failed(self):
+        self._assert_unbounded_malformed_status_fails_all(
+            [0, 0],
+            "unbounded-short-zero-status-request",
+        )
+
+    def test_handle_request_marks_unbounded_short_failure_status_failed(self):
+        self._assert_unbounded_malformed_status_fails_all(
+            [1, 0],
+            "unbounded-short-failure-status-request",
+        )
+
+    def test_handle_request_marks_unbounded_long_status_failed(self):
+        self._assert_unbounded_malformed_status_fails_all(
+            [0, 0, 0, 0],
+            "unbounded-long-status-request",
+        )
+
+    def test_handle_request_marks_unbounded_none_status_failed(self):
+        self._assert_unbounded_malformed_status_fails_all(
+            None,
+            "unbounded-none-status-request",
+        )
+
+    def test_handle_request_marks_unbounded_non_vector_status_failed(self):
+        self._assert_unbounded_malformed_status_fails_all(
+            0,
+            "unbounded-non-vector-status-request",
+        )
 
 
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")

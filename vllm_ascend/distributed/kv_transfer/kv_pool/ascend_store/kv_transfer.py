@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Set
 from typing import Any
 
 import numpy as np
@@ -881,23 +882,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             sub_keys = [key_list[i] for i in batch]
             sub_addrs = [addr_list[i] for i in batch]
             sub_sizes = [size_list[i] for i in batch]
-            sub_ret = self.m_store.get(sub_keys, sub_addrs, sub_sizes)
-            if sub_ret is None:
-                for index in batch:
-                    results[index] = 1
-            else:
-                if len(sub_ret) != len(batch):
-                    logger.error(
-                        "KV pool async recv get protocol error: received %d statuses for %d keys; "
-                        "marking submitted batch failed",
-                        len(sub_ret),
-                        len(batch),
-                    )
-                    for index in batch:
-                        results[index] = 1
-                    continue
-                for index, code in zip(batch, sub_ret, strict=True):
-                    results[index] = code
+            sub_ret = _normalize_get_statuses(
+                self.m_store.get(sub_keys, sub_addrs, sub_sizes),
+                len(batch),
+            )
+            for index, code in zip(batch, sub_ret, strict=True):
+                results[index] = code
         if len(batches) > 1 or oversized:
             logger.info(
                 "KV pool async recv chunked get: keys=%d batches=%d oversized=%d "
@@ -968,7 +958,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         )
         budgets = self._staging_get_budgets()
         if budgets is None:
-            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            ret = _normalize_get_statuses(
+                self.m_store.get(key_list_c, addr_list_c, size_list_c),
+                len(key_list_c),
+            )
         else:
             raw_budget_bytes, usable_budget_bytes = budgets
             ret = self._chunked_store_get(
@@ -978,26 +971,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 usable_budget_bytes=usable_budget_bytes,
                 raw_budget_bytes=raw_budget_bytes,
             )
-        if ret is not None and any(r != 0 for r in ret):
+        if any(r != 0 for r in ret):
             missing_block_ids = record_failed_blocks(
                 block_id_list_c,
                 ret,
-            )
-            if len(req_meta.block_ids_by_group) == 1:
-                with self._invalid_block_ids_lock:
-                    self._invalid_block_ids.update(missing_block_ids)
-            elif missing_block_ids:
-                logger.error(
-                    "KV load failed for hybrid request %s. "
-                    "Skip invalid-block fallback to avoid scheduler crash. "
-                    "failed_blocks=%s",
-                    req_id,
-                    missing_block_ids,
-                )
-        elif ret is None:
-            missing_block_ids = record_failed_blocks(
-                block_id_list_c,
-                [1] * len(block_id_list_c),
             )
             if len(req_meta.block_ids_by_group) == 1:
                 with self._invalid_block_ids_lock:
@@ -1643,6 +1620,41 @@ def _align_up(value: int, alignment: int) -> int:
 
 def _estimate_get_staging_bytes(key_sizes: list[int]) -> int:
     return _align_up(sum(key_sizes), _GET_STAGING_ALIGNMENT_BYTES) + _GET_STAGING_PADDING_BYTES
+
+
+def _normalize_get_statuses(statuses: Any, expected_count: int) -> list[int]:
+    """Return one backend status per submitted key, failing malformed results closed."""
+    failed_statuses = [1] * expected_count
+    if statuses is None or not isinstance(statuses, Iterable) or isinstance(
+        statuses,
+        (str, bytes, bytearray, Mapping, Set),
+    ):
+        logger.error(
+            "KV pool async recv get protocol error: expected %d statuses, received non-vector type %s; "
+            "marking submitted batch failed",
+            expected_count,
+            type(statuses).__name__,
+        )
+        return failed_statuses
+    try:
+        normalized = list(statuses)
+    except TypeError:
+        logger.error(
+            "KV pool async recv get protocol error: expected %d statuses, received invalid vector type %s; "
+            "marking submitted batch failed",
+            expected_count,
+            type(statuses).__name__,
+        )
+        return failed_statuses
+    if len(normalized) != expected_count:
+        logger.error(
+            "KV pool async recv get protocol error: received %d statuses for %d keys; "
+            "marking submitted batch failed",
+            len(normalized),
+            expected_count,
+        )
+        return failed_statuses
+    return normalized
 
 
 def _plan_get_batches(
