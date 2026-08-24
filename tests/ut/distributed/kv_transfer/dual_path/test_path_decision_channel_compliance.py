@@ -2,13 +2,19 @@ import queue
 import threading
 from unittest.mock import patch
 
+import pytest
 import zmq
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import path_decision_channel
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
+    PathAbortNotice,
+    PathAbortReason,
+    PathDecisionValidationError,
     PathDecisionResult,
     PathKind,
+    ReverseTerminalNotice,
+    ReverseTerminalState,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DecodeControlEndpoint,
@@ -60,6 +66,48 @@ class _MidDrainInjectingQueue(queue.SimpleQueue[PathDecision]):
         with self._registry_lock:
             self.put(self._late_decision)
         self._producer_finished.set()
+
+
+@pytest.mark.parametrize(
+    ("reverse_attempt_id", "state"),
+    [
+        (True, ReverseTerminalState.TERMINALIZED),
+        (-1, ReverseTerminalState.TERMINALIZED),
+        (3, "TERMINALIZED"),
+    ],
+)
+def test_reverse_terminal_notice_rejects_ambiguous_or_invalid_fields(
+    reverse_attempt_id: int,
+    state: object,
+) -> None:
+    with pytest.raises(PathDecisionValidationError):
+        ReverseTerminalNotice(
+            reverse_attempt_id=reverse_attempt_id,
+            state=state,
+        )
+
+
+@pytest.mark.parametrize(
+    "reverse_terminal",
+    [
+        {"reverse_attempt_id": 3, "state": "TERMINALIZED", "unexpected": "field"},
+        {"reverse_attempt_id": 3},
+        {"state": "TERMINALIZED"},
+    ],
+)
+def test_path_abort_rejects_non_exact_reverse_terminal_payload(reverse_terminal: object) -> None:
+    with pytest.raises(PathDecisionValidationError):
+        PathAbortNotice.from_dict(
+            {
+                "request_key": {
+                    "decode_engine_instance_id": "decode",
+                    "decode_request_id": "request",
+                    "admission_id": 0,
+                },
+                "reason": PathAbortReason.ACTIVATION_FAILED.value,
+                "reverse_terminal": reverse_terminal,
+            }
+        )
 
 
 def test_take_received_decisions_defers_decision_enqueued_during_drain() -> None:

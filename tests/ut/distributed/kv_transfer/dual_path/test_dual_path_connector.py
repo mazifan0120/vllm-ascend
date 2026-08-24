@@ -78,9 +78,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.connector import (  # 
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (  # noqa: E402
     DualPathConnectorMetadata,
+    ReverseReceiveFailureTerminal,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (  # noqa: E402
     DualPathRequestKey,
+    PathDecisionValidationError,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (  # noqa: E402
     DecodeControlEndpoint,
@@ -242,6 +244,46 @@ class MockSchedulerOutput:
         self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens or {}
         self.scheduled_new_reqs = new_reqs or []
         self.num_scheduled_tokens = num_sched or {}
+
+
+class TestDualPathConnectorMetadataContracts(unittest.TestCase):
+    def test_reverse_receive_failure_terminal_validates_exact_attempt_wire_identity(self):
+        request_key = DualPathRequestKey("decode", "request", 0)
+        terminal = ReverseReceiveFailureTerminal(
+            request_key=request_key,
+            reverse_attempt_id=3,
+            reverse_receive_completion_id=17,
+            wire_request_id="ra:decode:request:0:3",
+        )
+
+        self.assertEqual(terminal.request_key, request_key)
+        self.assertEqual(terminal.reverse_attempt_id, 3)
+        self.assertEqual(terminal.reverse_receive_completion_id, 17)
+        self.assertEqual(terminal.wire_request_id, "ra:decode:request:0:3")
+
+        for kwargs in (
+            {"reverse_attempt_id": True},
+            {"reverse_attempt_id": -1},
+            {"reverse_receive_completion_id": True},
+            {"reverse_receive_completion_id": -1},
+            {"wire_request_id": ""},
+            {"wire_request_id": "ra:decode:request:0:4"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(PathDecisionValidationError):
+                ReverseReceiveFailureTerminal(
+                    request_key=request_key,
+                    reverse_attempt_id=kwargs.get("reverse_attempt_id", 3),
+                    reverse_receive_completion_id=kwargs.get("reverse_receive_completion_id", 17),
+                    wire_request_id=kwargs.get("wire_request_id", "ra:decode:request:0:3"),
+                )
+
+    def test_connector_metadata_allocates_independent_failure_terminal_lists(self):
+        first = DualPathConnectorMetadata()
+        second = DualPathConnectorMetadata()
+
+        self.assertEqual(first.reverse_receive_failure_terminals, [])
+        self.assertEqual(second.reverse_receive_failure_terminals, [])
+        self.assertIsNot(first.reverse_receive_failure_terminals, second.reverse_receive_failure_terminals)
 
 
 def make_kv_transfer_config(kv_role):

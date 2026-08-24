@@ -13,7 +13,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     JsonValue,
     PathDecisionValidationError,
     PathKind,
+    ReverseAttemptKey,
     require_exact_payload,
+    reverse_wire_id,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorMetadata,
@@ -304,6 +306,33 @@ class ReverseReceiveBinding:
         object.__setattr__(self, "destination_block_ids", destination_block_ids)
 
 
+@dataclass(frozen=True)
+class ReverseReceiveFailureTerminal:
+    request_key: DualPathRequestKey
+    reverse_attempt_id: int
+    reverse_receive_completion_id: int
+    wire_request_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request_key, DualPathRequestKey):
+            raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
+        _validate_non_negative_integers(
+            (
+                ("reverse_attempt_id", self.reverse_attempt_id),
+                ("reverse_receive_completion_id", self.reverse_receive_completion_id),
+            )
+        )
+        _validate_non_empty_strings((("wire_request_id", self.wire_request_id),))
+        expected_wire_request_id = reverse_wire_id(
+            ReverseAttemptKey(
+                request_key=self.request_key,
+                reverse_attempt_id=self.reverse_attempt_id,
+            )
+        )
+        if self.wire_request_id != expected_wire_request_id:
+            raise PathDecisionValidationError("wire_request_id must match the Reverse attempt identity")
+
+
 class DualPathControlFailureReason(str, Enum):
     ACTIVATION_FAILED = "ACTIVATION_FAILED"
     REVERSE_JOB_FAILED = "REVERSE_JOB_FAILED"
@@ -359,6 +388,7 @@ class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):
     forward_receive_bindings: list[ForwardReceiveBinding]
     reverse_plans: list[ReversePlan]
     reverse_receive_bindings: list[ReverseReceiveBinding]
+    reverse_receive_failure_terminals: list[ReverseReceiveFailureTerminal]
     decode_store_metadata: AscendConnectorMetadata | None
 
     def __init__(self) -> None:
@@ -367,4 +397,5 @@ class DualPathConnectorMetadata(MooncakeLayerwiseConnectorMetadata):
         self.forward_receive_bindings = []
         self.reverse_plans = []
         self.reverse_receive_bindings = []
+        self.reverse_receive_failure_terminals = []
         self.decode_store_metadata = None

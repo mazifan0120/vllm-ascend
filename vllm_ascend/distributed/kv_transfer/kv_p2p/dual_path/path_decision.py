@@ -73,26 +73,78 @@ class PathAbortReason(str, Enum):
     REQUEST_ABORTED = "REQUEST_ABORTED"
 
 
+class ReverseTerminalState(str, Enum):
+    TERMINALIZED = "TERMINALIZED"
+
+
+@dataclass(frozen=True)
+class ReverseTerminalNotice:
+    reverse_attempt_id: int
+    state: ReverseTerminalState
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.reverse_attempt_id, bool)
+            or not isinstance(self.reverse_attempt_id, int)
+            or self.reverse_attempt_id < 0
+        ):
+            raise PathDecisionValidationError("reverse_attempt_id must be a non-negative integer")
+        if not isinstance(self.state, ReverseTerminalState):
+            raise PathDecisionValidationError("state must be a ReverseTerminalState")
+
+    def to_dict(self) -> JsonObject:
+        return {
+            "reverse_attempt_id": self.reverse_attempt_id,
+            "state": self.state.value,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: JsonValue) -> ReverseTerminalNotice:
+        data = require_exact_payload(
+            payload,
+            frozenset({"reverse_attempt_id", "state"}),
+        )
+        try:
+            state = ReverseTerminalState(data["state"])
+        except (TypeError, ValueError) as error:
+            raise PathDecisionValidationError("serialized reverse terminal state is not valid") from error
+        return cls(
+            reverse_attempt_id=data["reverse_attempt_id"],
+            state=state,
+        )
+
+
 @dataclass(frozen=True)
 class PathAbortNotice:
     request_key: DualPathRequestKey
     reason: PathAbortReason
+    reverse_terminal: ReverseTerminalNotice | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
             raise PathDecisionValidationError("request_key must be a DualPathRequestKey")
         if not isinstance(self.reason, PathAbortReason):
             raise PathDecisionValidationError("reason must be a PathAbortReason")
+        if self.reverse_terminal is not None and not isinstance(self.reverse_terminal, ReverseTerminalNotice):
+            raise PathDecisionValidationError("reverse_terminal must be a ReverseTerminalNotice or None")
 
     def to_dict(self) -> JsonObject:
-        return {
+        data: JsonObject = {
             "request_key": self.request_key.to_dict(),
             "reason": self.reason.value,
         }
+        if self.reverse_terminal is not None:
+            data["reverse_terminal"] = self.reverse_terminal.to_dict()
+        return data
 
     @classmethod
     def from_dict(cls, payload: JsonValue) -> PathAbortNotice:
-        data = require_exact_payload(payload, frozenset({"request_key", "reason"}))
+        if not isinstance(payload, dict):
+            raise PathDecisionValidationError("serialized payload must be a dictionary")
+        expected_keys = frozenset({"request_key", "reason"})
+        if "reverse_terminal" in payload:
+            expected_keys = expected_keys | {"reverse_terminal"}
+        data = require_exact_payload(payload, expected_keys)
         try:
             reason = PathAbortReason(data["reason"])
         except (TypeError, ValueError) as error:
@@ -100,6 +152,11 @@ class PathAbortNotice:
         return cls(
             request_key=DualPathRequestKey.from_dict(data["request_key"]),
             reason=reason,
+            reverse_terminal=(
+                None
+                if "reverse_terminal" not in data
+                else ReverseTerminalNotice.from_dict(data["reverse_terminal"])
+            ),
         )
 
 

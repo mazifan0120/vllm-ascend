@@ -30,6 +30,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionResult,
     PathDecisionValidationError,
     PathKind,
+    ReverseTerminalNotice,
+    ReverseTerminalState,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DecisionReplyStatus,
@@ -39,6 +41,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     PathDecisionCoordinator,
     PathDecisionDeliveryError,
     _deliver_decision,
+    decode_path_abort,
     decode_path_decision,
     encode_decision_reply,
     encode_path_abort,
@@ -100,6 +103,52 @@ _PROTOCOL_ERROR_BYTES = encode_decision_reply(DecisionReplyStatus.PROTOCOL_ERROR
 
 def _result_payload() -> JsonObject:
     return {"request_key": _key_payload(), "path": "PE_READ"}
+
+
+def test_path_abort_without_reverse_terminal_preserves_legacy_wire_payload() -> None:
+    notice = PathAbortNotice(
+        request_key=_request().request_key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+    )
+    expected_payload: JsonObject = {
+        "request_key": {
+            "decode_engine_instance_id": "decode-engine-1:0:boot-1",
+            "decode_request_id": "request-1",
+            "admission_id": 0,
+        },
+        "reason": "ACTIVATION_FAILED",
+    }
+
+    assert notice.to_dict() == expected_payload
+    assert PathAbortNotice.from_dict(expected_payload) == notice
+    assert decode_path_abort(encode_path_abort(notice)) == notice
+
+
+def test_path_abort_with_reverse_terminal_serializes_exact_proof_payload() -> None:
+    notice = PathAbortNotice(
+        request_key=_request().request_key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+        reverse_terminal=ReverseTerminalNotice(
+            reverse_attempt_id=3,
+            state=ReverseTerminalState.TERMINALIZED,
+        ),
+    )
+    expected_payload: JsonObject = {
+        "request_key": {
+            "decode_engine_instance_id": "decode-engine-1:0:boot-1",
+            "decode_request_id": "request-1",
+            "admission_id": 0,
+        },
+        "reason": "ACTIVATION_FAILED",
+        "reverse_terminal": {
+            "reverse_attempt_id": 3,
+            "state": "TERMINALIZED",
+        },
+    }
+
+    assert notice.to_dict() == expected_payload
+    assert PathAbortNotice.from_dict(expected_payload) == notice
+    assert decode_path_abort(encode_path_abort(notice)) == notice
 
 
 def _reverse_plan(key: DualPathRequestKey) -> ReversePlan:
