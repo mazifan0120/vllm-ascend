@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
@@ -38,11 +38,15 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
     PathAbortNotice,
     PathAbortReason,
+    PathDecisionResult,
     PathKind,
     ReverseAttemptKey,
+    ReverseTerminalNotice,
+    ReverseTerminalState,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
     DecodeControlEndpoint,
+    PathDecision,
 )
 
 
@@ -105,10 +109,18 @@ class TestDecodeFailureRelay:
         )
 
     @staticmethod
-    def _expected_abort() -> PathAbortNotice:
+    def _expected_abort(reverse_attempt_id: int | None = None) -> PathAbortNotice:
         return PathAbortNotice(
             request_key=_REQUEST_KEY,
             reason=PathAbortReason.ACTIVATION_FAILED,
+            reverse_terminal=(
+                None
+                if reverse_attempt_id is None
+                else ReverseTerminalNotice(
+                    reverse_attempt_id=reverse_attempt_id,
+                    state=ReverseTerminalState.TERMINALIZED,
+                )
+            ),
         )
 
     def test_decode_activation_validation_failure_sends_abort_without_persisting_untrusted_endpoint(
@@ -132,7 +144,7 @@ class TestDecodeFailureRelay:
         ]
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(),
+            self._expected_abort(0),
         )
 
     def test_decode_worker_failure_uses_persisted_prefill_endpoint(
@@ -163,7 +175,7 @@ class TestDecodeFailureRelay:
         )
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(),
+            self._expected_abort(0),
         )
 
     def test_decode_failure_still_sends_abort_when_control_failure_build_raises(
@@ -189,7 +201,7 @@ class TestDecodeFailureRelay:
         decode_control_seams.decode_coordinator.unregister.assert_called_with(state.request_key)
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(),
+            self._expected_abort(0),
         )
 
     def test_decode_failure_without_endpoint_is_local_only(
@@ -211,6 +223,76 @@ class TestDecodeFailureRelay:
             DualPathControlFailureReason.ACTIVATION_FAILED
         ]
         decode_control_seams.decode_coordinator.submit_abort.assert_not_called()
+
+    def test_pe_read_activation_failure_sends_abort_without_reverse_terminal_proof(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        decision = PathDecision(
+            result=PathDecisionResult(
+                request_key=_REQUEST_KEY,
+                path=PathKind.PE_READ,
+            ),
+            reverse_plan=None,
+            prefill_control_endpoint=_PREFILL_ENDPOINT_A,
+        )
+
+        with patch.object(
+            scheduler,
+            "_validate_committed_decision",
+            side_effect=RuntimeError("forward activation failed"),
+        ):
+            _activate_decision(scheduler, decode_control_seams, decision)
+
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(),
+        )
+
+    def test_decode_failed_reverse_send_waits_for_tp_barrier_before_terminal_proof(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory(world_size=2)
+        _admit_decode_request(scheduler)
+        metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(
+                0,
+                _PREFILL_ENDPOINT_A,
+                remote_tp_size=2,
+            ),
+        )
+        completion_id = metadata.reverse_plans[0].reverse_send_completion_id
+
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=make_worker_metadata(
+                    failure_reports={completion_id: 1}
+                )
+            )
+        )
+
+        completion = scheduler._completion_tracker.get(completion_id)
+        assert completion is not None
+        assert completion.failed is True
+        assert completion.closed is False
+        decode_control_seams.decode_coordinator.submit_abort.assert_not_called()
+
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=make_worker_metadata(
+                    completion_reports={completion_id: 1}
+                )
+            )
+        )
+
+        assert scheduler._completion_tracker.get(completion_id) is None
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(0),
+        )
 
     def test_failed_attempt_refresh_does_not_force_close_older_inflight_attempt(
         self, decode_scheduler_factory, decode_control_seams
@@ -237,7 +319,7 @@ class TestDecodeFailureRelay:
         assert completion is not None and completion.closed is False
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(),
+            self._expected_abort(1),
         )
         request.status = RequestStatus.FINISHED_STOPPED
         assert scheduler.request_finished(request, []) == (True, None)
@@ -284,7 +366,7 @@ class TestDecodeFailureRelay:
         assert refresh_metadata.reverse_plans == []
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(),
+            self._expected_abort(1),
         )
 
     def test_decode_late_worker_failure_after_request_finish_still_notifies_prefill(
@@ -312,12 +394,7 @@ class TestDecodeFailureRelay:
             request_key: _PREFILL_ENDPOINT_A
         }
 
-        with (
-            patch.object(scheduler, "_build_decode_control_failure") as build_failure,
-            patch(
-                "vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.scheduler.logger"
-            ) as scheduler_logger,
-        ):
+        with patch.object(scheduler, "_build_decode_control_failure") as build_failure:
             scheduler.update_connector_output(
                 KVConnectorOutput(
                     kv_connector_worker_meta=make_worker_metadata(
@@ -335,14 +412,10 @@ class TestDecodeFailureRelay:
 
         build_failure.assert_not_called()
         assert request_key not in scheduler._decode_late_abort_endpoints
-        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
-            _PREFILL_ENDPOINT_A,
-            self._expected_abort(),
-        )
-        assert any(
-            "has no Decode state or snapshot" in str(call)
-            for call in scheduler_logger.error.call_args_list
-        )
+        assert decode_control_seams.decode_coordinator.submit_abort.call_args_list == [
+            call(_PREFILL_ENDPOINT_A, self._expected_abort(0)),
+            call(_PREFILL_ENDPOINT_A, self._expected_abort(1)),
+        ]
 
     def test_late_failure_retires_old_admission_before_same_id_replacement(
         self, decode_scheduler_factory, decode_control_seams
@@ -398,6 +471,10 @@ class TestDecodeFailureRelay:
             PathAbortNotice(
                 request_key=old_key,
                 reason=PathAbortReason.ACTIVATION_FAILED,
+                reverse_terminal=ReverseTerminalNotice(
+                    reverse_attempt_id=0,
+                    state=ReverseTerminalState.TERMINALIZED,
+                ),
             ),
         )
 

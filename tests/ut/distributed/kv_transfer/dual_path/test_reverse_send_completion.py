@@ -307,6 +307,7 @@ def test_close_marks_the_send_completion_closed_and_not_failed(decode_scheduler_
     scheduler.update_connector_output(output)
     assert attempt_key not in scheduler._reverse_send_completion_ids
     assert scheduler._completion_tracker.get(completion_id) is None
+    decode_control_seams.decode_coordinator.submit_abort.assert_not_called()
 
 
 @pytest.mark.parametrize(
