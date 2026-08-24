@@ -81,6 +81,7 @@ def init_dual_path_worker_state(worker: DualPathConnectorWorker, role: str = "de
     worker._consumed_forward_terminal_wire_ids = {}
     worker._reverse_receive_bindings = {}
     worker._reverse_request_map = {}
+    worker._pending_reverse_receive_failure_terminals = {}
     worker._pending_reverse_done_wire_ids = set()
     worker._pending_reverse_failed_wire_ids = set()
     worker._consumed_reverse_terminal_wire_ids = {}

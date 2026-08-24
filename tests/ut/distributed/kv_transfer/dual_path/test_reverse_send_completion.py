@@ -35,6 +35,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathControlFailureReason,
     ReversePlan,
     ReverseReceiveBinding,
+    ReverseReceiveFailureTerminal,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     DualPathRequestKey,
@@ -124,6 +125,37 @@ def _seed_reverse_send_tracker(worker, reverse_send_completion_id: int, reverse_
     )
     worker._split_trackers[_REQUEST_ID] = tracker
     return tracker
+
+
+def _make_reverse_receive_binding(
+    *,
+    request_key: DualPathRequestKey = _REQUEST_KEY,
+    reverse_attempt_id: int = 0,
+    reverse_receive_completion_id: int = 91,
+) -> ReverseReceiveBinding:
+    attempt_key = _attempt_key(reverse_attempt_id, request_key)
+    return ReverseReceiveBinding(
+        request_key=request_key,
+        wire_request_id=path_decision_module.reverse_wire_id(attempt_key),
+        prefill_request_id="prefill-request-7",
+        destination_block_ids=((71, 72, 73, 74),),
+        token_start=16,
+        token_end=32,
+        reverse_attempt_id=reverse_attempt_id,
+        prefill_local_tokens=16,
+        reverse_receive_completion_id=reverse_receive_completion_id,
+    )
+
+
+def _make_reverse_receive_failure_terminal(
+    binding: ReverseReceiveBinding,
+) -> ReverseReceiveFailureTerminal:
+    return ReverseReceiveFailureTerminal(
+        request_key=binding.request_key,
+        reverse_attempt_id=binding.reverse_attempt_id,
+        reverse_receive_completion_id=binding.reverse_receive_completion_id,
+        wire_request_id=binding.wire_request_id,
+    )
 
 
 def _activate_two_reverse_attempts(scheduler, decode_control_seams):
@@ -337,6 +369,205 @@ def test_reverse_terminal_wire_payload_closes_prefill_receive_attempt(
     assert worker_metadata.failure_reports == ({} if trans_flag else expected_report)
     assert prefill_worker._pending_forward_done_wire_ids == set()
     assert prefill_worker._pending_forward_failed_wire_ids == set()
+
+
+def test_prefill_control_failure_after_binding_reports_exact_reverse_receive_failure():
+    worker = _make_prefill_worker()
+    binding = _make_reverse_receive_binding()
+    attempt_key = _attempt_key(binding.reverse_attempt_id, binding.request_key)
+    binding_metadata = DualPathConnectorMetadata()
+    binding_metadata.reverse_receive_bindings.append(binding)
+    worker.start_load_kv(binding_metadata)
+
+    terminal_metadata = DualPathConnectorMetadata()
+    terminal_metadata.reverse_receive_failure_terminals.append(_make_reverse_receive_failure_terminal(binding))
+    worker.start_load_kv(terminal_metadata)
+
+    worker_metadata = worker.build_connector_worker_meta()
+    assert worker_metadata is not None
+    assert worker_metadata.completion_reports == {}
+    assert worker_metadata.failure_reports == {binding.reverse_receive_completion_id: 1}
+    assert binding.wire_request_id not in worker._reverse_request_map
+    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: attempt_key}
+
+
+def test_prefill_control_failure_before_binding_waits_for_exact_reverse_attempt():
+    worker = _make_prefill_worker()
+    binding = _make_reverse_receive_binding()
+    terminal = _make_reverse_receive_failure_terminal(binding)
+    attempt_key = _attempt_key(binding.reverse_attempt_id, binding.request_key)
+    terminal_metadata = DualPathConnectorMetadata()
+    terminal_metadata.reverse_receive_failure_terminals.append(terminal)
+
+    worker.start_load_kv(terminal_metadata)
+
+    assert worker._pending_reverse_receive_failure_terminals == {attempt_key: terminal}
+    assert worker._reverse_request_map == {}
+    assert worker.build_connector_worker_meta() is None
+
+    binding_metadata = DualPathConnectorMetadata()
+    binding_metadata.reverse_receive_bindings.append(binding)
+    worker.start_load_kv(binding_metadata)
+
+    worker_metadata = worker.build_connector_worker_meta()
+    assert worker_metadata is not None
+    assert worker_metadata.completion_reports == {}
+    assert worker_metadata.failure_reports == {binding.reverse_receive_completion_id: 1}
+    assert worker._pending_reverse_receive_failure_terminals == {}
+    assert binding.wire_request_id not in worker._reverse_request_map
+    assert worker._consumed_reverse_terminal_wire_ids == {binding.wire_request_id: attempt_key}
+
+
+def test_duplicate_prefill_control_failure_does_not_report_twice():
+    worker = _make_prefill_worker()
+    binding = _make_reverse_receive_binding()
+    terminal = _make_reverse_receive_failure_terminal(binding)
+    metadata = DualPathConnectorMetadata()
+    metadata.reverse_receive_bindings.append(binding)
+    metadata.reverse_receive_failure_terminals.append(terminal)
+
+    worker.start_load_kv(metadata)
+    first_worker_metadata = worker.build_connector_worker_meta()
+    worker.start_load_kv(metadata)
+
+    assert first_worker_metadata is not None
+    assert first_worker_metadata.completion_reports == {}
+    assert first_worker_metadata.failure_reports == {binding.reverse_receive_completion_id: 1}
+    assert worker.build_connector_worker_meta() is None
+    assert worker._pending_reverse_receive_failure_terminals == {}
+
+
+@pytest.mark.parametrize("wire_terminal", ["done", "failed"])
+def test_late_reverse_wire_terminal_after_control_failure_does_not_report_twice(wire_terminal: str):
+    worker = _make_prefill_worker()
+    binding = _make_reverse_receive_binding()
+    metadata = DualPathConnectorMetadata()
+    metadata.reverse_receive_bindings.append(binding)
+    metadata.reverse_receive_failure_terminals.append(_make_reverse_receive_failure_terminal(binding))
+    worker.start_load_kv(metadata)
+    first_worker_metadata = worker.build_connector_worker_meta()
+    assert first_worker_metadata is not None
+    assert first_worker_metadata.failure_reports == {binding.reverse_receive_completion_id: 1}
+
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = (
+        {binding.wire_request_id} if wire_terminal == "done" else set()
+    )
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = (
+        {binding.wire_request_id} if wire_terminal == "failed" else set()
+    )
+
+    assert worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), set())
+    assert worker.build_connector_worker_meta() is None
+    assert binding.wire_request_id not in worker._reverse_request_map
+
+
+@pytest.mark.parametrize("wire_terminal", ["done", "failed"])
+def test_late_reverse_wire_terminal_pending_before_binding_does_not_report_twice(wire_terminal: str):
+    worker = _make_prefill_worker()
+    binding = _make_reverse_receive_binding()
+    terminal_metadata = DualPathConnectorMetadata()
+    terminal_metadata.reverse_receive_failure_terminals.append(_make_reverse_receive_failure_terminal(binding))
+    worker.start_load_kv(terminal_metadata)
+
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = (
+        {binding.wire_request_id} if wire_terminal == "done" else set()
+    )
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = (
+        {binding.wire_request_id} if wire_terminal == "failed" else set()
+    )
+    assert worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), set())
+    worker.kv_recv_layer_thread.get_and_clear_done_requests.return_value = set()
+    worker.kv_recv_layer_thread.get_and_clear_failed_requests.return_value = set()
+
+    binding_metadata = DualPathConnectorMetadata()
+    binding_metadata.reverse_receive_bindings.append(binding)
+    worker.start_load_kv(binding_metadata)
+
+    worker_metadata = worker.build_connector_worker_meta()
+    assert worker_metadata is not None
+    assert worker_metadata.failure_reports == {binding.reverse_receive_completion_id: 1}
+    assert worker._pending_reverse_done_wire_ids == set()
+    assert worker._pending_reverse_failed_wire_ids == set()
+    assert worker.get_finished(set(), DualPathConnectorMetadata()) == (set(), set())
+    assert worker.build_connector_worker_meta() is None
+
+
+def test_prefill_control_failure_does_not_match_same_request_id_across_admission_or_attempt():
+    worker = _make_prefill_worker()
+    failed_binding = _make_reverse_receive_binding()
+    live_request_key = replace(_REQUEST_KEY, admission_id=1)
+    live_binding = _make_reverse_receive_binding(
+        request_key=live_request_key,
+        reverse_attempt_id=1,
+        reverse_receive_completion_id=92,
+    )
+    failed_attempt_key = _attempt_key(failed_binding.reverse_attempt_id, failed_binding.request_key)
+    live_attempt_key = _attempt_key(live_binding.reverse_attempt_id, live_binding.request_key)
+    binding_metadata = DualPathConnectorMetadata()
+    binding_metadata.reverse_receive_bindings.extend((failed_binding, live_binding))
+    worker.start_load_kv(binding_metadata)
+
+    terminal_metadata = DualPathConnectorMetadata()
+    terminal_metadata.reverse_receive_failure_terminals.append(
+        _make_reverse_receive_failure_terminal(failed_binding)
+    )
+    worker.start_load_kv(terminal_metadata)
+
+    worker_metadata = worker.build_connector_worker_meta()
+    assert worker_metadata is not None
+    assert worker_metadata.completion_reports == {}
+    assert worker_metadata.failure_reports == {failed_binding.reverse_receive_completion_id: 1}
+    assert worker._reverse_receive_bindings[live_attempt_key] == live_binding
+    assert worker._reverse_request_map == {live_binding.wire_request_id: live_attempt_key}
+    assert worker._consumed_reverse_terminal_wire_ids == {
+        failed_binding.wire_request_id: failed_attempt_key,
+    }
+
+
+def test_prefill_control_failure_rejects_mismatched_completion_id():
+    worker = _make_prefill_worker()
+    binding = _make_reverse_receive_binding()
+    binding_metadata = DualPathConnectorMetadata()
+    binding_metadata.reverse_receive_bindings.append(binding)
+    worker.start_load_kv(binding_metadata)
+    terminal_metadata = DualPathConnectorMetadata()
+    terminal_metadata.reverse_receive_failure_terminals.append(
+        replace(
+            _make_reverse_receive_failure_terminal(binding),
+            reverse_receive_completion_id=binding.reverse_receive_completion_id + 1,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="mismatched Reverse receive failure terminal"):
+        worker.start_load_kv(terminal_metadata)
+
+    attempt_key = _attempt_key(binding.reverse_attempt_id, binding.request_key)
+    assert worker._reverse_receive_bindings[attempt_key] == binding
+    assert worker._reverse_request_map == {binding.wire_request_id: attempt_key}
+    assert worker._consumed_reverse_terminal_wire_ids == {}
+    assert worker.build_connector_worker_meta() is None
+
+
+def test_prefill_control_failure_rejects_mismatched_wire_id():
+    worker = _make_prefill_worker()
+    exact_binding = _make_reverse_receive_binding()
+    mismatched_binding = replace(exact_binding, wire_request_id="mismatched-binding-wire")
+    binding_metadata = DualPathConnectorMetadata()
+    binding_metadata.reverse_receive_bindings.append(mismatched_binding)
+    worker.start_load_kv(binding_metadata)
+    terminal_metadata = DualPathConnectorMetadata()
+    terminal_metadata.reverse_receive_failure_terminals.append(
+        _make_reverse_receive_failure_terminal(exact_binding)
+    )
+
+    with pytest.raises(RuntimeError, match="mismatched Reverse receive failure terminal"):
+        worker.start_load_kv(terminal_metadata)
+
+    attempt_key = _attempt_key(mismatched_binding.reverse_attempt_id, mismatched_binding.request_key)
+    assert worker._reverse_receive_bindings[attempt_key] == mismatched_binding
+    assert worker._reverse_request_map == {mismatched_binding.wire_request_id: attempt_key}
+    assert worker._consumed_reverse_terminal_wire_ids == {}
+    assert worker.build_connector_worker_meta() is None
 
 
 def test_reverse_terminal_is_not_visible_while_terminal_ack_is_blocked():
