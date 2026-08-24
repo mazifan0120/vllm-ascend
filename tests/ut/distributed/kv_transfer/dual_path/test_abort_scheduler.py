@@ -131,6 +131,38 @@ def test_same_drain_commits_decision_then_aborts_without_touching_completion_tra
     ]
 
 
+def test_decode_final_publication_gate_rejects_admission_frozen_during_validation(
+    decode_scheduler_factory,
+) -> None:
+    scheduler = decode_scheduler_factory()
+    request = _admit_decode_request(scheduler)
+    state = scheduler._decode_decision_states[request.request_id]
+    decision = _de_read_decision()
+    snapshot = scheduler._decode_kv_snapshots[request.request_id]
+    validate = scheduler._validate_committed_decision
+
+    def validate_then_freeze(*args, **kwargs):
+        validated = validate(*args, **kwargs)
+        scheduler._fail_decode_admission(
+            state,
+            snapshot,
+            local_reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+            peer_endpoint=decision.prefill_control_endpoint,
+            reverse_attempt_id=decision.result.reverse_attempt_id,
+        )
+        return validated
+
+    with patch.object(scheduler, "_validate_committed_decision", side_effect=validate_then_freeze):
+        metadata = scheduler_module.DualPathConnectorMetadata()
+        scheduler._activate_received_decision(decision, metadata)
+
+    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.reverse_admission_terminal == decision_model.ReverseAdmissionTerminalNotice(None)
+    assert metadata.reverse_plans == []
+    assert scheduler._completion_tracker.open_count() == 0
+    assert scheduler._reverse_send_completion_ids == {}
+
+
 def test_unknown_decode_abort_is_ignored(decode_scheduler_factory, decode_control_seams) -> None:
     scheduler = decode_scheduler_factory()
     unknown_key = decision_model.DualPathRequestKey(

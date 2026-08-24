@@ -36,6 +36,9 @@ from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion imp
 from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
     _make_prefill_worker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path import (
+    scheduler as scheduler_module,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathControlFailureReason,
 )
@@ -45,6 +48,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathAbortReason,
     PathDecisionResult,
     PathKind,
+    ReverseAdmissionTerminalNotice,
     ReverseAttemptKey,
     ReverseTerminalNotice,
     ReverseTerminalState,
@@ -117,7 +121,10 @@ class TestDecodeFailureRelay:
         )
 
     @staticmethod
-    def _expected_abort(reverse_attempt_id: int | None = None) -> PathAbortNotice:
+    def _expected_abort(
+        reverse_attempt_id: int | None,
+        may_have_started_through_attempt_id: int | None,
+    ) -> PathAbortNotice:
         return PathAbortNotice(
             request_key=_REQUEST_KEY,
             reason=PathAbortReason.ACTIVATION_FAILED,
@@ -128,6 +135,9 @@ class TestDecodeFailureRelay:
                     reverse_attempt_id=reverse_attempt_id,
                     state=ReverseTerminalState.TERMINALIZED,
                 )
+            ),
+            reverse_admission_terminal=ReverseAdmissionTerminalNotice(
+                may_have_started_through_attempt_id
             ),
         )
 
@@ -152,7 +162,7 @@ class TestDecodeFailureRelay:
         ]
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(0),
+            self._expected_abort(0, None),
         )
 
     def test_decode_worker_failure_uses_persisted_prefill_endpoint(
@@ -183,7 +193,7 @@ class TestDecodeFailureRelay:
         )
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(0),
+            self._expected_abort(0, 0),
         )
 
     def test_decode_failure_still_sends_abort_when_control_failure_build_raises(
@@ -209,7 +219,7 @@ class TestDecodeFailureRelay:
         decode_control_seams.decode_coordinator.unregister.assert_called_with(state.request_key)
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(0),
+            self._expected_abort(0, None),
         )
 
     def test_decode_failure_without_endpoint_is_local_only(
@@ -255,7 +265,7 @@ class TestDecodeFailureRelay:
 
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(),
+            self._expected_abort(None, None),
         )
 
     def test_decode_failed_reverse_send_waits_for_tp_barrier_before_terminal_proof(
@@ -299,7 +309,7 @@ class TestDecodeFailureRelay:
         assert scheduler._completion_tracker.get(completion_id) is None
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(0),
+            self._expected_abort(0, 0),
         )
 
     def test_failed_attempt_refresh_does_not_force_close_older_inflight_attempt(
@@ -327,7 +337,7 @@ class TestDecodeFailureRelay:
         assert completion is not None and completion.closed is False
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(1),
+            self._expected_abort(1, 0),
         )
         request.status = RequestStatus.FINISHED_STOPPED
         assert scheduler.request_finished(request, []) == (True, None)
@@ -374,7 +384,7 @@ class TestDecodeFailureRelay:
         assert refresh_metadata.reverse_plans == []
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
-            self._expected_abort(1),
+            self._expected_abort(1, 0),
         )
 
     def test_decode_late_worker_failure_after_request_finish_still_notifies_prefill(
@@ -398,8 +408,11 @@ class TestDecodeFailureRelay:
         request.status = RequestStatus.FINISHED_STOPPED
 
         assert scheduler.request_finished(request, []) == (True, None)
-        assert scheduler._decode_late_abort_endpoints == {
-            request_key: _PREFILL_ENDPOINT_A
+        assert scheduler._decode_late_abort_contexts == {
+            request_key: scheduler_module._DecodeLateAbortContext(
+                endpoint=_PREFILL_ENDPOINT_A,
+                reverse_admission_terminal=ReverseAdmissionTerminalNotice(1),
+            )
         }
 
         with patch.object(scheduler, "_build_decode_control_failure") as build_failure:
@@ -410,6 +423,12 @@ class TestDecodeFailureRelay:
                     )
                 )
             )
+            assert scheduler._decode_late_abort_contexts == {
+                request_key: scheduler_module._DecodeLateAbortContext(
+                    endpoint=_PREFILL_ENDPOINT_A,
+                    reverse_admission_terminal=ReverseAdmissionTerminalNotice(1),
+                )
+            }
             scheduler.update_connector_output(
                 KVConnectorOutput(
                     kv_connector_worker_meta=make_worker_metadata(
@@ -419,10 +438,10 @@ class TestDecodeFailureRelay:
             )
 
         build_failure.assert_not_called()
-        assert request_key not in scheduler._decode_late_abort_endpoints
+        assert request_key not in scheduler._decode_late_abort_contexts
         assert decode_control_seams.decode_coordinator.submit_abort.call_args_list == [
-            call(_PREFILL_ENDPOINT_A, self._expected_abort(0)),
-            call(_PREFILL_ENDPOINT_A, self._expected_abort(1)),
+            call(_PREFILL_ENDPOINT_A, self._expected_abort(0, 1)),
+            call(_PREFILL_ENDPOINT_A, self._expected_abort(1, 1)),
         ]
 
     def test_late_failure_retires_old_admission_before_same_id_replacement(
@@ -440,8 +459,11 @@ class TestDecodeFailureRelay:
         completion_id = activation_metadata.reverse_plans[0].reverse_send_completion_id
         old_request.status = RequestStatus.FINISHED_STOPPED
         assert scheduler.request_finished(old_request, []) == (True, None)
-        assert scheduler._decode_late_abort_endpoints == {
-            old_key: _PREFILL_ENDPOINT_A
+        assert scheduler._decode_late_abort_contexts == {
+            old_key: scheduler_module._DecodeLateAbortContext(
+                endpoint=_PREFILL_ENDPOINT_A,
+                reverse_admission_terminal=ReverseAdmissionTerminalNotice(0),
+            )
         }
 
         replacement = SimpleNamespace(
@@ -473,7 +495,7 @@ class TestDecodeFailureRelay:
         decode_control_seams.decode_coordinator.unregister.assert_not_called()
         build_failure.assert_not_called()
         assert replacement.request_id not in scheduler._decode_control_failures
-        assert old_key not in scheduler._decode_late_abort_endpoints
+        assert old_key not in scheduler._decode_late_abort_contexts
         decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
             _PREFILL_ENDPOINT_A,
             PathAbortNotice(
@@ -483,6 +505,7 @@ class TestDecodeFailureRelay:
                     reverse_attempt_id=0,
                     state=ReverseTerminalState.TERMINALIZED,
                 ),
+                reverse_admission_terminal=ReverseAdmissionTerminalNotice(0),
             ),
         )
 
@@ -496,6 +519,26 @@ class TestDecodeFailureRelay:
         decode_control_seams.decode_coordinator.register_pending.assert_called_with(
             replacement_state.request_key
         )
+
+    def test_decode_shutdown_clears_frozen_late_abort_context(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        metadata = _activate_decision(
+            scheduler,
+            decode_control_seams,
+            self._decision_with_endpoint(0, _PREFILL_ENDPOINT_A),
+        )
+        assert metadata.reverse_plans
+        request.status = RequestStatus.FINISHED_STOPPED
+
+        assert scheduler.request_finished(request, []) == (True, None)
+        assert scheduler._decode_late_abort_contexts
+
+        scheduler.shutdown()
+
+        assert scheduler._decode_late_abort_contexts == {}
 
 
 class TestBoundedCompletions:

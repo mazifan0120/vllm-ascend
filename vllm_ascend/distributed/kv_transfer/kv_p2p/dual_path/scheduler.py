@@ -48,6 +48,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathKind,
     PathPolicy,
     ReverseAttemptKey,
+    ReverseAdmissionTerminalNotice,
     ReverseTerminalNotice,
     ReverseTerminalState,
     RoundRobinPathPolicy,
@@ -116,6 +117,8 @@ class DecodePathDecisionState:
     request: Request
     status: _DecodeDecisionStatus
     prefill_control_endpoint: DecodeControlEndpoint | None = None
+    reverse_publication_watermark: int | None = None
+    reverse_admission_terminal: ReverseAdmissionTerminalNotice | None = None
 
     @property
     def request_key(self) -> DualPathRequestKey:
@@ -163,6 +166,14 @@ class _DeferredPrefillActivation:
     blocks: KVCacheBlocks = field(compare=False, repr=False)
     result: PathDecisionResult
     reverse_snapshot: _PrefillReverseActivationSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodeLateAbortContext:
+    """Frozen Decode evidence retained after the active request state releases."""
+
+    endpoint: DecodeControlEndpoint
+    reverse_admission_terminal: ReverseAdmissionTerminalNotice
 
 
 def _decode_ready_token_count(num_tokens: int) -> int:
@@ -269,7 +280,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_abort_request_ids: dict[DualPathRequestKey, str] = {}
         self._scheduler_side_finished_recving: set[str] = set()
         self._decode_control_failures: dict[str, DualPathControlFailureMetadata] = {}
-        self._decode_late_abort_endpoints: dict[DualPathRequestKey, DecodeControlEndpoint] = {}
+        self._decode_late_abort_contexts: dict[DualPathRequestKey, _DecodeLateAbortContext] = {}
         self._prefill_delivery_futures: dict[DualPathRequestKey, Future[None]] = {}
         self._prefill_delivery_records: dict[DualPathRequestKey, _PrefillDecisionDelivery] = {}
         self._prefill_invalid_request_keys: set[DualPathRequestKey] = set()
@@ -364,6 +375,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         reason: PathAbortReason,
         *,
         reverse_attempt_key: ReverseAttemptKey | None = None,
+        reverse_admission_terminal: ReverseAdmissionTerminalNotice | None = None,
     ) -> None:
         if reverse_attempt_key is not None and reverse_attempt_key.request_key != request_key:
             raise RuntimeError("Reverse terminal attempt does not match the ABORT request key")
@@ -378,6 +390,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     state=ReverseTerminalState.TERMINALIZED,
                 )
             ),
+            reverse_admission_terminal=reverse_admission_terminal,
         )
         try:
             delivery_future = self._path_decision_coordinator.submit_abort(endpoint, notice)
@@ -1751,12 +1764,21 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 metadata.control_failures.append(failure)
             return
 
+        expected_status = (
+            _DecodeDecisionStatus.COMMITTED
+            if is_attempt_refresh
+            else _DecodeDecisionStatus.PENDING
+        )
+        if state.status is not expected_status or state.reverse_admission_terminal is not None:
+            return
+
         state.prefill_control_endpoint = candidate_endpoint
         if reverse_plan is not None:
             # The reverse-send completion report id is allocated at attempt
             # acceptance, before any layer can enter the sender queue, and is
             # carried unchanged on the plan to every DE worker.
             attempt_key = ReverseAttemptKey(state.request_key, result.reverse_attempt_id)
+            state.reverse_publication_watermark = result.reverse_attempt_id
             send_completion = self._completion_tracker.open_completion(
                 CompletionKind.REVERSE_SEND,
                 expected_worker_count=self._expected_worker_count,
@@ -1772,6 +1794,17 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         metadata.forward_receive_bindings.append(binding)
         state.status = _DecodeDecisionStatus.COMMITTED
         self._log_decision_activation(decision, state, snapshot, reverse_plan, binding)
+
+    def _freeze_decode_reverse_admission_terminal(
+        self,
+        state: DecodePathDecisionState,
+    ) -> ReverseAdmissionTerminalNotice:
+        """Freeze the Decode-visible Reverse publication ceiling once per admission."""
+        if state.reverse_admission_terminal is None:
+            state.reverse_admission_terminal = ReverseAdmissionTerminalNotice(
+                state.reverse_publication_watermark
+            )
+        return state.reverse_admission_terminal
 
     def _fail_decode_admission(
         self,
@@ -1790,6 +1823,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         """
         state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
         self._path_decision_coordinator.unregister(state.request_key)
+        reverse_admission_terminal = self._freeze_decode_reverse_admission_terminal(state)
         endpoint = peer_endpoint or state.prefill_control_endpoint
         try:
             return self._build_decode_control_failure(
@@ -1818,6 +1852,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             reverse_attempt_id,
                         )
                     ),
+                    reverse_admission_terminal=reverse_admission_terminal,
                 )
 
     def _log_decision_activation(
@@ -2091,9 +2126,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     self._completion_tracker.discard(send_completion.completion_id)
             if self._has_open_reverse_send_completion(state.request_key):
                 if state.prefill_control_endpoint is not None:
-                    self._decode_late_abort_endpoints[state.request_key] = state.prefill_control_endpoint
+                    self._decode_late_abort_contexts[state.request_key] = _DecodeLateAbortContext(
+                        endpoint=state.prefill_control_endpoint,
+                        reverse_admission_terminal=self._freeze_decode_reverse_admission_terminal(state),
+                    )
             else:
-                self._decode_late_abort_endpoints.pop(state.request_key, None)
+                self._decode_late_abort_contexts.pop(state.request_key, None)
                 self._latest_reverse_attempt_ids.pop(request_id, None)
         if self.dual_path_cfg.role == "prefill":
             try:
@@ -2286,12 +2324,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             or state.request_key != failed_key
                             or snapshot is None
                         ):
-                            endpoint = (
+                            late_context = (
                                 None
                                 if failed_key is None
-                                else self._decode_late_abort_endpoints.get(failed_key)
+                                else self._decode_late_abort_contexts.get(failed_key)
                             )
-                            if endpoint is None:
+                            if late_context is None:
                                 logger.error(
                                     "DualPath failed job %s has no Decode state or snapshot for request %s",
                                     completion_id,
@@ -2300,9 +2338,12 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             else:
                                 self._send_abort_notice(
                                     failed_key,
-                                    endpoint,
+                                    late_context.endpoint,
                                     PathAbortReason.ACTIVATION_FAILED,
                                     reverse_attempt_key=attempt_key,
+                                    reverse_admission_terminal=(
+                                        late_context.reverse_admission_terminal
+                                    ),
                                 )
                         else:
                             failure = self._fail_decode_admission(
@@ -2352,7 +2393,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             if self._has_open_reverse_send_completion(request_key):
                 return set(), set()
 
-            self._decode_late_abort_endpoints.pop(request_key, None)
+            self._decode_late_abort_contexts.pop(request_key, None)
 
             # Request-level release is authorized only after every send attempt
             # for this exact request key has closed or disappeared.
@@ -2428,7 +2469,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._decode_kv_snapshots.clear()
         self._decode_decision_states.clear()
         self._decode_control_failures.clear()
-        self._decode_late_abort_endpoints.clear()
+        self._decode_late_abort_contexts.clear()
         self._prefill_request_keys.clear()
         self._prefill_decision_metadata.clear()
         self._prefill_local_tokens.clear()
