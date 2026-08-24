@@ -40,6 +40,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     PathDecision,
     PathDecisionCoordinator,
     PathDecisionDeliveryError,
+    PathDecisionRejectedError,
     _deliver_decision,
     decode_path_abort,
     decode_path_decision,
@@ -978,6 +979,36 @@ def test_delivery_makes_exactly_three_attempts_with_fresh_req_sockets() -> None:
     assert len(sockets) == 3
     assert len({id(socket) for socket in sockets}) == 3
     assert all(socket.sent == [b"encoded"] for socket in sockets)
+
+
+def test_typed_final_rejection_can_follow_a_prior_send_with_lost_ack() -> None:
+    first_send = _FakeDeliverySocket()
+    final_retry = _FakeDeliverySocket(ack=_UNKNOWN_REQUEST_BYTES)
+    pending_sockets = [first_send, final_retry]
+
+    @contextmanager
+    def opener(endpoint: DecodeControlEndpoint):
+        yield pending_sockets.pop(0)
+
+    # The first send completed but its ACK was not observable. A later typed
+    # rejection describes only that retry; it cannot prove the first payload
+    # was never accepted by the receiver.
+    with pytest.raises(PathDecisionRejectedError) as error:
+        _deliver_decision(
+            b"encoded",
+            _free_control_endpoint(),
+            opener=opener,
+            sleep=lambda _: None,
+            should_stop=lambda: False,
+            send_timeout_ms=1000,
+            poll_timeout_ms=1000,
+            retry_spacing_s=0.1,
+        )
+
+    assert error.value.status is DecisionReplyStatus.UNKNOWN_REQUEST
+    assert first_send.sent == [b"encoded"]
+    assert final_retry.sent == [b"encoded"]
+    assert pending_sockets == []
 
 
 def test_delivery_uses_spec_send_timeout_poll_bound_and_retry_spacing() -> None:

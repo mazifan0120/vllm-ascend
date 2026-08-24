@@ -537,104 +537,27 @@ class TestBoundedCompletions:
         assert binding.request_key in scheduler._prefill_invalid_request_keys
 
 
-class TestPrefillDecisionDeliveryTerminality:
-    @pytest.mark.parametrize(
-        "status",
-        [
-            DecisionReplyStatus.UNKNOWN_REQUEST,
-            DecisionReplyStatus.STALE_CLOSED,
-            DecisionReplyStatus.PROTOCOL_ERROR,
-        ],
-    )
-    def test_typed_rejection_before_dispatch_closes_exact_attempt_without_worker_terminal(
-        self,
-        pe_scheduler_factory,
-        status,
-    ):
-        delivery_future: Future[None] = Future()
-        scheduler, coordinator = pe_scheduler_factory(
-            PathKind.DE_READ,
-            pool=make_block_pool(),
-        )
-        coordinator.submit.return_value = delivery_future
-        request = _admit_de_read(scheduler)
-        binding = scheduler._prefill_pending_reverse_receive_bindings[
-            request.request_id
-        ]
-        delivery_future.set_exception(PathDecisionRejectedError(status))
-
-        metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
-
-        assert metadata.reverse_receive_bindings == []
-        assert metadata.reverse_receive_failure_terminals == []
-        assert len(metadata.control_failures) == 1
-        assert scheduler._completion_tracker.get(
-            binding.reverse_receive_completion_id
-        ) is None
-        assert request.request_id not in scheduler._waiting_reverse_attempt_ids
-        assert scheduler._scheduler_side_finished_recving == {request.request_id}
-
-    def test_typed_rejection_after_dispatch_closes_through_real_worker_report(
-        self,
-        pe_scheduler_factory,
-    ):
-        delivery_future: Future[None] = Future()
-        scheduler, coordinator = pe_scheduler_factory(
-            PathKind.DE_READ,
-            pool=make_block_pool(),
-        )
-        coordinator.submit.return_value = delivery_future
-        request = _admit_de_read(scheduler)
-        binding = scheduler._prefill_pending_reverse_receive_bindings[
-            request.request_id
-        ]
-        binding_metadata = scheduler.build_connector_meta(
-            make_empty_scheduler_output()
-        )
-        worker = _make_prefill_worker()
-        worker.start_load_kv(binding_metadata)
-        delivery_future.set_exception(
-            PathDecisionRejectedError(DecisionReplyStatus.UNKNOWN_REQUEST)
-        )
-
-        terminal_metadata = scheduler.build_connector_meta(
-            make_empty_scheduler_output()
-        )
-
-        completion = scheduler._completion_tracker.get(
-            binding.reverse_receive_completion_id
-        )
-        assert completion is not None
-        assert completion.dispatched is True
-        assert completion.failed is True
-        assert completion.closed is False
-        assert terminal_metadata.reverse_receive_bindings == []
-        assert len(terminal_metadata.reverse_receive_failure_terminals) == 1
-
-        worker.start_load_kv(terminal_metadata)
-        worker_report = worker.build_connector_worker_meta()
-        assert worker_report is not None
-        assert worker_report.failure_reports == {
-            binding.reverse_receive_completion_id: 1,
-        }
-        output = KVConnectorOutput(kv_connector_worker_meta=worker_report)
-        scheduler.update_connector_output(output)
-
-        assert output.finished_recving == {request.request_id}
-        assert scheduler._completion_tracker.get(
-            binding.reverse_receive_completion_id
-        ) is None
-
+class TestPrefillDecisionDeliveryAmbiguity:
     @pytest.mark.parametrize(
         "outcome",
         [
+            PathDecisionRejectedError(DecisionReplyStatus.UNKNOWN_REQUEST),
+            PathDecisionRejectedError(DecisionReplyStatus.STALE_CLOSED),
+            PathDecisionRejectedError(DecisionReplyStatus.PROTOCOL_ERROR),
             PathDecisionDeliveryError("acknowledgement lost"),
             RuntimeError("generic delivery failure"),
             None,
         ],
-        ids=["delivery-error", "generic-error", "cancelled"],
+        ids=[
+            "unknown-request",
+            "stale-closed",
+            "protocol-error",
+            "delivery-error",
+            "generic-error",
+            "cancelled",
+        ],
     )
-    def test_ambiguous_delivery_failure_dispatches_binding_without_worker_terminal(
+    def test_delivery_failure_before_binding_dispatch_is_ambiguous(
         self,
         pe_scheduler_factory,
         outcome,
@@ -666,6 +589,47 @@ class TestPrefillDecisionDeliveryTerminality:
         assert completion.dispatched is True
         assert completion.failed is False
         assert completion.closed is False
+        assert scheduler._scheduler_side_finished_recving == set()
+
+    def test_typed_final_rejection_after_dispatch_does_not_synthesize_terminal(
+        self,
+        pe_scheduler_factory,
+    ):
+        delivery_future: Future[None] = Future()
+        scheduler, coordinator = pe_scheduler_factory(
+            PathKind.DE_READ,
+            pool=make_block_pool(),
+        )
+        coordinator.submit.return_value = delivery_future
+        request = _admit_de_read(scheduler)
+        binding = scheduler._prefill_pending_reverse_receive_bindings[
+            request.request_id
+        ]
+        binding_metadata = scheduler.build_connector_meta(
+            make_empty_scheduler_output()
+        )
+        worker = _make_prefill_worker()
+        worker.start_load_kv(binding_metadata)
+        delivery_future.set_exception(
+            PathDecisionRejectedError(DecisionReplyStatus.UNKNOWN_REQUEST)
+        )
+
+        failure_metadata = scheduler.build_connector_meta(
+            make_empty_scheduler_output()
+        )
+
+        completion = scheduler._completion_tracker.get(
+            binding.reverse_receive_completion_id
+        )
+        assert completion is not None
+        assert completion.dispatched is True
+        assert completion.failed is False
+        assert completion.closed is False
+        assert failure_metadata.reverse_receive_bindings == []
+        assert failure_metadata.reverse_receive_failure_terminals == []
+        assert len(failure_metadata.control_failures) == 1
+        worker.start_load_kv(failure_metadata)
+        assert worker.build_connector_worker_meta() is None
         assert scheduler._scheduler_side_finished_recving == set()
 
 
@@ -832,7 +796,7 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         assert request_key not in scheduler._prefill_deferred_activations
         assert len(metadata.control_failures) == 1
 
-    def test_typed_rejection_terminalizes_rejected_attempt_after_deferred_rollback(
+    def test_typed_rejection_restores_prior_attempt_without_terminalizing_it(
         self,
         pe_scheduler_factory,
     ):
@@ -854,11 +818,23 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         )
         metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
 
-        assert metadata.reverse_receive_bindings == []
+        assert len(metadata.reverse_receive_bindings) == 1
+        restored_binding = metadata.reverse_receive_bindings[0]
+        assert restored_binding.request_key == request_key
+        assert restored_binding.reverse_attempt_id == 0
         assert metadata.reverse_receive_failure_terminals == []
-        assert scheduler._completion_tracker.open_count() == 0
-        assert request.request_id not in scheduler._waiting_reverse_attempt_ids
-        assert scheduler._scheduler_side_finished_recving == {request.request_id}
+        completion = scheduler._completion_tracker.get(
+            restored_binding.reverse_receive_completion_id
+        )
+        assert completion is not None
+        assert completion.dispatched is True
+        assert completion.failed is False
+        assert completion.closed is False
+        assert scheduler._completion_tracker.open_count() == 1
+        assert scheduler._waiting_reverse_attempt_ids[
+            request.request_id
+        ].reverse_attempt_id == 0
+        assert scheduler._scheduler_side_finished_recving == set()
 
 
 class TestCompletionTrackerRetirementWiring:

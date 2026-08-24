@@ -58,7 +58,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     DualPathDecisionMetadata,
     PathDecision,
     PathDecisionCoordinator,
-    PathDecisionRejectedError,
     derive_decode_control_port,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
@@ -439,10 +438,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     None if delivery_cancelled else delivery_future.exception()
                 )
                 delivery_failed = delivery_cancelled or delivery_error is not None
-                terminal_rejection = isinstance(
-                    delivery_error,
-                    PathDecisionRejectedError,
-                )
+                # Even a typed registry rejection may follow an earlier send
+                # that was accepted but whose ACK was lost. Without durable
+                # attempt-specific NEVER_ACCEPTED evidence, every delivery
+                # failure remains ambiguous at the data-plane boundary.
                 retain_delivery_record = False
                 if delivery_failed:
                     # A failed prior delivery cancels its deferred replacement
@@ -477,17 +476,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             retain_delivery_record = True
                         elif delivery_record.path is not PathKind.PE_READ:
                             assert_never(delivery_record.path)
-                    if (
-                        terminal_rejection
-                        and delivery_record.path is PathKind.DE_READ
-                    ):
-                        assert delivery_record.reverse_attempt_id is not None
-                        self._terminalize_prefill_reverse_attempt(
-                            ReverseAttemptKey(
-                                delivery_record.request_key,
-                                delivery_record.reverse_attempt_id,
-                            )
-                        )
                     self._send_abort_notice(
                         delivery_record.request_key,
                         delivery_record.endpoint,
