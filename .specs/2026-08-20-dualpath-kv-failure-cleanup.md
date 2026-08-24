@@ -14,6 +14,19 @@
 - usable budget 固定为 raw budget 的 90%，通过代码内不可变命名常量表达；不向用户暴露调参接口。
 - cleanup 故障注入只存在于外部 E2E 测试资产，不能进入产品源码、正式 manifest 或最终提交。
 
+## 2026-08-24 Critical lifecycle correction
+
+实现后复审确认：Task 4/8 原文把“尚无 worker report”误当成“binding 尚未 dispatch”。真实事故时序中，Prefill scheduler 已把 `REVERSE_RECEIVE` binding 下发给 worker，但 Decode Store 随后在 Reverse 从未提交前失败。此时 Prefill 不能由 scheduler 直接关闭 completion（worker 可能拥有数据面写入），也不能等待不存在的 wire terminal。
+
+本节及 `.specs/2026-08-24-dualpath-prefill-reverse-terminal-delta.md` 是该窗口的权威修订，覆盖下文 Task 4/7/8 中所有与之冲突的伪代码和测试 oracle：
+
+- `dispatched` 守卫保留；scheduler 只立即关闭尚未 dispatch 的 completion。
+- Decode 只在能够证明 exact Reverse attempt 已 `TERMINALIZED` 时，随 ABORT 传播 `(request_key, reverse_attempt_id)` 终端证明。`TERMINALIZED` 表示每个 Decode worker 对该 attempt 要么从未提交，要么已在 wire terminal 获得 Prefill ACK 后停止写入。
+- Prefill 对已 dispatch 的 exact attempt 不直接关闭；它向所有 Prefill workers 下发 exact `ReverseReceiveFailureTerminal`。每个 worker 复用 `_consume_reverse_receive_binding(..., succeeded=False)` 贡献一次 failure report；scheduler 收齐现有 all-worker barrier 后才执行 `_run_completion_close_action` 和 `finished_recving` 注入。
+- 普通 ABORT 若不携带 exact terminal proof，只能 latch failure，不能授权 worker 合成 terminal。
+- `DualPathControlFailureMetadata(request_id, ...)` 继续只表达请求失败/无效块，不能用作 Reverse completion 身份；worker terminal 必须同时校验 admission、attempt、completion id 与 wire id。
+- 当前 `test_prefill_peer_abort_after_binding_dispatch_waits_for_zero_report_barrier` 中手工注入 worker report 的 oracle 作废，必须替换为 scheduler→worker→worker metadata→scheduler 的真实闭环。
+
 ---
 
 ## 背景（事故链，已定位）
