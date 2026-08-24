@@ -15,7 +15,7 @@
 - A worker terminal must identify one exact `(DualPathRequestKey, reverse_attempt_id, completion_id, wire_request_id)` tuple. Never fall back to `request_id`.
 - `PathAbortReason` continues to describe why an admission failed. Terminal safety is a separate optional proof, not a reason overload.
 - `TERMINALIZED` is emitted only when Decode proves that the exact attempt cannot write again: every Decode worker either never submitted Reverse or reported only after a wire terminal ACK.
-- ABORT without exact terminal proof may latch failure and mark blocks invalid but cannot synthesize a Prefill worker completion report.
+- ABORT without exact terminal proof records the exact admission as invalid. It emits invalid-block control failure only while that key is the current exact admission and its current waiting attempt belongs to the same admission; it does not change or close the completion, stage a worker terminal, or inject `finished_recving`.
 - Every Prefill worker contributes at most one report per completion; duplicate control terminals and late DONE/FAILED wire terminals are idempotent.
 - Follow TDD: each production behavior begins with a focused failing test whose failure is observed before implementation.
 - Use `/Users/leqi/Documents/Code/vllm-ascend/.venv/bin/python -m pytest -p no:randomly` for tests.
@@ -182,7 +182,7 @@ When a failed `REVERSE_SEND` completion closes, send an ABORT carrying `completi
 
 - [ ] **Step 4: Stage exact Prefill worker terminals**
 
-In `_handle_received_peer_abort()` resolve the exact admission and attempt. An ABORT without proof only latches failure. For an exact proof, call `force_fail_completion()`: undispatched completions close immediately; dispatched open completions stage one `ReverseReceiveFailureTerminal` in scheduler-owned pending state. Track staged-or-delivered exact attempts until their completion closes so a duplicate ABORT cannot redispatch the terminal after `build_connector_meta()` drains the pending payload but before worker reports return. Retire that dedupe state from both current and stale completion close paths. Existing worker reports then close through `_aggregate_worker_completion_reports()` and `_run_completion_close_action()`.
+In `_handle_received_peer_abort()` resolve the exact admission and snapshot the current waiting attempt before any close action. An ABORT without proof records the exact admission invalid; only a current exact admission whose current waiting attempt belongs to that admission emits invalid-block control failure. It does not mutate or close the completion, stage `ReverseReceiveFailureTerminal`, or inject `finished_recving`. For an exact proof, call `force_fail_completion()`: undispatched completions close immediately; dispatched open completions stage one `ReverseReceiveFailureTerminal` in scheduler-owned pending state. Track staged-or-delivered exact attempts until their completion closes so a duplicate ABORT cannot redispatch the terminal after `build_connector_meta()` drains the pending payload but before worker reports return. Retire that dedupe state from both current and stale completion close paths. Existing worker reports then close through `_aggregate_worker_completion_reports()` and `_run_completion_close_action()`.
 
 - [ ] **Step 5: Add barrier and isolation tests**
 

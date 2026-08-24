@@ -60,6 +60,7 @@ _PREFILL_CONTROL_ENDPOINT = DecodeControlEndpoint(
     host="192.0.2.44",
     port=_PREFILL_CONTROL_PORT,
 )
+_EXPECTED_REVERSE_INVALID_BLOCKS = (71, 72)
 
 
 def _notice(request_key, reason: str = "REQUEST_ABORTED", *, reverse_attempt_id: int | None = None):
@@ -232,7 +233,9 @@ def test_prefill_admission_registers_abort_key_before_decision_submit(pe_schedul
     assert scheduler._prefill_abort_request_ids == {request_key: request.request_id}
 
 
-def test_prefill_received_abort_without_terminal_proof_latches_only(pe_scheduler_factory) -> None:
+def test_prefill_received_abort_without_terminal_proof_invalidates_without_closing_completion(
+    pe_scheduler_factory,
+) -> None:
     scheduler, coordinator, request, binding = _prefill_de_read_scheduler(pe_scheduler_factory)
     coordinator.take_received_aborts.return_value = [
         _notice(binding.request_key, "ACTIVATION_FAILED")
@@ -243,6 +246,13 @@ def test_prefill_received_abort_without_terminal_proof_latches_only(pe_scheduler
     completion = scheduler._completion_tracker.get(binding.reverse_receive_completion_id)
     assert metadata.reverse_receive_bindings == [binding]
     assert metadata.reverse_receive_failure_terminals == []
+    assert metadata.control_failures == [
+        DualPathControlFailureMetadata(
+            request_id=request.request_id,
+            invalid_block_ids=_EXPECTED_REVERSE_INVALID_BLOCKS,
+            reason=DualPathControlFailureReason.REVERSE_JOB_FAILED,
+        )
+    ]
     assert completion is not None
     assert completion.dispatched is True
     assert completion.failed is False
@@ -271,6 +281,14 @@ def test_prefill_received_terminalized_abort_fail_closes_unstarted_reverse_recei
     metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
 
     assert metadata.reverse_receive_bindings == []
+    assert metadata.reverse_receive_failure_terminals == []
+    assert metadata.control_failures == [
+        DualPathControlFailureMetadata(
+            request_id=request.request_id,
+            invalid_block_ids=_EXPECTED_REVERSE_INVALID_BLOCKS,
+            reason=DualPathControlFailureReason.REVERSE_JOB_FAILED,
+        )
+    ]
     assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None
     assert request.request_id not in scheduler._waiting_reverse_attempt_ids
     assert request.request_id not in scheduler._pending_finished_recving
@@ -283,13 +301,11 @@ def test_prefill_peer_abort_does_not_bypass_started_worker_barrier(pe_scheduler_
         pe_scheduler_factory,
         expected_worker_count=2,
     )
-    scheduler.build_connector_meta(make_empty_scheduler_output())
-    first_output = KVConnectorOutput(
-        kv_connector_worker_meta=make_worker_metadata(
-            completion_reports={binding.reverse_receive_completion_id: 1},
-        )
-    )
-    scheduler.update_connector_output(first_output)
+    binding_metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
+    first_worker = _make_prefill_worker()
+    second_worker = _make_prefill_worker()
+    first_worker.start_load_kv(binding_metadata)
+    second_worker.start_load_kv(binding_metadata)
     coordinator.take_received_aborts.return_value = [
         _notice(
             binding.request_key,
@@ -302,7 +318,7 @@ def test_prefill_peer_abort_does_not_bypass_started_worker_barrier(pe_scheduler_
 
     completion = scheduler._completion_tracker.get(binding.reverse_receive_completion_id)
     assert completion is not None
-    assert completion.completed_worker_count == 1
+    assert completion.completed_worker_count == 0
     assert completion.failed is True
     assert completion.closed is False
     assert binding.request_key in scheduler._prefill_invalid_request_keys
@@ -310,11 +326,30 @@ def test_prefill_peer_abort_does_not_bypass_started_worker_barrier(pe_scheduler_
     assert scheduler._waiting_reverse_attempt_ids[request.request_id].request_key == binding.request_key
     assert len(terminal_metadata.reverse_receive_failure_terminals) == 1
 
-    final_output = KVConnectorOutput(
-        kv_connector_worker_meta=make_worker_metadata(
-            failure_reports={binding.reverse_receive_completion_id: 1},
-        )
-    )
+    first_worker.start_load_kv(terminal_metadata)
+    second_worker.start_load_kv(terminal_metadata)
+    first_report = first_worker.build_connector_worker_meta()
+    second_report = second_worker.build_connector_worker_meta()
+    assert first_report is not None
+    assert second_report is not None
+    assert first_report.failure_reports == {
+        binding.reverse_receive_completion_id: 1,
+    }
+    assert second_report.failure_reports == {
+        binding.reverse_receive_completion_id: 1,
+    }
+
+    first_output = KVConnectorOutput(kv_connector_worker_meta=first_report)
+    scheduler.update_connector_output(first_output)
+
+    completion = scheduler._completion_tracker.get(binding.reverse_receive_completion_id)
+    assert completion is not None
+    assert completion.completed_worker_count == 1
+    assert completion.failed is True
+    assert completion.closed is False
+    assert first_output.finished_recving is None
+
+    final_output = KVConnectorOutput(kv_connector_worker_meta=second_report)
     scheduler.update_connector_output(final_output)
     assert final_output.finished_recving == {request.request_id}
     assert scheduler._completion_tracker.get(binding.reverse_receive_completion_id) is None

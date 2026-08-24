@@ -23,7 +23,7 @@
 - `dispatched` 守卫保留；scheduler 只立即关闭尚未 dispatch 的 completion。
 - Decode 只在能够证明 exact Reverse attempt 已 `TERMINALIZED` 时，随 ABORT 传播 `(request_key, reverse_attempt_id)` 终端证明。`TERMINALIZED` 表示每个 Decode worker 对该 attempt 要么从未提交，要么已在 wire terminal 获得 Prefill ACK 后停止写入。
 - Prefill 对已 dispatch 的 exact attempt 不直接关闭；它向所有 Prefill workers 下发 exact `ReverseReceiveFailureTerminal`。每个 worker 复用 `_consume_reverse_receive_binding(..., succeeded=False)` 贡献一次 failure report；scheduler 收齐现有 all-worker barrier 后才执行 `_run_completion_close_action` 和 `finished_recving` 注入。
-- 普通 ABORT 若不携带 exact terminal proof，只能 latch failure，不能授权 worker 合成 terminal。
+- 普通 ABORT 若不携带 exact terminal proof，记录 exact admission invalid；仅当它仍是 current exact admission 且 current waiting attempt 属于该 admission 时，生成 invalid-block control failure。它不修改 completion state、不关闭 completion、不 stage worker terminal，也不注入 `finished_recving`。
 - `DualPathControlFailureMetadata(request_id, ...)` 继续只表达请求失败/无效块，不能用作 Reverse completion 身份；worker terminal 必须同时校验 admission、attempt、completion id 与 wire id。
 - 当前 `test_prefill_peer_abort_after_binding_dispatch_waits_for_zero_report_barrier` 中手工注入 worker report 的 oracle 作废，必须替换为 scheduler→worker→worker metadata→scheduler 的真实闭环。
 
@@ -40,7 +40,7 @@
 - 触发器：`KVCacheStoreRecvingThread._handle_request`（`kv_transfer.py:846-943`）对整个请求发一次不分批的 `m_store.get`。staging buffer 硬约束来自 mooncake 对象语义 API（`batch_get_into_multi_buffers`），单 key（=单 block 全层，Qwen3-8B 约 18MiB）不可再分但远小于 buffer。
 - 上游对齐边界：vLLM 0.23 用 raw budget 判断单 key 是否绝对超限，用 usable budget（raw × ratio）约束多 key 批次，并按 4096B 对齐后额外计入 8192B padding。本文保留这一双预算/估算模型；唯一有意识的偏离是：单 key 超过 raw budget 时只把该 key 记为失败、继续处理其余 key，而不是像上游 disk-offload 路径那样放弃整个 GET。这里已有 per-key block failure 记账，局部失败能减少无关块重取。
 - 现成的关闭通道：worker `_record_completion_report(completion_id, succeeded=...)`（`worker.py:341-359`）→ scheduler `_aggregate_worker_completion_reports`（`scheduler.py:2026-2075`）→ `_run_completion_close_action`（`:2078+`）→ finished_sending/recving 注入 → 上游释放延迟块。completion 失败时 decode 分支已会构建 `_decode_control_failures`（`:2047`），prefill 分支已有 `_prefill_control_failures` + `_recovery_invalid_block_ids` 清理链（`:2060-2073`）——**Fix B 主要是把"失败"这个消息跨节点送达，后续清理链全是现成的**。
-- `TransferCompletionTracker.tally_reports`（`completion_tracker.py:149-173`）按 worker barrier 计数关闭；`fail_completion`（`:175`）只记一个失败终端，TP>1 时不够，需要 Fix B-1 的强制关闭。
+- `TransferCompletionTracker.tally_reports`（`completion_tracker.py:149-173`）按 worker barrier 计数关闭；TP>1 的已 dispatch completion 必须由所有真实 Prefill workers 各贡献一次 terminal report 后关闭，不能用 scheduler forced closure 绕过 barrier。
 - 控制投递是有界的：`_deliver_decision` 最多尝试 `_MAX_DELIVERY_ATTEMPTS = 3` 次；未收到合法 ACK 时 Future 以 `PathDecisionDeliveryError` 终止，不会无限重试。
 
 ## 文件地图
@@ -1123,8 +1123,8 @@ git commit -s -m "fix(dual_path): notify prefill over the control channel when a
 
 1. `test_prefill_admission_registers_abort_key_before_decision_submit`：配置 `prefill_control_port` 后，`coordinator.register_prefill_abort_key(key)` 发生在 `submit(endpoint, decision)` 之前；decision 携带 scheduler 实际绑定的 endpoint。
 2. `test_prefill_received_terminalized_abort_fail_closes_unstarted_reverse_receive`：ABORT 携带 exact terminalized attempt，且 completion 明确尚未 dispatch；处理后 record 关闭并走 `_run_completion_close_action`，request 从 `_pending_finished_recving` 移出、加入 `_scheduler_side_finished_recving`，key 标记 invalid。
-3. `test_prefill_received_abort_without_terminal_proof_latches_only`：普通 ABORT 只 latch exact admission failure，不关闭 completion、不生成 worker terminal；即使此时 worker report 数为 0，也不能把它解释为尚未 dispatch。
-4. `test_prefill_peer_abort_does_not_bypass_started_worker_barrier` 与 real-chain 测试：binding dispatch 后收到 exact proof，只 latch failed 并向 worker 下发 `ReverseReceiveFailureTerminal`；真实 worker 生成 failure report，再由 scheduler 的 all-worker 聚合关闭。TP=2 必须等两个 worker terminal 到齐。
+3. `test_prefill_received_abort_without_terminal_proof_invalidates_without_closing_completion`：普通 ABORT 记录 exact admission invalid；仅在 current exact admission 的 current waiting attempt 属于该 admission 时生成 invalid-block control failure。completion 保持 open 且 `failed=False`，不生成 worker terminal；即使此时 worker report 数为 0，也不能把它解释为尚未 dispatch。
+4. `test_prefill_peer_abort_does_not_bypass_started_worker_barrier` 与 real-chain 测试：binding dispatch 后收到 exact proof，只 latch failed 并向 worker 下发 `ReverseReceiveFailureTerminal`；TP=2 使用两个真实 Prefill workers 消费同一个 scheduler-produced terminal，各自经 worker metadata round-trip 回报，第一个 report 后 completion 仍 open，第二个后才由 all-worker 聚合关闭。
 5. `test_duplicate_terminalized_abort_does_not_redispatch_before_worker_report`：第一次 metadata drain 后到 worker report 返回前，重复 ABORT 不得再次 stage/deliver terminal；exact completion 关闭时退休 dedupe 状态。
 6. `test_terminalized_abort_closes_stale_attempt_without_touching_current_attempt`：proof 按 `(request_key, attempt)` 全局查找 named open completion，允许关闭 stale attempt；不得从 `_waiting_reverse_attempt_ids[request_id]` 恢复当前 attempt，也不得向 current attempt 注入 `finished_recving`。
 7. `test_prefill_abort_after_request_finished_still_finds_delayed_completion`：先让 request finish 并清掉 `_prefill_request_keys`，但 exact completion 仍 open；断言 `_prefill_abort_request_ids`/coordinator registry 仍保留，随后 exact terminalized ABORT 能关闭并释放。
@@ -1195,13 +1195,20 @@ Prefill 装配 coordinator 时，`prefill_control_port is not None` 才创建 en
             notice.reason.value,
         )
         self._prefill_invalid_request_keys.add(notice.request_key)
+        active_exact_admission = self._prefill_request_keys.get(request_id) == notice.request_key
+        current_waiting_attempt = self._waiting_reverse_attempt_ids.get(request_id)
         reverse_terminal = notice.reverse_terminal
         terminal_attempt = None
+        proof_matches_current_attempt = (
+            current_waiting_attempt is not None
+            and current_waiting_attempt.request_key == notice.request_key
+        )
         if reverse_terminal is not None:
             terminal_attempt = ReverseAttemptKey(
                 notice.request_key,
                 reverse_terminal.reverse_attempt_id,
             )
+            proof_matches_current_attempt = current_waiting_attempt == terminal_attempt
             completion = self._completion_tracker.find_open_completion(
                 CompletionKind.REVERSE_RECEIVE, terminal_attempt
             )
@@ -1226,11 +1233,6 @@ Prefill 装配 coordinator 时，`prefill_control_port is not None` 才创建 en
                     )
                 )
                 self._prefill_staged_or_delivered_reverse_terminals.add(terminal_attempt)
-        active_exact_admission = self._prefill_request_keys.get(request_id) == notice.request_key
-        proof_matches_current_attempt = (
-            terminal_attempt is None
-            or self._waiting_reverse_attempt_ids.get(request_id) == terminal_attempt
-        )
         invalid_block_ids = (
             self._recovery_invalid_block_ids(request_id)
             if active_exact_admission and proof_matches_current_attempt
@@ -1244,7 +1246,7 @@ Prefill 装配 coordinator 时，`prefill_control_port is not None` 才创建 en
             )
 ```
 
-普通 ABORT（`reverse_terminal is None`）只 latch failure，不调用 `force_fail_completion`，也不 stage worker terminal。exact proof 命中 undispatched completion 时才允许 scheduler 立即关闭；命中 dispatched completion 时 `force_fail_completion` 只 latch failed，scheduler 将一个 exact `ReverseReceiveFailureTerminal` 放入下一轮 metadata，由真实 worker 回报后关闭 barrier。`build_connector_meta()` drain pending payload 后，`_prefill_staged_or_delivered_reverse_terminals` 继续保留到 exact completion 关闭，防止重复 ABORT 再投递。control failure metadata 只允许从 `self._prefill_request_keys.get(request_id) == notice.request_key` 的 active exact admission 构建；若 ABORT 带 exact terminal proof，还必须证明该 attempt 等于 `_waiting_reverse_attempt_ids[request_id]` 后才能读取 request-id keyed current plan。已释放、stale attempt 或同 request-id 的新 admission不得读取/污染当前 request-id keyed plan。
+普通 ABORT（`reverse_terminal is None`）只记录 exact admission invalid；它不调用 `force_fail_completion`、不修改 completion state、不 close、不 stage worker terminal，也不注入 `finished_recving`。只有该 key 仍是 current exact admission 且 handler 入口快照到的 current waiting attempt 属于该 admission 时，才从 request-id keyed current plan 构建 invalid-block control failure。exact proof 同样先快照 current waiting attempt，再处理 completion：命中 undispatched completion 时 scheduler 才允许立即关闭；命中 dispatched completion 时 `force_fail_completion` 只 latch failed，scheduler 将一个 exact `ReverseReceiveFailureTerminal` 放入下一轮 metadata，由真实 worker 回报后关闭 barrier。`build_connector_meta()` drain pending payload 后，`_prefill_staged_or_delivered_reverse_terminals` 继续保留到 exact completion 关闭，防止重复 ABORT 再投递。带 proof 时还必须证明 exact attempt 等于入口快照的 current waiting attempt 后才能读取 current plan；已释放、stale attempt 或同 request-id 的新 admission不得读取/污染当前 request-id keyed plan。
 
 新增 `_maybe_retire_prefill_abort_key(request_id, request_key)`：仅当 `_prefill_request_keys.get(request_id) != request_key`（active admission 已释放）且 `TransferCompletionTracker.has_open_completion(CompletionKind.REVERSE_RECEIVE, request_key)` 为 False 时，才 pop `_prefill_abort_request_ids` 并调用 coordinator `unregister_prefill_abort_key`。调用点：
 

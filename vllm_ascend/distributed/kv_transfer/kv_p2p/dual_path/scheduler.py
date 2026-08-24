@@ -1928,13 +1928,20 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             notice.reason.value,
         )
         self._prefill_invalid_request_keys.add(notice.request_key)
+        active_exact_admission = self._prefill_request_keys.get(request_id) == notice.request_key
+        current_waiting_attempt = self._waiting_reverse_attempt_ids.get(request_id)
         reverse_terminal = notice.reverse_terminal
         terminal_attempt: ReverseAttemptKey | None = None
+        proof_matches_current_attempt = (
+            current_waiting_attempt is not None
+            and current_waiting_attempt.request_key == notice.request_key
+        )
         if reverse_terminal is not None:
             terminal_attempt = ReverseAttemptKey(
                 notice.request_key,
                 reverse_terminal.reverse_attempt_id,
             )
+            proof_matches_current_attempt = current_waiting_attempt == terminal_attempt
             completion = self._completion_tracker.find_open_completion(
                 CompletionKind.REVERSE_RECEIVE,
                 terminal_attempt,
@@ -1961,11 +1968,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 )
                 self._prefill_staged_or_delivered_reverse_terminals.add(terminal_attempt)
 
-        active_exact_admission = self._prefill_request_keys.get(request_id) == notice.request_key
-        proof_matches_current_attempt = (
-            terminal_attempt is None
-            or self._waiting_reverse_attempt_ids.get(request_id) == terminal_attempt
-        )
         invalid_block_ids = (
             self._recovery_invalid_block_ids(request_id)
             if active_exact_admission and proof_matches_current_attempt
