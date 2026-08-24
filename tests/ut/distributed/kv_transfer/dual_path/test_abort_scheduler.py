@@ -104,6 +104,9 @@ def test_pending_decode_abort_stages_peer_abort_failure(decode_scheduler_factory
     metadata = scheduler.build_connector_meta(MagicMock(name="scheduler_output"))
 
     assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.reverse_admission_terminal == (
+        decision_model.ReverseAdmissionTerminalNotice(None)
+    )
     assert metadata.control_failures == [
         DualPathControlFailureMetadata(
             request_id=request.request_id,
@@ -138,6 +141,9 @@ def test_same_drain_commits_decision_then_aborts_without_touching_completion_tra
     assert scheduler._completion_tracker.open_count() == 1
     assert len(scheduler._reverse_send_completion_ids) == 1
     assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.reverse_admission_terminal == (
+        decision_model.ReverseAdmissionTerminalNotice(0)
+    )
     assert metadata.control_failures == [
         DualPathControlFailureMetadata(
             request_id=request.request_id,
@@ -177,6 +183,7 @@ def test_decode_final_publication_gate_rejects_admission_frozen_during_validatio
     assert metadata.reverse_plans == []
     assert scheduler._completion_tracker.open_count() == 0
     assert scheduler._reverse_send_completion_ids == {}
+    scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
 
 
 def test_unknown_decode_abort_is_ignored(decode_scheduler_factory, decode_control_seams) -> None:
@@ -585,6 +592,67 @@ def test_prefill_ceiling_zero_authorizes_only_attempts_above_zero(
         CompletionKind.REVERSE_RECEIVE,
         binding.request_key,
     ) == (attempt_0,)
+
+
+def test_prefill_ceiling_keeps_dispatched_attempt_at_or_below_ceiling_open(
+    pe_scheduler_factory,
+) -> None:
+    scheduler, _, request, binding = _prefill_de_read_scheduler(
+        pe_scheduler_factory
+    )
+    attempt_0 = ReverseAttemptKey(binding.request_key, 0)
+    scheduler.build_connector_meta(make_empty_scheduler_output())
+    completion = scheduler._completion_tracker.get(
+        binding.reverse_receive_completion_id
+    )
+    assert completion is not None
+    assert completion.dispatched is True
+
+    scheduler._handle_received_peer_abort(
+        _notice(
+            binding.request_key,
+            "ACTIVATION_FAILED",
+            may_have_started_through_attempt_id=0,
+        )
+    )
+
+    assert scheduler._completion_tracker.get(completion.completion_id) is completion
+    assert completion.failed is False
+    assert completion.closed is False
+    assert scheduler._prefill_pending_reverse_receive_failure_terminals == {}
+    assert scheduler._prefill_staged_or_delivered_reverse_terminals == set()
+    assert scheduler._completion_tracker.open_attempt_keys(
+        CompletionKind.REVERSE_RECEIVE,
+        binding.request_key,
+    ) == (attempt_0,)
+
+
+def test_prefill_ignores_exact_terminal_authority_without_terminalized_state(
+    pe_scheduler_factory,
+) -> None:
+    scheduler, _, _, binding = _prefill_de_read_scheduler(pe_scheduler_factory)
+    completion = scheduler._completion_tracker.get(
+        binding.reverse_receive_completion_id
+    )
+    assert completion is not None
+    reverse_terminal = decision_model.ReverseTerminalNotice(
+        reverse_attempt_id=0,
+        state=decision_model.ReverseTerminalState.TERMINALIZED,
+    )
+    object.__setattr__(reverse_terminal, "state", object())
+
+    scheduler._handle_received_peer_abort(
+        decision_model.PathAbortNotice(
+            request_key=binding.request_key,
+            reason=decision_model.PathAbortReason.ACTIVATION_FAILED,
+            reverse_terminal=reverse_terminal,
+        )
+    )
+
+    assert scheduler._completion_tracker.get(completion.completion_id) is completion
+    assert completion.failed is False
+    assert completion.closed is False
+    assert scheduler._prefill_pending_reverse_receive_failure_terminals == {}
 
 
 def test_prefill_explicit_null_ceiling_authorizes_every_open_attempt(

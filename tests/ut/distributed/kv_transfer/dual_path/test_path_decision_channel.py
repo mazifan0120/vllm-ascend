@@ -656,10 +656,16 @@ def test_prefill_coordinator_enqueues_proofless_then_exact_abort_for_registered_
     try:
         prefill.register_prefill_abort_key(key)
         assert sender.submit_abort(prefill_endpoint, proofless_notice).result(timeout=5) is None
+        assert sender.submit_abort(prefill_endpoint, exact_notice).result(timeout=5) is None
         assert sender.submit_abort(prefill_endpoint, ceiling_only_notice).result(timeout=5) is None
         assert sender.submit_abort(prefill_endpoint, combined_notice).result(timeout=5) is None
         assert sender.submit_abort(prefill_endpoint, combined_notice).result(timeout=5) is None
-        assert prefill.take_received_aborts() == [proofless_notice, ceiling_only_notice, combined_notice]
+        assert prefill.take_received_aborts() == [
+            proofless_notice,
+            exact_notice,
+            ceiling_only_notice,
+            combined_notice,
+        ]
         assert prefill.take_received_aborts() == []
     finally:
         sender.close()

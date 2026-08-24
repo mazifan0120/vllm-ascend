@@ -47,8 +47,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionValidationError,
     PathKind,
     PathPolicy,
-    ReverseAttemptKey,
     ReverseAdmissionTerminalNotice,
+    ReverseAttemptKey,
     ReverseTerminalNotice,
     ReverseTerminalState,
     RoundRobinPathPolicy,
@@ -1712,6 +1712,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
 
         snapshot = self._decode_kv_snapshots[request_id]
         candidate_endpoint = decision.prefill_control_endpoint
+        expected_status = (
+            _DecodeDecisionStatus.COMMITTED
+            if is_attempt_refresh
+            else _DecodeDecisionStatus.PENDING
+        )
         if (
             state.prefill_control_endpoint is not None
             and candidate_endpoint != state.prefill_control_endpoint
@@ -1743,6 +1748,11 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_start=forward_token_start,
                 token_end=snapshot.transfer_tokens,
             )
+            if (
+                state.status is not expected_status
+                or state.reverse_admission_terminal is not None
+            ):
+                return
             if not is_attempt_refresh and result.path is PathKind.DE_READ and snapshot.store_load_spec is not None:
                 assert self._kvpool_adapter is not None
                 self._kvpool_adapter.commit_after_alloc(
@@ -1767,11 +1777,6 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 metadata.control_failures.append(failure)
             return
 
-        expected_status = (
-            _DecodeDecisionStatus.COMMITTED
-            if is_attempt_refresh
-            else _DecodeDecisionStatus.PENDING
-        )
         if state.status is not expected_status or state.reverse_admission_terminal is not None:
             return
 
@@ -1927,6 +1932,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             return
         state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
         self._path_decision_coordinator.unregister(state.request_key)
+        self._freeze_decode_reverse_admission_terminal(state)
         snapshot = self._decode_kv_snapshots[request_id]
         try:
             self._decode_control_failures[request_id] = self._build_decode_control_failure(
@@ -2036,12 +2042,22 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 accepted_ceiling = None
 
         terminal_attempts: set[ReverseAttemptKey] = set()
-        if notice.reverse_terminal is not None:
+        if (
+            notice.reverse_terminal is not None
+            and notice.reverse_terminal.state is ReverseTerminalState.TERMINALIZED
+        ):
             terminal_attempts.add(
                 ReverseAttemptKey(
                     notice.request_key,
                     notice.reverse_terminal.reverse_attempt_id,
                 )
+            )
+        elif notice.reverse_terminal is not None:
+            logger.error(
+                "DualPath Prefill received unsupported Reverse terminal state "
+                "%r for request %s; ignoring exact terminal authority",
+                notice.reverse_terminal.state,
+                request_id,
             )
         if accepted_ceiling is not None:
             ceiling = accepted_ceiling.may_have_started_through_attempt_id
