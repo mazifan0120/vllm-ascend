@@ -30,6 +30,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionResult,
     PathDecisionValidationError,
     PathKind,
+    ReverseAdmissionTerminalNotice,
     ReverseTerminalNotice,
     ReverseTerminalState,
 )
@@ -150,6 +151,49 @@ def test_path_abort_with_reverse_terminal_serializes_exact_proof_payload() -> No
     assert notice.to_dict() == expected_payload
     assert PathAbortNotice.from_dict(expected_payload) == notice
     assert decode_path_abort(encode_path_abort(notice)) == notice
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "request_key": _key_payload(),
+            "reason": "ACTIVATION_FAILED",
+        },
+        {
+            "request_key": _key_payload(),
+            "reason": "ACTIVATION_FAILED",
+            "reverse_terminal": {
+                "reverse_attempt_id": 3,
+                "state": "TERMINALIZED",
+            },
+        },
+        {
+            "request_key": _key_payload(),
+            "reason": "ACTIVATION_FAILED",
+            "reverse_admission_terminal": {
+                "may_have_started_through_attempt_id": None,
+            },
+        },
+        {
+            "request_key": _key_payload(),
+            "reason": "ACTIVATION_FAILED",
+            "reverse_terminal": {
+                "reverse_attempt_id": 3,
+                "state": "TERMINALIZED",
+            },
+            "reverse_admission_terminal": {
+                "may_have_started_through_attempt_id": 2,
+            },
+        },
+    ],
+)
+def test_path_abort_preserves_each_accepted_terminal_wire_shape(payload: JsonObject) -> None:
+    notice = PathAbortNotice.from_dict(payload)
+
+    assert notice.to_dict() == payload
+    assert PathAbortNotice.from_dict(notice.to_dict()).to_dict() == payload
+    assert decode_path_abort(encode_path_abort(notice)).to_dict() == payload
 
 
 def _reverse_plan(key: DualPathRequestKey) -> ReversePlan:
@@ -597,11 +641,25 @@ def test_prefill_coordinator_enqueues_proofless_then_exact_abort_for_registered_
             state=ReverseTerminalState.TERMINALIZED,
         ),
     )
+    ceiling_only_notice = replace(
+        proofless_notice,
+        reverse_admission_terminal=ReverseAdmissionTerminalNotice(
+            may_have_started_through_attempt_id=None,
+        ),
+    )
+    combined_notice = replace(
+        exact_notice,
+        reverse_admission_terminal=ReverseAdmissionTerminalNotice(
+            may_have_started_through_attempt_id=2,
+        ),
+    )
     try:
         prefill.register_prefill_abort_key(key)
         assert sender.submit_abort(prefill_endpoint, proofless_notice).result(timeout=5) is None
-        assert sender.submit_abort(prefill_endpoint, exact_notice).result(timeout=5) is None
-        assert prefill.take_received_aborts() == [proofless_notice, exact_notice]
+        assert sender.submit_abort(prefill_endpoint, ceiling_only_notice).result(timeout=5) is None
+        assert sender.submit_abort(prefill_endpoint, combined_notice).result(timeout=5) is None
+        assert sender.submit_abort(prefill_endpoint, combined_notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == [proofless_notice, ceiling_only_notice, combined_notice]
         assert prefill.take_received_aborts() == []
     finally:
         sender.close()

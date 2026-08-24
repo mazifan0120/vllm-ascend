@@ -115,10 +115,38 @@ class ReverseTerminalNotice:
 
 
 @dataclass(frozen=True)
+class ReverseAdmissionTerminalNotice:
+    may_have_started_through_attempt_id: int | None
+
+    def __post_init__(self) -> None:
+        value = self.may_have_started_through_attempt_id
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise PathDecisionValidationError(
+                "may_have_started_through_attempt_id must be a non-negative integer or None"
+            )
+
+    def to_dict(self) -> JsonObject:
+        return {
+            "may_have_started_through_attempt_id": self.may_have_started_through_attempt_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: JsonValue) -> ReverseAdmissionTerminalNotice:
+        data = require_exact_payload(
+            payload,
+            frozenset({"may_have_started_through_attempt_id"}),
+        )
+        return cls(data["may_have_started_through_attempt_id"])
+
+
+@dataclass(frozen=True)
 class PathAbortNotice:
     request_key: DualPathRequestKey
     reason: PathAbortReason
     reverse_terminal: ReverseTerminalNotice | None = None
+    reverse_admission_terminal: ReverseAdmissionTerminalNotice | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_key, DualPathRequestKey):
@@ -127,6 +155,12 @@ class PathAbortNotice:
             raise PathDecisionValidationError("reason must be a PathAbortReason")
         if self.reverse_terminal is not None and not isinstance(self.reverse_terminal, ReverseTerminalNotice):
             raise PathDecisionValidationError("reverse_terminal must be a ReverseTerminalNotice or None")
+        if self.reverse_admission_terminal is not None and not isinstance(
+            self.reverse_admission_terminal, ReverseAdmissionTerminalNotice
+        ):
+            raise PathDecisionValidationError(
+                "reverse_admission_terminal must be a ReverseAdmissionTerminalNotice or None"
+            )
 
     def to_dict(self) -> JsonObject:
         data: JsonObject = {
@@ -135,6 +169,8 @@ class PathAbortNotice:
         }
         if self.reverse_terminal is not None:
             data["reverse_terminal"] = self.reverse_terminal.to_dict()
+        if self.reverse_admission_terminal is not None:
+            data["reverse_admission_terminal"] = self.reverse_admission_terminal.to_dict()
         return data
 
     @classmethod
@@ -144,6 +180,8 @@ class PathAbortNotice:
         expected_keys = frozenset({"request_key", "reason"})
         if "reverse_terminal" in payload:
             expected_keys = expected_keys | {"reverse_terminal"}
+        if "reverse_admission_terminal" in payload:
+            expected_keys = expected_keys | {"reverse_admission_terminal"}
         data = require_exact_payload(payload, expected_keys)
         try:
             reason = PathAbortReason(data["reason"])
@@ -156,6 +194,11 @@ class PathAbortNotice:
                 None
                 if "reverse_terminal" not in data
                 else ReverseTerminalNotice.from_dict(data["reverse_terminal"])
+            ),
+            reverse_admission_terminal=(
+                None
+                if "reverse_admission_terminal" not in data
+                else ReverseAdmissionTerminalNotice.from_dict(data["reverse_admission_terminal"])
             ),
         )
 

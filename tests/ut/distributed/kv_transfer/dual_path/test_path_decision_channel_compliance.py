@@ -13,6 +13,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     PathDecisionValidationError,
     PathDecisionResult,
     PathKind,
+    ReverseAdmissionTerminalNotice,
     ReverseTerminalNotice,
     ReverseTerminalState,
 )
@@ -87,6 +88,16 @@ def test_reverse_terminal_notice_rejects_ambiguous_or_invalid_fields(
         )
 
 
+@pytest.mark.parametrize("may_have_started_through_attempt_id", [True, -1])
+def test_reverse_admission_terminal_notice_rejects_ambiguous_or_invalid_ceiling(
+    may_have_started_through_attempt_id: object,
+) -> None:
+    with pytest.raises(PathDecisionValidationError):
+        ReverseAdmissionTerminalNotice(
+            may_have_started_through_attempt_id=may_have_started_through_attempt_id,
+        )
+
+
 @pytest.mark.parametrize(
     "reverse_terminal",
     [
@@ -106,6 +117,34 @@ def test_path_abort_rejects_non_exact_reverse_terminal_payload(reverse_terminal:
                 },
                 "reason": PathAbortReason.ACTIVATION_FAILED.value,
                 "reverse_terminal": reverse_terminal,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "reverse_admission_terminal",
+    [
+        None,
+        {},
+        {
+            "may_have_started_through_attempt_id": 0,
+            "unexpected": "field",
+        },
+    ],
+)
+def test_path_abort_rejects_non_exact_reverse_admission_terminal_payload(
+    reverse_admission_terminal: object,
+) -> None:
+    with pytest.raises(PathDecisionValidationError):
+        PathAbortNotice.from_dict(
+            {
+                "request_key": {
+                    "decode_engine_instance_id": "decode",
+                    "decode_request_id": "request",
+                    "admission_id": 0,
+                },
+                "reason": PathAbortReason.ACTIVATION_FAILED.value,
+                "reverse_admission_terminal": reverse_admission_terminal,
             }
         )
 
