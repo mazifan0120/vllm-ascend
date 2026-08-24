@@ -1665,6 +1665,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_maybe_retire_prefill_abort_key",
                 "_recovery_invalid_block_ids",
                 "_freeze_decode_reverse_admission_terminal",
+                "_mark_decode_admission_failed",
                 "_fail_decode_admission",
                 "_aggregate_worker_completion_reports",
                 "_run_completion_close_action",

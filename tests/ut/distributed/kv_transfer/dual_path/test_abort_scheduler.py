@@ -116,6 +116,7 @@ def test_pending_decode_abort_stages_peer_abort_failure(decode_scheduler_factory
     ]
     assert scheduler._decode_control_failures == {}
     decode_control_seams.decode_coordinator.unregister.assert_called_once_with(state.request_key)
+    decode_control_seams.decode_coordinator.submit_abort.assert_not_called()
 
 
 def test_same_drain_commits_decision_then_aborts_without_touching_completion_tracker(
@@ -184,6 +185,39 @@ def test_decode_final_publication_gate_rejects_admission_frozen_during_validatio
     assert scheduler._completion_tracker.open_count() == 0
     assert scheduler._reverse_send_completion_ids == {}
     scheduler._kvpool_adapter.commit_after_alloc.assert_not_called()
+
+
+def test_decode_final_publication_gate_rejects_admission_frozen_during_store_commit(
+    decode_scheduler_factory,
+) -> None:
+    scheduler = decode_scheduler_factory()
+    request = _admit_decode_request(scheduler)
+    state = scheduler._decode_decision_states[request.request_id]
+    decision = _de_read_decision()
+    snapshot = scheduler._decode_kv_snapshots[request.request_id]
+
+    def commit_then_freeze(*args, **kwargs):
+        scheduler._fail_decode_admission(
+            state,
+            snapshot,
+            local_reason=DualPathControlFailureReason.ACTIVATION_FAILED,
+            peer_endpoint=decision.prefill_control_endpoint,
+            reverse_attempt_id=decision.result.reverse_attempt_id,
+        )
+
+    scheduler._kvpool_adapter.commit_after_alloc.side_effect = commit_then_freeze
+    metadata = scheduler_module.DualPathConnectorMetadata()
+
+    scheduler._activate_received_decision(decision, metadata)
+
+    assert state.status is scheduler_module._DecodeDecisionStatus.ACTIVATION_FAILED
+    assert state.reverse_admission_terminal == (
+        decision_model.ReverseAdmissionTerminalNotice(None)
+    )
+    assert metadata.reverse_plans == []
+    assert scheduler._completion_tracker.open_count() == 0
+    assert scheduler._reverse_send_completion_ids == {}
+    scheduler._kvpool_adapter.commit_after_alloc.assert_called_once()
 
 
 def test_unknown_decode_abort_is_ignored(decode_scheduler_factory, decode_control_seams) -> None:

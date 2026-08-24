@@ -213,6 +213,17 @@ def _is_open_decision_status(status: _DecodeDecisionStatus) -> bool:
     return status is _DecodeDecisionStatus.PENDING
 
 
+def _is_decode_admission_live(
+    state: DecodePathDecisionState,
+    expected_status: _DecodeDecisionStatus,
+) -> bool:
+    """Return whether one exact admission may still publish activation state."""
+    return (
+        state.status is expected_status
+        and state.reverse_admission_terminal is None
+    )
+
+
 def _validate_local_topology(vllm_config: VllmConfig) -> None:
     """Require PP, DP, PCP, and DCP sizes of one."""
     parallel_config = vllm_config.parallel_config
@@ -1748,10 +1759,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 token_start=forward_token_start,
                 token_end=snapshot.transfer_tokens,
             )
-            if (
-                state.status is not expected_status
-                or state.reverse_admission_terminal is not None
-            ):
+            if not _is_decode_admission_live(state, expected_status):
                 return
             if not is_attempt_refresh and result.path is PathKind.DE_READ and snapshot.store_load_spec is not None:
                 assert self._kvpool_adapter is not None
@@ -1777,7 +1785,10 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 metadata.control_failures.append(failure)
             return
 
-        if state.status is not expected_status or state.reverse_admission_terminal is not None:
+        # KVPool commit is non-reentrant today. Keep the same admission check
+        # at the worker-visibility boundary so a future adapter callback cannot
+        # publish after terminalization without changing this contract.
+        if not _is_decode_admission_live(state, expected_status):
             return
 
         state.prefill_control_endpoint = candidate_endpoint
@@ -1829,25 +1840,18 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         in-flight attempt still owns the all-worker barrier and block-release
         lifecycle.
         """
-        state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
-        self._path_decision_coordinator.unregister(state.request_key)
-        reverse_admission_terminal = self._freeze_decode_reverse_admission_terminal(state)
         endpoint = peer_endpoint or state.prefill_control_endpoint
         try:
-            return self._build_decode_control_failure(
-                state.request_key.decode_request_id,
+            failure, _ = self._mark_decode_admission_failed(
+                state,
                 snapshot,
-                local_reason,
+                local_reason=local_reason,
             )
-        except RuntimeError as error:
-            logger.error(
-                "DualPath could not build Decode control failure for request %s: %s",
-                state.request_key.decode_request_id,
-                error,
-            )
-            return None
         finally:
-            if endpoint is not None:
+            # Once failure marking has frozen evidence, notify even if control
+            # failure construction raises an unexpected exception.
+            reverse_admission_terminal = state.reverse_admission_terminal
+            if endpoint is not None and reverse_admission_terminal is not None:
                 self._send_abort_notice(
                     state.request_key,
                     endpoint,
@@ -1862,6 +1866,38 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                     ),
                     reverse_admission_terminal=reverse_admission_terminal,
                 )
+        return failure
+
+    def _mark_decode_admission_failed(
+        self,
+        state: DecodePathDecisionState,
+        snapshot: DecodeKVSnapshot,
+        *,
+        local_reason: DualPathControlFailureReason,
+    ) -> tuple[
+        DualPathControlFailureMetadata | None,
+        ReverseAdmissionTerminalNotice,
+    ]:
+        """Make one exact Decode admission terminal without notifying its peer."""
+        state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
+        self._path_decision_coordinator.unregister(state.request_key)
+        reverse_admission_terminal = self._freeze_decode_reverse_admission_terminal(
+            state
+        )
+        try:
+            failure = self._build_decode_control_failure(
+                state.request_key.decode_request_id,
+                snapshot,
+                local_reason,
+            )
+        except RuntimeError as error:
+            logger.error(
+                "DualPath could not build Decode control failure for request %s: %s",
+                state.request_key.decode_request_id,
+                error,
+            )
+            failure = None
+        return failure, reverse_admission_terminal
 
     def _log_decision_activation(
         self,
@@ -1930,22 +1966,14 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
             )
         ):
             return
-        state.status = _DecodeDecisionStatus.ACTIVATION_FAILED
-        self._path_decision_coordinator.unregister(state.request_key)
-        self._freeze_decode_reverse_admission_terminal(state)
         snapshot = self._decode_kv_snapshots[request_id]
-        try:
-            self._decode_control_failures[request_id] = self._build_decode_control_failure(
-                request_id,
-                snapshot,
-                DualPathControlFailureReason.PEER_ABORT,
-            )
-        except RuntimeError as error:
-            logger.error(
-                "DualPath peer ABORT could not build Decode control failure for request %s: %s",
-                request_id,
-                error,
-            )
+        failure, _ = self._mark_decode_admission_failed(
+            state,
+            snapshot,
+            local_reason=DualPathControlFailureReason.PEER_ABORT,
+        )
+        if failure is not None:
+            self._decode_control_failures[request_id] = failure
 
     def _unregister_prefill_abort_key(self, request_key: DualPathRequestKey) -> None:
         if self._prefill_abort_request_ids.pop(request_key, None) is None:

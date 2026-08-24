@@ -222,6 +222,40 @@ class TestDecodeFailureRelay:
             self._expected_abort(0, None),
         )
 
+    def test_decode_failure_sends_abort_before_unexpected_control_failure_error_propagates(
+        self, decode_scheduler_factory, decode_control_seams
+    ):
+        scheduler = decode_scheduler_factory()
+        request = _admit_decode_request(scheduler)
+        state = scheduler._decode_decision_states[request.request_id]
+
+        with (
+            patch.object(
+                scheduler,
+                "_build_decode_control_failure",
+                side_effect=ValueError("unexpected metadata failure"),
+            ),
+            pytest.raises(ValueError, match="unexpected metadata failure"),
+        ):
+            _activate_decision(
+                scheduler,
+                decode_control_seams,
+                self._decision_with_endpoint(
+                    0,
+                    _PREFILL_ENDPOINT_A,
+                    remote_tp_size=2,
+                ),
+            )
+
+        assert state.status.value == "ACTIVATION_FAILED"
+        assert state.reverse_admission_terminal == ReverseAdmissionTerminalNotice(
+            None
+        )
+        decode_control_seams.decode_coordinator.submit_abort.assert_called_once_with(
+            _PREFILL_ENDPOINT_A,
+            self._expected_abort(0, None),
+        )
+
     def test_decode_failure_without_endpoint_is_local_only(
         self, decode_scheduler_factory, decode_control_seams
     ):

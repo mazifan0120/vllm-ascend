@@ -259,7 +259,7 @@ if reverse_plan is not None:
     # Open the exact completion, attach its id, then append to metadata.
 ```
 
-The final gate, watermark update, metadata append, `_fail_decode_admission()` terminal transition/unregister/freeze, and request-state release remain on the scheduler thread. `_fail_decode_admission()` must set `ACTIVATION_FAILED`, unregister, freeze, then send one ABORT containing both optional exact proof and the frozen admission proof.
+The liveness predicate is shared by the pre-Store-commit and final publication gates so their definition cannot drift. The watermark update, metadata append, failure transition, and request-state release remain on the scheduler thread. `_mark_decode_admission_failed()` owns the common `ACTIVATION_FAILED` → unregister → freeze → control-failure sequence. `_fail_decode_admission()` calls it and then sends one ABORT containing both optional exact proof and the frozen admission proof; once evidence is frozen, its `finally` path preserves that notification even if control-failure construction raises an unexpected exception. Peer-ABORT handling calls the mark helper without notifying Prefill again.
 
 - [ ] **Step 7: Preserve frozen evidence for late failures**
 
