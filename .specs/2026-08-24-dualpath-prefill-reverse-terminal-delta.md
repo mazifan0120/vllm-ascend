@@ -182,7 +182,7 @@ When a failed `REVERSE_SEND` completion closes, send an ABORT carrying `completi
 
 - [ ] **Step 4: Stage exact Prefill worker terminals**
 
-In `_handle_received_peer_abort()` resolve the exact admission and attempt. An ABORT without proof only latches failure. For an exact proof, call `force_fail_completion()`: undispatched completions close immediately; dispatched open completions stage one `ReverseReceiveFailureTerminal` in scheduler-owned pending state. `build_connector_meta()` drains that state exactly once. Existing worker reports then close through `_aggregate_worker_completion_reports()` and `_run_completion_close_action()`.
+In `_handle_received_peer_abort()` resolve the exact admission and attempt. An ABORT without proof only latches failure. For an exact proof, call `force_fail_completion()`: undispatched completions close immediately; dispatched open completions stage one `ReverseReceiveFailureTerminal` in scheduler-owned pending state. Track staged-or-delivered exact attempts until their completion closes so a duplicate ABORT cannot redispatch the terminal after `build_connector_meta()` drains the pending payload but before worker reports return. Retire that dedupe state from both current and stale completion close paths. Existing worker reports then close through `_aggregate_worker_completion_reports()` and `_run_completion_close_action()`.
 
 - [ ] **Step 5: Add barrier and isolation tests**
 
