@@ -570,6 +570,79 @@ def test_prefill_control_failure_rejects_mismatched_wire_id():
     assert worker.build_connector_worker_meta() is None
 
 
+@pytest.mark.parametrize("mismatch", ["completion", "wire"])
+def test_pending_failure_terminal_mismatch_leaves_live_reverse_state_unchanged(mismatch: str):
+    worker = _make_prefill_worker()
+    prior_binding = _make_reverse_receive_binding()
+    prior_metadata = DualPathConnectorMetadata()
+    prior_metadata.reverse_receive_bindings.append(prior_binding)
+    prior_metadata.reverse_receive_failure_terminals.append(
+        _make_reverse_receive_failure_terminal(prior_binding)
+    )
+    worker.start_load_kv(prior_metadata)
+    assert worker.build_connector_worker_meta() is not None
+
+    exact_candidate = _make_reverse_receive_binding(
+        reverse_attempt_id=1,
+        reverse_receive_completion_id=92,
+    )
+    candidate = (
+        replace(exact_candidate, reverse_receive_completion_id=93)
+        if mismatch == "completion"
+        else replace(exact_candidate, wire_request_id="mismatched-pending-binding-wire")
+    )
+    terminal = _make_reverse_receive_failure_terminal(exact_candidate)
+    terminal_metadata = DualPathConnectorMetadata()
+    terminal_metadata.reverse_receive_failure_terminals.append(terminal)
+    worker.start_load_kv(terminal_metadata)
+
+    worker._pending_forward_done_wire_ids = {candidate.wire_request_id}
+    worker._pending_forward_failed_wire_ids = {"retained-forward-failed-wire"}
+    worker._pending_reverse_done_wire_ids = {"retained-reverse-done-wire"}
+    worker._pending_reverse_failed_wire_ids = {"retained-reverse-failed-wire"}
+    expected_reverse_receive_bindings = dict(worker._reverse_receive_bindings)
+    expected_reverse_request_map = dict(worker._reverse_request_map)
+    expected_pending_forward_done = set(worker._pending_forward_done_wire_ids)
+    expected_pending_forward_failed = set(worker._pending_forward_failed_wire_ids)
+    expected_pending_reverse_done = set(worker._pending_reverse_done_wire_ids)
+    expected_pending_reverse_failed = set(worker._pending_reverse_failed_wire_ids)
+
+    binding_metadata = DualPathConnectorMetadata()
+    binding_metadata.reverse_receive_bindings.append(candidate)
+    with pytest.raises(RuntimeError, match="mismatched Reverse receive failure terminal"):
+        worker.start_load_kv(binding_metadata)
+
+    attempt_key = _attempt_key(exact_candidate.reverse_attempt_id, exact_candidate.request_key)
+    assert worker._reverse_receive_bindings == expected_reverse_receive_bindings
+    assert worker._reverse_request_map == expected_reverse_request_map
+    assert worker._pending_reverse_receive_failure_terminals == {attempt_key: terminal}
+    assert worker._pending_forward_done_wire_ids == expected_pending_forward_done
+    assert worker._pending_forward_failed_wire_ids == expected_pending_forward_failed
+    assert worker._pending_reverse_done_wire_ids == expected_pending_reverse_done
+    assert worker._pending_reverse_failed_wire_ids == expected_pending_reverse_failed
+    assert worker.build_connector_worker_meta() is None
+
+
+def test_late_failure_terminal_after_shutdown_does_not_repopulate_reverse_state():
+    worker = _make_prefill_worker()
+    terminal = _make_reverse_receive_failure_terminal(_make_reverse_receive_binding())
+    metadata = DualPathConnectorMetadata()
+    metadata.reverse_receive_failure_terminals.append(terminal)
+
+    worker.shutdown()
+    worker.start_load_kv(metadata)
+    worker.shutdown()
+
+    assert worker._accepting_split_requests is False
+    assert worker._reverse_receive_bindings == {}
+    assert worker._reverse_request_map == {}
+    assert worker._pending_reverse_receive_failure_terminals == {}
+    assert worker._pending_reverse_done_wire_ids == set()
+    assert worker._pending_reverse_failed_wire_ids == set()
+    assert worker._consumed_reverse_terminal_wire_ids == {}
+    assert worker.build_connector_worker_meta() is None
+
+
 def test_reverse_terminal_is_not_visible_while_terminal_ack_is_blocked():
     worker = _make_worker()
     tracker = _seed_reverse_send_tracker(worker, reverse_send_completion_id=17)
