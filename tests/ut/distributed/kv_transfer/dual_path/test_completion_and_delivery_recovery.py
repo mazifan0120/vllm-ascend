@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import pytest
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
@@ -31,6 +33,9 @@ from tests.ut.distributed.kv_transfer.dual_path.test_reverse_send_completion imp
     _admit_decode_request,
     _de_read_decision,
 )
+from tests.ut.distributed.kv_transfer.dual_path.test_split_lifecycle import (
+    _make_prefill_worker,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.metadata import (
     DualPathControlFailureReason,
 )
@@ -45,8 +50,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision import (
     ReverseTerminalState,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel import (
+    DecisionReplyStatus,
     DecodeControlEndpoint,
     PathDecision,
+    PathDecisionDeliveryError,
+    PathDecisionRejectedError,
 )
 
 
@@ -529,6 +537,138 @@ class TestBoundedCompletions:
         assert binding.request_key in scheduler._prefill_invalid_request_keys
 
 
+class TestPrefillDecisionDeliveryTerminality:
+    @pytest.mark.parametrize(
+        "status",
+        [
+            DecisionReplyStatus.UNKNOWN_REQUEST,
+            DecisionReplyStatus.STALE_CLOSED,
+            DecisionReplyStatus.PROTOCOL_ERROR,
+        ],
+    )
+    def test_typed_rejection_before_dispatch_closes_exact_attempt_without_worker_terminal(
+        self,
+        pe_scheduler_factory,
+        status,
+    ):
+        delivery_future: Future[None] = Future()
+        scheduler, coordinator = pe_scheduler_factory(
+            PathKind.DE_READ,
+            pool=make_block_pool(),
+        )
+        coordinator.submit.return_value = delivery_future
+        request = _admit_de_read(scheduler)
+        binding = scheduler._prefill_pending_reverse_receive_bindings[
+            request.request_id
+        ]
+        delivery_future.set_exception(PathDecisionRejectedError(status))
+
+        metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
+
+        assert metadata.reverse_receive_bindings == []
+        assert metadata.reverse_receive_failure_terminals == []
+        assert len(metadata.control_failures) == 1
+        assert scheduler._completion_tracker.get(
+            binding.reverse_receive_completion_id
+        ) is None
+        assert request.request_id not in scheduler._waiting_reverse_attempt_ids
+        assert scheduler._scheduler_side_finished_recving == {request.request_id}
+
+    def test_typed_rejection_after_dispatch_closes_through_real_worker_report(
+        self,
+        pe_scheduler_factory,
+    ):
+        delivery_future: Future[None] = Future()
+        scheduler, coordinator = pe_scheduler_factory(
+            PathKind.DE_READ,
+            pool=make_block_pool(),
+        )
+        coordinator.submit.return_value = delivery_future
+        request = _admit_de_read(scheduler)
+        binding = scheduler._prefill_pending_reverse_receive_bindings[
+            request.request_id
+        ]
+        binding_metadata = scheduler.build_connector_meta(
+            make_empty_scheduler_output()
+        )
+        worker = _make_prefill_worker()
+        worker.start_load_kv(binding_metadata)
+        delivery_future.set_exception(
+            PathDecisionRejectedError(DecisionReplyStatus.UNKNOWN_REQUEST)
+        )
+
+        terminal_metadata = scheduler.build_connector_meta(
+            make_empty_scheduler_output()
+        )
+
+        completion = scheduler._completion_tracker.get(
+            binding.reverse_receive_completion_id
+        )
+        assert completion is not None
+        assert completion.dispatched is True
+        assert completion.failed is True
+        assert completion.closed is False
+        assert terminal_metadata.reverse_receive_bindings == []
+        assert len(terminal_metadata.reverse_receive_failure_terminals) == 1
+
+        worker.start_load_kv(terminal_metadata)
+        worker_report = worker.build_connector_worker_meta()
+        assert worker_report is not None
+        assert worker_report.failure_reports == {
+            binding.reverse_receive_completion_id: 1,
+        }
+        output = KVConnectorOutput(kv_connector_worker_meta=worker_report)
+        scheduler.update_connector_output(output)
+
+        assert output.finished_recving == {request.request_id}
+        assert scheduler._completion_tracker.get(
+            binding.reverse_receive_completion_id
+        ) is None
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            PathDecisionDeliveryError("acknowledgement lost"),
+            RuntimeError("generic delivery failure"),
+            None,
+        ],
+        ids=["delivery-error", "generic-error", "cancelled"],
+    )
+    def test_ambiguous_delivery_failure_dispatches_binding_without_worker_terminal(
+        self,
+        pe_scheduler_factory,
+        outcome,
+    ):
+        delivery_future: Future[None] = Future()
+        scheduler, coordinator = pe_scheduler_factory(
+            PathKind.DE_READ,
+            pool=make_block_pool(),
+        )
+        coordinator.submit.return_value = delivery_future
+        request = _admit_de_read(scheduler)
+        binding = scheduler._prefill_pending_reverse_receive_bindings[
+            request.request_id
+        ]
+        if outcome is None:
+            assert delivery_future.cancel()
+        else:
+            delivery_future.set_exception(outcome)
+
+        metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
+
+        completion = scheduler._completion_tracker.get(
+            binding.reverse_receive_completion_id
+        )
+        assert metadata.reverse_receive_bindings == [binding]
+        assert metadata.reverse_receive_failure_terminals == []
+        assert len(metadata.control_failures) == 1
+        assert completion is not None
+        assert completion.dispatched is True
+        assert completion.failed is False
+        assert completion.closed is False
+        assert scheduler._scheduler_side_finished_recving == set()
+
+
 class TestSingleUnresolvedDeliveryFuture:
     def test_replacement_delivery_defers_until_prior_future_resolves(self, pe_scheduler_factory):
         pool = make_block_pool()
@@ -691,6 +831,34 @@ class TestFailedPriorFutureCancelsDeferredReplacement:
         assert request_key not in scheduler._prefill_deferred_deliveries
         assert request_key not in scheduler._prefill_deferred_activations
         assert len(metadata.control_failures) == 1
+
+    def test_typed_rejection_terminalizes_rejected_attempt_after_deferred_rollback(
+        self,
+        pe_scheduler_factory,
+    ):
+        scheduler, coordinator = pe_scheduler_factory(
+            PathKind.DE_READ,
+            pool=make_block_pool(),
+        )
+        request, pending_future = self._defer_replacement(scheduler, coordinator)
+        request_key = scheduler._prefill_request_keys[request.request_id]
+        rejected_record = scheduler._prefill_delivery_records[request_key]
+        assert rejected_record.reverse_attempt_id == 0
+        assert scheduler._waiting_reverse_attempt_ids[
+            request.request_id
+        ].reverse_attempt_id == 1
+
+        pending_future.done.return_value = True
+        pending_future.exception.return_value = PathDecisionRejectedError(
+            DecisionReplyStatus.STALE_CLOSED
+        )
+        metadata = scheduler.build_connector_meta(make_empty_scheduler_output())
+
+        assert metadata.reverse_receive_bindings == []
+        assert metadata.reverse_receive_failure_terminals == []
+        assert scheduler._completion_tracker.open_count() == 0
+        assert request.request_id not in scheduler._waiting_reverse_attempt_ids
+        assert scheduler._scheduler_side_finished_recving == {request.request_id}
 
 
 class TestCompletionTrackerRetirementWiring:

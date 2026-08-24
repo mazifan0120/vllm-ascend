@@ -580,7 +580,87 @@ def test_result_delivery_round_trip_enqueues_once_and_returns_ack() -> None:
         receiver.close()
 
 
-def test_prefill_coordinator_receives_abort_on_control_endpoint() -> None:
+def test_prefill_coordinator_enqueues_proofless_then_exact_abort_for_registered_key() -> None:
+    prefill_endpoint = _free_control_endpoint()
+    prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
+    sender = PathDecisionCoordinator.for_prefill()
+    key = _request().request_key
+    proofless_notice = PathAbortNotice(
+        request_key=key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+    )
+    exact_notice = replace(
+        proofless_notice,
+        reverse_terminal=ReverseTerminalNotice(
+            reverse_attempt_id=0,
+            state=ReverseTerminalState.TERMINALIZED,
+        ),
+    )
+    try:
+        prefill.register_prefill_abort_key(key)
+        assert sender.submit_abort(prefill_endpoint, proofless_notice).result(timeout=5) is None
+        assert sender.submit_abort(prefill_endpoint, exact_notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == [proofless_notice, exact_notice]
+        assert prefill.take_received_aborts() == []
+    finally:
+        sender.close()
+        prefill.close()
+
+
+def test_prefill_coordinator_enqueues_each_exact_abort_attempt_once() -> None:
+    prefill_endpoint = _free_control_endpoint()
+    prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
+    sender = PathDecisionCoordinator.for_prefill()
+    key = _request().request_key
+    attempt_zero = PathAbortNotice(
+        request_key=key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+        reverse_terminal=ReverseTerminalNotice(
+            reverse_attempt_id=0,
+            state=ReverseTerminalState.TERMINALIZED,
+        ),
+    )
+    attempt_one = replace(
+        attempt_zero,
+        reverse_terminal=replace(
+            attempt_zero.reverse_terminal,
+            reverse_attempt_id=1,
+        ),
+    )
+    try:
+        prefill.register_prefill_abort_key(key)
+        assert sender.submit_abort(prefill_endpoint, attempt_zero).result(timeout=5) is None
+        assert sender.submit_abort(prefill_endpoint, attempt_one).result(timeout=5) is None
+        assert prefill.take_received_aborts() == [attempt_zero, attempt_one]
+    finally:
+        sender.close()
+        prefill.close()
+
+
+def test_prefill_coordinator_deduplicates_exact_abort_sender_retry() -> None:
+    prefill_endpoint = _free_control_endpoint()
+    prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
+    sender = PathDecisionCoordinator.for_prefill()
+    key = _request().request_key
+    notice = PathAbortNotice(
+        request_key=key,
+        reason=PathAbortReason.ACTIVATION_FAILED,
+        reverse_terminal=ReverseTerminalNotice(
+            reverse_attempt_id=0,
+            state=ReverseTerminalState.TERMINALIZED,
+        ),
+    )
+    try:
+        prefill.register_prefill_abort_key(key)
+        assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == [notice]
+    finally:
+        sender.close()
+        prefill.close()
+
+
+def test_prefill_abort_unregister_drops_notice_and_resets_dedupe_on_reregister() -> None:
     prefill_endpoint = _free_control_endpoint()
     prefill = PathDecisionCoordinator.for_prefill(control_endpoint=prefill_endpoint)
     sender = PathDecisionCoordinator.for_prefill()
@@ -592,9 +672,15 @@ def test_prefill_coordinator_receives_abort_on_control_endpoint() -> None:
     try:
         prefill.register_prefill_abort_key(key)
         assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == [notice]
+
+        prefill.unregister_prefill_abort_key(key)
+        assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
+        assert prefill.take_received_aborts() == []
+
+        prefill.register_prefill_abort_key(key)
         assert sender.submit_abort(prefill_endpoint, notice).result(timeout=5) is None
         assert prefill.take_received_aborts() == [notice]
-        assert prefill.take_received_aborts() == []
     finally:
         sender.close()
         prefill.close()
@@ -1097,6 +1183,7 @@ def test_prefill_receiver_close_clears_registry_queues_and_releases_endpoint() -
     assert coordinator._receiver_thread is not None
     assert not coordinator._receiver_thread.is_alive()
     assert coordinator._prefill_abort_keys == set()
+    assert coordinator._prefill_received_abort_notices == {}
     assert coordinator._received_decisions.empty()
     assert coordinator._received_aborts.empty()
     with pytest.raises(RuntimeError, match="closed"):

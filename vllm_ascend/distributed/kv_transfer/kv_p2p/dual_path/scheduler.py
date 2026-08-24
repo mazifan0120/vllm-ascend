@@ -58,6 +58,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dual_path.path_decision_channel 
     DualPathDecisionMetadata,
     PathDecision,
     PathDecisionCoordinator,
+    PathDecisionRejectedError,
     derive_decode_control_port,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
@@ -433,7 +434,15 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 request_id = delivery_record.request_id
                 if delivery_record.future is not delivery_future:
                     raise RuntimeError(f"DualPath Prefill request {request_id} has mismatched Decision delivery state")
-                delivery_failed = delivery_future.cancelled() or delivery_future.exception() is not None
+                delivery_cancelled = delivery_future.cancelled()
+                delivery_error = (
+                    None if delivery_cancelled else delivery_future.exception()
+                )
+                delivery_failed = delivery_cancelled or delivery_error is not None
+                terminal_rejection = isinstance(
+                    delivery_error,
+                    PathDecisionRejectedError,
+                )
                 retain_delivery_record = False
                 if delivery_failed:
                     # A failed prior delivery cancels its deferred replacement
@@ -468,6 +477,17 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                             retain_delivery_record = True
                         elif delivery_record.path is not PathKind.PE_READ:
                             assert_never(delivery_record.path)
+                    if (
+                        terminal_rejection
+                        and delivery_record.path is PathKind.DE_READ
+                    ):
+                        assert delivery_record.reverse_attempt_id is not None
+                        self._terminalize_prefill_reverse_attempt(
+                            ReverseAttemptKey(
+                                delivery_record.request_key,
+                                delivery_record.reverse_attempt_id,
+                            )
+                        )
                     self._send_abort_notice(
                         delivery_record.request_key,
                         delivery_record.endpoint,
@@ -1917,13 +1937,47 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._unregister_prefill_abort_key(request_key)
         self._prefill_invalid_request_keys.discard(request_key)
 
+    def _terminalize_prefill_reverse_attempt(
+        self,
+        attempt_key: ReverseAttemptKey,
+    ) -> None:
+        """Close or stage one exact Reverse receive proven safe to stop."""
+        completion = self._completion_tracker.find_open_completion(
+            CompletionKind.REVERSE_RECEIVE,
+            attempt_key,
+        )
+        if completion is None:
+            return
+        if self._completion_tracker.force_fail_completion(
+            completion.completion_id,
+            expected_kind=CompletionKind.REVERSE_RECEIVE,
+            expected_attempt_key=attempt_key,
+        ):
+            _, finished_recving = self._run_completion_close_action(completion)
+            self._scheduler_side_finished_recving.update(finished_recving)
+            return
+        if (
+            completion.closed
+            or attempt_key in self._prefill_staged_or_delivered_reverse_terminals
+        ):
+            return
+        self._prefill_pending_reverse_receive_failure_terminals[attempt_key] = (
+            ReverseReceiveFailureTerminal(
+                request_key=attempt_key.request_key,
+                reverse_attempt_id=attempt_key.reverse_attempt_id,
+                reverse_receive_completion_id=completion.completion_id,
+                wire_request_id=reverse_wire_id(attempt_key),
+            )
+        )
+        self._prefill_staged_or_delivered_reverse_terminals.add(attempt_key)
+
     def _handle_received_peer_abort(self, notice: PathAbortNotice) -> None:
-        """Fail-close one exact Prefill Reverse receive after a peer ABORT."""
+        """Apply one exact-admission peer ABORT to Prefill recovery state."""
         request_id = self._prefill_abort_request_ids.get(notice.request_key)
         if request_id is None:
             return
         logger.warning(
-            "dual_path peer_abort key=%s reason=%s: fail-closing reverse receive",
+            "dual_path peer_abort key=%s reason=%s: handling reverse receive failure",
             notice.request_key.decode_request_id,
             notice.reason.value,
         )
@@ -1942,31 +1996,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
                 reverse_terminal.reverse_attempt_id,
             )
             proof_matches_current_attempt = current_waiting_attempt == terminal_attempt
-            completion = self._completion_tracker.find_open_completion(
-                CompletionKind.REVERSE_RECEIVE,
-                terminal_attempt,
-            )
-            if completion is not None and self._completion_tracker.force_fail_completion(
-                completion.completion_id,
-                expected_kind=CompletionKind.REVERSE_RECEIVE,
-                expected_attempt_key=terminal_attempt,
-            ):
-                _, finished_recving = self._run_completion_close_action(completion)
-                self._scheduler_side_finished_recving.update(finished_recving)
-            elif (
-                completion is not None
-                and not completion.closed
-                and terminal_attempt not in self._prefill_staged_or_delivered_reverse_terminals
-            ):
-                self._prefill_pending_reverse_receive_failure_terminals[terminal_attempt] = (
-                    ReverseReceiveFailureTerminal(
-                        request_key=terminal_attempt.request_key,
-                        reverse_attempt_id=terminal_attempt.reverse_attempt_id,
-                        reverse_receive_completion_id=completion.completion_id,
-                        wire_request_id=reverse_wire_id(terminal_attempt),
-                    )
-                )
-                self._prefill_staged_or_delivered_reverse_terminals.add(terminal_attempt)
+            self._terminalize_prefill_reverse_attempt(terminal_attempt)
 
         invalid_block_ids = (
             self._recovery_invalid_block_ids(request_id)

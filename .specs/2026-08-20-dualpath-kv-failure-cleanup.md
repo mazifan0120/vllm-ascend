@@ -24,6 +24,8 @@
 - Decode 只在能够证明 exact Reverse attempt 已 `TERMINALIZED` 时，随 ABORT 传播 `(request_key, reverse_attempt_id)` 终端证明。`TERMINALIZED` 表示每个 Decode worker 对该 attempt 要么从未提交，要么已在 wire terminal 获得 Prefill ACK 后停止写入。
 - Prefill 对已 dispatch 的 exact attempt 不直接关闭；它向所有 Prefill workers 下发 exact `ReverseReceiveFailureTerminal`。每个 worker 复用 `_consume_reverse_receive_binding(..., succeeded=False)` 贡献一次 failure report；scheduler 收齐现有 all-worker barrier 后才执行 `_run_completion_close_action` 和 `finished_recving` 注入。
 - 普通 ABORT 若不携带 exact terminal proof，记录 exact admission invalid；仅当它仍是 current exact admission 且 current waiting attempt 属于该 admission 时，生成 invalid-block control failure。它不修改 completion state、不关闭 completion、不 stage worker terminal，也不注入 `finished_recving`。
+- Prefill control-channel registration 不是一次性 notice latch：同一 exact key 在 scheduler 注销前可依次接收 proofless ABORT、不同 attempt 的 terminalized ABORT。receiver 只按完整 `PathAbortNotice` 去重 sender retry；scheduler-driven unregister 和 coordinator close 才清 registry 及该 key 的 notice dedupe。
+- Decision delivery failure 必须按证据强度分流。`PathDecisionRejectedError`（`UNKNOWN_REQUEST`、`STALE_CLOSED`、`PROTOCOL_ERROR`）证明该 delivery record 的 decision 未被 peer 接受，因此其 exact DE_READ attempt 可复用 ABORT 的 exact-attempt terminal helper：未 dispatch completion 由 scheduler 关闭，已 dispatch completion 只 latch/stage worker terminal 并等待真实 barrier。timeout、ACK loss、cancel 和普通 `PathDecisionDeliveryError` 仍是 ambiguous；它们可以使 admission invalid 并生成 control failure，但不得关闭 completion 或 stage worker terminal。
 - `DualPathControlFailureMetadata(request_id, ...)` 继续只表达请求失败/无效块，不能用作 Reverse completion 身份；worker terminal 必须同时校验 admission、attempt、completion id 与 wire id。
 - 当前 `test_prefill_peer_abort_after_binding_dispatch_waits_for_zero_report_barrier` 中手工注入 worker report 的 oracle 作废，必须替换为 scheduler→worker→worker metadata→scheduler 的真实闭环。
 
@@ -41,7 +43,7 @@
 - 上游对齐边界：vLLM 0.23 用 raw budget 判断单 key 是否绝对超限，用 usable budget（raw × ratio）约束多 key 批次，并按 4096B 对齐后额外计入 8192B padding。本文保留这一双预算/估算模型；唯一有意识的偏离是：单 key 超过 raw budget 时只把该 key 记为失败、继续处理其余 key，而不是像上游 disk-offload 路径那样放弃整个 GET。这里已有 per-key block failure 记账，局部失败能减少无关块重取。
 - 现成的关闭通道：worker `_record_completion_report(completion_id, succeeded=...)`（`worker.py:341-359`）→ scheduler `_aggregate_worker_completion_reports`（`scheduler.py:2026-2075`）→ `_run_completion_close_action`（`:2078+`）→ finished_sending/recving 注入 → 上游释放延迟块。completion 失败时 decode 分支已会构建 `_decode_control_failures`（`:2047`），prefill 分支已有 `_prefill_control_failures` + `_recovery_invalid_block_ids` 清理链（`:2060-2073`）——**Fix B 主要是把"失败"这个消息跨节点送达，后续清理链全是现成的**。
 - `TransferCompletionTracker.tally_reports`（`completion_tracker.py:149-173`）按 worker barrier 计数关闭；TP>1 的已 dispatch completion 必须由所有真实 Prefill workers 各贡献一次 terminal report 后关闭，不能用 scheduler forced closure 绕过 barrier。
-- 控制投递是有界的：`_deliver_decision` 最多尝试 `_MAX_DELIVERY_ATTEMPTS = 3` 次；未收到合法 ACK 时 Future 以 `PathDecisionDeliveryError` 终止，不会无限重试。
+- 控制投递是有界的：`_deliver_decision` 最多尝试 `_MAX_DELIVERY_ATTEMPTS = 3` 次；未收到合法 ACK 时 Future 以 `PathDecisionDeliveryError` 终止，不会无限重试。只有带 terminal registry reply 的 `PathDecisionRejectedError` 能证明 decision 未被接受；无 reply 的 exhaustion/timeout 仍是 ambiguous delivery。
 
 ## 文件地图
 
@@ -799,7 +801,7 @@ git commit -s -m "feat(dual_path): carry optional prefill control endpoint on pa
 - Test: `tests/ut/distributed/kv_transfer/dual_path/test_path_decision_channel.py`
 - Test: `tests/ut/distributed/kv_transfer/dual_path/test_dual_path_connector.py`
 
-设计：不能直接复用 Decode receiver 的 registry 语义。现有 `_handle_decision_frame`/`_handle_abort_frame` 都读取 `decode_engine_instance_id` 和 `_pending_keys`，Prefill coordinator 没有这些状态。receiver 必须先按 role 分流：Decode 继续维护 decision admission registry；Prefill 只允许 ABORT，并用独立的 `_prefill_abort_keys` 做 exact-key admission。未知/已注销的 ABORT 仍 ACK（幂等丢弃，避免发送端无谓重试），但不得入队；投到 Prefill receiver 的 DECISION 明确回复 `PROTOCOL_ERROR`。`for_decode` 增加发送 executor，`for_prefill(control_endpoint=...)` 增加接收线程；两侧 `close()` 统一关闭自己实际创建的 receiver/executor 并清空各自 registry/queue。
+设计：不能直接复用 Decode receiver 的 registry 语义。现有 `_handle_decision_frame`/`_handle_abort_frame` 都读取 `decode_engine_instance_id` 和 `_pending_keys`，Prefill coordinator 没有这些状态。receiver 必须先按 role 分流：Decode 继续维护 decision admission registry；Prefill 只允许 ABORT，并用独立的 `_prefill_abort_keys` 做 exact-key admission。该 registration 覆盖 scheduler 所管理 admission 的完整生命周期，收到 notice 不自动注销；同 key 的 proofless→terminalized、attempt 0→attempt 1 必须分别入队，只有完整 `PathAbortNotice` 相同的 sender retry 被去重。scheduler-driven unregister 同时清该 key 的 notice dedupe，使未来重新 register 可再次接收相同 notice；`close()` 清空 registry、dedupe 和 queue。未知/已注销的 ABORT 仍 ACK（幂等丢弃，避免发送端无谓重试），但不得入队；投到 Prefill receiver 的 DECISION 明确回复 `PROTOCOL_ERROR`。`for_decode` 增加发送 executor，`for_prefill(control_endpoint=...)` 增加接收线程；两侧 `close()` 统一关闭自己实际创建的 receiver/executor 并清空各自 registry/queue。
 
 - [ ] **Step 0: 读 `_handle_decision_frame`/`_handle_abort_frame` 与 config 测试，确认本 Task 不让 Prefill 访问 `decode_engine_instance_id`，也不复用 `_pending_keys`**
 

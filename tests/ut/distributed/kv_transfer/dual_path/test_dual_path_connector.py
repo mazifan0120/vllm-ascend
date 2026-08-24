@@ -1659,6 +1659,7 @@ class TestDualPathInheritanceGuards(unittest.TestCase):
                 "_request_for_failed_completion",
                 "_handle_received_abort",
                 "_handle_received_peer_abort",
+                "_terminalize_prefill_reverse_attempt",
                 "_unregister_prefill_abort_key",
                 "_maybe_retire_prefill_abort_key",
                 "_recovery_invalid_block_ids",

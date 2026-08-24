@@ -350,6 +350,9 @@ class PathDecisionCoordinator:
         self._accepted_decisions: dict[DualPathRequestKey, PathDecision] = {}
         self._closed_through_attempt_ids: dict[DualPathRequestKey, int] = {}
         self._prefill_abort_keys: set[DualPathRequestKey] = set()
+        self._prefill_received_abort_notices: dict[
+            DualPathRequestKey, set[PathAbortNotice]
+        ] = {}
         self._received_decisions: queue.SimpleQueue[PathDecision] = queue.SimpleQueue()
         self._received_aborts: queue.SimpleQueue[PathAbortNotice] = queue.SimpleQueue()
         self._registry_lock = threading.Lock()
@@ -480,6 +483,7 @@ class PathDecisionCoordinator:
             raise RuntimeError("only a Prefill coordinator can unregister abort keys")
         with self._registry_lock:
             self._prefill_abort_keys.discard(key)
+            self._prefill_received_abort_notices.pop(key, None)
 
     def take_received_decisions(self) -> list[PathDecision]:
         if self._closed:
@@ -565,6 +569,7 @@ class PathDecisionCoordinator:
             self._accepted_decisions.clear()
             self._closed_through_attempt_ids.clear()
             self._prefill_abort_keys.clear()
+            self._prefill_received_abort_notices.clear()
         self._drain_received_decisions()
         self._drain_received_aborts()
 
@@ -662,8 +667,13 @@ class PathDecisionCoordinator:
         if self._role == "prefill":
             with self._registry_lock:
                 if key in self._prefill_abort_keys:
-                    self._prefill_abort_keys.discard(key)
-                    self._received_aborts.put(notice)
+                    received_notices = self._prefill_received_abort_notices.setdefault(
+                        key,
+                        set(),
+                    )
+                    if notice not in received_notices:
+                        received_notices.add(notice)
+                        self._received_aborts.put(notice)
             self._reply_decision(socket, identity, DecisionReplyStatus.ACK)
             return
         assert self._role == "decode"
