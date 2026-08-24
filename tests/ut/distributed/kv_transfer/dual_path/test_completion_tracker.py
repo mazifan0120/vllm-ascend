@@ -322,6 +322,55 @@ class TestTransferCompletionTracker:
         assert not tracker.has_open_completion(completion_tracker.CompletionKind.REVERSE_RECEIVE, request_key)
         assert tracker.open_count() == 1
 
+    def test_open_attempt_keys_returns_only_open_exact_kind_in_completion_order(self):
+        completion_tracker = _completion_tracker()
+        tracker = completion_tracker.TransferCompletionTracker()
+        request_key = DualPathRequestKey("decode", "request", 0)
+        attempt_0 = ReverseAttemptKey(request_key, 0)
+        attempt_1 = ReverseAttemptKey(request_key, 1)
+        closed_attempt = ReverseAttemptKey(request_key, 2)
+        replacement_attempt = ReverseAttemptKey(
+            DualPathRequestKey("decode", "request", 1),
+            0,
+        )
+
+        tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=1,
+            reverse_attempt_key=attempt_0,
+        )
+        tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_SEND,
+            expected_worker_count=1,
+            reverse_attempt_key=attempt_0,
+        )
+        tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=1,
+            reverse_attempt_key=attempt_1,
+        )
+        closed_record = tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=1,
+            reverse_attempt_key=closed_attempt,
+        )
+        tracker.open_completion(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_worker_count=1,
+            reverse_attempt_key=replacement_attempt,
+        )
+        assert tracker.force_fail_completion(
+            closed_record.completion_id,
+            expected_kind=completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            expected_attempt_key=closed_attempt,
+        )
+
+        assert tracker.open_attempt_keys(
+            completion_tracker.CompletionKind.REVERSE_RECEIVE,
+            request_key,
+        ) == (attempt_0, attempt_1)
+        assert tracker.open_count() == 4
+
     def test_invalid_expected_worker_count_rejected(self):
         completion_tracker = _completion_tracker()
         tracker = completion_tracker.TransferCompletionTracker()

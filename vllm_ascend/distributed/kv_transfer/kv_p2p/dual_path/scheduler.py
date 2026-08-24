@@ -278,6 +278,9 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_control_failures: dict[str, DualPathControlFailureMetadata] = {}
         self._prefill_control_endpoint: DecodeControlEndpoint | None = None
         self._prefill_abort_request_ids: dict[DualPathRequestKey, str] = {}
+        self._prefill_observed_reverse_admission_terminals: dict[
+            DualPathRequestKey, ReverseAdmissionTerminalNotice
+        ] = {}
         self._scheduler_side_finished_recving: set[str] = set()
         self._decode_control_failures: dict[str, DualPathControlFailureMetadata] = {}
         self._decode_late_abort_contexts: dict[DualPathRequestKey, _DecodeLateAbortContext] = {}
@@ -1941,6 +1944,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
     def _unregister_prefill_abort_key(self, request_key: DualPathRequestKey) -> None:
         if self._prefill_abort_request_ids.pop(request_key, None) is None:
             return
+        self._prefill_observed_reverse_admission_terminals.pop(request_key, None)
         self._path_decision_coordinator.unregister_prefill_abort_key(request_key)
 
     def _maybe_retire_prefill_abort_key(
@@ -2007,23 +2011,57 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_invalid_request_keys.add(notice.request_key)
         active_exact_admission = self._prefill_request_keys.get(request_id) == notice.request_key
         current_waiting_attempt = self._waiting_reverse_attempt_ids.get(request_id)
-        reverse_terminal = notice.reverse_terminal
-        terminal_attempt: ReverseAttemptKey | None = None
-        proof_matches_current_attempt = (
+        current_attempt_belongs_to_admission = (
             current_waiting_attempt is not None
             and current_waiting_attempt.request_key == notice.request_key
         )
-        if reverse_terminal is not None:
-            terminal_attempt = ReverseAttemptKey(
-                notice.request_key,
-                reverse_terminal.reverse_attempt_id,
+
+        accepted_ceiling = notice.reverse_admission_terminal
+        if accepted_ceiling is not None:
+            observed_ceiling = self._prefill_observed_reverse_admission_terminals.get(
+                notice.request_key
             )
-            proof_matches_current_attempt = current_waiting_attempt == terminal_attempt
+            if observed_ceiling is None:
+                self._prefill_observed_reverse_admission_terminals[notice.request_key] = (
+                    accepted_ceiling
+                )
+            elif observed_ceiling != accepted_ceiling:
+                logger.error(
+                    "DualPath Prefill received conflicting Reverse admission terminal "
+                    "for request %s: first=%s later=%s; ignoring later ceiling authority",
+                    request_id,
+                    observed_ceiling,
+                    accepted_ceiling,
+                )
+                accepted_ceiling = None
+
+        terminal_attempts: set[ReverseAttemptKey] = set()
+        if notice.reverse_terminal is not None:
+            terminal_attempts.add(
+                ReverseAttemptKey(
+                    notice.request_key,
+                    notice.reverse_terminal.reverse_attempt_id,
+                )
+            )
+        if accepted_ceiling is not None:
+            ceiling = accepted_ceiling.may_have_started_through_attempt_id
+            terminal_attempts.update(
+                attempt_key
+                for attempt_key in self._completion_tracker.open_attempt_keys(
+                    CompletionKind.REVERSE_RECEIVE,
+                    notice.request_key,
+                )
+                if ceiling is None or attempt_key.reverse_attempt_id > ceiling
+            )
+        for terminal_attempt in sorted(
+            terminal_attempts,
+            key=lambda attempt_key: attempt_key.reverse_attempt_id,
+        ):
             self._terminalize_prefill_reverse_attempt(terminal_attempt)
 
         invalid_block_ids = (
             self._recovery_invalid_block_ids(request_id)
-            if active_exact_admission and proof_matches_current_attempt
+            if active_exact_admission and current_attempt_belongs_to_admission
             else ()
         )
         if invalid_block_ids:
@@ -2484,6 +2522,7 @@ class DualPathConnectorScheduler(MooncakeLayerwiseConnectorScheduler):
         self._prefill_staged_or_delivered_reverse_terminals.clear()
         self._prefill_control_failures.clear()
         self._prefill_abort_request_ids.clear()
+        self._prefill_observed_reverse_admission_terminals.clear()
         self._scheduler_side_finished_recving.clear()
         self._prefill_control_endpoint = None
         self._prefill_delivery_futures.clear()

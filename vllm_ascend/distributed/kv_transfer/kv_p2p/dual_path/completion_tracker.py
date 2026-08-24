@@ -102,6 +102,20 @@ class TransferCompletionTracker:
             raise RuntimeError("multiple open completions exist for one Reverse attempt")
         return matches[0] if matches else None
 
+    def open_attempt_keys(
+        self,
+        completion_kind: CompletionKind,
+        request_key: DualPathRequestKey,
+    ) -> tuple[ReverseAttemptKey, ...]:
+        return tuple(
+            record.reverse_attempt_key
+            for record in self._records.values()
+            if not record.closed
+            and record.completion_kind is completion_kind
+            and record.reverse_attempt_key is not None
+            and record.reverse_attempt_key.request_key == request_key
+        )
+
     def discard(self, completion_id: int) -> bool:
         """Retire a closed record with its owning attempt; open completions stay."""
         record = self._records.get(completion_id)
