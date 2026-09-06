@@ -2017,10 +2017,27 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         main_block_ids = groups[self.main_group_idx]
         if num_external_tokens > 0 and bound_blocks > len(main_block_ids):
             raise ValueError("vLLM has not allocated enough Main Host blocks")
+        invalid_block_ids = groups[0]
+        if num_external_tokens > 0 and tracker.num_computed_tokens > 0:
+            # Diagnostic only: do not silently narrow the current reporting range.
+            # A partially cached block overlaps the read and is not protected here.
+            group0_block_size = self.block_size[0]
+            prefix_blocks = tracker.num_computed_tokens // group0_block_size
+            prefix_block_ids = groups[0][:prefix_blocks]
+            misreported_prefix_ids = sorted(set(invalid_block_ids).intersection(prefix_block_ids))
+            assert not misreported_prefix_ids, (
+                "Mooncake DSA failure-reporting range includes untouched prefix blocks before transfer: "
+                f"request={request.request_id}, group=0, group_block_size={group0_block_size}, "
+                f"read_tokens=[{tracker.num_computed_tokens}, {bound_tokens}), "
+                f"invalid_block_ids={invalid_block_ids}, "
+                f"untouched_prefix_block_ids={misreported_prefix_ids}. "
+                "A later load failure would invalidate these locally cached blocks; "
+                "no transfer failure or impact on other requests has been observed by this check."
+            )
         tracker.source = replace(tracker.source, num_external_tokens=num_external_tokens)
         tracker.allocated = True
         tracker.notify_only = num_external_tokens == 0
-        tracker.invalid_block_ids = groups[0]
+        tracker.invalid_block_ids = invalid_block_ids
         tracker.indexer_hbm_block_ids = indexer_block_ids
         tracker.main_block_ids = main_block_ids[:bound_blocks]
         if isinstance(request.kv_transfer_params, dict):
@@ -3711,6 +3728,32 @@ class MooncakeConnectorWorker:
             return remote_port_send_num
 
         mappings = get_local_remote_block_port_mappings()
+        if self._prefill_pp_size > 1:
+            # Inspect selected sources, not advertised endpoints or zero-reader
+            # notification entries. DCP is inside TP; PCP is inside each PP stage.
+            stage_width = prefill_tp_size * meta.remote_pcp_size
+            selected_ports = {port for groups in mappings.values() for ports in groups for port in ports}
+            selected_shards = set()
+            for port in selected_ports:
+                pp_rank, stage_rank = divmod(port - meta.remote_port, stage_width)
+                pcp_rank, tp_rank = divmod(stage_rank, prefill_tp_size)
+                selected_shards.add((pp_rank, pcp_rank * meta.remote_dcp_size + tp_rank % meta.remote_dcp_size))
+            required_shards = {
+                (pp_rank, cp_rank)
+                for pp_rank in range(self._prefill_pp_size)
+                for cp_rank in range(meta.remote_pcp_size * meta.remote_dcp_size)
+            }
+            missing_shards = required_shards - selected_shards
+            assert not missing_shards, (
+                "Mooncake KV source coverage incomplete before transfer: "
+                f"request={getattr(meta, 'remote_request_id', '<unknown>')}, remote_engine={meta.remote_engine_id}, "
+                f"P(TP={prefill_tp_size}, PCP={meta.remote_pcp_size}, "
+                f"DCP={meta.remote_dcp_size}, PP={self._prefill_pp_size}), "
+                f"D(TP={self.tp_size}, PCP={self.pcp_size}, DCP={self.dcp_size}), "
+                f"base_port={meta.remote_port}, selected_ports={sorted(selected_ports)}, "
+                f"missing_(pp_rank,cp_rank)={sorted(missing_shards)}. "
+                "These source shards have no planned reader; KV byte contents have not been checked."
+            )
         return mappings, get_remote_port_send_num(mappings)
 
     def _get_kv_split_metadata(

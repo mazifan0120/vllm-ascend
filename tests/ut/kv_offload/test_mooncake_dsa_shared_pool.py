@@ -310,6 +310,48 @@ def test_prefill_pp_keeps_indexer_task_in_every_stage():
     assert [(rank, pp, indexer) for rank, _, pp, indexer, _, _ in readers] == [(0, 0, True), (4, 1, True)]
 
 
+@pytest.mark.parametrize("dsa", [False, True])
+def test_dcp_pp_missing_source_stage_is_reported_before_transfer(dsa):
+    worker, thread, command = make_worker(ptp=8, dcp=8, dtp=4)
+    worker._prefill_pp_size = 2
+    endpoints = tuple(RemoteEndpoint("127.0.0.1", 5000 + p, "prefill") for p in range(16))
+    command = replace(command, source=replace(command.source, remote_pp_size=2, endpoints_by_prefill_rank=endpoints))
+    with pytest.raises(AssertionError, match="Mooncake KV source coverage incomplete") as error:
+        if dsa:
+            worker._dispatch_dsa_commands((command,))
+        else:
+            worker._is_hma_required = False
+            worker.pcp_rank = worker.dcp_rank = 0
+            worker.block_size = 4
+            worker.block_size_scale = [[1]]
+            worker.kv_group2layeridx = {0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0])}
+            worker.local_remote_block_port_mapping = {}
+            worker.remote_port_send_num = {}
+            meta = SimpleNamespace(
+                remote_pcp_size=1,
+                remote_dcp_size=8,
+                remote_ptp_size=8,
+                remote_port=5000,
+                remote_host="localhost",
+                remote_engine_id="prefill",
+                remote_request_id="remote",
+                remote_multi_nodes_meta_mapping={},
+                remote_block_size=4,
+                num_external_tokens=32,
+                num_computed_tokens=0,
+                num_prompt_blocks=8,
+                local_block_ids=(list(range(8)),),
+                remote_block_ids=([9],),
+            )
+            worker._get_kv_split_metadata("remote", meta)
+    message = str(error.value)
+    assert "request=remote" in message
+    assert f"missing_(pp_rank,cp_rank)={[(1, rank) for rank in range(8)]}" in message
+    assert "selected_ports=[5000, 5001, 5002, 5003, 5004, 5005, 5006, 5007]" in message
+    assert thread.request_queue.empty()
+    thread.engine.batch_transfer_sync_read.assert_not_called()
+
+
 def test_dsa_main_and_indexer_have_distinct_metadata_indices():
     worker = object.__new__(MooncakeConnectorWorker)
     worker._dsa_pd_offload = True

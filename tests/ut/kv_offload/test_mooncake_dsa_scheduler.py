@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
     _MooncakeDsaDecodeScheduler,
 )
@@ -15,6 +17,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_metadata import (
 def _scheduler():
     scheduler = object.__new__(_MooncakeDsaDecodeScheduler)
     scheduler._main_block_size = 2
+    scheduler.block_size = [2, 2]
     scheduler.main_group_idx = 1
     scheduler.indexer_group_idx = 0
     scheduler._dsa_requests = {}
@@ -40,6 +43,40 @@ def _request():
             "remote_multi_nodes_meta_mapping": {},
         },
     )
+
+
+@pytest.mark.parametrize("group0_block_size,prefix_tokens", [(2, 2), (1, 2)])
+def test_failure_reporting_asserts_before_emitting_cached_prefix(group0_block_size, prefix_tokens):
+    scheduler = _scheduler()
+    scheduler.block_size[0] = group0_block_size
+    request = _request()
+    external_tokens, _ = scheduler.get_num_new_matched_tokens(request, prefix_tokens)
+    group0_ids = list(range(30, 30 + 4 // group0_block_size))
+    blocks = SimpleNamespace(get_block_ids=lambda: (group0_ids, [40, 41]))
+    with pytest.raises(AssertionError, match="failure-reporting range includes untouched prefix") as error:
+        scheduler.update_state_after_alloc(request, blocks, external_tokens)
+    assert "request=request" in str(error.value)
+    assert "read_tokens=[2, 4)" in str(error.value)
+    assert f"untouched_prefix_block_ids={group0_ids[: prefix_tokens // group0_block_size]}" in str(error.value)
+    assert scheduler.build_connector_meta(None).requests == ()
+
+
+@pytest.mark.parametrize(
+    "group0_block_size,prefix_tokens,external_tokens", [(2, 0, 4), (2, 1, 3), (4, 2, 2), (2, 4, 0)]
+)
+def test_failure_reporting_allows_overlapping_block_and_notification_only(
+    group0_block_size, prefix_tokens, external_tokens
+):
+    scheduler = _scheduler()
+    scheduler.block_size[0] = group0_block_size
+    request = _request()
+    scheduler.get_num_new_matched_tokens(request, prefix_tokens)
+    group0_ids = list(range(30, 30 + 4 // group0_block_size))
+    blocks = SimpleNamespace(get_block_ids=lambda: (group0_ids, [40, 41]))
+    scheduler.update_state_after_alloc(request, blocks, external_tokens)
+    (command,) = scheduler.build_connector_meta(None).requests
+    assert command.invalid_block_ids == tuple(group0_ids)
+    assert command.notify_only == (external_tokens == 0)
 
 
 def test_dsa_scheduler_emits_once_and_waits_for_all_tp_results():
