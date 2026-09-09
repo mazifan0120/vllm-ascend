@@ -95,7 +95,13 @@ from .mooncake_dsa_metadata import (
     RemoteEndpoint,
     RemoteSource,
 )
-from .mooncake_dsa_transfer import DsaCacheLayout, build_component_read
+from .mooncake_dsa_transfer import (
+    DsaCacheLayout,
+    DsaRegisterAtom,
+    build_component_read,
+    collect_bounded_register_regions,
+    layout_span_bytes,
+)
 
 # isort: off
 if TYPE_CHECKING:
@@ -390,8 +396,13 @@ class KVCacheSendingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.pcp_rank = pcp_rank
         self.port_send_num: dict[str, int] = {}
+        self._stop_event = threading.Event()
 
         self.task_tracker = KVCacheTaskTracker()
+
+    def stop(self) -> None:
+        """Stop serving metadata before its registered buffers are released."""
+        self._stop_event.set()
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -446,8 +457,10 @@ class KVCacheSendingThread(threading.Thread):
             logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
 
         decoder = msgspec.msgpack.Decoder(type=tuple)
-        while True:
+        while not self._stop_event.is_set():
             try:
+                if not sock.poll(timeout=100):
+                    continue
                 frames = sock.recv_multipart()
                 if len(frames) < 2:
                     logger.error(
@@ -501,7 +514,7 @@ class KVCacheSendingThread(threading.Thread):
                     else:
                         self.task_tracker.update_done_task_count(request_id)
                     # Acknowledge the request completion.
-                    while True:
+                    while not self._stop_event.is_set():
                         try:
                             # Send ACK to the sender.
                             sock.send_multipart((identity, b"", b"ACK"), flags=zmq.NOBLOCK)  # type: ignore
@@ -2959,6 +2972,8 @@ class MooncakeConnectorWorker:
             self._dsa_active_commands: dict[str, DsaStepRequest] = {}
             self._dsa_cancel_events: dict[str, threading.Event] = {}
             self._dsa_results: queue.SimpleQueue[DsaLocalResult] = queue.SimpleQueue()
+            self._dsa_dispatch_lock = threading.Lock()
+            self._closing = False
             logger.debug(
                 "DSA worker enabled engine=%s decode_rank=%s/%s prefill_topology=(tp=%s,pp=%s) "
                 "local_context_parallel=(pcp=%s,dcp=%s)",
@@ -3348,15 +3363,104 @@ class MooncakeConnectorWorker:
 
         return ptrs, lengths
 
-    def _dsa_consumer_device_register_regions(self, kv_caches: dict[str, torch.Tensor]) -> RegisterRegions:
-        indexer_caches = {
-            name: self._as_kv_cache_tuple(cache) for name, cache in kv_caches.items() if "indexer" in name.lower()
-        }
-        if not indexer_caches:
-            raise ValueError("Blockwise DSA Decode has no Indexer device cache")
-        return collect_storage_merged_register_regions(indexer_caches)
+    def _dsa_consumer_register_regions(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        layouts: tuple[list[DsaCacheLayout], list[DsaCacheLayout]],
+    ) -> tuple[RegisterRegions, list[str]]:
+        """Collect Host Main and HBM Indexer atoms for one TE registration."""
+        indexer_layouts, main_layouts = layouts
+        manager = get_sparse_kv_offload_manager()
+        pool = manager.get_mooncake_host_pool()
+        pool_start = pool.data_ptr
+        pool_end = pool_start + pool.nbytes
+        host_location = f"npu:{pool.topology.device_id}"
+        atoms: list[DsaRegisterAtom] = []
 
-    def _build_dsa_local_layouts(self, kv_caches, layer_name_to_idx):
+        for layout in main_layouts:
+            end = layout.base + layout_span_bytes(layout)
+            if layout.base < pool_start or end > pool_end:
+                raise ValueError(f"DSA Host component {layout.layer_name} is outside the Mooncake Host pool")
+            atoms.append(
+                DsaRegisterAtom(
+                    layout.base,
+                    end,
+                    host_location,
+                    ("host", pool_start),
+                )
+            )
+
+        for layout in indexer_layouts:
+            tensors = self._as_kv_cache_tuple(kv_caches[layout.layer_name])
+            if layout.position >= len(tensors):
+                raise ValueError(f"missing DSA Indexer tensor position {layout.position}")
+            tensor = tensors[layout.position]
+            storage = tensor.untyped_storage()
+            storage_start = tensor_storage_key(tensor)
+            storage_end = storage_start + storage.nbytes()
+            end = layout.base + layout_span_bytes(layout)
+            if layout.base < storage_start or end > storage_end:
+                raise ValueError(f"DSA Indexer component {layout.layer_name} is outside its storage")
+            atoms.append(
+                DsaRegisterAtom(
+                    layout.base,
+                    end,
+                    "*",
+                    ("hbm", storage_start),
+                )
+            )
+
+        bounded = collect_bounded_register_regions(atoms)
+        regions = RegisterRegions(
+            ptrs=bounded.ptrs,
+            lengths=bounded.lengths,
+            logical_tensor_count=len(atoms),
+            logical_total_bytes=sum(atom.end - atom.start for atom in atoms),
+        )
+        return regions, bounded.locations
+
+    def _dsa_producer_register_regions(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> tuple[RegisterRegions, list[str]]:
+        """Collect DSA source HBM atoms with layout-base-aligned splits."""
+        atoms: list[DsaRegisterAtom] = []
+        for caches in kv_caches.values():
+            for tensor in self._as_kv_cache_tuple(caches):
+                if tensor.numel() == 0:
+                    continue
+                if tensor.ndim < 1 or tensor.shape[0] <= 0:
+                    raise ValueError("DSA producer tensor must have a physical page dimension")
+                block_bytes = tensor.element_size() * math.prod(tensor.shape[1:])
+                stride = tensor.stride(0) * tensor.element_size()
+                if stride < block_bytes:
+                    raise ValueError("DSA producer tensor has overlapping physical pages")
+                start = tensor.data_ptr()
+                end = start + (tensor.shape[0] - 1) * stride + block_bytes
+                storage = tensor.untyped_storage()
+                storage_start = tensor_storage_key(tensor)
+                if start < storage_start or end > storage_start + storage.nbytes():
+                    raise ValueError("DSA producer tensor is outside its storage")
+                atoms.append(
+                    DsaRegisterAtom(
+                        start,
+                        end,
+                        "*",
+                        ("hbm", storage_start),
+                    )
+                )
+        if not atoms:
+            raise ValueError("Blockwise DSA producer has no HBM cache tensors")
+        bounded = collect_bounded_register_regions(atoms)
+        regions = RegisterRegions(
+            ptrs=bounded.ptrs,
+            lengths=bounded.lengths,
+            logical_tensor_count=len(atoms),
+            logical_total_bytes=sum(atom.end - atom.start for atom in atoms),
+        )
+        return regions, bounded.locations
+
+    def _build_dsa_local_layouts(self, kv_caches):
         from vllm.v1.worker.utils import extract_layer_index
 
         self._dsa_transformer_layers = {
@@ -3364,7 +3468,6 @@ class MooncakeConnectorWorker:
             for name in kv_caches
         }
         manager = get_sparse_kv_offload_manager()
-        pool = manager.get_mooncake_host_pool()
         indexer, main = [], []
         for name, caches in kv_caches.items():
             is_indexer = "indexer" in name.lower()
@@ -3390,15 +3493,11 @@ class MooncakeConnectorWorker:
         if not indexer or not main:
             raise ValueError("DSA requires Main and Indexer component layouts")
         logger.debug(
-            "DSA local layouts ready decode_rank=%s indexer_components=%s main_components=%s "
-            "host_pool_bytes=%s host_pool_owner=%s",
+            "DSA local layouts ready decode_rank=%s indexer_components=%s main_components=%s",
             self.tp_rank,
             len(indexer),
             len(main),
-            pool.nbytes,
-            pool.topology.owner_rank,
         )
-        pool.register_local_writer(self.engine)
         return indexer, main
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -3455,13 +3554,20 @@ class MooncakeConnectorWorker:
 
         dsa_local_layouts = None
         if self._dsa_decode:
-            dsa_local_layouts = self._build_dsa_local_layouts(kv_caches, layer_name_to_idx)
+            dsa_local_layouts = self._build_dsa_local_layouts(kv_caches)
 
+        register_locations = None
         if has_mamba_group:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         elif self._dsa_decode:
-            register_regions = self._dsa_consumer_device_register_regions(kv_caches)
+            assert dsa_local_layouts is not None
+            register_regions, register_locations = self._dsa_consumer_register_regions(
+                kv_caches,
+                dsa_local_layouts,
+            )
+        elif self._dsa_pd_offload:
+            register_regions, register_locations = self._dsa_producer_register_regions(kv_caches)
         elif self.use_hybrid:
             ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
@@ -3472,7 +3578,14 @@ class MooncakeConnectorWorker:
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
         validate_register_region_count(register_regions)
-        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        if register_locations is None:
+            global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        else:
+            global_te.register_buffer(
+                register_regions.ptrs,
+                register_regions.lengths,
+                register_locations,
+            )
 
         logger.debug(
             "Mooncake register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "
@@ -4705,14 +4818,20 @@ class MooncakeConnectorWorker:
                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
 
     def shutdown(self) -> None:
-        self._closing = True
-        if self.kv_recv_thread is not None:
-            self.kv_recv_thread.request_queue.join()
-            self.kv_recv_thread.request_queue.put(None)
-            self.kv_recv_thread.join()
-            self.kv_recv_thread.executor.shutdown(wait=True)
-            if self._dsa_decode:
-                get_sparse_kv_offload_manager().get_mooncake_host_pool().unregister()
+        if self._dsa_decode:
+            with self._dsa_dispatch_lock:
+                self._closing = True
+        try:
+            if self.kv_send_thread is not None:
+                self.kv_send_thread.stop()
+                self.kv_send_thread.join()
+            if self.kv_recv_thread is not None:
+                self.kv_recv_thread.request_queue.join()
+                self.kv_recv_thread.request_queue.put(None)
+                self.kv_recv_thread.join()
+                self.kv_recv_thread.executor.shutdown(wait=True)
+        finally:
+            global_te.unregister_buffer()
 
     def _plan_dsa_endpoints(self, command: DsaStepRequest):
         """Adapt ordinary source participants; writer filtering cannot remove tasks."""
@@ -4774,8 +4893,14 @@ class MooncakeConnectorWorker:
         return tasks
 
     def _dispatch_dsa_commands(self, commands: tuple[DsaStepRequest, ...]) -> None:
-        if not self._dsa_decode or getattr(self, "_closing", False):
+        if not self._dsa_decode:
             raise RuntimeError("DSA commands require an active Decode consumer")
+        with self._dsa_dispatch_lock:
+            if self._closing:
+                raise RuntimeError("DSA commands require an active Decode consumer")
+            self._enqueue_dsa_commands(commands)
+
+    def _enqueue_dsa_commands(self, commands: tuple[DsaStepRequest, ...]) -> None:
         for command in commands:
             existing = self._dsa_active_commands.get(command.request_id)
             if existing is not None:

@@ -46,7 +46,6 @@ class HostMemoryRegion:
     handle: Any = None
     release_callback: Callable[[Any], None] | None = None
     segment_offset: int = 0
-    segment_offset: int = 0
     _released: bool = field(default=False, init=False)
 
     def release(self) -> None:
@@ -254,6 +253,7 @@ class MooncakeHostPool:
             self.nbytes,
         )
         return self.region.segment_offset, self.nbytes, tuple(entries)
+
     def close(self) -> None:
         if self._closed:
             return
