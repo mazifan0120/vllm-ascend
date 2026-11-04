@@ -120,6 +120,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         if len(sinks) != 1 or not self._external_slot_release_sink_configured:
             raise RuntimeError("Reuse source contract requires one wired Store sink")
         sinks[0].set_reuse_source_consumer(providers[0])
+        bound = getattr(providers[0], "bind_reuse_source_contract", None)
+        if callable(bound):
+            bound()
 
     def _wait_for_external_slot_release(self, layer_idx: int) -> None:
         for provider in self._layerwise_slot_release_providers:

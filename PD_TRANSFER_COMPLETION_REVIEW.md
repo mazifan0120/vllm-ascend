@@ -6,6 +6,44 @@
 本次已纳入远端增量并修复一批入口、元数据和失败路径；模型端到端功能及性能尚未验证。
 早期 A1/A2 的原生资源验证仍然有效，但不等于完整 PD 验收。
 
+## 第四阶段：SourceReady 直接发送与 exact epoch（2026-11-05）
+
+- 新增 `ManifestSourceWriter`，`prepare_layerwise_step()` 先登记 manifest 请求，
+  保留 manager block ID，不再套用旧 sender 的 kernel block／port 转换。
+  Store `SourceReady` 直接生成全部请求的 read job，无需等待 model save hook。
+  使用已有 NPU send thread 执行真实 `batch_transfer_sync_write` 调用；Host／device
+  分批，Main P0 唯一写者、Indexer Pi→Di，地址通过原始 owner lease 的 peer lookup 取得。
+  **本轮验证使用 CPU 实存储 copy engine 和真实依赖入口，尚未提交原生远端 WRITE。**
+- source consumer 现在登记整个 batch 的 exact epoch ticket 后才发布任何任务；
+  等待必须满足 ready、sealed、所有读者完成且无错误，不再委托 layer-number 等待。
+  普通 sender 的读者也有完成回调；晚于 seal 的 legacy hook 使用预留 ticket。
+  已完成 epoch 按物理 slot 保留高水位，旧 Indexer occupant 重复等待不会追逐新 Main。
+- manifest 请求从旧 `save_kv_layer` 发送循环剔除，避免双发；混合 batch 仍保留普通任务。
+  必须显式接入 Store source registry，否则收到 manifest 时失败，不静默等 watchdog。
+  实际有效尾部取 Store source 与 D prompt 的交集，私有 Store instance 不进入 PD wire。
+- 原生完成先回调 source reader；peer 回执由独立线程发送，等待 D ACK 不占用源槽。
+  逐 entry 结果按 receiver 批量发送，并复用该线程独占的 REQ socket；terminal 携带
+  明确 generation 和 source_quiesced。D 的实际 batch handler 已接到精确账本。
+  原生负返回／异常一律当作 DMA 未决，保留 source；不能据此发静止成功。
+  某请求的 peer 发送耗尽重试后，不对它后续每层重复等待同一超时，D 仍保持不放行。
+- P worker 收到 finished request 后，完整已登记计划仍排空在途读者，随后清理重型状态；
+  未覆盖完整计划的结束按 CANCELLED 封口，未执行的 job 不提交 DMA，也不污染安全源槽。
+  清理后保留目标代际到写者的精简记录，拒绝相同／不同 P 内部 ID 重放已封口目标。
+  这不是 D→P 远端取消协议：后者以及 D proof／retirement 清理仍待完成。
+
+本阶段组合 CPU 回归 182 项／50 子用例通过（含旧 receipt），1 项运行时限定 skip；
+P 聚焦 141 项通过。覆盖实际 CPU memmove 字节、跨页尾部、原生 fence 顺序、
+ACK 阻塞与源释放分离、失败静止保留、封口、部分取消、重型状态清理及真实 ZMQ 连接复用。
+原 P 容器独立进程中，748 个候选生产 Python 源文件内存导入通过，9 项真实准备／
+receiver／early-admission 方法、既有 hook／sender fence／CPU 注册选择和四条实际
+vLLM scheduler 控制路径通过；没有替换服务源码、启动模型或真正远端 DMA。
+证据：`artifacts/p-main-buffer-reuse/pd-transfer-source-writer-20261105/`。
+
+下一步先补 D 实际接收依赖、forward／writeback owner-use、全 rank readiness 与
+ReleaseAck、超时后晚到 proof 的保留／安全清理，再接远端取消及真实 P restore-only。
+之后必须验证新注册路径与真实 RoCE WRITE→Host／NPU read，及完整模型功能和性能。
+当前完整模型功能／性能仍为 NOT_RUN；不能把上述 CPU copy／控制测试当作验收。
+
 ## 第三阶段：实际目标计划与 receive admission（2026-11-05）
 
 仍在原分支开发，本阶段没有重启模型或替换运行服务的源码。

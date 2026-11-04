@@ -110,6 +110,46 @@ class TestExactReceiverProtocol(unittest.TestCase):
         ledger.finish_rank(ledger.request, 0, lc.Status.SUCCESS, True)
         self.assertIsNone(ledger.build_receipt())
 
+    def test_actual_batch_handler_accepts_entry_results_and_explicit_cancel_terminal(self):
+        receiver, ledger, required = self.fixture()
+        frames = []
+        for key in required:
+            frames.append(
+                (
+                    lc.LAYER_RESULT_MSG,
+                    lc.CONTRACT_VERSION,
+                    key.request.request_instance,
+                    5,
+                    0,
+                    0,
+                    key.operation_id,
+                    key.component.value,
+                    0,
+                    23,
+                    key.target_scope.backing_id,
+                    7,
+                    "success",
+                    True,
+                )
+            )
+        frames.append(
+            (lc.RANK_TERMINAL_MSG, lc.CONTRACT_VERSION, ledger.request.request_instance, 5, 0, "cancelled", True)
+        )
+        receiver.handle_proof_batch(_encode_decode((lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, tuple(frames))))
+        self.assertTrue(ledger.remote_quiesced())
+        self.assertIsNone(ledger.build_receipt())
+
+    def test_actual_batch_handler_rejects_invalid_envelope_before_crediting_any_frame(self):
+        receiver, ledger, _ = self.fixture()
+        for message in (
+            (lc.LAYER_RESULTS_MSG, True, ()),
+            (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, ()),
+            (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, ((b"unsupported",),)),
+        ):
+            with self.assertRaises(lc.ContractError):
+                receiver.handle_proof_batch(_encode_decode(message))
+        self.assertFalse(ledger.remote_quiesced())
+
 
 class TestEarlyTargetAdmission(unittest.TestCase):
     def test_actual_install_maps_early_completions_before_scheduler_metadata(self):
@@ -128,6 +168,69 @@ class TestEarlyTargetAdmission(unittest.TestCase):
         self.assertEqual(worker._admitted_target_blocks[request_id], ((1, 3),))
         with self.assertRaises(lc.ContractError):
             worker._install_admitted_target(request_id, lease, ledger)
+
+
+class TestSourceReadyPreparation(unittest.TestCase):
+    def worker(self):
+        worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
+        worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_producer=True))
+        worker.total_layers = 1
+        worker.pcp_size = worker.dcp_size = worker.pd_head_ratio = 1
+        worker.tp_size = 2
+        worker.enable_c8_quant = worker.enable_kv_quant = False
+        worker._source_contract_bound = True
+        worker._manifest_source_writer = SimpleNamespace(register_request=Mock(), prepare_job=Mock(return_value="job"))
+        worker.attn_resharding_group_idx = set()
+        worker._align_remote_block_ids = Mock(side_effect=AssertionError("manifest must retain manager block IDs"))
+        target = SimpleNamespace(lease=SimpleNamespace(allocation=SimpleNamespace(prompt_tokens=23)))
+        meta = SimpleNamespace(
+            remote_target_manifest=target,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            remote_tp_size=2,
+            local_transed_tokens=16,
+        )
+        metadata = SimpleNamespace(requests={"internal-source": meta})
+        return worker, metadata
+
+    def test_real_prepare_preserves_manager_ids_and_registers_before_source_callbacks(self):
+        worker, metadata = self.worker()
+        before = metadata.requests["internal-source"]
+        worker.prepare_layerwise_step(metadata)
+        worker._manifest_source_writer.register_request.assert_called_once_with("internal-source", before)
+        self.assertIs(metadata.requests["internal-source"], before)
+        worker._align_remote_block_ids.assert_not_called()
+
+    def test_real_prepare_rejects_unwired_source_contract_before_any_transfer_job(self):
+        worker, metadata = self.worker()
+        worker._source_contract_bound = False
+        with self.assertRaisesRegex(lc.ContractError, "wired Store"):
+            worker.prepare_layerwise_step(metadata)
+        worker._manifest_source_writer.register_request.assert_not_called()
+
+    def test_real_source_batch_clamps_store_private_identity_to_actual_pd_tail(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.reuse_source import RequestSource
+
+        worker, metadata = self.worker()
+        worker.prepare_layerwise_step(metadata)
+        source, event = object(), object()
+        request = RequestSource("internal-source", "private-store-instance", 0, 24, ((2, 0), (3, 1)))
+        jobs, legacy = worker.prepare_source_batch(source, (request,), event)
+        self.assertEqual(jobs, ("job",))
+        self.assertFalse(legacy)
+        actual = worker._manifest_source_writer.prepare_job.call_args.args
+        self.assertIs(actual[0], source)
+        self.assertIs(actual[2], event)
+        self.assertEqual((actual[1].start_token, actual[1].end_token), (16, 23))
+        self.assertEqual(actual[1].request_instance, "private-store-instance")
+        self.assertEqual(actual[1].block_ids_by_group, request.block_ids_by_group)
+
+    def test_real_source_batch_rejects_missing_store_request(self):
+        worker, metadata = self.worker()
+        worker.prepare_layerwise_step(metadata)
+        with self.assertRaisesRegex(lc.ContractError, "missing from the Store"):
+            worker.prepare_source_batch(object(), (), object())
+        worker._manifest_source_writer.prepare_job.assert_not_called()
 
 
 class TestSchedulerRetentionBinding:

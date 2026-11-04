@@ -14,7 +14,7 @@ import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -81,8 +81,12 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_exact_receipt
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_metadata import LayerMetadata, ReqMeta
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_peer import (
     GET_TARGET_REGIONS_MSG,
+    LAYER_RESULTS_MSG,
+    MAX_PROOF_BATCH_FRAMES,
     TARGET_PEER_ERROR,
+    ManifestPeerProofs,
     encode_target_addresses,
+    resolve_manifest_addresses,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receipt import (
     ReceiptLedger,
@@ -96,6 +100,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
     target_manifest_from_wire,
     target_manifest_to_wire,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_writer import ManifestSourceWriter, SourceWriteJob
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import TargetManifest
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
@@ -180,6 +185,7 @@ class SendTask:
     # Additional Store source fence; preserve wait_event for the legacy
     # attention/quantization/resharding path instead of replacing it.
     source_ready_event: Any = None
+    source_completion: Any = None
 
 
 @dataclass
@@ -315,7 +321,15 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event.set()
         while True:
             send_task = self.send_queue.get()
-            self._handle_request(send_task)
+            if isinstance(send_task, SourceWriteJob):
+                try:
+                    send_task.execute(self.engine)
+                except Exception:
+                    logger.exception("Exact source job failed; source and targets remain retained")
+                finally:
+                    self.send_queue.task_done()
+            else:
+                self._handle_request(send_task)
 
     def _handle_request(self, send_task: SendTask):
         error: str | None = None
@@ -355,6 +369,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                             # FAILED can never send SUCCESS afterwards.
                             self._terminal_failed.add(req_id)
                             self.failed_reqs.discard(req_id)
+            if send_task.source_completion is not None:
+                send_task.source_completion(RuntimeError(error) if error else None, error is None)
             if self.reuse_completion_callback is not None:
                 self.reuse_completion_callback(send_task.layer_idx, error)
             self._emit_layer_results(send_task, error)
@@ -785,6 +801,24 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
 
+    def handle_proof_batch(self, msg: tuple) -> None:
+        if (
+            len(msg) != 3
+            or type(msg[1]) is not int
+            or msg[1] != CONTRACT_VERSION
+            or type(msg[2]) not in (tuple, list)
+            or not 0 < len(msg[2]) <= MAX_PROOF_BATCH_FRAMES
+        ):
+            raise ContractError("Malformed manifest completion proof batch")
+        for frame in msg[2]:
+            if not frame or frame[0] not in (LAYER_RESULT_MSG, RANK_TERMINAL_MSG):
+                raise ContractError("Manifest proof batch contains an unsupported operation")
+        for frame in msg[2]:
+            if frame[0] == LAYER_RESULT_MSG:
+                self.handle_layer_result(tuple(frame))
+            else:
+                self.handle_rank_terminal(tuple(frame))
+
     def handle_layer_result(self, msg: tuple) -> None:
         """LAYER_RESULT_MSG: (type, version, instance, gen, rank,
         layer, op_id, component, start, end, backing_id, backing_gen, status,
@@ -1061,6 +1095,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
                     elif msg[0] == RANK_TERMINAL_MSG:
                         self.handle_rank_terminal(msg)
                         sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == LAYER_RESULTS_MSG:
+                        self.handle_proof_batch(msg)
+                        sock.send_multipart((identity, b"", b"ACK"))
                     else:
                         logger.error(
                             "Unexpected message type: %s. expected GET_META_MSG or DONE_RECVING_MSG. msg=%s",
@@ -1257,6 +1294,9 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_scheduler._release_target_if_any(request)
 
     def shutdown(self) -> None:
+        writer = getattr(self.connector_worker, "_manifest_source_writer", None)
+        if writer is not None:
+            writer.close()
         for binding in (getattr(self, "_scheduler_target_rpc", None), getattr(self, "_worker_target_rpc", None)):
             if binding is not None:
                 binding.close()
@@ -1378,7 +1418,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
+        return self.connector_worker.get_finished(finished_req_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get the block ids that have load errors."""
@@ -1411,6 +1451,10 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     # Source consumer v1: the five callbacks are driven by the Store-side
     # registry. They delegate to the worker's adapter, which maps them onto the
     # existing slot ledger and send path so no second send path starts.
+    def bind_reuse_source_contract(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker._source_contract_bound = True
+
     def open_source(self, source) -> None:
         assert self.connector_worker is not None
         consumer = getattr(self.connector_worker, "_reuse_source_consumer", None)
@@ -2133,6 +2177,9 @@ class MooncakeLayerwiseConnectorWorker:
         # registry can drive source-lifecycle callbacks. It delegates to this
         # worker's slot ledger and send path, never starting a second send.
         self._reuse_source_consumer: Any = None
+        self._manifest_source_writer = None
+        self._source_request_metadata = {}
+        self._source_contract_bound = False
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_source_consumer import (
                 LayerwiseSourceConsumer,
@@ -2586,6 +2633,12 @@ class MooncakeLayerwiseConnectorWorker:
             self.kv_send_layer_thread.start()
             self.kv_send_layer_thread.layer_result_sender = self.send_layer_result
             ready_event.wait()
+            self._manifest_source_writer = ManifestSourceWriter(
+                self.tp_rank,
+                self.kv_send_layer_thread.send_queue,
+                resolve_manifest_addresses,
+                ManifestPeerProofs(self.tp_rank),
+            )
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             ready_event = threading.Event()
@@ -2601,7 +2654,10 @@ class MooncakeLayerwiseConnectorWorker:
             self.kv_recv_layer_thread.start()
             ready_event.wait()
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(self, finished_req_ids=None) -> tuple[set[str], set[str]]:
+        writer = getattr(self, "_manifest_source_writer", None)
+        if writer is not None and finished_req_ids:
+            writer.finish_requests(finished_req_ids)
         done_recving = (
             self.kv_recv_layer_thread.get_and_clear_done_requests(  # type: ignore[union-attr]
             )
@@ -2896,14 +2952,53 @@ class MooncakeLayerwiseConnectorWorker:
         if self._target_provider is not None:
             thread.receipt_provider = self._target_provider
 
+    def prepare_source_batch(self, source, requests, ready_event):
+        """Build the complete local reader list without peer/native work."""
+        metadata = self._source_request_metadata
+        legacy_expected = any(meta.remote_target_manifest is None for meta in metadata.values())
+        jobs = []
+        by_id = {request.request_id: request for request in requests}
+        for req_id, meta in metadata.items():
+            if meta.remote_target_manifest is None:
+                continue
+            request = by_id.get(req_id)
+            if request is None:
+                raise ContractError("Admitted PD request is missing from the Store source batch")
+            end = min(request.end_token, meta.remote_target_manifest.lease.allocation.prompt_tokens)
+            start = max(request.start_token, min(meta.local_transed_tokens, end))
+            jobs.append(
+                self._manifest_source_writer.prepare_job(
+                    source, replace(request, start_token=start, end_token=end), ready_event
+                )
+            )
+        return tuple(jobs), legacy_expected
+
     def prepare_layerwise_step(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
         """Prepare layerwise hooks once, when metadata is bound before forward."""
         self.current_layer = 0
         self._cache_write_events = [None] * self.total_layers
         if self.vllm_config.kv_transfer_config.is_kv_producer:
+            self._source_request_metadata = dict(metadata.requests)
             # update trans info
             update_metadata = {}
             for req_idx, (req_id, req_meta) in enumerate(metadata.requests.items()):
+                if req_meta.remote_target_manifest is not None:
+                    if not self._source_contract_bound:
+                        raise ContractError("Manifest producer requires a wired Store SourceReady registry")
+                    if (
+                        self.pcp_size != 1
+                        or self.dcp_size != 1
+                        or req_meta.remote_pcp_size != 1
+                        or req_meta.remote_dcp_size != 1
+                        or req_meta.remote_tp_size != self.tp_size
+                        or self.pd_head_ratio != 1
+                        or self.enable_c8_quant
+                        or self.enable_kv_quant
+                    ):
+                        raise ContractError("Manifest SourceReady writes require equal TP, CP1 and BF16 Main")
+                    self._manifest_source_writer.register_request(req_id, req_meta)
+                    update_metadata[req_id] = req_meta
+                    continue
                 transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
                 self._align_remote_block_ids(req_meta)
                 for i, kv_cache_spec in enumerate(self.kv_cache_specs):
@@ -3139,6 +3234,8 @@ class MooncakeLayerwiseConnectorWorker:
             for req_id, req_meta in connector_metadata.requests.items():
                 if len(req_meta.local_block_ids) <= layer_group_idx or not req_meta.local_block_ids[layer_group_idx]:
                     continue
+                if req_meta.remote_target_manifest is not None:
+                    continue  # The SourceReady job is this request's sole data-plane reader.
                 # Apply the lease writer plan: a Main backing has exactly one
                 # writer rank; other ranks skip it to avoid duplicate sends.
                 # Indexer ranges go to every consuming rank. v1 single-backing:
@@ -3169,6 +3266,7 @@ class MooncakeLayerwiseConnectorWorker:
             needs_reuse_gate = any(
                 len(req_meta.local_block_ids) > layer_group_idx and bool(req_meta.local_block_ids[layer_group_idx])
                 for req_meta in connector_metadata.requests.values()
+                if req_meta.remote_target_manifest is None
             )
             # register the layer's whole batch — all
             # requests — in one atomic register+seal, so a shared layer cannot

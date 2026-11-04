@@ -8,10 +8,14 @@ import zmq
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import CONTRACT_VERSION, ContractError
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import RegionAddress
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import target_lease_to_wire
 
 GET_TARGET_REGIONS_MSG = b"get_target_regions_v1"
 TARGET_REGIONS_REPLY = b"target_regions_v1"
 TARGET_PEER_ERROR = b"target_peer_error_v1"
+LAYER_RESULTS_MSG = b"layer_results_v1"
+MAX_PROOF_BATCH_FRAMES = 64
+TARGET_PEER_TIMEOUT_SECONDS = 30.0
 
 
 def encode_target_addresses(lease, handles) -> tuple:
@@ -121,3 +125,97 @@ def target_peer_call(host: str, port: int, message: tuple, *, timeout: float) ->
         raise ContractError(f"Target side-channel operation failed: {error}") from error
     finally:
         socket.close(linger=0)
+
+
+def resolve_manifest_addresses(metadata, plan, producer_rank):
+    # Every producer writes only its local Indexer, plus canonical P0 Main.
+    # The original owner lease (not the aggregate) authenticates the lookup.
+    lease = plan.manifest.for_rank(producer_rank).lease
+    response = target_peer_call(
+        metadata.remote_host,
+        metadata.remote_port + producer_rank,
+        (GET_TARGET_REGIONS_MSG, target_lease_to_wire(lease)),
+        timeout=TARGET_PEER_TIMEOUT_SECONDS,
+    )
+    return decode_target_addresses(lease, response)
+
+
+class ManifestPeerProofs:
+    """Persistent REQ sockets exclusively owned by the writer's proof thread."""
+
+    def __init__(self, producer_rank, *, timeout=TARGET_PEER_TIMEOUT_SECONDS):
+        if type(producer_rank) is not int or producer_rank < 0:
+            raise ContractError("Proof transport requires its explicit producer rank")
+        self.producer_rank = producer_rank
+        self._timeout_ms = max(1, math.ceil(timeout * 1000))
+        self._sockets = {}
+
+    def _send(self, host, port, message):
+        endpoint = f"tcp://{host}:{port}"
+        encoded = msgspec.msgpack.encode(message)
+        for attempt in range(3):
+            socket = self._sockets.get(endpoint)
+            if socket is None:
+                socket = zmq.Context.instance().socket(zmq.REQ)
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
+                socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
+                socket.connect(endpoint)
+                self._sockets[endpoint] = socket
+            try:
+                socket.send(encoded)
+                if socket.recv() != b"ACK":
+                    raise ContractError("Peer did not acknowledge the exact completion proof")
+                return
+            except (zmq.ZMQError, ContractError):
+                self._sockets.pop(endpoint).close(linger=0)
+                if attempt == 2:
+                    raise
+
+    def __call__(self, metadata, results, terminal):
+        batches = {}
+        for result, receivers in results:
+            key = result.key
+            frame = (
+                b"layer_result_msg",
+                CONTRACT_VERSION,
+                key.request.request_instance,
+                key.request.transfer_generation,
+                key.rank,
+                key.logical_layer,
+                key.operation_id,
+                key.component.value,
+                key.token_range.start,
+                key.token_range.end,
+                key.target_scope.backing_id,
+                key.target_scope.backing_generation,
+                result.status.value,
+                result.source_quiesced,
+            )
+            for rank in receivers:
+                batches.setdefault(rank, []).append(frame)
+        if terminal is not None:
+            status, quiesced = terminal
+            request = metadata.remote_target_manifest.lease.request
+            for rank in range(len(metadata.remote_target_manifest.targets)):
+                batches.setdefault(rank, []).append(
+                    (
+                        b"rank_terminal_msg",
+                        CONTRACT_VERSION,
+                        request.request_instance,
+                        request.transfer_generation,
+                        # Set explicitly at construction by the producer worker.
+                        self.producer_rank,
+                        status.value,
+                        quiesced,
+                    )
+                )
+        for rank, frames in batches.items():
+            self._send(
+                metadata.remote_host, metadata.remote_port + rank, (LAYER_RESULTS_MSG, CONTRACT_VERSION, tuple(frames))
+            )
+
+    def close(self):
+        for socket in self._sockets.values():
+            socket.close(linger=0)
+        self._sockets.clear()

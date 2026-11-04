@@ -4,23 +4,30 @@
 import threading
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 
 import msgspec
 import zmq
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+from tests.ut.distributed.ascend_store.test_target_coordinator import coordinated
 from tests.ut.distributed.ascend_store.test_target_owner_runtime import OwnerFixture
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     ContractError,
     ReleaseAck,
+    Status,
+    TransferResult,
     assert_pd_consistent,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_peer import (
     GET_TARGET_REGIONS_MSG,
+    LAYER_RESULTS_MSG,
+    ManifestPeerProofs,
     decode_target_addresses,
     encode_target_addresses,
     target_peer_call,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import manifest_requirements
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
     target_lease_from_wire,
     target_lease_to_wire,
@@ -30,6 +37,59 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec im
 
 
 class TestTargetPeer(unittest.TestCase):
+    def test_real_proof_socket_batches_entries_and_reuses_connection_until_terminal(self):
+        provider, _, request, allocation = coordinated(tp=1, layers=1)
+        manifest = provider.manifest(provider.acquire_target(request, allocation))
+        ready = threading.Event()
+        endpoints, messages, errors = [], [], []
+
+        def serve():
+            context = zmq.Context()
+            socket = context.socket(zmq.ROUTER)
+            try:
+                socket.bind("tcp://127.0.0.1:*")
+                endpoints.append(socket.getsockopt_string(zmq.LAST_ENDPOINT))
+                ready.set()
+                for _ in range(2):
+                    if not socket.poll(2000):
+                        raise TimeoutError("CPU proof test did not receive frame")
+                    identity, _, payload = socket.recv_multipart()
+                    messages.append((identity, msgspec.msgpack.decode(payload, type=tuple)))
+                    socket.send_multipart((identity, b"", b"ACK"))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                socket.close(linger=0)
+                context.term()
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        proofs = ManifestPeerProofs(0, timeout=1)
+        try:
+            self.assertTrue(ready.wait(1))
+            meta = SimpleNamespace(
+                remote_target_manifest=manifest,
+                remote_host="127.0.0.1",
+                remote_port=int(endpoints[0].rsplit(":", 1)[1]),
+            )
+            key = manifest_requirements(manifest)[0].key
+            proofs(meta, ((TransferResult(key, Status.SUCCESS, True), (0,)),), None)
+            proofs(meta, (), (Status.SUCCESS, True))
+            self.assertEqual(messages[0][0], messages[1][0])
+            self.assertTrue(all(message[1][0] == LAYER_RESULTS_MSG for message in messages))
+            result = messages[0][1][2][0]
+            self.assertEqual(
+                (result[2], result[6], result[10]),
+                (request.request_instance, key.operation_id, key.target_scope.backing_id),
+            )
+            self.assertEqual(messages[1][1][2][0][-2:], ["success", True])
+        finally:
+            proofs.close()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            provider.release_target(manifest.lease)
+
     def test_registered_address_lookup_uses_real_retained_owner_and_msgpack(self):
         fixture = OwnerFixture()
         lease = fixture.acquire()
