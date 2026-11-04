@@ -6,6 +6,49 @@
 本次已纳入远端增量并修复一批入口、元数据和失败路径；模型端到端功能及性能尚未验证。
 早期 A1/A2 的原生资源验证仍然有效，但不等于完整 PD 验收。
 
+## 第三阶段：实际目标计划与 receive admission（2026-11-05）
+
+仍在原分支开发，本阶段没有重启模型或替换运行服务的源码。
+
+- `mooncake_layerwise_plan.py` 由完整 manifest 为每个 layer／component／entry
+  分配稳定 operation ID；Main 只由 P0 写一次，共享完成消息送全部 D owner，Indexer
+  由对应 P rank 写入对应 D rank 的 data／scale。复用现有 DSA 页映射器，支持 P/D
+  独立的物理页、stride、分组、block ID 和未对齐有效尾部。
+- `ManifestWritePlan` 在请求 admission 时预编译每个 producer／layer 与 receiver
+  的 entry 列表，避免未来 SourceReady 路径逐层重扫整个 TP manifest。
+  当前尚未由生产 source driver 调用 `plan_layer_writes()` 提交原生传输。
+- worker 本地 `resolve_target_regions()` 在原始 lease 有效期内解析真实 MR 基址，
+  经 D 侧既有 peer listener 返回绑定 request／token／allocation／registration 代际
+  的地址。地址不进入 scheduler owner IPC，后者继续只接受白名单 catalog／lease 值。
+- D 注册复用现有 bounded DSA packer，支持同一真实 backing 的多段不重叠 MR，
+  不再把整个 Host pool 当作一个无限大的注册区。组件 view 仍须完整落在一个实际 MR
+  内，单 entry 跨 MR 的超大几何明确拒绝；本轮没有完成真实新注册路径的 NPU 验证。
+- `ExactReceiptLedger` 按 admitted entry 的完整 key 和有效 token 区间记账，
+  不用 layer×backing 的笛卡尔积。SUCCESS 且 source_quiesced 才计覆盖；全部写者
+  明确封口且所有已知原生操作静止才提供 remote_quiesced。失败／取消可满足安全回收，
+  但不会满足 decode readiness；冲突、未知 entry、错误代际或未决 DMA 均不能放行。
+- scheduler 在通知 P 前对全部 TP owner 执行同步 `admit_target()`，逐个安装真实
+  原始 lease、精确账本、内部／外部 request 映射和失败 block 列表后才确认。
+  connector metadata 随后重复到达是幂等的，不重置已收到的完成结果。
+  部分 admission 失败保留目标，不通知 P；acquire 后校验失败也保留可追踪 lease。
+- 真实 receiver 处理器已切入 manifest 精确账本；terminal 必须附带明确的 DMA
+  静止 bool，并匹配 request generation。旧 plain／legacy 协议路径保留。
+  新账本已有 all-rank 状态查询，但尚未生成生产 ReleaseAck；缺证明仍保持分配。
+
+本阶段组合 CPU 回归 119 项／46 子用例通过，另 1 项运行时限定测试 skip；
+P 聚焦 141 项通过。组合覆盖真实双 owner loopback RPC admission、CPU 实际存储和
+memmove 的页／尾块／padding 检查、碎片注册、未知／冲突／乱序消息等。
+原 P 容器的新独立 Python 进程通过 747 个候选生产 Python 源文件内存加载、
+3 项真实 receiver／early-admission 方法、3 项 sender fence、1 项 CPU 存储注册选择、
+6 项 hook 及 4 条实际 vLLM scheduler 控制路径。
+上述进程未提交真实远端 DMA 或模型计算；完整模型功能及性能仍为 NOT_RUN。
+证据目录：`artifacts/p-main-buffer-reuse/pd-transfer-data-plane-20261105/`。
+
+接下来必须接通 SourceReady 直接提交这些计划与 exact epoch reader、真实原生完成
+及 peer 回执、D Host／device 可见性与完整 forward／writeback use、全 rank readiness
+和远端静止聚合，再完成取消／抢占及 P restore-only。完成后才启动短请求和 32K／64K
+同配置无共享／共享对照，不能用本阶段控制测试代替完整验收。
+
 ## 第二阶段：生产初始化和 scheduler 门禁（2026-11-05）
 
 本轮继续在同一分支开发，新增以下真实调用入口；**尚未启动完整 PD 模型**。

@@ -10,6 +10,7 @@ references. Missing retention, visibility or release guarantees fail closed.
 import hashlib
 import json
 import threading
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from typing import Protocol
@@ -28,6 +29,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TokenRange,
     WriterPlan,
     assert_lease_consistent,
+    assert_registered_regions,
 )
 
 
@@ -139,8 +141,7 @@ class RegisteredTargetProvider:
         by_region = {region.region_id: region for region in regions}
         if len(by_region) != len(regions):
             raise ContractError("Registered target region IDs must be unique")
-        if len({(r.backing_id, r.backing_generation) for r in regions}) != len(regions):
-            raise ContractError("Receipt v1 cannot represent multiple regions of one backing")
+        assert_registered_regions(regions)
         if set(required_layers) != {Component.MAIN, Component.INDEXER} or any(
             not layers
             or len(set(layers)) != len(layers)
@@ -295,6 +296,19 @@ class RegisteredTargetProvider:
             if state.phase not in ("ACQUIRED", "READY"):
                 raise ContractError("Target views are not available in this lease state")
             return state.lease.views
+
+    @contextmanager
+    def inspect_target(self, lease: TargetLease):
+        """Worker-local atomic inspection, excluding concurrent lease release.
+
+        This only protects a control-plane lookup. Actual model operations
+        still require TargetRuntime.use(), including asynchronous writeback.
+        """
+        with self._lock:
+            state = self._state(lease)
+            if state.phase not in ("ACQUIRED", "READY"):
+                raise ContractError("Target registration lookup is not available in this lease state")
+            yield state.lease
 
     def prepare_decode(self, lease: TargetLease, receipt: ReceiveReceipt) -> None:
         if receipt.request != lease.request or receipt.target_generation != lease.allocation.allocation_generation:

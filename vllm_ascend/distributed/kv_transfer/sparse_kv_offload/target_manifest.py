@@ -199,7 +199,7 @@ def aggregate_rank_targets(targets: tuple[RankTarget, ...]) -> TargetLease:
         ):
             raise ContractError("Manifest requires one canonical writer for each shared Main backing")
     selected_views, selected_regions = [], []
-    seen_regions, seen_backings = set(), set()
+    seen_regions, backing_owners = set(), {}
     for target in targets:
         views = tuple(
             v for v in target.lease.views if v.component is Component.INDEXER or target.rank == CANONICAL_MAIN_RANK
@@ -210,10 +210,10 @@ def aggregate_rank_targets(targets: tuple[RankTarget, ...]) -> TargetLease:
             if region.region_id not in needed_regions:
                 continue
             backing = (region.backing_id, region.backing_generation)
-            if region.region_id in seen_regions or backing in seen_backings:
+            previous_owner = backing_owners.setdefault(backing, target.rank)
+            if region.region_id in seen_regions or previous_owner != target.rank:
                 raise ContractError("Manifest repeats a region or aliases device backings across owners")
             seen_regions.add(region.region_id)
-            seen_backings.add(backing)
             selected_regions.append(region)
     aggregate = TargetLease(
         CONTRACT_VERSION,

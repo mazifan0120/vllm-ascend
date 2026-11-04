@@ -190,10 +190,10 @@ class TestRegisteredTargetProvider(unittest.TestCase):
             provider.prepare_decode(lease, receipt)
         self.assertFalse(receipt.visible)
 
-    def test_same_backing_split_registration_is_explicitly_unsupported_by_contract(self):
+    def test_overlapping_same_backing_registration_is_rejected(self):
         self.make()
         self.regions = (*self.regions, replace(self.regions[0], region_id="second-host-region"))
-        with self.assertRaisesRegex(ContractError, "multiple regions"):
+        with self.assertRaisesRegex(ContractError, "overlap"):
             self.construct()
 
     def test_int8_main_target_is_not_claimed_as_supported_by_bf16_runtime(self):

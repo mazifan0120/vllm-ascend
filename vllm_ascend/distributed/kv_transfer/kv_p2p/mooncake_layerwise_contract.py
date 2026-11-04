@@ -288,7 +288,7 @@ class WriterPlan:
 @dataclass(frozen=True)
 class TargetLease:
     """Acquired target: binds RegisteredRegions + CacheViews + WriterPlan to one
-    request. Regions must not repeat (backing_id, backing_generation)."""
+    request. Regions of one backing must describe disjoint physical spans."""
 
     contract_version: int
     request: RequestKey
@@ -310,12 +310,7 @@ class TargetLease:
         for i, r in enumerate(self.regions):
             if not isinstance(r, RegisteredRegion):
                 raise ContractError(f"TargetLease.regions[{i}] must be RegisteredRegion, got {type(r).__name__}")
-        seen: set[tuple[str, int]] = set()
-        for r in self.regions:
-            pair = (r.backing_id, r.backing_generation)
-            if pair in seen:
-                raise ContractError(f"TargetLease.regions repeats (backing_id, backing_generation)={pair}")
-            seen.add(pair)
+        assert_registered_regions(self.regions)
         for i, v in enumerate(self.views):
             if not isinstance(v, CacheView):
                 raise ContractError(f"TargetLease.views[{i}] must be CacheView, got {type(v).__name__}")
@@ -450,6 +445,32 @@ def assert_provider_capabilities(provider: Any) -> None:
         raise ContractError("TargetProvider capability check failed:\n  - " + "\n  - ".join(problems))
 
 
+def assert_registered_regions(regions) -> None:
+    """One registered identity per span; large backings may have several MRs."""
+    seen_ids = set()
+    backings = {}
+    for region in regions:
+        if region.region_id in seen_ids:
+            raise ContractError("Target lease repeats a registered region identity")
+        seen_ids.add(region.region_id)
+        identity = (
+            region.engine_instance,
+            region.registration_generation,
+            region.backing_generation,
+            region.memory_kind,
+        )
+        previous, spans = backings.setdefault(region.backing_id, (identity, []))
+        if previous != identity:
+            raise ContractError("One backing mixes registration owners, memory kinds or generations")
+        spans.append((region.backing_offset_bytes, region.backing_offset_bytes + region.length_bytes))
+    for _, spans in backings.values():
+        last_end = -1
+        for start, end in sorted(spans):
+            if start < last_end:
+                raise ContractError("Registered regions overlap within the same backing")
+            last_end = end
+
+
 def assert_lease_consistent(lease: TargetLease, request: RequestKey) -> None:
     """Per-request gate before the target is used. Raises
     ContractError -> that request fails; other requests continue."""
@@ -462,12 +483,7 @@ def assert_lease_consistent(lease: TargetLease, request: RequestKey) -> None:
         raise ContractError(f"lease belongs to {lease.request}, expected {request}")
     if lease.allocation.request != request:
         raise ContractError("Target allocation belongs to another request identity")
-    seen: set[tuple[str, int]] = set()
-    for r in lease.regions:
-        pair = (r.backing_id, r.backing_generation)
-        if pair in seen:
-            raise ContractError(f"lease regions repeat (backing_id, backing_generation)={pair}")
-        seen.add(pair)
+    assert_registered_regions(lease.regions)
     region_ids = {r.region_id for r in lease.regions}
     if len(region_ids) != len(lease.regions):
         raise ContractError("Target lease repeats a registered region identity")
@@ -489,7 +505,7 @@ def assert_pd_consistent(
     """Startup-time P/D consistency gate for a receipt-mode target lease.
 
     The D-side catalog already validates single-end geometry (manager block %
-    page, one backing one region, BF16 Main). This gate checks the producer
+    page, disjoint registered spans per backing, BF16 Main). This gate checks the producer
     side against the lease the scheduler carried over, so a P/D mismatch fails
     fast at the first request rather than corrupting a transfer mid-stream:
 
@@ -499,11 +515,11 @@ def assert_pd_consistent(
       because the writer plan assumes the same page granularity).
     - BF16 Main: a Main view whose dtype is not bfloat16 is rejected. The D
       Host Main pool is BF16-only; an INT8 producer Main cannot splice into it.
-    - one backing one region (v1): no backing may own more than one region.
+    - regions: spans sharing one backing must be disjoint and share the same
+      registration owner, memory kind and generation.
 
-    The v1 restrictions (single backing, fixed transfer generation 0, no
-    retry, TP-only) are enforced here as explicit checks, not relied on by
-    omission.
+    Retries and TP geometry are validated by the rank-explicit manifest and
+    the per-request source plan; this gate does not invent either identity.
     """
     if type(producer_tp_size) is not int or producer_tp_size < 1:
         raise ContractError(f"producer_tp_size must be a positive int, got {producer_tp_size!r}")
@@ -527,12 +543,7 @@ def assert_pd_consistent(
             raise ContractError(
                 f"v1 requires one writer rank per Main backing; backing {backing!r} has {len(ranks)} writers {ranks}"
             )
-    backing_regions: dict[str, int] = {}
-    for region in lease.regions:
-        backing_regions[region.backing_id] = backing_regions.get(region.backing_id, 0) + 1
-    multi = {backing: count for backing, count in backing_regions.items() if count > 1}
-    if multi:
-        raise ContractError(f"v1 requires one region per backing; backings with multiple regions: {multi}")
+    assert_registered_regions(lease.regions)
     main_views = [view for view in lease.views if view.component is Component.MAIN]
     if not main_views:
         raise ContractError("lease has no MAIN view; receipt v1 requires a Main backing")

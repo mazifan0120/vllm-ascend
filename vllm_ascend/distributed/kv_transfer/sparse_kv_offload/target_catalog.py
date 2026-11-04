@@ -209,13 +209,9 @@ class RegisteredTargetResources:
                     )
                 )
         regions = {}
-        backing_regions = {}
         for _, _, component, _, _, _, registration, backing in raw_entries:
             address, size, _ = registration
             identity = (address, size)
-            previous = backing_regions.setdefault(backing[:2], identity)
-            if previous != identity:
-                raise ContractError("Receipt v1 cannot describe multiple regions of one real backing")
             candidate = RegisteredRegion(
                 self._snapshot.engine_instance,
                 self._snapshot.generation,

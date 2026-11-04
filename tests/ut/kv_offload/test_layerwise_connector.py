@@ -8,6 +8,7 @@ by test_layerwise_receipt.py, which runs anywhere. The no-compute marking
 case exercises save_kv_layer end to end and belongs on the NPU CI.
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -18,12 +19,115 @@ npu = pytest.importorskip("torch_npu")
 msgspec = pytest.importorskip("msgspec")
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as lc  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_exact_receipt import ExactReceiptLedger  # noqa: E402
 
 
 def _encode_decode(msg):
     encoder = msgspec.msgpack.Encoder()
     decoder = msgspec.msgpack.Decoder(type=tuple)
     return decoder.decode(encoder.encode(msg))
+
+
+class TestExactReceiverProtocol(unittest.TestCase):
+    def fixture(self):
+        request = lc.RequestKey("wire-entry-request", 5)
+        required = tuple(
+            lc.TransferKey(
+                request,
+                0,
+                0,
+                entry,
+                component,
+                lc.TokenRange(0, 23),
+                lc.TargetScope(
+                    "shared-main" if component is lc.Component.MAIN else "indexer",
+                    7,
+                    None if component is lc.Component.MAIN else 0,
+                ),
+            )
+            for entry, component in enumerate(lc.Component)
+        )
+        ledger = ExactReceiptLedger(request, required, expected_ranks=(0,), target_generation=8, visibility_rank=0)
+        receiver = object.__new__(lc.KVCacheRecvingLayerThread)
+        receiver.lock = threading.RLock()
+        receiver.ledger_by_req = {request.request_instance: ledger}
+        receiver._maybe_publish = Mock()
+        return receiver, ledger, required
+
+    def test_actual_message_handlers_preserve_generation_entries_and_explicit_quiescence(self):
+        receiver, ledger, required = self.fixture()
+        for key in required:
+            message = (
+                lc.LAYER_RESULT_MSG,
+                lc.CONTRACT_VERSION,
+                key.request.request_instance,
+                5,
+                0,
+                0,
+                key.operation_id,
+                key.component.value,
+                0,
+                23,
+                key.target_scope.backing_id,
+                7,
+                "success",
+                True,
+            )
+            receiver.handle_layer_result(_encode_decode(message))
+        terminal = (lc.RANK_TERMINAL_MSG, lc.CONTRACT_VERSION, ledger.request.request_instance, 5, 0, "success", True)
+        receiver.handle_rank_terminal(_encode_decode((*terminal[:3], 4, *terminal[4:])))
+        self.assertFalse(ledger.remote_quiesced())
+        receiver.handle_rank_terminal(_encode_decode(terminal[:-1]))
+        self.assertFalse(ledger.remote_quiesced())
+        receiver.handle_rank_terminal(_encode_decode(terminal))
+        self.assertTrue(ledger.remote_quiesced())
+        self.assertIsNotNone(ledger.build_receipt())
+
+    def test_truthy_untyped_quiescence_and_empty_backing_cannot_credit_a_manifest_entry(self):
+        receiver, ledger, required = self.fixture()
+        key = required[0]
+        message = (
+            lc.LAYER_RESULT_MSG,
+            lc.CONTRACT_VERSION,
+            ledger.request.request_instance,
+            5,
+            0,
+            0,
+            key.operation_id,
+            key.component.value,
+            0,
+            23,
+            key.target_scope.backing_id,
+            7,
+            "success",
+            1,
+        )
+        receiver.handle_layer_result(_encode_decode(message))
+        receiver.handle_layer_result(_encode_decode((message[0], True, *message[2:13], True)))
+        receiver.handle_layer_result(_encode_decode((*message[:10], "", *message[11:13], True)))
+        for key in required[1:]:
+            ledger.record(lc.TransferResult(key, lc.Status.SUCCESS, True))
+        ledger.finish_rank(ledger.request, 0, lc.Status.SUCCESS, True)
+        self.assertIsNone(ledger.build_receipt())
+
+
+class TestEarlyTargetAdmission(unittest.TestCase):
+    def test_actual_install_maps_early_completions_before_scheduler_metadata(self):
+        worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
+        worker.request_map = {}
+        worker.kv_recv_layer_thread = SimpleNamespace(
+            lock=threading.RLock(), ledger_by_req={}, instance_to_req={}, receipt_mode_reqs=set(), receipt_deadlines={}
+        )
+        _, ledger, _ = TestExactReceiverProtocol().fixture()
+        request_id = "early-request-12345678"
+        lease = SimpleNamespace(request=ledger.request, allocation=SimpleNamespace(group_block_ids=((1, 3),)))
+        worker._install_admitted_target(request_id, lease, ledger)
+        external = lc.get_external_request_id(request_id)
+        self.assertEqual(worker.request_map[external], request_id)
+        self.assertIs(worker.kv_recv_layer_thread.ledger_by_req[ledger.request.request_instance], ledger)
+        self.assertEqual(worker._admitted_target_blocks[request_id], ((1, 3),))
+        with self.assertRaises(lc.ContractError):
+            worker._install_admitted_target(request_id, lease, ledger)
 
 
 class TestSchedulerRetentionBinding:
@@ -211,7 +315,7 @@ class TestTargetHostRegistration(unittest.TestCase):
         with patch.object(lc, "global_te", te):
             worker.register_kv_caches(original)
         pointers, lengths, locations = te.register_buffer.call_args.args
-        self.assertEqual((pointers[0], lengths[0], locations[0]), (host.data_ptr(), host.numel(), "npu:0"))
+        self.assertEqual((pointers[0], lengths[0], locations[0]), (host.data_ptr(), 512, "npu:0"))
         self.assertEqual(set(pointers[1:]), {t.untyped_storage().data_ptr() for t in hbm_indexer})
         self.assertTrue(set(pointers).isdisjoint(t.data_ptr() for t in hbm_main))
         self.assertEqual(worker.layer_metadata[main].kv_caches_base_addr, [t.data_ptr() for t in host_views])

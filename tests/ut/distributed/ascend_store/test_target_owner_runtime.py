@@ -104,7 +104,7 @@ class AllocationManager:
 
 
 class OwnerFixture:
-    def __init__(self, layers=2):
+    def __init__(self, layers=2, registration_chunk_bytes=None):
         raw = torch.empty(8192, dtype=torch.int8)
         self.pool = MooncakeHostPool(HostMemoryRegion(raw), HostPoolTopology(0, 1))
         self.host = {}
@@ -136,8 +136,14 @@ class OwnerFixture:
         # The producer reaches the target's TransferEngine at this endpoint.
         self.te._handshake_host = "127.0.0.1"
         self.te.transfer_engine._rpc_port = 25000
-        pointers = [raw.data_ptr()]
-        lengths = [raw.numel()]
+        if registration_chunk_bytes is None:
+            pointers, lengths = [raw.data_ptr()], [raw.numel()]
+        else:
+            pointers = [raw.data_ptr() + start for start in range(0, raw.numel(), registration_chunk_bytes)]
+            lengths = [
+                min(registration_chunk_bytes, raw.numel() - start)
+                for start in range(0, raw.numel(), registration_chunk_bytes)
+            ]
         for name, tensors in self.caches.items():
             if self.components[name] is Component.INDEXER:
                 for tensor in tensors:
@@ -550,12 +556,13 @@ class TestTargetOwnerRuntime(unittest.TestCase):
         with self.assertRaises(ContractError):
             client.bind_transport(SimpleNamespace(call=lambda command: None))
 
-    def test_split_real_backing_is_rejected_with_pins_rolled_back(self):
+    def test_split_real_backing_preserves_identity_and_releases_registration_pins(self):
         f = OwnerFixture()
         f.facade.close()
         f.te.unregister_buffer()
         # Register each Main view separately: one actual pool now has multiple
-        # regions. Receipt v1 must reject it instead of inventing backing IDs.
+        # regions. Keep the real backing ID and disjoint offsets, rather than
+        # inventing one backing per registration.
         pointers, lengths = [], []
         for tensors in f.host.values():
             for tensor in tensors:
@@ -568,8 +575,15 @@ class TestTargetOwnerRuntime(unittest.TestCase):
                     lengths.append(tensor.untyped_storage().nbytes())
         f.te.register_buffer(pointers, lengths)
         before = f.pool._target_lifetime.pins
-        with self.assertRaisesRegex(ContractError, "multiple regions"):
-            f.build_resources()
+        resources = f.build_resources()
+        try:
+            hosts = tuple(r for r in resources.catalog().regions if r.memory_kind == "host")
+            self.assertEqual(len(hosts), 4)
+            self.assertEqual(len({r.backing_id for r in hosts}), 1)
+            self.assertEqual({r.backing_offset_bytes for r in hosts}, {0, 256, 512, 768})
+            self.assertGreater(f.pool._target_lifetime.pins, before)
+        finally:
+            resources.close()
         self.assertEqual(f.pool._target_lifetime.pins, before)
         f.te.unregister_buffer()
         f.pool.close()

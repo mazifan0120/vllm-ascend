@@ -1,8 +1,10 @@
 # P buffer reuse 与 layerwise receipt：实现现状及剩余工作
 
 2026-11-05 最新核对：已实际 fetch 并在原 `p-main-buffer-reuse` 纳入 receipt
-`fa5aec40b` 的 12 个新增提交。完整 PD 仍有生产 IPC、Host 注册／目标传输计划、
-精确 receipt、D 消费及取消／抢占回收等缺口；已开始修复。
+`fa5aec40b` 的 12 个新增提交。已接生产 owner RPC／scheduler 门禁、Host 目标注册
+选择、manifest 逐 entry 计划、精确 receipt 与通知 P 前的全 TP receive admission。
+SourceReady 真实发送、D 接收可见性／消费写回、all-rank readiness／静止证明、
+取消／抢占与 restore-only 仍待接通；完整模型功能和性能尚未验证。
 当前清单与验证边界见 [最新补齐审查](PD_TRANSFER_COMPLETION_REVIEW.md)。
 下文保留 2026-11-04 的整理记录，不以旧的分工或接口测试代替完整端到端验收。
 

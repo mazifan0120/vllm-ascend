@@ -56,6 +56,24 @@ class TargetOwner:
     def retry_failed_retains(self) -> None:
         self.runtime.retry_failed_retains()
 
+    def resolve_target_regions(self, lease):
+        # Data-plane-only address handles are deliberately not an owner IPC
+        # operation. The scheduler continues to receive identities/offsets.
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import RegionAddress
+
+        with self.provider.inspect_target(lease):
+            self.resources.validate(lease)
+            return tuple(
+                RegionAddress(
+                    lease.request,
+                    lease.allocation.allocation_generation,
+                    lease.allocation.retention_token,
+                    region,
+                    self.resources._base_addresses[region.region_id],
+                )
+                for region in lease.regions
+            )
+
     def publish_received(self, lease, host_visible, indexer_event) -> None:
         self.runtime.publish_received(lease, ReceivedTargetWrites(lease, host_visible, indexer_event))
 
@@ -122,6 +140,10 @@ class DeferredTargetProvider:
     def get_target_views(self, lease) -> tuple[CacheView, ...]:
         with self._operation() as owner:
             return owner.get_target_views(lease)
+
+    def resolve_target_regions(self, lease):
+        with self._operation() as owner:
+            return owner.resolve_target_regions(lease)
 
     def prepare_decode(self, lease, receipt) -> None:
         with self._operation() as owner:
@@ -248,8 +270,9 @@ class TargetOwnerDispatcher:
     worker installs them locally and the scheduler only receives pure values.
     """
 
-    def __init__(self, facade: DeferredTargetProvider) -> None:
+    def __init__(self, facade: DeferredTargetProvider, *, delivery=None) -> None:
         self._facade = facade
+        self._delivery = delivery
 
     def dispatch(self, call: TargetOwnerCall) -> TargetOwnerReply:
         if not isinstance(call, TargetOwnerCall) or not call.call_id:
@@ -263,6 +286,10 @@ class TargetOwnerDispatcher:
         }
         for operation in ("manifest", "catalogs"):
             method = getattr(self._facade, operation, None)
+            if callable(method):
+                operations[operation] = method
+        for operation in ("admit_target", "delivery_status"):
+            method = getattr(self._delivery if self._delivery is not None else self._facade, operation, None)
             if callable(method):
                 operations[operation] = method
         try:
@@ -350,6 +377,20 @@ class TargetProviderClient:
         result = self._call("manifest", lease)
         if type(result) is not TargetManifest or result.lease != lease:
             raise ContractError("Target owner did not return the matching rank-explicit manifest")
+        return result
+
+    def admit_target(self, manifest, request_id) -> None:
+        if self._call("admit_target", manifest, request_id) is not None:
+            raise ContractError("Target owner admission returned a malformed acknowledgement")
+
+    def delivery_status(self, lease) -> dict:
+        result = self._call("delivery_status", lease)
+        if (
+            type(result) is not dict
+            or set(result) != {"ready", "remote_quiesced"}
+            or any(type(value) is not bool for value in result.values())
+        ):
+            raise ContractError("Target owner returned malformed delivery proofs")
         return result
 
     def prepare_decode(self, lease, receipt) -> None:

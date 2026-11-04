@@ -35,8 +35,10 @@ class _CoordinatedTarget:
     acquired: dict[int, TargetLease] = field(default_factory=dict)
     manifest: TargetManifest | None = None
     prepared: set[int] = field(default_factory=set)
+    admitted: set[int] = field(default_factory=set)
     released: set[int] = field(default_factory=set)
     error: Exception | None = None
+    request_id: str | None = None
 
 
 def _fingerprint(lease: TargetLease) -> str:
@@ -139,6 +141,43 @@ class MultiRankTargetProvider:
             except Exception as error:
                 target.error = error
                 raise ContractError("TP decode visibility is incomplete; target remains retained") from error
+
+    def admit_target(self, manifest, request_id) -> None:
+        with self._lock:
+            if type(manifest) is not TargetManifest or type(request_id) is not str or not request_id:
+                raise ContractError("TP admission requires a manifest and internal request identity")
+            target = self._target(manifest.lease)
+            if (
+                target.manifest != manifest
+                or target.error is not None
+                or target.released
+                or target.request_id not in (None, request_id)
+            ):
+                raise ContractError("Cannot admit a changed, failed or releasing TP target")
+            target.request_id = request_id
+            try:
+                for rank, owner in enumerate(self._owners):
+                    if rank not in target.admitted:
+                        owner.admit_target(target.manifest, request_id)
+                        target.admitted.add(rank)
+            except Exception as error:
+                target.error = error
+                raise ContractError("TP receive admission is incomplete; producer must not be notified") from error
+
+    def delivery_status(self, lease) -> dict:
+        with self._lock:
+            target = self._target(lease)
+            if target.admitted != set(range(len(self._owners))):
+                raise ContractError("All TP receive owners must admit before a delivery proof is available")
+            statuses = tuple(owner.delivery_status(target.acquired[rank]) for rank, owner in enumerate(self._owners))
+            if any(
+                type(status) is not dict
+                or set(status) != {"ready", "remote_quiesced"}
+                or any(type(value) is not bool for value in status.values())
+                for status in statuses
+            ):
+                raise ContractError("TP owner returned malformed delivery proofs")
+            return {key: all(status[key] for status in statuses) for key in ("ready", "remote_quiesced")}
 
     def release_target(self, lease) -> None:
         # Caller still owns remote-DMA proof. This method aggregates only the
