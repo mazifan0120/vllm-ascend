@@ -341,6 +341,66 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertTrue(ledger.should_publish())  # new-instance data publishes normally
 
 
+class RequiredPlanAndFailureGates(TestCase):
+    """Plan-aware coverage and failure blocking: a layer outside the required
+    plan cannot hide inside the union, and a FAILED scope keeps readiness
+    False even after an overlapping success (v1 has no retry policy)."""
+
+    def _plan_ledger(self, request: RequestKey, *, layers=(0, 1)) -> ReceiptLedger:
+        return ReceiptLedger(
+            request=request,
+            expected_ranks=EXPECTED,
+            main_backings=BACKINGS,
+            indexer_ranks=INDEXER_RANKS,
+            prompt_len=PROMPT,
+            required_layers=layers,
+            indexer_backings=("ib0",),
+        )
+
+    def _feed_layer(self, ledger: ReceiptLedger, request: RequestKey, layer: int) -> None:
+        for start, end in ((0, 4), (4, 8)):
+            ledger.record(make_result(make_key(request, layer=layer, start=start, end=end)))
+            for rank in INDEXER_RANKS:
+                ledger.record(
+                    make_result(
+                        make_key(
+                            request,
+                            rank=rank,
+                            layer=layer,
+                            start=start,
+                            end=end,
+                            component=Component.INDEXER,
+                            consumer=rank,
+                        )
+                    )
+                )
+
+    def test_missing_required_layer_blocks_ready(self):
+        request = make_request()
+        ledger = self._plan_ledger(request)
+        self._feed_layer(ledger, request, 0)
+        for rank in EXPECTED:
+            ledger.finish_rank(rank, Status.SUCCESS)
+        self.assertFalse(ledger._data_ready())
+        self._feed_layer(ledger, request, 1)
+        self.assertTrue(ledger._data_ready())
+
+    def test_failed_scope_blocks_ready_even_after_overlapping_success(self):
+        request = make_request()
+        ledger = self._plan_ledger(request, layers=(0,))
+        ledger.record(make_result(make_key(request, layer=0, op=1), status=Status.FAILED))
+        ledger.record(make_result(make_key(request, layer=0, op=2)))
+        self.assertFalse(ledger._data_ready())
+        self.assertIn(("main:b0", 0), ledger._failed_scopes)
+
+    def test_out_of_plan_layer_counts_invalid(self):
+        request = make_request()
+        ledger = self._plan_ledger(request, layers=(0,))
+        ledger.record(make_result(make_key(request, layer=7)))
+        self.assertEqual(ledger._invalid_results, 1)
+        self.assertFalse(ledger._data_ready())
+
+
 class ReceiptFuzz(TestCase):
     """Random shuffle/drop fuzz, 2000 iterations with a fixed seed."""
 
@@ -587,6 +647,167 @@ class ContractTests(TestCase):
                 writer_plan=lease.writer_plan,
             )
             C.assert_lease_consistent(dup_regions, request)
+
+
+class PDConsistencyTests(TestCase):
+    """Startup P/D consistency gate for a receipt-mode target lease.
+
+    The producer must cover every writer rank, Main must be BF16 (an INT8
+    producer Main cannot splice into the BF16 D Host pool), and v1 requires
+    one region per backing. These cases run pure-stdlib on the contract module.
+    """
+
+    def _lease(self):
+        provider = FakeTargetProvider()
+        request = make_request()
+        allocation = C.BlockAllocation(
+            request=request,
+            allocation_generation=1,
+            group_block_ids=((0, 1, 2), (3, 4)),
+            manager_block_size_tokens=16,
+            prompt_tokens=PROMPT,
+            retention_token="ret-pd",
+        )
+        return provider.acquire_target(request, allocation)
+
+    def test_consistent_lease_passes(self):
+        lease = self._lease()
+        # The fake provider writes backing with rank 0; producer tp_size=1
+        # covers it, the Main view is BF16 and its block size is in the set.
+        C.assert_pd_consistent(
+            lease,
+            producer_tp_size=1,
+            producer_block_sizes=(16,),
+            producer_main_dtype="bfloat16",
+        )
+
+    def test_writer_rank_outside_producer_tp_fails(self):
+        lease = self._lease()
+        # The fake provider assigns writer rank 0; a producer tp_size that
+        # cannot hold rank 0 fails closed.
+        with self.assertRaisesRegex(ContractError, "producer_tp_size"):
+            C.assert_pd_consistent(
+                lease,
+                producer_tp_size=0,
+                producer_block_sizes=(16,),
+                producer_main_dtype="bfloat16",
+            )
+
+    def test_writer_rank_beyond_producer_tp_fails(self):
+        lease = self._lease()
+        # Reassign the writer rank to 5; producer tp_size=1 cannot cover it.
+        plan = C.WriterPlan(
+            writers_by_backing={backing: (5,) for backing, ranks in lease.writer_plan.writers_by_backing.items()},
+            ranges_by_backing=lease.writer_plan.ranges_by_backing,
+        )
+        bad = C.TargetLease(
+            contract_version=1,
+            request=lease.request,
+            rank=lease.rank,
+            allocation=lease.allocation,
+            regions=lease.regions,
+            views=lease.views,
+            writer_plan=plan,
+        )
+        with self.assertRaisesRegex(ContractError, "writer plan assigns ranks"):
+            C.assert_pd_consistent(
+                bad,
+                producer_tp_size=1,
+                producer_block_sizes=(16,),
+                producer_main_dtype="bfloat16",
+            )
+
+    def test_multiple_writers_per_backing_rejected(self):
+        lease = self._lease()
+        # v1 requires exactly one writer rank per Main backing. Assigning
+        # two ranks models a catalog that did not apply the single-writer rule.
+        plan = C.WriterPlan(
+            writers_by_backing={backing: (0, 1) for backing in lease.writer_plan.writers_by_backing},
+            ranges_by_backing=lease.writer_plan.ranges_by_backing,
+        )
+        bad = C.TargetLease(
+            contract_version=1,
+            request=lease.request,
+            rank=lease.rank,
+            allocation=lease.allocation,
+            regions=lease.regions,
+            views=lease.views,
+            writer_plan=plan,
+        )
+        with self.assertRaisesRegex(ContractError, "one writer rank per Main backing"):
+            C.assert_pd_consistent(
+                bad,
+                producer_tp_size=2,
+                producer_block_sizes=(16,),
+                producer_main_dtype="bfloat16",
+            )
+
+    def test_int8_main_rejected(self):
+        lease = self._lease()
+        # Swap the Main view dtype to INT8 to model an INT8 producer Main
+        # splicing into a BF16 D Host pool.
+        int8_views = tuple(
+            C.CacheView(
+                component=v.component,
+                logical_layer=v.logical_layer,
+                region_binding=v.region_binding,
+                dtype="int8" if v.component is Component.MAIN else v.dtype,
+                strides_bytes=v.strides_bytes,
+                page_size_tokens=v.page_size_tokens,
+                manager_block_size_tokens=v.manager_block_size_tokens,
+                block_capacity=v.block_capacity,
+                region_offset_bytes=v.region_offset_bytes,
+                block_ids=v.block_ids,
+            )
+            for v in lease.views
+        )
+        bad = C.TargetLease(
+            contract_version=1,
+            request=lease.request,
+            rank=lease.rank,
+            allocation=lease.allocation,
+            regions=lease.regions,
+            views=int8_views,
+            writer_plan=lease.writer_plan,
+        )
+        with self.assertRaisesRegex(ContractError, "BF16"):
+            C.assert_pd_consistent(
+                bad,
+                producer_tp_size=1,
+                producer_block_sizes=(16,),
+                producer_main_dtype="bfloat16",
+            )
+
+    def test_block_size_mismatch_fails(self):
+        lease = self._lease()
+        with self.assertRaisesRegex(ContractError, "manager_block_size_tokens"):
+            C.assert_pd_consistent(
+                lease,
+                producer_tp_size=1,
+                producer_block_sizes=(32,),  # lease view uses 16
+                producer_main_dtype="bfloat16",
+            )
+
+    def test_no_main_view_rejected(self):
+        lease = self._lease()
+        # Drop every Main view; receipt v1 requires a Main backing.
+        indexer_only = tuple(v for v in lease.views if v.component is not Component.MAIN)
+        bad = C.TargetLease(
+            contract_version=1,
+            request=lease.request,
+            rank=lease.rank,
+            allocation=lease.allocation,
+            regions=lease.regions,
+            views=indexer_only,
+            writer_plan=lease.writer_plan,
+        )
+        with self.assertRaisesRegex(ContractError, "no MAIN view"):
+            C.assert_pd_consistent(
+                bad,
+                producer_tp_size=1,
+                producer_block_sizes=(16,),
+                producer_main_dtype="bfloat16",
+            )
 
 
 class NoComputePredicateTests(TestCase):

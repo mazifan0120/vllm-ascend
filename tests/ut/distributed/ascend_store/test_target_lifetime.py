@@ -31,6 +31,10 @@ class Engine:
         self.removed = []
         self.fail_remove = False
         self.fail_register = False
+        self._rpc_port = 0
+
+    def get_rpc_port(self):
+        return self._rpc_port
 
     def register_memory(self, address, size, location):
         if self.fail_register:

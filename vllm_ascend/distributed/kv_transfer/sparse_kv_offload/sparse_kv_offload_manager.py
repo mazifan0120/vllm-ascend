@@ -806,6 +806,23 @@ class SparseKVOffloadManager:
             )
         ):
             raise ContractError("Registered D targets require eager, PP/CP/DCP=1 and no speculative/MTP")
+        # v1 restrictions explicitly logged, not relied on by omission:
+        # - Single Main backing, one writer rank (rank 0); TP>1 Main sharding
+        #   is not supported and the catalog assigns a single writer.
+        # - Partial-block tail transfers as whole blocks; prompts whose length
+        #   is not a multiple of the block size carry padding bytes and require
+        #   NPU validation of the truncation formula before being supported.
+        # - No abort_request scheduler entry; cancellation relies on the source
+        #   consumer abort + watchdog timeout. First-run deployments do not
+        #   trigger preemption/abort.
+        # - The preempt-path gate (design 5.6) is not enforced at runtime yet:
+        #   receipt mode activates without verifying the target vLLM cancel/
+        #   preempt path retains in-flight target blocks. This is safe only
+        #   when no preempt/abort occurs mid-transfer.
+        logger.warning(
+            "Receipt-mode v1 active: single Main backing/writer, whole-block tail, "
+            "no abort_request entry, preempt-path gate not yet enforced (design 5.6)"
+        )
         components, identities, block_tokens = {}, {}, {}
         for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
             for name in group.layer_names:

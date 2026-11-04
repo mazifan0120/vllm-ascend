@@ -863,13 +863,23 @@ class KVPoolScheduler:
             snapshot_generation=previous_tracker.snapshot_generation if previous_tracker else 0,
         )
         self._request_trackers[request.req_id] = request_tracker
+        # Receipt-mode restore-only: the D scheduler marked this request's
+        # entire prompt as covered by the target lease, so the Store restore
+        # driver must restore the full range (restore_end_token == token_len)
+        # rather than the partially-computed prefix. Without this the driver's
+        # no-new-tokens contract rejects the request.
+        params = getattr(request, "kv_transfer_params", None) or {}
+        if params.get("restore_only"):
+            restore_end_token = num_tokens_to_compute
+        else:
+            restore_end_token = request.num_computed_tokens
         return self._build_req_meta(
             request_tracker,
             request_real.block_hashes,
             load_spec,
             request.prompt_token_ids,
             force_skip_save,
-            restore_end_token=request.num_computed_tokens,
+            restore_end_token=restore_end_token,
         )
 
     def _process_preempted_cached_request(

@@ -8,6 +8,10 @@ by test_layerwise_receipt.py, which runs anywhere. The no-compute marking
 case exercises save_kv_layer end to end and belongs on the NPU CI.
 """
 
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 
 npu = pytest.importorskip("torch_npu")
@@ -22,9 +26,83 @@ def _encode_decode(msg):
     return decoder.decode(encoder.encode(msg))
 
 
-class WireFormatTests:
+class TestSchedulerRetentionBinding:
+    def test_standard_kv_cache_manager_hook_binds_receipt_authority(self):
+        connector = object.__new__(lc.MooncakeLayerwiseConnector)
+        bind = Mock()
+        connector.connector_scheduler = SimpleNamespace(bind_scheduler_retention=bind)
+        connector.target_provider = object()
+        manager = SimpleNamespace(block_pool=object())
+        connector.bind_kv_cache_manager(manager)
+        assert connector._kv_cache_manager is manager
+        bind.assert_called_once_with(manager)
+
+    def test_plain_scheduler_retains_the_existing_binding_behavior(self):
+        connector = object.__new__(lc.MooncakeLayerwiseConnector)
+        bind = Mock()
+        connector.connector_scheduler = SimpleNamespace(bind_scheduler_retention=bind)
+        connector.target_provider = None
+        manager = SimpleNamespace(block_pool=object())
+        connector.bind_kv_cache_manager(manager)
+        assert connector._kv_cache_manager is manager
+        bind.assert_not_called()
+
+
+class TestSourceDependencies(unittest.TestCase):
+    """Use real sender code; the CPU engine records submission, never DMA."""
+
+    def _sender_and_task(self, failed_fence=None):
+        observed = []
+
+        def fence(name):
+            def synchronize():
+                observed.append(name)
+                if name == failed_fence:
+                    raise TimeoutError(name)
+
+            return SimpleNamespace(synchronize=synchronize)
+
+        sender = object.__new__(lc.KVCacheSendingLayerThread)
+        sender.pd_head_ratio = 1
+        sender.layer_metadata = {"layer": lc.LayerMetadata([0], [4096], [16], [1])}
+        sender.get_transfer_meta = lambda *args: ([4096], [8192], [16])
+
+        def submit(*args):
+            observed.append("submit")
+            return 0
+
+        sender.engine = SimpleNamespace(batch_transfer_sync_write=submit)
+        metadata = lc.ReqMeta([[0]], None, [[0]], [[16]], None, None, None, None, None, None, 1, 1, 1)
+        metadata.remote_te_rpc_endpoint = "127.0.0.1:1"
+        task = lc.SendTask(
+            send_request={"request": metadata},
+            layer_name="layer",
+            wait_event=fence("legacy"),
+            source_ready_event=fence("source"),
+        )
+        return sender, task, observed
+
+    def test_both_fences_precede_transfer_submission(self):
+        sender, task, observed = self._sender_and_task()
+        self.assertIsNone(sender._transfer_kv_cache(task))
+        self.assertEqual(observed, ["source", "legacy", "submit"])
+
+    def test_failed_source_fence_prevents_submission(self):
+        sender, task, observed = self._sender_and_task("source")
+        with self.assertRaises(TimeoutError):
+            sender._transfer_kv_cache(task)
+        self.assertEqual(observed, ["source"])
+
+    def test_failed_legacy_fence_prevents_submission(self):
+        sender, task, observed = self._sender_and_task("legacy")
+        with self.assertRaises(TimeoutError):
+            sender._transfer_kv_cache(task)
+        self.assertEqual(observed, ["source", "legacy"])
+
+
+class TestWireFormat:
     """Positional arrays only; the decoder is Decoder(type=tuple),
-    so a map-encoded message must fail loudly, never silently mis-bind."""
+    so a map-encoded message must fail loudly instead of binding incorrectly."""
 
     def test_layer_result_roundtrip(self):
         msg = (
@@ -58,7 +136,7 @@ class WireFormatTests:
             decoder.decode(encoder.encode({"type": lc.LAYER_RESULT_MSG, "version": lc.CONTRACT_VERSION}))
 
 
-class ReceiptHandlerTests:
+class TestReceiptHandler:
     """Drive the receive-thread handlers directly (no zmq): malformed frames
     are logged and dropped, version mismatches never reach the ledger."""
 
@@ -93,7 +171,7 @@ class ReceiptHandlerTests:
         assert not thread.done_requests
 
 
-class PrefixHitNoComputeTests:
+class TestPrefixHitNoCompute:
     """Prefix-hit a layer whose requests are all fully prefix-hit has
     no compute reader — it must be marked no_compute_reader and must not hang
     the send path waiting on a compute-done event that will never come."""

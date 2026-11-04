@@ -51,6 +51,9 @@ CHECK_IMPORTS = {
             "tests/ut/distributed/ascend_store/test_target_provider.py",
             "tests/ut/distributed/ascend_store/test_target_lifetime.py",
             "tests/ut/distributed/ascend_store/test_target_owner_runtime.py",
+            # Trusted local connector metadata must remain serializable when
+            # crossing the scheduler/worker process boundary.
+            "tests/ut/distributed/ascend_store/test_layerwise_metadata.py",
             "tests/e2e/kv_transfer/target_owner_runtime_npu.py",
         },
     ),

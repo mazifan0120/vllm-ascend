@@ -114,6 +114,15 @@ class SchedulerRetentionRegistry:
             self._record(allocation).guards += 1
             return _RegistryGuard(self, allocation)
 
+    def release_guard(self, allocation: BlockAllocation) -> None:
+        """Public release of one guard counted by :meth:`retain`.
+
+        A wire retention dispatcher mirrors the local ``_RegistryGuard`` release
+        through this entry, so the owner-side guard never needs the registry
+        object itself across the process boundary.
+        """
+        self._release_guard(allocation)
+
     def _release_guard(self, allocation: BlockAllocation) -> None:
         with self._lock:
             record = self._record(allocation)

@@ -879,7 +879,8 @@ class KVPoolWorker:
         if getattr(self, "_reuse_source_registry", None) is None:
             raise RuntimeError("Restore-only transfer requires a registered source consumer")
         for request in metadata.requests:
-            if not request.request_instance or request.restore_end_token != request.token_len_chunk:
+            valid_end = getattr(request, "target_token_len", request.token_len_chunk)
+            if not request.request_instance or request.restore_end_token != valid_end:
                 raise ValueError("Restore-only requires the entire valid source range, with no new tokens")
         self.drain_reuse_sources()
         self.prepare_layerwise_step(metadata)
@@ -1528,17 +1529,24 @@ class KVPoolWorker:
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
         if getattr(self, "_reuse_source_registry", None) is not None:
-            self._reuse_source_requests = tuple(
-                RequestSource(
-                    r.req_id,
-                    r.request_instance or "",
-                    0,
-                    r.token_len_chunk,
-                    tuple(tuple(ids) for ids in r.block_ids_by_group),
-                )
-                for r in metadata.requests
-            )
+            self._reuse_source_requests = self._source_requests(metadata.requests)
         self.process_layer_data(metadata.requests)
+
+    @staticmethod
+    def _source_requests(requests) -> tuple[RequestSource, ...]:
+        # Public Store save_end is block-aligned. A PD reader must also see
+        # the valid partial tail already written by this step, while private
+        # Store request/snapshot identity stays independent of PD identity.
+        return tuple(
+            RequestSource(
+                request.req_id,
+                request.request_instance or "",
+                0,
+                getattr(request, "target_token_len", request.token_len_chunk),
+                tuple(tuple(ids) for ids in request.block_ids_by_group),
+            )
+            for request in requests
+        )
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         if self.use_layerwise:

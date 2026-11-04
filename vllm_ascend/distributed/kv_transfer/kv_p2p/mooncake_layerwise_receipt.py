@@ -92,11 +92,20 @@ class ReceiptLedger:
         main_backings: Iterable[str],
         indexer_ranks: Iterable[int],
         prompt_len: int,
+        required_layers: Iterable[int] = (),
+        indexer_backings: Iterable[str] = (),
     ) -> None:
         self.request = request
         self.expected_ranks = frozenset(expected_ranks)
         self.main_backings = tuple(main_backings)
         self.indexer_ranks = frozenset(indexer_ranks)
+        # Wire contract identity for INDEXER transfers: the sender does not
+        # know D's backing layout in v1, so the D side resolves an empty wire
+        # backing_id against this tuple (never a fabricated ID).
+        self.indexer_backings = tuple(indexer_backings)
+        # Required layer plan: when non-empty, coverage is judged per logical
+        # layer, so a layer that never reports cannot hide inside the union.
+        self.required_layers = frozenset(int(layer) for layer in required_layers)
         self.prompt_len = int(prompt_len)
         self._entries: dict[TransferKey, _ResultEntry] = {}
         self._terminals: dict[int, Status] = {}
@@ -105,8 +114,13 @@ class ReceiptLedger:
         self._conflicts = 0
         self._stale_dropped = 0
         self._invalid_results = 0
-        self._main_ranges: dict[str, set[tuple[int, int]]] = {}
-        self._indexer_ranges: dict[int, set[tuple[int, int]]] = {}
+        # spans carry the logical layer: backing/rank -> {(layer, start, end)}
+        self._main_ranges: dict[str, set[tuple[int, int, int]]] = {}
+        self._indexer_ranges: dict[int, set[tuple[int, int, int]]] = {}
+        # Failed transfers keep their scope blocked: a FAILED write may have
+        # touched the target and v1 has no retry policy, so readiness stays
+        # False until the bounded-failure path retires the request.
+        self._failed_scopes: set[tuple[str, int]] = set()
 
     # ------------------------------------------------------------- record
 
@@ -144,28 +158,38 @@ class ReceiptLedger:
             return
 
         self._entries[key] = _ResultEntry(status=result.status, source_quiesced=result.source_quiesced)
-        if result.status is Status.SUCCESS:
-            scope = key.target_scope
-            span = (key.token_range.start, key.token_range.end)
-            if key.component is Component.MAIN:
-                if scope.backing_id in self.main_backings:
-                    self._main_ranges.setdefault(scope.backing_id, set()).add(span)
-                else:
-                    self._invalid_results += 1
-                    logger.warning(
-                        "ReceiptLedger invalid result: unknown MAIN backing %r (key=%s)", scope.backing_id, key
-                    )
+        if self.required_layers and key.logical_layer not in self.required_layers:
+            self._invalid_results += 1
+            logger.warning(
+                "ReceiptLedger invalid result: layer %s is outside the required plan (key=%s)", key.logical_layer, key
+            )
+            return
+        scope = key.target_scope
+        if key.component is Component.MAIN:
+            scope_key = (f"main:{scope.backing_id}", key.logical_layer)
+        else:
+            assert scope.consumer_rank is not None  # guaranteed by TransferKey validation
+            scope_key = (f"indexer:{scope.consumer_rank}", key.logical_layer)
+        if result.status is not Status.SUCCESS:
+            self._failed_scopes.add(scope_key)
+            return
+        span = (key.logical_layer, key.token_range.start, key.token_range.end)
+        if key.component is Component.MAIN:
+            if scope.backing_id in self.main_backings:
+                self._main_ranges.setdefault(scope.backing_id, set()).add(span)
             else:
-                assert scope.consumer_rank is not None  # guaranteed by TransferKey validation
-                if scope.consumer_rank in self.indexer_ranks:
-                    self._indexer_ranges.setdefault(scope.consumer_rank, set()).add(span)
-                else:
-                    self._invalid_results += 1
-                    logger.warning(
-                        "ReceiptLedger invalid result: unknown INDEXER consumer rank %s (key=%s)",
-                        scope.consumer_rank,
-                        key,
-                    )
+                self._invalid_results += 1
+                logger.warning("ReceiptLedger invalid result: unknown MAIN backing %r (key=%s)", scope.backing_id, key)
+        else:
+            if scope.consumer_rank in self.indexer_ranks:
+                self._indexer_ranges.setdefault(scope.consumer_rank, set()).add(span)
+            else:
+                self._invalid_results += 1
+                logger.warning(
+                    "ReceiptLedger invalid result: unknown INDEXER consumer rank %s (key=%s)",
+                    scope.consumer_rank,
+                    key,
+                )
 
     def finish_rank(self, rank: int, status: Status) -> None:
         """Rank terminal. First write wins; identical repeats are idempotent;
@@ -202,13 +226,33 @@ class ReceiptLedger:
         a precondition here."""
         if self._conflicts or self._invalid_results:
             return False
+        if self._failed_scopes:
+            return False
         if set(self._terminals) != self.expected_ranks:
             return False
         if any(status is not Status.SUCCESS for status in self._terminals.values()):
             return False
+        if self.required_layers:
+            return all(
+                _ranges_cover(
+                    {(s, e) for (lay, s, e) in self._main_ranges.get(backing, ()) if lay == layer}, self.prompt_len
+                )
+                for layer in self.required_layers
+                for backing in self.main_backings
+            ) and all(
+                _ranges_cover(
+                    {(s, e) for (lay, s, e) in self._indexer_ranges.get(rank, ()) if lay == layer}, self.prompt_len
+                )
+                for layer in self.required_layers
+                for rank in self.indexer_ranks
+            )
         return all(
-            _ranges_cover(self._main_ranges.get(backing, ()), self.prompt_len) for backing in self.main_backings
-        ) and all(_ranges_cover(self._indexer_ranges.get(rank, ()), self.prompt_len) for rank in self.indexer_ranks)
+            _ranges_cover({(s, e) for (_, s, e) in self._main_ranges.get(backing, ())}, self.prompt_len)
+            for backing in self.main_backings
+        ) and all(
+            _ranges_cover({(s, e) for (_, s, e) in self._indexer_ranges.get(rank, ())}, self.prompt_len)
+            for rank in self.indexer_ranks
+        )
 
     def should_publish(self) -> bool:
         """Full conjunction (data conditions + every expected rank
@@ -225,9 +269,13 @@ class ReceiptLedger:
         return ReceiveReceipt(
             request=self.request,
             target_generation=self.request.transfer_generation,
-            main_union_ok=all(_ranges_cover(self._main_ranges.get(b, ()), self.prompt_len) for b in self.main_backings),
+            main_union_ok=all(
+                _ranges_cover({(s, e) for (_, s, e) in self._main_ranges.get(b, ())}, self.prompt_len)
+                for b in self.main_backings
+            ),
             indexer_ranks_ok=all(
-                _ranges_cover(self._indexer_ranges.get(r, ()), self.prompt_len) for r in self.indexer_ranks
+                _ranges_cover({(s, e) for (_, s, e) in self._indexer_ranges.get(r, ())}, self.prompt_len)
+                for r in self.indexer_ranks
             ),
             terminals_ok=(
                 set(self._terminals) == set(self.expected_ranks)

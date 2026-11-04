@@ -69,6 +69,7 @@ def build_simple_lease(
                 backing_offset_bytes=0,
                 length_bytes=max_region_bytes,
                 memory_kind="host" if i == 0 else "device",
+                transport_endpoint="fake-host:0",
             )
         )
     views: list[CacheView] = []

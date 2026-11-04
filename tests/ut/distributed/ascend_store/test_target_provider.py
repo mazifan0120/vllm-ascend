@@ -29,8 +29,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_provider impor
 
 class TestRegisteredTargetProvider(unittest.TestCase):
     def make(self):
-        main = RegisteredRegion("engine", 1, "main-region", "shared-host", 1, 0, 1024, "host")
-        index = RegisteredRegion("engine", 1, "index-region", "rank0-index", 1, 0, 512, "device")
+        main = RegisteredRegion("engine", 1, "main-region", "shared-host", 1, 0, 1024, "host", "host:1")
+        index = RegisteredRegion("engine", 1, "index-region", "rank0-index", 1, 0, 512, "device", "host:1")
         self.regions = (main, index)
         self.bindings = (
             TargetBinding(CacheView(Component.MAIN, 0, main.region_id, "bfloat16", (64,), 16, 32, 8, 0, ()), 0, 48),

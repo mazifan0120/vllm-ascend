@@ -225,6 +225,7 @@ class RegisteredTargetResources:
                 address - backing[2],
                 size,
                 "host" if component is Component.MAIN else "device",
+                self._snapshot.transport_endpoint,
             )
             if identity in regions and regions[identity] != candidate:
                 raise ContractError("TE region ambiguously mixes target backing identities")
@@ -248,8 +249,14 @@ class RegisteredTargetResources:
         main_backings = {r.backing_id for r in regions.values() if r.memory_kind == "host"}
         topology = self._pool.topology
         capacity_tokens = num_blocks * min(block_tokens.values())
+        # v1: one writer rank per Main backing. The design selects a unique
+        # writer per backing via destination_ordinal % len(writer_ranks); v1
+        # has a single Main backing and every P rank holds the full Main
+        # content, so rank 0 is the canonical writer and other ranks skip Main
+        # to avoid duplicate sends. A later version that shards Main across
+        # ranks must switch to the ordinal-based selection in the producer.
         writers = WriterPlan(
-            {b: tuple(range(topology.tp_size)) for b in main_backings},
+            {b: (0,) for b in main_backings},
             {b: (TokenRange(0, capacity_tokens),) for b in main_backings},
         )
         self._catalog = TargetCatalog(

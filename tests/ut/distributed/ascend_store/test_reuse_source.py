@@ -167,6 +167,23 @@ class TestReuseSource(unittest.TestCase):
         self.assertEqual(views[0][1].strides_bytes, (32, 2, 1))
         self.assertEqual(views[0][0].page_tokens, 16)
 
+    def test_worker_source_range_includes_the_valid_non_block_aligned_tail(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ReqMeta
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        request = ReqMeta(
+            "internal-request",
+            save_end_token=32,
+            target_token_len=47,
+            block_ids_by_group=[[1, 3]],
+            request_instance="private-store-instance",
+        )
+        source = KVPoolWorker._source_requests([request])[0]
+        self.assertEqual(source.end_token, 47)
+        self.assertEqual(source.block_ids_by_group, ((1, 3),))
+        self.assertEqual(source.request_instance, "private-store-instance")
+        self.assertEqual(request.save_end_token, 32)
+
     def test_restore_only_runs_all_layers_without_forward_and_rejects_new_tokens(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
@@ -213,6 +230,17 @@ class TestReuseSource(unittest.TestCase):
         request.restore_end_token = 32
         with self.assertRaisesRegex(ValueError, "entire valid"):
             worker.restore_kv_for_transfer(metadata)
+        # The public save range may end at the preceding block. The driver
+        # checks actual restored valid tokens, including a private tail.
+        request.token_len_chunk = 32
+        request.target_token_len = request.restore_end_token = 47
+        worker.current_layer = 0
+        order.clear()
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_attention_compute_start_gate"
+        ):
+            worker.restore_kv_for_transfer(metadata)
+        self.assertIn(("load", 2), order)
 
     def test_multi_connector_installs_only_explicit_version_one_consumer(self):
         # Only the unavailable upstream base is stubbed; execute the real
@@ -236,6 +264,24 @@ class TestReuseSource(unittest.TestCase):
         multi._external_slot_release_sink_configured = False
         with self.assertRaisesRegex(RuntimeError, "wired Store"):
             multi._configure_reuse_source_contract()
+
+    def test_plain_storeless_transport_capability_does_not_opt_in_to_source_reuse(self):
+        module = SimpleNamespace(MultiConnector=type("MultiConnector", (), {}))
+        with patch.dict(sys.modules, {"vllm.distributed.kv_transfer.kv_connector.v1.multi_connector": module}):
+            from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import AscendMultiConnector
+
+        provider = SimpleNamespace(reuse_source_contract_version=1)
+        multi = AscendMultiConnector.__new__(AscendMultiConnector)
+        multi._layerwise_slot_release_providers = [provider]
+        multi._connectors = [provider]
+        multi._external_slot_release_sink_configured = False
+        multi._configure_reuse_source_contract()
+        # A regular Store also exposes the setter, but has no shared Main
+        # layout from which SourceViews could be exported.
+        store = SimpleNamespace(wants_reuse_source_contract=lambda: False, set_reuse_source_consumer=MagicMock())
+        multi._connectors.append(store)
+        multi._configure_reuse_source_contract()
+        store.set_reuse_source_consumer.assert_not_called()
 
     def test_empty_get_dispatch_opens_epoch_after_external_wait(self):
         from tests.ut.distributed.ascend_store.test_kv_transfer import TestGVALayerReceivingTaskOwnership

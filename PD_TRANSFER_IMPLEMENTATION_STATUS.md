@@ -1,5 +1,11 @@
 # P buffer reuse 与 layerwise receipt：实现现状及剩余工作
 
+2026-11-05 最新核对：已实际 fetch 并在原 `p-main-buffer-reuse` 纳入 receipt
+`fa5aec40b` 的 12 个新增提交。完整 PD 仍有生产 IPC、Host 注册／目标传输计划、
+精确 receipt、D 消费及取消／抢占回收等缺口；已开始修复。
+当前清单与验证边界见 [最新补齐审查](PD_TRANSFER_COMPLETION_REVIEW.md)。
+下文保留 2026-11-04 的整理记录，不以旧的分工或接口测试代替完整端到端验收。
+
 首次 review 建议先读 [双方实现与验证摘要](CODE_REVIEW_SUMMARY.md)，其中包含固定代码快照、提交分组和建议审查顺序。
 
 核对日期：2026-11-04。按用户要求，暂不继续64K异常定位；本文件从两分支代码核对开始，后续 A1/A2 开发进度见下一节。

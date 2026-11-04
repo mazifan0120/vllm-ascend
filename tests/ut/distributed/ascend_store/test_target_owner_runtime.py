@@ -133,6 +133,9 @@ class OwnerFixture:
         )
         self.te = GlobalTE()
         self.te.transfer_engine = Engine()
+        # The producer reaches the target's TransferEngine at this endpoint.
+        self.te._handshake_host = "127.0.0.1"
+        self.te.transfer_engine._rpc_port = 25000
         pointers = [raw.data_ptr()]
         lengths = [raw.numel()]
         for name, tensors in self.caches.items():

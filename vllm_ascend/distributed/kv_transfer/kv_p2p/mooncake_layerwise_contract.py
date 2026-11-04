@@ -218,6 +218,10 @@ class RegisteredRegion:
     backing_offset_bytes: int
     length_bytes: int
     memory_kind: str
+    # "host:rpc_port" the producer opens a mooncake session to. Per-engine,
+    # shared by every region of one lease; the producer uses it instead of a
+    # separate zmq handshake to reach the target's TransferEngine.
+    transport_endpoint: str = ""
 
     def __post_init__(self) -> None:
         _require_str("RegisteredRegion.engine_instance", self.engine_instance)
@@ -231,6 +235,7 @@ class RegisteredRegion:
             raise ContractError(
                 f"RegisteredRegion.memory_kind must be one of {_MEMORY_KINDS}, got {self.memory_kind!r}"
             )
+        _require_str("RegisteredRegion.transport_endpoint", self.transport_endpoint)
 
 
 @dataclass(frozen=True)
@@ -455,6 +460,8 @@ def assert_lease_consistent(lease: TargetLease, request: RequestKey) -> None:
         raise ContractError(f"lease.contract_version mismatch: {lease.contract_version} != {CONTRACT_VERSION}")
     if lease.request != request:
         raise ContractError(f"lease belongs to {lease.request}, expected {request}")
+    if lease.allocation.request != request:
+        raise ContractError("Target allocation belongs to another request identity")
     seen: set[tuple[str, int]] = set()
     for r in lease.regions:
         pair = (r.backing_id, r.backing_generation)
@@ -462,11 +469,84 @@ def assert_lease_consistent(lease: TargetLease, request: RequestKey) -> None:
             raise ContractError(f"lease regions repeat (backing_id, backing_generation)={pair}")
         seen.add(pair)
     region_ids = {r.region_id for r in lease.regions}
+    if len(region_ids) != len(lease.regions):
+        raise ContractError("Target lease repeats a registered region identity")
     for view in lease.views:
         if view.region_binding not in region_ids:
             raise ContractError(
                 f"view (component={view.component.value}, layer={view.logical_layer}) binds unknown region "
                 f"{view.region_binding!r}; known regions={sorted(region_ids)}"
+            )
+
+
+def assert_pd_consistent(
+    lease: TargetLease,
+    *,
+    producer_tp_size: int,
+    producer_block_sizes: tuple[int, ...],
+    producer_main_dtype: str,
+) -> None:
+    """Startup-time P/D consistency gate for a receipt-mode target lease.
+
+    The D-side catalog already validates single-end geometry (manager block %
+    page, one backing one region, BF16 Main). This gate checks the producer
+    side against the lease the scheduler carried over, so a P/D mismatch fails
+    fast at the first request rather than corrupting a transfer mid-stream:
+
+    - TP: every writer rank the lease assigns must exist on the producer.
+    - block size: each Main view's manager block must equal the producer's
+      matching block size (v1 requires exact equality, not just divisibility,
+      because the writer plan assumes the same page granularity).
+    - BF16 Main: a Main view whose dtype is not bfloat16 is rejected. The D
+      Host Main pool is BF16-only; an INT8 producer Main cannot splice into it.
+    - one backing one region (v1): no backing may own more than one region.
+
+    The v1 restrictions (single backing, fixed transfer generation 0, no
+    retry, TP-only) are enforced here as explicit checks, not relied on by
+    omission.
+    """
+    if type(producer_tp_size) is not int or producer_tp_size < 1:
+        raise ContractError(f"producer_tp_size must be a positive int, got {producer_tp_size!r}")
+    if producer_main_dtype not in ("bfloat16", "torch.bfloat16"):
+        raise ContractError("Producer MAIN dtype must be BF16 for the registered Host Main target")
+    if not producer_block_sizes or any(type(size) is not int or size < 1 for size in producer_block_sizes):
+        raise ContractError("Producer block sizes must be positive integers")
+    for backing, ranks in lease.writer_plan.writers_by_backing.items():
+        if not ranks:
+            raise ContractError(f"writer plan backing {backing!r} has no writer ranks")
+        unknown = [rank for rank in ranks if rank < 0 or rank >= producer_tp_size]
+        if unknown:
+            raise ContractError(
+                f"writer plan assigns ranks {unknown} to backing {backing!r} but producer tp_size={producer_tp_size}"
+            )
+        # v1: exactly one writer rank per Main backing. The design selects a
+        # unique writer via destination_ordinal % len(writer_ranks); v1 has a
+        # single Main backing with rank 0 as canonical writer, so multiple
+        # ranks here means the catalog did not apply the v1 single-writer rule.
+        if len(ranks) != 1:
+            raise ContractError(
+                f"v1 requires one writer rank per Main backing; backing {backing!r} has {len(ranks)} writers {ranks}"
+            )
+    backing_regions: dict[str, int] = {}
+    for region in lease.regions:
+        backing_regions[region.backing_id] = backing_regions.get(region.backing_id, 0) + 1
+    multi = {backing: count for backing, count in backing_regions.items() if count > 1}
+    if multi:
+        raise ContractError(f"v1 requires one region per backing; backings with multiple regions: {multi}")
+    main_views = [view for view in lease.views if view.component is Component.MAIN]
+    if not main_views:
+        raise ContractError("lease has no MAIN view; receipt v1 requires a Main backing")
+    producer_block_set = set(producer_block_sizes)
+    for view in main_views:
+        if view.dtype != "bfloat16" and view.dtype not in ("torch.bfloat16",):
+            raise ContractError(
+                f"MAIN view dtype {view.dtype!r} is not BF16; an INT8 producer Main cannot splice "
+                "into the BF16 D Host Main pool"
+            )
+        if view.manager_block_size_tokens not in producer_block_set:
+            raise ContractError(
+                f"MAIN view manager_block_size_tokens={view.manager_block_size_tokens} does not match "
+                f"any producer block size {sorted(producer_block_set)}"
             )
 
 
@@ -491,5 +571,6 @@ __all__ = [
     "TransferResult",
     "WriterPlan",
     "assert_lease_consistent",
+    "assert_pd_consistent",
     "assert_provider_capabilities",
 ]

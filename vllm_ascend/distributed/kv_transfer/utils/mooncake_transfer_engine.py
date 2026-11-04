@@ -14,6 +14,10 @@ class RegistrationSnapshot:
     engine_instance: str
     generation: int
     regions: tuple[tuple[int, int, str], ...]
+    # "host:rpc_port" the remote side opens a mooncake session to. Per-engine,
+    # shared by every region; carried into RegisteredRegion so the producer can
+    # reach the target without a separate zmq handshake.
+    transport_endpoint: str = ""
 
     def __getstate__(self):
         raise TypeError("Local TE addresses must not enter target wire metadata")
@@ -29,6 +33,7 @@ class GlobalTE:
         self._registration_instance = uuid4().hex
         self._registration_generation = 0
         self._registration_complete = False
+        self._handshake_host: str = ""
         self._target_lifetime = AllocationLifetime("Mooncake TE registration")
 
     def get_transfer_engine(self, hostname: str, device_name: str | None):
@@ -49,7 +54,18 @@ class GlobalTE:
                     ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
                     if ret_value != 0:
                         raise RuntimeError(f"TransferEngine initialization failed with ret_value: {ret_value}")
+                self._handshake_host = hostname
         return self.transfer_engine
+
+    def transport_endpoint(self) -> str:
+        """The 'host:rpc_port' a remote producer opens a mooncake session to.
+
+        Empty until the engine is initialized; the catalog rejects an empty
+        endpoint so a target lease never carries an unreachable address.
+        """
+        if self.transfer_engine is None or not self._handshake_host:
+            return ""
+        return f"{self._handshake_host}:{self.transfer_engine.get_rpc_port()}"
 
     def _unregister_regions(
         self,
@@ -138,13 +154,19 @@ class GlobalTE:
             if not self._registration_complete or not self.is_register_buffer or not self._registered_regions:
                 raise RuntimeError("Target catalog requires a complete live TE registration")
             return RegistrationSnapshot(
-                self._registration_instance, self._registration_generation, tuple(self._registered_regions)
+                self._registration_instance,
+                self._registration_generation,
+                tuple(self._registered_regions),
+                self.transport_endpoint(),
             )
 
     def retain_registration(self, snapshot: RegistrationSnapshot) -> AllocationPin:
         with self.register_buffer_lock:
             current = RegistrationSnapshot(
-                self._registration_instance, self._registration_generation, tuple(self._registered_regions)
+                self._registration_instance,
+                self._registration_generation,
+                tuple(self._registered_regions),
+                self.transport_endpoint(),
             )
             if not self._registration_complete or current != snapshot:
                 raise RuntimeError("Target registration changed or is no longer live")

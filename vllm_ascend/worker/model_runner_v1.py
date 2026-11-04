@@ -4685,7 +4685,36 @@ class NPUModelRunner(GPUModelRunner):
                     layer = self.compilation_config.static_forward_context[layer_name]
                     layer.impl.bind_copy_sfa_kv_cache(self.sparse_kv_offload_manager, layer_name)
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            connector = get_kv_transfer_group()
+            # Receipt-mode decode worker: bind the sparse manager, consumption
+            # stream and shared TE to the target owner facade before KV
+            # registration. The scheduler retention authority and transport are
+            # resolved through the co-located channel when the caller omits them;
+            # a multi-process deployment passes real wire objects.
+            facade = getattr(connector, "target_provider", None)
+            if (
+                facade is not None
+                and getattr(connector, "connector_worker", None) is not None
+                and getattr(connector, "_target_owner_binding", None) is None
+            ):
+                # Receipt-mode decode requires the sparse offload manager: the
+                # Host Main pool it owns is the target backing. A receipt worker
+                # without sparse offload is a misconfiguration, not a silent skip.
+                assert self.sparse_kv_offload_manager is not None, (
+                    "Receipt-mode decode requires sparse KV offload to be enabled"
+                )
+                from vllm_ascend.distributed.kv_transfer.utils.utils import (
+                    get_transfer_timeout_value,
+                )
+
+                connector.configure_target_owner(
+                    self.sparse_kv_offload_manager,
+                    retention=None,
+                    consumption_stream=torch.npu.current_stream(),
+                    timeout=float(get_transfer_timeout_value()),
+                    te=None,
+                )
+            connector.register_kv_caches(kv_caches)
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,
