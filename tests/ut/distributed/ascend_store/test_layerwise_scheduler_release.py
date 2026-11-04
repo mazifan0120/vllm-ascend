@@ -49,6 +49,9 @@ class TestSchedulerTargetRelease(unittest.TestCase):
             _target_provider=self.fixture.facade,
             _request_leases={self.fixture.request.request_instance: self.lease},
             _retention_registry=self.fixture.retention,
+            _target_release_acks={
+                self.lease.request: ReleaseAck(True, self.lease.allocation.retention_token, "CPU unused target fixture")
+            },
         )
         self.release = _release_method()
 
@@ -92,3 +95,9 @@ class TestSchedulerTargetRelease(unittest.TestCase):
 
     def test_plain_mode_has_no_receipt_retention(self):
         self.assertTrue(self.release(SimpleNamespace(_target_provider=None, _request_leases={}), self.request))
+
+    def test_finished_request_without_remote_quiescence_proof_cannot_release(self):
+        self.scheduler._target_release_acks.clear()
+        self.assertFalse(self.release(self.scheduler, self.request))
+        self.assertIn(self.fixture.request.request_instance, self.scheduler._request_leases)
+        self.fixture.retention.validate(self.fixture.allocation)

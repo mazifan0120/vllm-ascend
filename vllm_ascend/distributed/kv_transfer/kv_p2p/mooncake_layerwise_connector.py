@@ -83,7 +83,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receipt impor
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
     target_lease_from_wire,
     target_lease_to_wire,
+    target_manifest_from_wire,
+    target_manifest_to_wire,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import TargetManifest
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
@@ -117,18 +120,6 @@ if TYPE_CHECKING:
 
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
-
-
-def _multiprocessing_enabled() -> bool:
-    """Whether the V1 scheduler runs the decode worker in a separate process.
-
-    The receipt target owner channel has two transports: a co-located one that
-    shares the scheduler retention registry by reference, and a wire one for
-    multi-process deployments. When multiprocessing is on, the co-located
-    channel cannot cross the boundary, so omitting the transport/retention
-    argument fails closed instead of silently falling back to it.
-    """
-    return os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "0") == "1"
 
 
 # Layerwise receipt protocol positional arrays decoded by
@@ -1071,6 +1062,10 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
     ):
         wire_lease = kv_transfer_params.get("remote_target_lease")
         lease = target_lease_from_wire(wire_lease) if wire_lease is not None else None
+        wire_manifest = kv_transfer_params.get("remote_target_manifest")
+        manifest = target_manifest_from_wire(wire_manifest) if wire_manifest is not None else None
+        if manifest is not None and manifest.lease != lease:
+            raise ContractError("Published manifest and aggregate lease do not identify the same target")
         instance = kv_transfer_params.get("request_instance", "")
         if lease is not None and lease.request.request_instance != instance:
             raise ContractError("Published target lease belongs to another request instance")
@@ -1089,6 +1084,7 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
             remote_te_rpc_endpoint=kv_transfer_params.get("remote_te_rpc_endpoint"),
             remote_writer_plan=lease.writer_plan if lease is not None else None,
             remote_target_lease=lease,
+            remote_target_manifest=manifest,
             remote_layer_metadata=kv_transfer_params.get("remote_layer_metadata"),
             metaserver=kv_transfer_params.get("metaserver"),
             remote_tp_size=kv_transfer_params.get("remote_tp_size"),
@@ -1133,6 +1129,9 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         self.target_provider = None
         self._target_owner_binding = None
         self._target_owner_dispatcher = None
+        self._worker_target_rpc = None
+        self._scheduler_target_rpc = None
+        self._target_rpc_config = None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         requested = extra.get("layerwise_receipt_mode", False)
         if type(requested) is not bool:
@@ -1142,12 +1141,21 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
                 DeferredTargetProvider,
                 TargetProviderClient,
             )
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_factory import TargetOwnerRpcConfig
 
             if role == KVConnectorRole.SCHEDULER:
                 self.target_provider = TargetProviderClient()
             else:
                 self.target_provider = DeferredTargetProvider()
                 self.connector_worker.target_provider = self.target_provider
+            self._target_rpc_config = TargetOwnerRpcConfig.from_extra(
+                extra, vllm_config.parallel_config.tensor_parallel_size
+            )
+            self.set_target_provider(self.target_provider)
+
+    @property
+    def requires_target_owner(self) -> bool:
+        return self.connector_worker is not None and self.target_provider is not None
 
     def configure_target_owner(self, manager, *, retention, consumption_stream, timeout: float, te=None) -> None:
         """A2 worker-local initialization, before register_kv_caches.
@@ -1156,50 +1164,68 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         owner as the connector. The actual catalog is constructed AFTER that
         registration. No caller may serialize these local objects.
 
-        In a co-located deployment (scheduler and decode worker in one process)
-        the caller may omit ``retention``: the scheduler retention registry is
-        then consumed from the module-level rendezvous channel shared by the
-        scheduler role. A multi-process deployment must pass a real wire
-        retention client; no authority is guessed or fabricated.
+        When retention is omitted, explicit loopback RPC settings select the
+        reverse scheduler authority. Construction does not wait for scheduler
+        initialization. Tests/deployment adapters can inject an authority.
         """
         if self.connector_worker is None or self.target_provider is None:
             raise ContractError("Target owner binding is only available on receipt Decode workers")
         if self._target_owner_binding is not None or self.target_provider.ready:
             raise ContractError("Target owner initialization cannot be replaced")
-        if retention is None:
-            if _multiprocessing_enabled():
-                raise ContractError(
-                    "Multi-process deployment must supply a real wire retention authority; "
-                    "the co-located channel does not cross a process boundary"
-                )
-            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
-
-            retention = target_owner_channel.scheduler_retention_authority()
         te = global_te if te is None else te
         if te.transfer_engine is not self.connector_worker.engine:
             raise ContractError("Target catalog must use this connector's actual TE registration owner")
+        if retention is None:
+            if self._target_rpc_config is None:
+                raise ContractError("Receipt workers require explicit RPC ports or an injected retention authority")
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_factory import WorkerTargetRpc
+
+            self._worker_target_rpc = WorkerTargetRpc(
+                self._target_rpc_config, self.connector_worker.tp_rank, self.target_provider
+            )
+            retention = self._worker_target_rpc.retention
         self._target_owner_binding = (manager, te, retention, consumption_stream, timeout)
+        self.connector_worker.target_owner_manager = manager
 
     def bind_target_owner_transport(self, transport=None) -> None:
         """A2 scheduler facade; B binds its actual worker-owner channel here.
 
-        In a co-located deployment the caller may omit ``transport``: a local
-        dispatcher-backed transport is built from the module-level rendezvous
-        channel shared by the worker role. A multi-process deployment must pass
-        a real wire transport; no transport is guessed silently.
+        Explicit RPC settings connect every TP worker; an injected transport
+        remains available for focused adapters/tests. No global rendezvous is
+        used by this initialization path.
         """
         if self.connector_scheduler is None or self.target_provider is None:
             raise ContractError("Target owner transport is only available on receipt Decode schedulers")
         if transport is None:
-            if _multiprocessing_enabled():
-                raise ContractError(
-                    "Multi-process deployment must supply a real wire owner transport; "
-                    "the co-located channel does not cross a process boundary"
-                )
-            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
+            if self._target_rpc_config is None:
+                raise ContractError("Receipt schedulers require explicit RPC ports or an injected owner transport")
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_factory import SchedulerTargetRpc
 
-            transport = target_owner_channel.LocalOwnerTransport()
+            self._scheduler_target_rpc = SchedulerTargetRpc(
+                self._target_rpc_config, self.connector_scheduler._retention_registry
+            )
+            transport = self._scheduler_target_rpc.transport
         self.target_provider.bind_transport(transport)
+
+    def configure_receipt_scheduler_runtime(self, manager, allocation_lock):
+        if self.connector_scheduler is None or self.target_provider is None:
+            return None
+        self.connector_scheduler.bind_scheduler_retention(manager, allocation_lock=allocation_lock)
+        registry = self.connector_scheduler._retention_registry
+        manager.bind_retention_registry(registry)
+        self.bind_target_owner_transport()
+        return registry
+
+    def prepare_target_free(self, request) -> bool:
+        if self.connector_scheduler is None:
+            return True
+        return self.connector_scheduler._release_target_if_any(request)
+
+    def shutdown(self) -> None:
+        for binding in (getattr(self, "_scheduler_target_rpc", None), getattr(self, "_worker_target_rpc", None)):
+            if binding is not None:
+                binding.close()
+        super().shutdown()
 
     ############################################################
     # Scheduler Side Methods
@@ -1242,6 +1268,10 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         """The only capability-probe entry point. AscendMultiConnector
         calls this; capability gaps abort startup."""
         assert_provider_capabilities(provider)
+        if getattr(self, "_target_provider", None) is provider:
+            return
+        if getattr(self, "_target_provider", None) is not None:
+            raise ContractError("Cannot replace the target provider across owner generations")
         self._target_provider = provider
         if self.connector_scheduler is not None:
             self.connector_scheduler.attach_target_provider(provider)
@@ -1293,15 +1323,14 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if not facade.ready:
                 raise ContractError("Receipt target owner is not ready after KV registration")
-            # Co-located deployment: publish the bound owner dispatcher through
-            # the module-level rendezvous so the scheduler's TargetProviderClient
-            # can reach it. A multi-process deployment wires a real wire transport
-            # through bind_target_owner_transport instead; in that mode the
-            # dispatcher is still cached here so the worker-side wire server loop
-            # can reach it without the module channel.
-            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
+            # Publish only after real allocation/registration; independent TP
+            # processes serve their explicit local endpoint, not a global slot.
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import TargetOwnerDispatcher
 
-            self._target_owner_dispatcher = target_owner_channel.bind_worker_dispatcher(facade)
+            self._target_owner_dispatcher = TargetOwnerDispatcher(facade)
+            worker_rpc = getattr(self, "_worker_target_rpc", None)
+            if worker_rpc is not None:
+                worker_rpc.serve_registered_owner(self._target_owner_dispatcher)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -1646,6 +1675,7 @@ class MooncakeLayerwiseConnectorScheduler:
         self._target_provider = provider
         self._pending_receipt_specs: dict[str, tuple] = {}
         self._request_leases: dict[str, Any] = {}
+        self._target_release_acks: dict[RequestKey, ReleaseAck] = {}
         # Scheduler-owned retention authority, bound via
         # bind_scheduler_retention() by the deployment's scheduler wrapper.
         # Receipt-mode admission fails closed until it is bound: a non-empty
@@ -1653,7 +1683,7 @@ class MooncakeLayerwiseConnectorScheduler:
         # scheduler allocation, never from a fabricated string.
         self._retention_registry = None
 
-    def bind_scheduler_retention(self, kv_cache_manager) -> None:
+    def bind_scheduler_retention(self, kv_cache_manager, *, allocation_lock=None) -> None:
         """Bind the scheduler's real KVCacheManager as the retention authority.
 
         The scheduler wrapper calls this once at init, before any receipt
@@ -1665,14 +1695,9 @@ class MooncakeLayerwiseConnectorScheduler:
             SchedulerRetentionRegistry,
         )
 
-        self._retention_registry = SchedulerRetentionRegistry(kv_cache_manager)
-        # Co-located deployment: share the registry by reference through the
-        # module-level rendezvous so the decode worker's owner runtime can nest
-        # retain() calls on the calling thread. A multi-process deployment
-        # wires a real wire retention client through configure_target_owner.
-        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
-
-        target_owner_channel.bind_scheduler_retention_authority(self._retention_registry)
+        if self._retention_registry is not None and self._retention_registry._records:
+            raise ContractError("Cannot replace an active scheduler retention authority")
+        self._retention_registry = SchedulerRetentionRegistry(kv_cache_manager, allocation_lock=allocation_lock)
 
     def _maybe_publish_target(self, request: "Request", kv_transfer_params: dict, local_block_ids) -> None:
         """Acquire the D-side target right after allocation and
@@ -1698,6 +1723,10 @@ class MooncakeLayerwiseConnectorScheduler:
                 request.request_id,
             )
             return False
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import SerializedKVCacheManager
+
+        if not isinstance(registry._manager, SerializedKVCacheManager):
+            raise ContractError("Receipt target admission requires ReceiptScheduler's serialized allocation/free gate")
         allocation = BlockAllocation(
             request=request_key,
             allocation_generation=0,
@@ -1709,12 +1738,16 @@ class MooncakeLayerwiseConnectorScheduler:
         lease = provider.acquire_target(request_key, allocation)
         assert_lease_consistent(lease, request_key)
         wire_lease = target_lease_to_wire(lease)
+        manifest = provider.get_target_manifest(lease)
+        wire_manifest = target_manifest_to_wire(manifest)
         # P/D consistency: the producer must cover every writer rank the lease
         # assigns, Main must be BF16 (an INT8 producer Main cannot splice into
         # the BF16 D Host pool), and v1 requires one region per backing. The
         # producer TP comes from the lease's sender ranks; the block sizes and
         # Main dtype are the D catalog's own, which the lease views mirror.
         sender_ranks = kv_transfer_params.get("remote_tp_size") or self.vllm_config.parallel_config.tensor_parallel_size
+        if sender_ranks != len(manifest.targets):
+            raise ContractError("Producer and consumer TP sizes must match the rank-explicit manifest")
         assert_pd_consistent(
             lease,
             producer_tp_size=sender_ranks,
@@ -1756,7 +1789,7 @@ class MooncakeLayerwiseConnectorScheduler:
             tuple(range(sender_ranks)),
             backings,
             prompt_len,
-            lease,
+            manifest,
         )
         self._pending_receipt_specs[request_instance] = spec
         self._request_leases[request_instance] = lease
@@ -1767,6 +1800,7 @@ class MooncakeLayerwiseConnectorScheduler:
         if lease.regions:
             kv_transfer_params["remote_te_rpc_endpoint"] = lease.regions[0].transport_endpoint
         kv_transfer_params["remote_target_lease"] = wire_lease
+        kv_transfer_params["remote_target_manifest"] = wire_manifest
         # Destination capacity says nothing about whether P has committed KV.
         # Only P's actual Store lookup may select a no-forward restore step.
         logger.info(
@@ -1895,10 +1929,14 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
-        # layer_wise push frees immediately; defer only when the target
-        # release failed (the provider may still reference the blocks).
-        safe_to_free = self._release_target_if_any(request)
-        return not safe_to_free, None
+        # ReceiptScheduler retires only after its GPU/queued-step fence.
+        # This hook runs earlier and must not release a target that a queued
+        # worker step has not entered yet.
+        return self._has_retained_target(request), None
+
+    def _has_retained_target(self, request) -> bool:
+        instance = (request.kv_transfer_params or {}).get("request_instance")
+        return instance in getattr(self, "_request_leases", {})
 
     def _release_target_if_any(self, request: "Request") -> bool:
         """Release entry: the provider's release_target normal return is its
@@ -1919,6 +1957,11 @@ class MooncakeLayerwiseConnectorScheduler:
         lease = leases.get(instance) if instance else None
         if lease is None:
             return True
+        ack = getattr(self, "_target_release_acks", {}).get(lease.request)
+        if ack is None or not ack.safe_to_release or ack.retention_token != lease.allocation.retention_token:
+            # Request completion/cancellation is not remote DMA quiescence.
+            # A worker/control-path proof must precede local owner release.
+            return False
         try:
             provider.release_target(lease)
         except Exception as e:
@@ -1942,7 +1985,7 @@ class MooncakeLayerwiseConnectorScheduler:
         try:
             registry.retire(
                 lease.allocation,
-                ReleaseAck(safe_to_release=True, retention_token=lease.allocation.retention_token),
+                ack,
             )
         except Exception as e:
             logger.error(
@@ -1955,6 +1998,7 @@ class MooncakeLayerwiseConnectorScheduler:
         # Preserve the lease on every failed retirement. Otherwise a retry
         # sees no lease and incorrectly authorizes the ordinary free path.
         leases.pop(instance, None)
+        self._target_release_acks.pop(lease.request, None)
         logger.info("Released target for %s (instance=%s)", request.request_id, instance)
         return True
 
@@ -1967,10 +2011,7 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
-        safe_to_free = self._release_target_if_any(request)
-        # layer_wise push frees immediately; defer only when the target
-        # release failed (the provider may still reference the blocks).
-        return not safe_to_free, None
+        return self._has_retained_target(request), None
 
 
 class MooncakeLayerwiseConnectorWorker:
@@ -2287,6 +2328,9 @@ class MooncakeLayerwiseConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
+        target_manager = getattr(self, "target_owner_manager", None)
+        if target_manager is not None:
+            kv_caches = target_manager.get_target_transfer_caches(kv_caches)
         layer2group_ids: dict[str, int] = {}
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
         for i, kv_cache_group_spec in enumerate(kv_cache_groups):
@@ -2364,7 +2408,7 @@ class MooncakeLayerwiseConnectorWorker:
                     layer_kv_group_id,
                     block_size_scale,
                 )
-                if group_block_size_scale != block_size_scale:
+                if group_block_size_scale != block_size_scale and target_manager is None:
                     raise NotImplementedError(
                         "Mooncake layerwise connector does not support KV cache components "
                         "with different block size scales in one group, including DCP replicated indexer cache."
@@ -2394,7 +2438,21 @@ class MooncakeLayerwiseConnectorWorker:
                 ptrs.append(min(set(tensor_addrs)))
                 lengths.append(kv_cache_tensor.size)
 
-        if self.use_attn_mamba_hybrid:
+        register_locations = None
+        if target_manager is not None:
+            components, _, _ = target_manager.get_target_cache_identities()
+            indexer_caches = {name: cache for name, cache in kv_caches.items() if components[name] is Component.INDEXER}
+            device_regions = collect_storage_merged_register_regions(indexer_caches)
+            pool = target_manager.get_mooncake_host_pool()
+            # One real shared Host allocation, one registration. Keep its
+            # bounds inside the pool rather than registering the larger raw
+            # storage including shared-segment alignment slack.
+            register_regions = RegisterRegions(
+                ptrs=[pool.data_ptr, *device_regions.ptrs],
+                lengths=[pool.nbytes, *device_regions.lengths],
+            )
+            register_locations = [f"npu:{pool.topology.device_id}", *["*"] * len(device_regions.ptrs)]
+        elif self.use_attn_mamba_hybrid:
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         else:
             # For normal attention / sparse-c8 KV cache, register merged memory
@@ -2402,7 +2460,10 @@ class MooncakeLayerwiseConnectorWorker:
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
         validate_register_region_count(register_regions)
-        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        if register_locations is None:
+            global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        else:
+            global_te.register_buffer(register_regions.ptrs, register_regions.lengths, register_locations)
 
         if kv_buffer is not None:
             self.create_kv_buffer(kv_buffer)
@@ -2419,9 +2480,10 @@ class MooncakeLayerwiseConnectorWorker:
         for layer_names in self.index_to_name.values():
             layer_names.sort(key=lambda name: "indexer" in name.lower())
             primary_group_idx = self.layer_metadata[layer_names[0]].tensor_group_idx[0]
-            assert all(self.layer_metadata[name].tensor_group_idx[0] == primary_group_idx for name in layer_names), (
-                f"Mooncake layerwise merged components must share one KV cache group. layer_names={layer_names}"
-            )
+            if target_manager is None:
+                assert all(
+                    self.layer_metadata[name].tensor_group_idx[0] == primary_group_idx for name in layer_names
+                ), f"Mooncake layerwise merged components must share one KV cache group. layer_names={layer_names}"
         if mtp_layer_name != "":
             self.index_to_name[max(self.index_to_name.keys()) + 1].append(mtp_layer_name)
         if self.index_to_name:
@@ -2711,6 +2773,8 @@ class MooncakeLayerwiseConnectorWorker:
         thread = self.kv_recv_layer_thread
         for instance, spec in specs.items():
             req_id, expected_ranks, backings, prompt_len, lease = spec
+            if isinstance(lease, TargetManifest):
+                lease = lease.for_rank(self.tp_rank).lease
             indexer_backings: tuple[str, ...] = ()
             if lease is not None:
                 region_by_id = {region.region_id: region for region in lease.regions}

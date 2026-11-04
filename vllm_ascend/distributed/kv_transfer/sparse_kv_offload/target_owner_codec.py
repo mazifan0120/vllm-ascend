@@ -28,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     WriterPlan,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_catalog import TargetCatalog, TargetEntry
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import RankTarget, TargetManifest
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import TargetOwnerCall, TargetOwnerReply
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_wire import RetentionOp, RetentionResult
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_provider import TargetBinding
@@ -58,6 +59,8 @@ OWNER_RECORD_TYPES = (
     TargetOwnerReply,
     RetentionOp,
     RetentionResult,
+    RankTarget,
+    TargetManifest,
 )
 OWNER_ENUM_TYPES = (Component, Status)
 
@@ -142,5 +145,5 @@ def decode_owner_value(frame: bytes):
         ):
             raise ContractError("Owner wire protocol version mismatch")
         return _ValueCodec().decode(envelope[1])
-    except (TypeError, ValueError, RecursionError, UnicodeError) as error:
+    except (TypeError, ValueError, RecursionError, UnicodeError, KeyError, AttributeError, IndexError) as error:
         raise ContractError(f"Cannot decode owner wire value: {error}") from error

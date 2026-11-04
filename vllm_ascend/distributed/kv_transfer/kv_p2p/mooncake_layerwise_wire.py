@@ -6,6 +6,7 @@ Keep the network schema separate from owner-local resources and reconstruct
 the contract types before a producer consumes the descriptor.
 """
 
+import json
 from dataclasses import fields
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
@@ -21,8 +22,26 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     WriterPlan,
     assert_lease_consistent,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import TargetManifest
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec import (
+    decode_owner_value,
+    encode_owner_value,
+)
 
 TARGET_LEASE_WIRE_VERSION = 1
+
+
+def target_manifest_to_wire(manifest: TargetManifest):
+    if type(manifest) is not TargetManifest:
+        raise ContractError("Target publication requires a validated rank-explicit manifest")
+    return json.loads(encode_owner_value(manifest))
+
+
+def target_manifest_from_wire(value) -> TargetManifest:
+    result = decode_owner_value(json.dumps(_plain(value), separators=(",", ":")).encode())
+    if type(result) is not TargetManifest:
+        raise ContractError("Published target value is not a rank-explicit manifest")
+    return result
 
 
 def _plain(value):

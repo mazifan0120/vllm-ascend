@@ -10,7 +10,7 @@ case exercises save_kv_layer end to end and belongs on the NPU CI.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -27,6 +27,43 @@ def _encode_decode(msg):
 
 
 class TestSchedulerRetentionBinding:
+    def test_direct_connector_binds_its_stable_provider_without_multi_wrapper(self):
+        for role, factory in (
+            (lc.KVConnectorRole.SCHEDULER, "MooncakeLayerwiseConnectorScheduler"),
+            (lc.KVConnectorRole.WORKER, "MooncakeLayerwiseConnectorWorker"),
+        ):
+            inner = SimpleNamespace(attach_target_provider=Mock())
+            config = SimpleNamespace(
+                kv_transfer_config=SimpleNamespace(
+                    is_kv_producer=False,
+                    is_kv_consumer=True,
+                    engine_id="unit-target",
+                    kv_connector_extra_config={"layerwise_receipt_mode": True},
+                ),
+                parallel_config=SimpleNamespace(tensor_parallel_size=2),
+            )
+            with patch.object(lc, factory, return_value=inner):
+                connector = lc.MooncakeLayerwiseConnector(config, role, None)
+            assert connector._target_provider is connector.target_provider
+            inner.attach_target_provider.assert_called_once_with(connector.target_provider)
+            connector.set_target_provider(connector.target_provider)
+            inner.attach_target_provider.assert_called_once()
+
+    def test_plain_direct_connector_does_not_install_receipt_provider(self):
+        inner = SimpleNamespace(attach_target_provider=Mock())
+        config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                is_kv_producer=False,
+                is_kv_consumer=True,
+                engine_id="plain-target",
+                kv_connector_extra_config={},
+            )
+        )
+        with patch.object(lc, "MooncakeLayerwiseConnectorScheduler", return_value=inner):
+            connector = lc.MooncakeLayerwiseConnector(config, lc.KVConnectorRole.SCHEDULER, None)
+        assert connector.target_provider is None
+        inner.attach_target_provider.assert_not_called()
+
     def test_standard_kv_cache_manager_hook_binds_receipt_authority(self):
         connector = object.__new__(lc.MooncakeLayerwiseConnector)
         bind = Mock()
@@ -46,6 +83,23 @@ class TestSchedulerRetentionBinding:
         connector.bind_kv_cache_manager(manager)
         assert connector._kv_cache_manager is manager
         bind.assert_not_called()
+
+    def test_finished_hook_defers_target_without_releasing_before_gpu_fence(self):
+        scheduler = object.__new__(lc.MooncakeLayerwiseConnectorScheduler)
+        scheduler._request_leases = {"instance": object()}
+        scheduler._release_target_if_any = Mock(
+            side_effect=AssertionError("retirement must follow scheduler GPU fence")
+        )
+        request = SimpleNamespace(kv_transfer_params={"request_instance": "instance"})
+        assert scheduler.request_finished(request, []) == (True, None)
+        assert scheduler.request_finished_all_groups(request, ([],)) == (True, None)
+        scheduler._release_target_if_any.assert_not_called()
+
+    def test_plain_finished_hook_preserves_immediate_release(self):
+        scheduler = object.__new__(lc.MooncakeLayerwiseConnectorScheduler)
+        scheduler._request_leases = {}
+        request = SimpleNamespace(kv_transfer_params={})
+        assert scheduler.request_finished(request, []) == (False, None)
 
 
 class TestSourceDependencies(unittest.TestCase):
@@ -98,6 +152,71 @@ class TestSourceDependencies(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             sender._transfer_kv_cache(task)
         self.assertEqual(observed, ["source", "legacy"])
+
+
+class TestTargetHostRegistration(unittest.TestCase):
+    def test_registers_existing_host_main_and_device_indexer_in_distinct_groups(self):
+        # Real CPU storage verifies pointer selection; no NPU allocation or
+        # native registration is performed by the recording TE below.
+        host = lc.torch.empty(1024, dtype=lc.torch.int8, device="cpu")
+        host_views = (
+            host[:256].view(lc.torch.bfloat16).view(4, 16, 1, 2),
+            host[256:512].view(lc.torch.bfloat16).view(4, 16, 1, 2),
+        )
+        main = "model.layers.0.self_attn.attn"
+        indexer = "model.layers.0.self_attn.indexer"
+        hbm_main = tuple(lc.torch.empty_like(tensor) for tensor in host_views)
+        hbm_indexer = (
+            lc.torch.empty(8, 8, 1, 2, dtype=lc.torch.int8, device="cpu"),
+            lc.torch.empty(8, 8, 1, 1, dtype=lc.torch.float16, device="cpu"),
+        )
+        original = {main: hbm_main, indexer: hbm_indexer}
+        effective = {main: host_views, indexer: hbm_indexer}
+        pool = SimpleNamespace(data_ptr=host.data_ptr(), nbytes=host.numel(), topology=SimpleNamespace(device_id=0))
+        manager = SimpleNamespace(
+            get_target_transfer_caches=Mock(return_value=effective),
+            get_target_cache_identities=lambda: ({main: lc.Component.MAIN, indexer: lc.Component.INDEXER}, {}, {}),
+            get_mooncake_host_pool=lambda: pool,
+        )
+        worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
+        worker.target_owner_manager = manager
+        spec = SimpleNamespace()
+        worker.kv_cache_config = SimpleNamespace(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=[main], kv_cache_spec=spec),
+                SimpleNamespace(layer_names=[indexer], kv_cache_spec=spec),
+            ],
+        )
+        worker.kv_cache_specs = [spec, spec]
+        worker.use_attn_mamba_hybrid = False
+        worker.pd_head_ratio = 1
+        worker.enable_kv_quant = False
+        worker.enable_c8_quant = False
+        worker.sparse_sfa_c8_layers = set()
+        worker.attn_resharding_group_idx = set()
+        worker.kernel_block_size_scale = [1, 1]
+        worker.layer_metadata = {}
+        worker.index_to_name = lc.defaultdict(list)
+        worker.total_layers = 1
+        worker.te_rpc_port = 1
+        worker._init_layerwise_reuse_state = Mock()
+        worker._run_startup_validations = Mock()
+        worker.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")),
+            kv_transfer_config=SimpleNamespace(is_kv_producer=False, is_kv_consumer=False),
+        )
+        te = SimpleNamespace(register_buffer=Mock())
+        with patch.object(lc, "global_te", te):
+            worker.register_kv_caches(original)
+        pointers, lengths, locations = te.register_buffer.call_args.args
+        self.assertEqual((pointers[0], lengths[0], locations[0]), (host.data_ptr(), host.numel(), "npu:0"))
+        self.assertEqual(set(pointers[1:]), {t.untyped_storage().data_ptr() for t in hbm_indexer})
+        self.assertTrue(set(pointers).isdisjoint(t.data_ptr() for t in hbm_main))
+        self.assertEqual(worker.layer_metadata[main].kv_caches_base_addr, [t.data_ptr() for t in host_views])
+        self.assertEqual(worker.layer_metadata[indexer].block_size_scale, [2, 2])
+        manager.get_target_transfer_caches.assert_called_once_with(original)
 
 
 class TestWireFormat:

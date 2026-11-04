@@ -786,10 +786,8 @@ class SparseKVOffloadManager:
         consumption stream. No second pool, tensor or request block is allocated.
         Every TP rank calls this during the same initialization phase.
         """
-        from vllm.v1.worker.utils import extract_layer_index
 
-        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import Component, ContractError
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import ContractError
         from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
             DeferredTargetProvider,
             create_registered_target_owner,
@@ -806,44 +804,7 @@ class SparseKVOffloadManager:
             )
         ):
             raise ContractError("Registered D targets require eager, PP/CP/DCP=1 and no speculative/MTP")
-        # v1 restrictions explicitly logged, not relied on by omission:
-        # - Single Main backing, one writer rank (rank 0); TP>1 Main sharding
-        #   is not supported and the catalog assigns a single writer.
-        # - Partial-block tail transfers as whole blocks; prompts whose length
-        #   is not a multiple of the block size carry padding bytes and require
-        #   NPU validation of the truncation formula before being supported.
-        # - No abort_request scheduler entry; cancellation relies on the source
-        #   consumer abort + watchdog timeout. First-run deployments do not
-        #   trigger preemption/abort.
-        # - The preempt-path gate (design 5.6) is not enforced at runtime yet:
-        #   receipt mode activates without verifying the target vLLM cancel/
-        #   preempt path retains in-flight target blocks. This is safe only
-        #   when no preempt/abort occurs mid-transfer.
-        logger.warning(
-            "Receipt-mode v1 active: single Main backing/writer, whole-block tail, "
-            "no abort_request entry, preempt-path gate not yet enforced (design 5.6)"
-        )
-        components, identities, block_tokens = {}, {}, {}
-        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            for name in group.layer_names:
-                spec = group.kv_cache_spec
-                if isinstance(spec, UniformTypeKVCacheSpecs):
-                    spec = spec.kv_cache_specs[name]
-                if isinstance(spec, AscendSFAIndexerCacheSpec):
-                    component = Component.INDEXER
-                elif isinstance(spec, AscendMLAAttentionSpec):
-                    component = Component.MAIN
-                else:
-                    raise ContractError("D target catalog encountered an unsupported cache component")
-                layer = extract_layer_index(name)
-                if not 0 <= layer < self.num_target_layers or name in components:
-                    raise ContractError("D target layer identity is extra, duplicate or out of range")
-                components[name] = component
-                identities[name] = (layer, group_id)
-                block_tokens[name] = spec.block_size
-        main_layers = {identities[name][0] for name, component in components.items() if component is Component.MAIN}
-        if main_layers != set(range(self.num_target_layers)):
-            raise ContractError("D target catalog does not cover every model Main layer")
+        components, identities, block_tokens = self.get_target_cache_identities()
         with self._target_owner_lock:
             if self._target_owner_facade is not None:
                 raise ContractError("D target owner is already bound to a registration generation")
@@ -868,6 +829,48 @@ class SparseKVOffloadManager:
                 raise
             self._target_owner_facade = facade
             return facade
+
+    def get_target_cache_identities(self):
+        """Explicit registered-target roles, shared by registration and owner."""
+        from vllm.v1.worker.utils import extract_layer_index
+
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import Component, ContractError
+
+        components, identities, block_tokens = {}, {}, {}
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            for name in group.layer_names:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[name]
+                if isinstance(spec, AscendSFAIndexerCacheSpec):
+                    component = Component.INDEXER
+                elif isinstance(spec, AscendMLAAttentionSpec):
+                    component = Component.MAIN
+                else:
+                    raise ContractError("D target catalog encountered an unsupported cache component")
+                layer = extract_layer_index(name)
+                if not 0 <= layer < self.num_target_layers or name in components:
+                    raise ContractError("D target layer identity is extra, duplicate or out of range")
+                components[name] = component
+                identities[name] = (layer, group_id)
+                block_tokens[name] = spec.block_size
+        main_layers = {identities[name][0] for name, component in components.items() if component is Component.MAIN}
+        if main_layers != set(range(self.num_target_layers)):
+            raise ContractError("D target catalog does not cover every model Main layer")
+        return components, identities, block_tokens
+
+    def get_target_transfer_caches(self, kv_caches):
+        """Views of existing Host Main and HBM Indexer; allocate nothing."""
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import Component, ContractError
+
+        components, _, _ = self.get_target_cache_identities()
+        if set(kv_caches) != set(components):
+            raise ContractError("Target registration must cover every actual component cache")
+        return {
+            name: self.get_local_host_kv_views(name) if component is Component.MAIN else kv_caches[name]
+            for name, component in components.items()
+        }
 
     def _get_mooncake_writeback_view(
         self,

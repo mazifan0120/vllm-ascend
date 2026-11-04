@@ -4688,15 +4688,10 @@ class NPUModelRunner(GPUModelRunner):
             connector = get_kv_transfer_group()
             # Receipt-mode decode worker: bind the sparse manager, consumption
             # stream and shared TE to the target owner facade before KV
-            # registration. The scheduler retention authority and transport are
-            # resolved through the co-located channel when the caller omits them;
-            # a multi-process deployment passes real wire objects.
-            facade = getattr(connector, "target_provider", None)
-            if (
-                facade is not None
-                and getattr(connector, "connector_worker", None) is not None
-                and getattr(connector, "_target_owner_binding", None) is None
-            ):
+            # registration. A MultiConnector explicitly forwards this setup to
+            # its target child; the owner's reverse authority uses configured
+            # loopback RPC and does not wait for scheduler initialization.
+            if getattr(connector, "requires_target_owner", False):
                 # Receipt-mode decode requires the sparse offload manager: the
                 # Host Main pool it owns is the target backing. A receipt worker
                 # without sparse offload is a misconfiguration, not a silent skip.

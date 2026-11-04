@@ -49,3 +49,4 @@ class ReqMeta:
     restore_end_token: int = 0
     token_len_chunk: int = 0
     remote_target_lease: Any = None
+    remote_target_manifest: Any = None

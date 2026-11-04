@@ -179,6 +179,29 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         self._connectors[:] = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
         super().shutdown()
 
+    @property
+    def requires_target_owner(self) -> bool:
+        return any(getattr(c, "requires_target_owner", False) for c in self._connectors)
+
+    def configure_target_owner(self, manager, **kwargs) -> None:
+        owners = [c for c in self._connectors if getattr(c, "requires_target_owner", False)]
+        if len(owners) != 1:
+            raise RuntimeError("Receipt worker requires exactly one target owner connector")
+        owners[0].configure_target_owner(manager, **kwargs)
+
+    def configure_receipt_scheduler_runtime(self, manager, allocation_lock):
+        owners = [c for c in self._connectors if getattr(c, "target_provider", None) is not None]
+        if len(owners) != 1:
+            raise RuntimeError("Receipt scheduler requires exactly one target owner connector")
+        return owners[0].configure_receipt_scheduler_runtime(manager, allocation_lock)
+
+    def prepare_target_free(self, request) -> bool:
+        return all(
+            c.prepare_target_free(request)
+            for c in self._connectors
+            if callable(getattr(c, "prepare_target_free", None))
+        )
+
     def _receipt_restore_only_requests(self):
         """Collect request ids marked restore-only across layerwise child metadata.
 

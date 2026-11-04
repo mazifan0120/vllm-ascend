@@ -68,13 +68,14 @@ class SchedulerRetentionRegistry:
     normal/cancel/preemption free paths through retire().
     """
 
-    def __init__(self, kv_cache_manager) -> None:
+    def __init__(self, kv_cache_manager, *, allocation_lock=None) -> None:
         if not callable(getattr(kv_cache_manager, "get_block_ids", None)):
             raise TypeError("Retention requires the real scheduler allocation lookup")
         self._manager = kv_cache_manager
-        self._lock = threading.RLock()
+        self._lock = threading.RLock() if allocation_lock is None else allocation_lock
         self._records: dict[str, _RetentionRecord] = {}
         self._requests: dict[object, str] = {}
+        self._internal_requests: dict[str, str] = {}
 
     def _check_blocks(self, allocation: BlockAllocation, request_id: str) -> None:
         current = tuple(tuple(group) for group in self._manager.get_block_ids(request_id))
@@ -89,13 +90,14 @@ class SchedulerRetentionRegistry:
         if not internal_request_id or allocation.retention_token:
             raise ContractError("Issue retention exactly once from an unretained allocation")
         with self._lock:
-            if allocation.request in self._requests:
+            if allocation.request in self._requests or internal_request_id in self._internal_requests:
                 raise ContractError("Request already has scheduler retention")
             self._check_blocks(allocation, internal_request_id)
             token = uuid4().hex
             retained = replace(allocation, retention_token=token)
             self._records[token] = _RetentionRecord(retained, internal_request_id)
             self._requests[allocation.request] = token
+            self._internal_requests[internal_request_id] = token
             return retained
 
     def _record(self, allocation: BlockAllocation) -> _RetentionRecord:
@@ -144,6 +146,52 @@ class SchedulerRetentionRegistry:
                 raise ContractError("Target owner still retains the scheduler allocation")
             del self._records[allocation.retention_token]
             del self._requests[allocation.request]
+            del self._internal_requests[record.internal_request_id]
+
+    def has_request(self, internal_request_id: str) -> bool:
+        with self._lock:
+            return internal_request_id in self._internal_requests
+
+    def assert_can_free(self, internal_request_id: str) -> None:
+        if self.has_request(internal_request_id):
+            raise ContractError("Cannot free/pop scheduler blocks while their target allocation is retained")
 
     def __getstate__(self):
         raise TypeError("Scheduler retention registry must remain in the scheduler")
+
+
+class SerializedKVCacheManager:
+    """Scheduler instance adapter sharing the reverse authority's same lock.
+
+    Serializes method calls rather than holding a lock across scheduler RPCs:
+    owner acquire/release may nest a reverse retention call on another thread.
+    Allocation methods keep their normal ref counts; retained requests cannot
+    enter the real free/pop path until the scheduler retires their authority.
+    """
+
+    def __init__(self, manager, allocation_lock) -> None:
+        self._manager = manager
+        self._lock = allocation_lock
+        self._registry = None
+
+    def bind_retention_registry(self, registry) -> None:
+        with self._lock:
+            if self._registry is not None:
+                raise ContractError("Scheduler allocation authority cannot be replaced")
+            self._registry = registry
+
+    def __getattr__(self, name):
+        value = getattr(self._manager, name)
+        if not callable(value):
+            return value
+
+        def serialized(*args, **kwargs):
+            with self._lock:
+                if name in ("free", "pop_blocks_for_free"):
+                    if self._registry is None:
+                        raise ContractError("Scheduler allocation authority has not been installed")
+                    request = args[0] if args else kwargs.get("request")
+                    self._registry.assert_can_free(request if isinstance(request, str) else request.request_id)
+                return value(*args, **kwargs)
+
+        return serialized

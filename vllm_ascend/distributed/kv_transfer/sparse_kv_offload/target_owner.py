@@ -232,6 +232,7 @@ def _assert_wire_value(value) -> None:
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract",
         "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_provider",
         "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_catalog",
+        "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest",
         __name__,
     ):
         for field in fields(value):
@@ -260,6 +261,10 @@ class TargetOwnerDispatcher:
             "prepare": self._facade.prepare_decode,
             "release": self._facade.release_target,
         }
+        for operation in ("manifest", "catalogs"):
+            method = getattr(self._facade, operation, None)
+            if callable(method):
+                operations[operation] = method
         try:
             _assert_wire_value(call.arguments)
             if call.operation not in operations:
@@ -336,6 +341,15 @@ class TargetProviderClient:
         result = self._call("views", lease)
         if not isinstance(result, tuple) or result != lease.views or any(not isinstance(v, CacheView) for v in result):
             raise ContractError("Target owner did not return flat cache views")
+        return result
+
+    def get_target_manifest(self, lease):
+        # Lazy import avoids the owner/catalog/manifest initialization cycle.
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import TargetManifest
+
+        result = self._call("manifest", lease)
+        if type(result) is not TargetManifest or result.lease != lease:
+            raise ContractError("Target owner did not return the matching rank-explicit manifest")
         return result
 
     def prepare_decode(self, lease, receipt) -> None:

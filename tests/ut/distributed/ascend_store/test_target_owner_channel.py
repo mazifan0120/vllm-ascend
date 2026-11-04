@@ -9,6 +9,7 @@ calls back into the scheduler process synchronously.
 
 import importlib.util
 import unittest
+from types import SimpleNamespace
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 from tests.ut.distributed.ascend_store._mock_deps import _MOCK_VLLM_DEPS
@@ -112,78 +113,45 @@ class TestCoLocatedOwnerChannel(unittest.TestCase):
         g.pool.close()
 
     @unittest.skipUnless(_HAS_CONNECTOR_DEPS, "real vLLM and msgspec needed for connector integration")
-    def test_connector_colocated_auto_wiring_through_channel(self):
-        """The connector's configure/bind methods auto-wire through the
-        module-level channel when the caller omits the transport and retention
-        arguments, exactly as a co-located deployment would.
-
-        The scheduler wrapper publishes its retention registry to the channel
-        (the deployment's responsibility, mirroring bind_scheduler_retention);
-        the connector facade methods then resolve the missing transport and
-        retention from that same channel.
-        """
-        from types import SimpleNamespace
-
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-            MooncakeLayerwiseConnector,
-            MooncakeLayerwiseConnectorWorker,
+    def test_connector_requires_explicit_authority_and_transport(self):
+        """Production initialization cannot silently use a module rendezvous."""
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import MooncakeLayerwiseConnector
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
+            DeferredTargetProvider,
+            TargetOwnerDispatcher,
         )
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_factory import DispatcherOwnerTransport
 
-        f = OwnerFixture()
-
-        # A stub sparse manager whose bind_registered_target_owner binds the
-        # pre-built owner into the facade, mirroring the real A2 path without
-        # re-implementing cache spec inspection (covered by A's own tests).
-        class _StubManager:
-            def __init__(self, fixture):
-                self._fixture = fixture
-
-            def bind_registered_target_owner(
-                self, kv_caches, te, *, retention, consumption_stream, timeout, facade=None
-            ):
-                facade.bind(self._fixture.owner)
-
-        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
-        worker.engine = f.te.transfer_engine
-        worker.kv_recv_layer_thread = None
-        worker.target_provider = f.facade
-
-        scheduler_connector = MooncakeLayerwiseConnector.__new__(MooncakeLayerwiseConnector)
-        scheduler_connector.connector_scheduler = SimpleNamespace()
-        scheduler_connector.connector_worker = None
-        scheduler_connector.target_provider = TargetProviderClient()
-        scheduler_connector._target_owner_binding = None
-        scheduler_connector._target_provider = None
-
-        worker_connector = MooncakeLayerwiseConnector.__new__(MooncakeLayerwiseConnector)
-        worker_connector.connector_scheduler = None
-        worker_connector.connector_worker = worker
-        worker_connector.target_provider = f.facade
-        worker_connector._target_owner_binding = None
-        worker_connector._target_provider = None
-
-        # Scheduler wrapper publishes its retention registry to the channel;
-        # the scheduler facade then auto-wires its transport from the channel.
-        target_owner_channel.bind_scheduler_retention_authority(f.retention)
-        scheduler_connector.bind_target_owner_transport(None)
-        # Worker configure auto-wires retention from the channel when omitted.
-        worker_connector.configure_target_owner(
-            _StubManager(f), retention=None, consumption_stream=f.streams, timeout=0.02, te=f.te
+        fixture = OwnerFixture()
+        scheduler = object.__new__(MooncakeLayerwiseConnector)
+        scheduler.connector_scheduler = SimpleNamespace()
+        scheduler.connector_worker = None
+        scheduler.target_provider = TargetProviderClient()
+        scheduler._target_rpc_config = None
+        worker = object.__new__(MooncakeLayerwiseConnector)
+        worker.connector_scheduler = None
+        worker.connector_worker = SimpleNamespace(engine=fixture.te.transfer_engine)
+        worker.target_provider = DeferredTargetProvider()
+        worker._target_owner_binding = None
+        worker._target_rpc_config = None
+        with self.assertRaisesRegex(ContractError, "explicit RPC ports"):
+            scheduler.bind_target_owner_transport()
+        with self.assertRaisesRegex(ContractError, "explicit RPC ports"):
+            worker.configure_target_owner(
+                object(), retention=None, consumption_stream=fixture.streams, timeout=1, te=fixture.te
+            )
+        scheduler.bind_target_owner_transport(DispatcherOwnerTransport(TargetOwnerDispatcher(fixture.facade)))
+        worker.configure_target_owner(
+            object(), retention=fixture.retention, consumption_stream=fixture.streams, timeout=1, te=fixture.te
         )
-        # register_kv_caches binds the owner and publishes the dispatcher.
-        worker_connector.register_kv_caches({})
-
-        client = scheduler_connector.target_provider
-        catalog = client.catalog()
-        self.assertEqual(len(catalog.entries), 8)
-        lease = client.acquire_target(f.request, f.allocation)
-        self.assertEqual(client.get_target_views(lease), lease.views)
-        f.ready(lease)
-        client.release_target(lease)
-        f.retention.retire(f.allocation, ReleaseAck(True, f.allocation.retention_token))
-        f.facade.close()
-        f.te.unregister_buffer()
-        f.pool.close()
+        self.assertIs(worker._target_owner_binding[2], fixture.retention)
+        lease = scheduler.target_provider.acquire_target(fixture.request, fixture.allocation)
+        self.assertEqual(scheduler.target_provider.get_target_views(lease), lease.views)
+        scheduler.target_provider.release_target(lease)
+        fixture.retention.retire(fixture.allocation, ReleaseAck(True, fixture.allocation.retention_token))
+        fixture.facade.close()
+        fixture.te.unregister_buffer()
+        fixture.pool.close()
 
 
 if __name__ == "__main__":

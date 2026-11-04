@@ -52,14 +52,15 @@ def _milliseconds(timeout: float) -> int:
 
 
 class OwnerRpcClient:
-    def __init__(self, endpoint: str, *, timeout: float) -> None:
+    def __init__(self, endpoint: str, *, timeout: float, context=None) -> None:
         _validate_endpoint(endpoint)
         self._endpoint = endpoint
         self._timeout_ms = _milliseconds(timeout)
         self._lock = threading.Lock()
         self._closed = False
         self._uncertain = False
-        self._context = zmq.Context()
+        self._owns_context = context is None
+        self._context = zmq.Context() if context is None else context
 
     def call(self, command):
         # Reject live objects before creating a socket or poisoning the client.
@@ -100,7 +101,8 @@ class OwnerRpcClient:
         with self._lock:
             if not self._closed:
                 self._closed = True
-                self._context.term()
+                if self._owns_context:
+                    self._context.term()
 
 
 class RpcRetentionAuthority(WireRetentionAuthority):

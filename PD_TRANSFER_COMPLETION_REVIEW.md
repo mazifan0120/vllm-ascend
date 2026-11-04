@@ -6,6 +6,50 @@
 本次已纳入远端增量并修复一批入口、元数据和失败路径；模型端到端功能及性能尚未验证。
 早期 A1/A2 的原生资源验证仍然有效，但不等于完整 PD 验收。
 
+## 第二阶段：生产初始化和 scheduler 门禁（2026-11-05）
+
+本轮继续在同一分支开发，新增以下真实调用入口；**尚未启动完整 PD 模型**。
+
+- `ReceiptScheduler` 在基类构造完成后将同一个串行 KVCacheManager 适配器重新绑定给
+  connector，启动 scheduler 反向 retention server，并连接全部 TP owner。
+  它覆盖正常结束／取消后的延迟 free、常规抢占、强制 prefix reset 及异步接收失败。
+  标准 GPU step fence 必须先满足；不额外增加 block ref_cnt。
+- `target_owner_factory.py` 接入 connector 的 scheduler／worker 初始化，worker 在真实
+  注册并绑定 owner 后才启动自己的 endpoint。生产路径不再使用模块全局 rendezvous。
+  参数为 `target_owner_rpc_base_port`、`target_retention_rpc_port` 和可选
+  `target_owner_rpc_timeout_s`；每 rank 一个端口，retention 端口不得与其重叠。
+- `MultiRankTargetProvider` 保留各 rank 原始 lease；`TargetManifest` 只选择一次共享
+  Host Main 注册，并包含所有消费 rank 的 Indexer。P HTTP 元数据携带完整 manifest，
+  D worker 选择自己的原始 lease，不把聚合 lease 当成本地 owner 的分配。
+  校验 Main backing／generation／偏移一致、entry／分组／页大小／stride／容量和有效范围。
+- MultiConnector 明确转发 worker owner 初始化。直接使用 LayerwiseConnector 也会自行
+  挂载稳定 provider；重复挂载同一对象不重置状态。
+- D 注册代码改用 manager 已有 Host Main 与 HBM Indexer 视图，Host pool 单独注册且不含
+  原始 segment 的对齐余量；保留每个 entry 的页比例，支持 Main／Indexer 属于不同 group。
+  这是代码接线与 CPU 注册范围回归，**真实新路径的 TE／HostRegister 仍待原生验证**。
+- `request_finished` 只报告需要延迟回收；实际 release 留给 scheduler 在 GPU fence 后执行。
+  还必须提供匹配 token 的真实远端静止证明，不能因请求结束就制造 safe ReleaseAck。
+  证明的真实数据路径尚待下一阶段接线；缺证明时保持分配，不会自行释放。
+
+本轮证据在部署仓 `artifacts/p-main-buffer-reuse/pd-transfer-production-wiring-20261105/`：
+P 聚焦 141 项通过；组合 67 项、33 个子用例通过，另 1 项真实依赖限定用例明确 skip。
+包含实际 loopback socket 的双 rank factory 往返／反向 retention、TP16×78 层描述符
+编解码、部分 acquire／release 失败保留、共享锁阻止 RPC 看到分配中间态等。
+真实运行时测试执行了实际 vLLM Scheduler／KVCacheManager 的四条控制路径，
+使用 CPU 未提交 DMA 的证明 fixture；它不构成真实远端取消或模型写回验证。
+
+model runner 的调整只发生在 KV 初始化：通过 wrapper 的显式入口传入已存在的 manager、
+消费 stream 和 TE，再注册实际目标；不增加逐 token／逐层 forward 调用。
+原入口只识别外层单 connector，无法覆盖 MultiConnector，这是改动的必要性。
+scheduler subclass 则用于 connector 的 finished hook 无法覆盖的 free／preempt 路径，
+并复用上游 GPU fence 与原分配器；没有改模型实现或通过额外引用计数触发 CoW。
+这些初始化／控制路径回归已执行，性能影响仍需实际模型与相同部署参数对照确认。
+
+下一步优先完成 manifest 驱动的有效范围传输计划、worker-ready、SourceReady 直接发送、
+真实 receive 可见性／forward-use／writeback 与取消／静止证明，再执行模型部署与性能测试。
+下面的“本次已修复／完整特性仍缺什么”保留首批 `9cbdde548` 时的审查上下文，
+其中 IPC、初始化和 scheduler 门禁的代码进展以上述本节为准；模型验收状态仍未完成。
+
 ## 固定审查对象
 
 | 对象 | 提交／证据 |
