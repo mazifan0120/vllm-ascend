@@ -41,6 +41,7 @@ MOONCAKE_LAYERWISE_CLIENT_METHODS = (
     "batch_get_session_end",
 )
 _KVPOOL_RANGE_DEBUG_PREFIX = "[KVPOOL_RANGE_DEBUG]"
+_MOONCAKE_OBJECT_NOT_FOUND = -704
 
 
 def _emit_whole_key_debug_event(direction: str, key_count: int) -> None:
@@ -441,7 +442,10 @@ class MooncakeBackend(Backend):
         self.ensure_initialized()
         if self.store is None or not callable(getattr(self.store, "remove", None)):
             raise RuntimeError("Mooncake client does not provide private snapshot cleanup")
-        return [int(self.store.remove(key, False)) for key in keys]
+        codes = [int(self.store.remove(key, False)) for key in keys]
+        # Eviction or an earlier remove with a lost response already retired
+        # the object. Lease conflicts and other failures still require retry.
+        return [0 if code == _MOONCAKE_OBJECT_NOT_FOUND else code for code in codes]
 
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()

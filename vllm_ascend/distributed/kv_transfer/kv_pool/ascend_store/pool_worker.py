@@ -137,6 +137,7 @@ MEMCACHE_UNMATCHED_STATE = -3101
 PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
 SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
+PRIVATE_SNAPSHOT_CLEANUP_RETRY_INTERVAL_S = 1.0
 
 
 class KVPoolWorker:
@@ -492,6 +493,7 @@ class KVPoolWorker:
         self._load_session_lock = threading.Lock()
         self._layer_load_aborted = threading.Event()
         self._layerwise_session_tracker = LayerwiseSessionTracker()
+        self._private_snapshot_cleanup_retry_at = 0.0
         self._current_layerwise_request_ids: set[str] = set()
         self._current_layerwise_last_chunk_req_ids: set[str] = set()
         # (tag, req_id, group_id, start_block, end_block) -> runs, cleared per
@@ -3231,6 +3233,8 @@ class KVPoolWorker:
                     return
         tracker = self._layerwise_session_tracker
         self._end_layerwise_load_keys(tracker.collect_obsolete_private_sessions())
+        if time.monotonic() < self._private_snapshot_cleanup_retry_at:
+            return
         keys = tracker.private_cleanup_candidates()
         if not keys:
             return
@@ -3239,10 +3243,16 @@ class KVPoolWorker:
                 "remove_private_snapshots", keys, self.m_store.remove_private_snapshots(keys)
             )
             tracker.acknowledge_private_cleanup(key for key, code in zip(keys, codes, strict=True) if code == 0)
-            failed = sum(code != 0 for code in codes)
+            failed = [code for code in codes if code != 0]
             if failed:
-                logger.warning("Keeping %d private KV snapshots pending cleanup", failed)
+                self._private_snapshot_cleanup_retry_at = time.monotonic() + PRIVATE_SNAPSHOT_CLEANUP_RETRY_INTERVAL_S
+                logger.warning(
+                    "Keeping %d private KV snapshots pending cleanup, Store remove codes=%s",
+                    len(failed),
+                    sorted(set(failed)),
+                )
         except Exception:
+            self._private_snapshot_cleanup_retry_at = time.monotonic() + PRIVATE_SNAPSHOT_CLEANUP_RETRY_INTERVAL_S
             logger.exception("Private KV snapshot cleanup failed; retaining retry records")
 
     def _build_shared_save_data(self) -> None:

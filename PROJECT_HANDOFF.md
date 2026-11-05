@@ -1,7 +1,25 @@
 # Prefill KV buffer reuse 与 Mooncake PD transfer 项目交接
 
-更新：2026-11-05。源码快照：`4204f545d59f448373794f100ceb6bdd31c7866a`。
-部署工作区：`/home/gao/code/Ops/deploy-glm52`。
+## 2026-11-05 四节点实机验证更新
+
+- Ansible 复现了 `4204f545d` 的 TP1 原生探针。随后在 P r05／D r03 镜像上加载本次修复，完成
+  B1/B2/B3 的真实 GLM-5.2 P/D 验证，覆盖三 chunk、Store 回放、双 D 并发和连续生成。
+- D 在原有 proof batch ACK 中反馈目标关闭。P 停止后续读取，D 等待全部 writer 静止后才回收。
+  实机覆盖首 token 后断连、查询地址前取消，以及首笔 RoCE WRITE 返回后取消。
+- writer 关闭时等待已接收作业及源回调入队，再停止 proof 线程。实机覆盖最后一批 WRITE 返回后仍有源回调的情形。
+  私有快照删除对已不存在的对象按完成处理，租约冲突保留重试。
+- 固定 513 blocks 的纯 HBM 对照走一体 vLLM，B2/Host 和对照各九条请求全部正确。实验后原四引擎和代理
+  均恢复 HTTP 200，原 Mooncake Master 启动时间一致。
+- 完整模型的自动 restore-only 仍缺 scheduler 选择和跳过 forward 的生命周期。同步 DMA 卡死的安全退出、
+  进程级传输资源销毁和旧逐层普通 D HBM 首传兼容性仍待验收。
+
+部署配置和详细证据在部署工作区 `/home/gao/code/Ops/deploy-glm52` 的
+`docs/m1-buffer-reuse-runbook.md` §11.52–11.56。
+
+## 原始交接快照
+
+以下记录对应 `4204f545d59f448373794f100ceb6bdd31c7866a` 及随后的原生探针交接，
+保留当时的部署限制、实现缺口和现场状态。
 
 **当前原功能目标已由用户暂停。本轮仅整理交接，不代表恢复开发、部署或模型测试。**
 

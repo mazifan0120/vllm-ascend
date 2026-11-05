@@ -22,6 +22,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_peer import (
     GET_TARGET_REGIONS_MSG,
     LAYER_RESULTS_MSG,
+    PROOF_ACK,
+    PROOF_ACK_TARGET_CLOSED,
     ManifestPeerProofs,
     decode_target_addresses,
     encode_target_addresses,
@@ -50,12 +52,12 @@ class TestTargetPeer(unittest.TestCase):
                 socket.bind("tcp://127.0.0.1:*")
                 endpoints.append(socket.getsockopt_string(zmq.LAST_ENDPOINT))
                 ready.set()
-                for _ in range(2):
+                for ack in (PROOF_ACK, PROOF_ACK_TARGET_CLOSED):
                     if not socket.poll(2000):
                         raise TimeoutError("CPU proof test did not receive frame")
                     identity, _, payload = socket.recv_multipart()
                     messages.append((identity, msgspec.msgpack.decode(payload, type=tuple)))
-                    socket.send_multipart((identity, b"", b"ACK"))
+                    socket.send_multipart((identity, b"", ack))
             except Exception as error:
                 errors.append(error)
             finally:
@@ -73,8 +75,8 @@ class TestTargetPeer(unittest.TestCase):
                 remote_port=int(endpoints[0].rsplit(":", 1)[1]),
             )
             key = manifest_requirements(manifest)[0].key
-            proofs(meta, ((TransferResult(key, Status.SUCCESS, True), (0,)),), None)
-            proofs(meta, (), (Status.SUCCESS, True))
+            self.assertFalse(proofs(meta, ((TransferResult(key, Status.SUCCESS, True), (0,)),), None))
+            self.assertTrue(proofs(meta, (), (Status.SUCCESS, True)))
             self.assertEqual(messages[0][0], messages[1][0])
             self.assertTrue(all(message[1][0] == LAYER_RESULTS_MSG for message in messages))
             result = messages[0][1][2][0]

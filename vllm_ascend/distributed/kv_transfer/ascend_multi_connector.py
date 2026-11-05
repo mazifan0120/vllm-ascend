@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
@@ -222,18 +223,12 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             yield
 
     def _receipt_restore_only_requests(self):
-        """Collect request ids marked restore-only across layerwise child metadata.
-
-        A receipt-mode request whose entire prompt is covered by the target
-        lease is marked restore-only by the D scheduler. Those requests must
-        bypass the normal forward load path and go through the Store restore
-        driver instead.
-        """
+        """Collect explicit restore-only marks from request-keyed child metadata."""
         marked = set()
         for connector in self._connectors:
             metadata = getattr(connector, "_connector_metadata", None)
             requests = getattr(metadata, "requests", None)
-            if not requests:
+            if not isinstance(requests, Mapping):
                 continue
             for req_id, meta in requests.items():
                 if getattr(meta, "restore_only", False):

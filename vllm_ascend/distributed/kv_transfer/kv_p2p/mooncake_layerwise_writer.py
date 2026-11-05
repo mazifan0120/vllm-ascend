@@ -7,10 +7,12 @@ before the independent proof thread waits on peer acknowledgements. Unknown
 native failures never certify source quiescence or target retirement.
 """
 
-import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
+
+from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     ContractError,
@@ -20,6 +22,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import ManifestWritePlan, plan_layer_writes
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receipt import _ranges_cover
+
+SOURCE_WRITER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -32,6 +36,7 @@ class _RequestWrites:
     pending: int = 0
     closed: bool = False
     failed: bool = False
+    first_error: Exception | None = None
     cancelled: bool = False
     unknown: bool = False
     terminal_sent: bool = False
@@ -83,6 +88,8 @@ class ManifestSourceWriter:
         self._resolve = resolve_addresses
         self._send_proofs = send_proofs
         self._lock = threading.RLock()
+        self._drained = threading.Condition(self._lock)
+        self._callbacks_in_progress = 0
         self._requests = {}
         # Compact lifetime tombstones survive heavy plan cleanup. A repeated
         # HTTP notification must not reopen a target after its terminal closed
@@ -91,8 +98,8 @@ class ManifestSourceWriter:
         self._unquiesced = []
         self._closing = False
         self._closed = False
+        self._proof_stop_queued = False
         self._proof_queue = queue.Queue()
-        self._logger = logging.getLogger(__name__)
         self._proof_thread = threading.Thread(target=self._run_proofs, name="LayerwiseWriteProofs", daemon=True)
         self._proof_thread.start()
 
@@ -124,15 +131,28 @@ class ManifestSourceWriter:
             self._requests[request_id] = _RequestWrites(request_id, metadata, plan, required)
             self._target_owners[target] = request_id
 
-    def prepare_job(self, source, request, ready_event) -> SourceWriteJob:
+    def prepare_job(self, source, request, ready_event) -> SourceWriteJob | None:
         with self._lock:
             state = self._requests.get(request.request_id)
-            if self._closing or state is None or state.closed or state.finished:
+            if self._closing or state is None:
+                raise ContractError("Source read belongs to an unknown or closed producer request")
+            if state.failed:
+                raise ContractError("Producer request closed after an earlier write failure") from state.first_error
+            if state.cancelled:
+                # The P forward may still reach later layers after D closes
+                # admission. Those layers must not register new DMA readers.
+                return None
+            requirements = state.plan.for_layer(self.rank, source.layer)
+            # An Indexer-only rank may finish its last write before the model
+            # reaches later layers whose Main data is sent by rank zero.
+            if not requirements:
+                return None
+            if state.closed or state.finished:
                 raise ContractError("Source read belongs to an unknown or closed producer request")
             if not callable(getattr(ready_event, "synchronize", None)):
                 raise ContractError("Source write requires the actual recorded source-ready fence")
             state.pending += 1
-            for requirement in state.plan.for_layer(self.rank, source.layer):
+            for requirement in requirements:
                 state.prepared_ranges.setdefault(requirement.key.operation_id, set()).add(
                     (request.start_token, request.end_token)
                 )
@@ -145,7 +165,6 @@ class ManifestSourceWriter:
         partial plan (e.g. cancellation before all layers) closes as failed,
         never as a successful empty transfer or an artificial DMA fence.
         """
-        proofs = []
         with self._lock:
             for request_id in request_ids:
                 state = self._requests.get(request_id)
@@ -160,11 +179,9 @@ class ManifestSourceWriter:
                 if state.closed and not state.pending and not state.terminal_sent:
                     state.terminal_sent = True
                     verdict = Status.FAILED if state.failed else Status.CANCELLED
-                    proofs.append((state, (), (verdict, not state.unknown)))
+                    self._proof_queue.put((state, (), (verdict, not state.unknown)))
                 if state.closed and not state.pending and not state.unknown:
                     self._requests.pop(request_id)
-        for proof in proofs:
-            self._proof_queue.put(proof)
 
     def _execute(self, job, engine) -> None:
         with self._lock:
@@ -198,8 +215,11 @@ class ManifestSourceWriter:
                 destinations = [address for write in writes for address in write.target_addresses]
                 lengths = [length for write in writes for length in write.lengths]
                 if lengths:
-                    native_started = True
-                    quiesced = False
+                    with self._lock:
+                        if job.state.cancelled and not job.state.failed:
+                            break
+                        native_started = True
+                        quiesced = False
                     result = engine.batch_transfer_sync_write(endpoint, sources, destinations, lengths)
                     if type(result) is not int or result != 0:
                         raise ContractError(f"Native component WRITE did not complete successfully: {result!r}")
@@ -229,6 +249,8 @@ class ManifestSourceWriter:
             if state.pending < 0:
                 raise ContractError("Producer source job completed more than once")
             if error is not None:
+                if state.first_error is None:
+                    state.first_error = error
                 state.failed = True
                 state.closed = True
             if not quiesced:
@@ -248,11 +270,29 @@ class ManifestSourceWriter:
                 terminal = (verdict, not state.unknown)
             if state.finished and state.closed and not state.pending and not state.unknown:
                 self._requests.pop(state.request_id, None)
+            self._callbacks_in_progress += 1
         # The exact epoch read ends on native completion. Peer ACK/D decode
         # must never keep the physical P slot busy (design I4).
-        job._completion(error, quiesced)
-        if results or terminal is not None:
-            self._proof_queue.put((state, results, terminal))
+        try:
+            job._completion(error, quiesced)
+            if results or terminal is not None:
+                self._proof_queue.put((state, results, terminal))
+        finally:
+            with self._drained:
+                self._callbacks_in_progress -= 1
+                self._drained.notify_all()
+
+    def _cancel_from_peer(self, state) -> tuple[Status, bool] | None:
+        with self._lock:
+            if state.cancelled or state.terminal_sent:
+                return None
+            state.cancelled = state.closed = True
+            logger.info("Peer closed target for producer request %s", state.request_id)
+            if state.pending:
+                return None
+            state.terminal_sent = True
+            verdict = Status.FAILED if state.failed else Status.CANCELLED
+            return verdict, not state.unknown
 
     def _run_proofs(self) -> None:
         while True:
@@ -269,24 +309,39 @@ class ManifestSourceWriter:
                 # Do not spend the same timeout again for every queued layer;
                 # keep D fail-closed until the separate retirement protocol.
                 if state.delivery_error is None:
-                    self._send_proofs(state.metadata, results, terminal)
+                    if self._send_proofs(state.metadata, results, terminal):
+                        cancelled = self._cancel_from_peer(state)
+                        if cancelled is not None:
+                            # Complete this proof before the queued shutdown
+                            # sentinel can stop the transport.
+                            self._send_proofs(state.metadata, (), cancelled)
             except Exception as error:
                 with self._lock:
                     state.delivery_error = error
-                self._logger.error("Manifest completion proof delivery failed; D must retain target: %s", error)
+                logger.error("Manifest completion proof delivery failed; D must retain target: %s", error)
             finally:
                 self._proof_queue.task_done()
 
     def close(self) -> None:
-        with self._lock:
+        deadline = time.monotonic() + SOURCE_WRITER_SHUTDOWN_TIMEOUT_SECONDS
+        with self._drained:
             if self._closed:
                 return
-            if self._unquiesced or any(s.pending for s in self._requests.values()):
-                raise ContractError("Source writer still has pending or unknown native reads")
             if not self._closing:
                 self._closing = True
+                self.finish_requests(tuple(self._requests))
+            drained = self._drained.wait_for(
+                lambda: bool(self._unquiesced)
+                or (not self._callbacks_in_progress and not any(state.pending for state in self._requests.values())),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+            if not drained or self._unquiesced:
+                raise ContractError("Source writer still has pending or unknown native reads")
+            if not self._proof_stop_queued:
+                self._proof_stop_queued = True
                 self._proof_queue.put(None)
-        self._proof_thread.join(timeout=1)
+        self._proof_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._proof_thread.is_alive():
             raise ContractError("Source proof delivery is still running")
-        self._closed = True
+        with self._lock:
+            self._closed = True

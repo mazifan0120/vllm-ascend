@@ -188,16 +188,30 @@ class TestExactReceiverProtocol(unittest.TestCase):
         frames.append(
             (lc.RANK_TERMINAL_MSG, lc.CONTRACT_VERSION, ledger.request.request_instance, 5, 0, "cancelled", True)
         )
-        receiver.handle_proof_batch(_encode_decode((lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, tuple(frames))))
+        batch = _encode_decode((lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, tuple(frames)))
+        self.assertEqual(receiver.handle_proof_batch(batch), lc.PROOF_ACK)
         self.assertTrue(ledger.remote_quiesced())
         self.assertIsNone(ledger.build_receipt())
+        ledger.abort_delivery()
+        self.assertEqual(receiver.handle_proof_batch(batch), lc.PROOF_ACK_TARGET_CLOSED)
 
     def test_actual_batch_handler_rejects_invalid_envelope_before_crediting_any_frame(self):
         receiver, ledger, _ = self.fixture()
+        terminal = (
+            lc.RANK_TERMINAL_MSG,
+            lc.CONTRACT_VERSION,
+            ledger.request.request_instance,
+            ledger.request.transfer_generation,
+            0,
+            "success",
+            True,
+        )
+        stale_terminal = (*terminal[:3], ledger.request.transfer_generation + 1, *terminal[4:])
         for message in (
             (lc.LAYER_RESULTS_MSG, True, ()),
             (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, ()),
             (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, ((b"unsupported",),)),
+            (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, (terminal, stale_terminal)),
         ):
             with self.assertRaises(lc.ContractError):
                 receiver.handle_proof_batch(_encode_decode(message))

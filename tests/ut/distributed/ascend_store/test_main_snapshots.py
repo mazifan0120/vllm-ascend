@@ -23,6 +23,7 @@ class TestMainSnapshotVersions(unittest.TestCase):
         worker._invalid_block_ids_lock = threading.Lock()
         worker._current_layerwise_request_ids = set()
         worker._current_layerwise_last_chunk_req_ids = set()
+        worker._private_snapshot_cleanup_retry_at = 0.0
         worker.kv_recv_thread = worker.kv_send_thread = None
         published = published if published is not None else set()
         blocked_public = blocked_public or set()
@@ -253,11 +254,19 @@ class TestMainSnapshotVersions(unittest.TestCase):
         self.commit(worker, published, request)
         worker._release_layerwise_requests_terminal({"r1"})
         worker.m_store.remove_private_snapshots.side_effect = None
-        worker.m_store.remove_private_snapshots.return_value = [-1]
-        worker._cleanup_main_private_snapshots()
-        self.assertEqual(worker._layerwise_session_tracker.private_cleanup_candidates(), [request.save_last_block_key])
-        worker.m_store.remove_private_snapshots.return_value = [0]
-        worker._cleanup_main_private_snapshots()
+        worker.m_store.remove_private_snapshots.return_value = [-706]
+        clock = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.time.monotonic"
+        with patch(clock, return_value=10.0) as monotonic:
+            worker._cleanup_main_private_snapshots()
+            self.assertEqual(
+                worker._layerwise_session_tracker.private_cleanup_candidates(), [request.save_last_block_key]
+            )
+            worker.m_store.remove_private_snapshots.return_value = [0]
+            worker._cleanup_main_private_snapshots()
+            self.assertEqual(worker.m_store.remove_private_snapshots.call_count, 1)
+            monotonic.return_value = 11.0
+            worker._cleanup_main_private_snapshots()
+        self.assertEqual(worker.m_store.remove_private_snapshots.call_count, 2)
         self.assertEqual(worker._layerwise_session_tracker.private_cleanup_candidates(), [])
 
 

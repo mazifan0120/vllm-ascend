@@ -18,6 +18,8 @@ GET_TARGET_REGIONS_MSG = b"get_target_regions_v1"
 TARGET_REGIONS_REPLY = b"target_regions_v1"
 TARGET_PEER_ERROR = b"target_peer_error_v1"
 LAYER_RESULTS_MSG = b"layer_results_v1"
+PROOF_ACK = b"ACK"
+PROOF_ACK_TARGET_CLOSED = b"ACK_TARGET_CLOSED"
 MAX_PROOF_BATCH_FRAMES = 64
 TARGET_PEER_TIMEOUT_SECONDS = 30.0
 
@@ -156,7 +158,7 @@ class ManifestPeerProofs:
         self._timeout_ms = max(1, math.ceil(timeout * 1000))
         self._sockets = {}
 
-    def _send(self, host, port, message):
+    def _send(self, host, port, message) -> bool:
         endpoint = f"tcp://{host}:{port}"
         encoded = msgspec.msgpack.encode(message)
         for attempt in range(3):
@@ -170,15 +172,18 @@ class ManifestPeerProofs:
                 self._sockets[endpoint] = socket
             try:
                 socket.send(encoded)
-                if socket.recv() != b"ACK":
-                    raise ContractError("Peer did not acknowledge the exact completion proof")
-                return
+                response = socket.recv()
+                if response == PROOF_ACK:
+                    return False
+                if response == PROOF_ACK_TARGET_CLOSED:
+                    return True
+                raise ContractError("Peer did not acknowledge the exact completion proof")
             except (zmq.ZMQError, ContractError):
                 self._sockets.pop(endpoint).close(linger=0)
                 if attempt == 2:
                     raise
 
-    def __call__(self, metadata, results, terminal):
+    def __call__(self, metadata, results, terminal) -> bool:
         batches = {}
         for result, receivers in results:
             key = result.key
@@ -216,10 +221,13 @@ class ManifestPeerProofs:
                         quiesced,
                     )
                 )
+        cancelled = False
         for rank, frames in batches.items():
-            self._send(
+            closed = self._send(
                 metadata.remote_host, metadata.remote_port + rank, (LAYER_RESULTS_MSG, CONTRACT_VERSION, tuple(frames))
             )
+            cancelled |= closed
+        return cancelled
 
     def close(self):
         for socket in self._sockets.values():

@@ -113,10 +113,10 @@ class ReceiptScheduler(Scheduler):
             elif request.is_finished() and self._request_blocks_can_be_freed(request):
                 self._free_blocks(request)
 
-    def schedule(self):
+    def schedule(self, throttle_prefills: bool = False):
         self._poll_target_receives()
         self._drain_retained_finished()
-        return super().schedule()
+        return super().schedule(throttle_prefills)
 
     def has_finished_requests(self):
         return bool(self._retained_finished or self._target_recv_pending) or super().has_finished_requests()

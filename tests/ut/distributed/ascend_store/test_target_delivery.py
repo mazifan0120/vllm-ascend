@@ -10,6 +10,7 @@ from tests.ut.distributed.ascend_store.test_target_owner_factory import _endpoin
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     ContractError,
     Status,
+    TargetClosedError,
     TransferResult,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import ManifestWritePlan
@@ -24,6 +25,35 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_rpc impo
 
 
 class TestTargetDelivery(unittest.TestCase):
+    def test_abort_after_address_lookup_retains_target_until_all_writers_quiesce(self):
+        provider, owners, request, allocation = coordinated()
+        lease = provider.acquire_target(request, allocation)
+        manifest = provider.manifest(lease)
+        local = manifest.for_rank(0).lease
+        ledgers = []
+        control = WorkerTargetDelivery(0, owners[0], lambda _, __, ledger: ledgers.append(ledger))
+        try:
+            control.admit_target(manifest, "internal")
+            with control.source_lookup(local):
+                pass
+            control.abort_requests({"internal"})
+            with self.assertRaises(TargetClosedError), control.source_lookup(local):
+                self.fail("An aborted target exposed native addresses again")
+            self.assertEqual(control.delivery_status(local), {"ready": False, "remote_quiesced": False})
+            with self.assertRaises(ContractError):
+                control.release_target(local)
+            ledgers[0].finish_rank(request, 0, Status.SUCCESS, True)
+            ledgers[0].finish_rank(request, 1, Status.CANCELLED, False)
+            with self.assertRaises(ContractError):
+                control.release_target(local)
+            self.assertEqual(owners[0].releases, [])
+            ledgers[0].finish_rank(request, 1, Status.CANCELLED, True)
+            self.assertEqual(control.delivery_status(local), {"ready": False, "remote_quiesced": True})
+            control.release_target(local)
+            self.assertEqual(owners[0].releases, [local])
+        finally:
+            provider.release_target(lease)
+
     def test_real_two_owner_rpc_ack_waits_for_all_receive_maps_and_retains_exact_proofs(self):
         _, owners, request, allocation = coordinated()
         maps = ({}, {})

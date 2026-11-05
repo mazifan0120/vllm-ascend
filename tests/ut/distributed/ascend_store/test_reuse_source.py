@@ -283,6 +283,21 @@ class TestReuseSource(unittest.TestCase):
         multi._configure_reuse_source_contract()
         store.set_reuse_source_consumer.assert_not_called()
 
+    def test_restore_only_scan_ignores_store_request_list(self):
+        module = SimpleNamespace(MultiConnector=type("MultiConnector", (), {}))
+        with patch.dict(sys.modules, {"vllm.distributed.kv_transfer.kv_connector.v1.multi_connector": module}):
+            from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import AscendMultiConnector
+
+        store = SimpleNamespace(_connector_metadata=SimpleNamespace(requests=[SimpleNamespace()]))
+        transfer = SimpleNamespace(
+            _connector_metadata=SimpleNamespace(requests={"ordinary": SimpleNamespace(restore_only=False)})
+        )
+        multi = AscendMultiConnector.__new__(AscendMultiConnector)
+        multi._connectors = [transfer, store]
+        self.assertEqual(multi._receipt_restore_only_requests(), set())
+        transfer._connector_metadata.requests["restore"] = SimpleNamespace(restore_only=True)
+        self.assertEqual(multi._receipt_restore_only_requests(), {"restore"})
+
     def test_empty_get_dispatch_opens_epoch_after_external_wait(self):
         from tests.ut.distributed.ascend_store.test_kv_transfer import TestGVALayerReceivingTaskOwnership
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import LayerLoadTask

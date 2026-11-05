@@ -83,6 +83,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_peer import (
     GET_TARGET_REGIONS_MSG,
     LAYER_RESULTS_MSG,
     MAX_PROOF_BATCH_FRAMES,
+    PROOF_ACK,
+    PROOF_ACK_TARGET_CLOSED,
     TARGET_PEER_ERROR,
     ManifestPeerProofs,
     encode_target_addresses,
@@ -801,7 +803,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
 
-    def handle_proof_batch(self, msg: tuple) -> None:
+    def handle_proof_batch(self, msg: tuple) -> bytes:
         if (
             len(msg) != 3
             or type(msg[1]) is not int
@@ -810,14 +812,28 @@ class KVCacheRecvingLayerThread(threading.Thread):
             or not 0 < len(msg[2]) <= MAX_PROOF_BATCH_FRAMES
         ):
             raise ContractError("Malformed manifest completion proof batch")
+        identity = None
         for frame in msg[2]:
-            if not frame or frame[0] not in (LAYER_RESULT_MSG, RANK_TERMINAL_MSG):
+            if (
+                type(frame) not in (tuple, list)
+                or len(frame) < 4
+                or frame[0] not in (LAYER_RESULT_MSG, RANK_TERMINAL_MSG)
+            ):
                 raise ContractError("Manifest proof batch contains an unsupported operation")
+            frame_identity = RequestKey(frame[2], frame[3])
+            if identity is not None and frame_identity != identity:
+                raise ContractError("Manifest proof batch mixes request generations")
+            identity = frame_identity
         for frame in msg[2]:
             if frame[0] == LAYER_RESULT_MSG:
                 self.handle_layer_result(tuple(frame))
             else:
                 self.handle_rank_terminal(tuple(frame))
+        with self.lock:
+            ledger = self.ledger_by_req.get(identity.request_instance)
+        if isinstance(ledger, ExactReceiptLedger) and ledger.request == identity and ledger.delivery_aborted:
+            return PROOF_ACK_TARGET_CLOSED
+        return PROOF_ACK
 
     def handle_layer_result(self, msg: tuple) -> None:
         """LAYER_RESULT_MSG: (type, version, instance, gen, rank,
@@ -1121,8 +1137,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         self.handle_rank_terminal(msg)
                         sock.send_multipart((identity, b"", b"ACK"))
                     elif msg[0] == LAYER_RESULTS_MSG:
-                        self.handle_proof_batch(msg)
-                        sock.send_multipart((identity, b"", b"ACK"))
+                        sock.send_multipart((identity, b"", self.handle_proof_batch(msg)))
                     else:
                         logger.error(
                             "Unexpected message type: %s. expected GET_META_MSG or DONE_RECVING_MSG. msg=%s",
@@ -3075,11 +3090,11 @@ class MooncakeLayerwiseConnectorWorker:
                 raise ContractError("Admitted PD request is missing from the Store source batch")
             end = min(request.end_token, meta.remote_target_manifest.lease.allocation.prompt_tokens)
             start = max(request.start_token, min(meta.local_transed_tokens, end))
-            jobs.append(
-                self._manifest_source_writer.prepare_job(
-                    source, replace(request, start_token=start, end_token=end), ready_event
-                )
+            job = self._manifest_source_writer.prepare_job(
+                source, replace(request, start_token=start, end_token=end), ready_event
             )
+            if job is not None:
+                jobs.append(job)
         return tuple(jobs), legacy_expected
 
     def prepare_layerwise_step(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:

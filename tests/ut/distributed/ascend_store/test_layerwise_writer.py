@@ -5,6 +5,7 @@ import ctypes
 import queue
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -44,11 +45,52 @@ def metadata(fixture):
 
 
 class TestSourceWriter(unittest.TestCase):
+    def test_close_drains_the_final_callback_before_stopping_proof_delivery(self):
+        fixture, writer, work, proofs = self.make()
+        source, request = fixture.source(0)
+        fence = SimpleNamespace(synchronize=lambda: None)
+        entered_callback = threading.Event()
+        release_callback = threading.Event()
+        closed_admission = threading.Event()
+        finish_requests = writer.finish_requests
+
+        def complete(error, quiesced):
+            self.assertIsNone(error)
+            self.assertTrue(quiesced)
+            entered_callback.set()
+            self.assertTrue(release_callback.wait(3))
+
+        def finish(request_ids):
+            finish_requests(request_ids)
+            closed_admission.set()
+
+        writer.finish_requests = finish
+        try:
+            writer.prepare_job(source, request, fence).publish(complete)
+            with ThreadPoolExecutor(max_workers=2) as threads:
+                executing = threads.submit(work.get_nowait().execute, CpuEngine())
+                self.assertTrue(entered_callback.wait(2))
+                closing = threads.submit(writer.close)
+                try:
+                    self.assertTrue(closed_admission.wait(2))
+                    self.assertFalse(closing.done())
+                    with self.assertRaisesRegex(ContractError, "after writer shutdown"):
+                        writer.register_request("another-request", metadata(fixture))
+                finally:
+                    release_callback.set()
+                executing.result(timeout=2)
+                closing.result(timeout=2)
+            self.assertEqual(proofs[-1][2], (Status.SUCCESS, True))
+            self.assertEqual(writer._proof_queue.unfinished_tasks, 0)
+        finally:
+            release_callback.set()
+            self.stop(writer)
+
     def test_closed_remote_target_before_address_lookup_cancels_without_native_reads(self):
         def resolve(*args):
             raise TargetClosedError("D cancelled before exposing addresses")
 
-        fixture, writer, work, proofs = self.make(resolve=resolve)
+        fixture, writer, work, proofs = self.make(resolve=resolve, layers=2)
         source, request = fixture.source(0)
         done = []
         engine = CpuEngine()
@@ -60,6 +102,9 @@ class TestSourceWriter(unittest.TestCase):
             self.assertEqual(engine.calls, [])
             self.assertEqual(done, [(None, True)])
             self.assertEqual(proofs[-1][2], (Status.CANCELLED, True))
+            later_source = replace(source, layer=1)
+            self.assertIsNone(writer.prepare_job(later_source, request, SimpleNamespace(synchronize=lambda: None)))
+            self.assertTrue(work.empty())
         finally:
             self.stop(writer)
 
@@ -89,8 +134,38 @@ class TestSourceWriter(unittest.TestCase):
         finally:
             self.stop(writer)
 
-    def make(self, rank=0, *, resolve=None, proofs=None):
-        fixture = MemoryFixture(layers=1)
+    def test_closed_proof_ack_cancels_cached_addresses_and_drains_queued_jobs(self):
+        proofs = []
+
+        def send_proofs(*args):
+            proofs.append(args)
+            return True
+
+        fixture, writer, work, _ = self.make(proofs=send_proofs, layers=2)
+        source, request = fixture.source(0)
+        later_source = replace(source, layer=1)
+        fence = SimpleNamespace(synchronize=lambda: None)
+        done = []
+        engine = CpuEngine()
+        try:
+            for layer in (source, later_source):
+                writer.prepare_job(layer, request, fence).publish(lambda *args: done.append(args))
+            work.get_nowait().execute(engine)
+            reads_after_first_layer = list(engine.calls)
+            self.assertTrue(reads_after_first_layer)
+            writer._proof_queue.join()
+            self.assertIsNone(proofs[-1][2])  # The queued source still owns a reader ticket.
+            self.assertIsNone(writer.prepare_job(later_source, request, fence))
+            work.get_nowait().execute(engine)
+            writer._proof_queue.join()
+            self.assertEqual(engine.calls, reads_after_first_layer)
+            self.assertEqual(done, [(None, True), (None, True)])
+            self.assertEqual(proofs[-1][2], (Status.CANCELLED, True))
+        finally:
+            self.stop(writer)
+
+    def make(self, rank=0, *, resolve=None, proofs=None, layers=1):
+        fixture = MemoryFixture(layers=layers)
         native_queue = queue.Queue()
         received = []
         writer = ManifestSourceWriter(
@@ -134,6 +209,27 @@ class TestSourceWriter(unittest.TestCase):
         finally:
             self.stop(writer)
             self.stop(peer)
+
+    def test_indexer_only_rank_skips_later_layers_after_success_terminal(self):
+        fixture, writer, work, received = self.make(rank=1)
+        source, request = fixture.source(1)
+        ready = SimpleNamespace(synchronize=lambda: None)
+        later = replace(source, layer=source.layer + 1)
+        completed = []
+        try:
+            self.assertIsNone(writer.prepare_job(later, request, ready))
+            job = writer.prepare_job(source, request, ready)
+            job.publish(lambda error, q: completed.append((error, q)))
+            work.get_nowait().execute(CpuEngine())
+            writer._proof_queue.join()
+            self.assertEqual(completed, [(None, True)])
+            self.assertEqual(received[0][2], (Status.SUCCESS, True))
+            self.assertIsNone(writer.prepare_job(later, request, ready))
+            self.assertTrue(work.empty())
+            with self.assertRaises(ContractError):
+                writer.prepare_job(source, request, ready)
+        finally:
+            self.stop(writer)
 
     def test_native_completion_releases_exact_epoch_while_peer_ack_is_still_blocked(self):
         entered = threading.Event()

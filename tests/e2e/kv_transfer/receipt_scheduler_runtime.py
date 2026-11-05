@@ -9,6 +9,7 @@ CPU test control: no remote transfer is submitted by this test.
 import json
 import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from vllm import SamplingParams
@@ -93,6 +94,15 @@ def _fixture(name):
 def exercise_scheduler_lifetime():
     # Proofs below authorize CPU-only unused blocks, not real remote transfers.
     passed = []
+    scheduler, *_ = _fixture("throttle-prefills")
+    with patch.object(ReceiptScheduler.__mro__[1], "schedule", autospec=True) as schedule:
+        assert scheduler.schedule(True) is schedule.return_value
+        schedule.assert_called_once_with(scheduler, True)
+        schedule.reset_mock()
+        assert scheduler.schedule() is schedule.return_value
+        schedule.assert_called_once_with(scheduler, False)
+    passed.append("schedule_forwards_engine_prefill_throttle")
+
     scheduler, request, _, proof, _, raw = _fixture("all-rank-receive")
     visible = threading.Event()
     outputs = []
