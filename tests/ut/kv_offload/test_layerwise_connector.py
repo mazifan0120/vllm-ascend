@@ -29,6 +29,59 @@ def _encode_decode(msg):
 
 
 class TestExactReceiverProtocol(unittest.TestCase):
+    def publisher(self):
+        receiver, ledger, required = self.fixture()
+        receiver.instance_to_req = {ledger.request.request_instance: "external"}
+        receiver.done_requests = set()
+        receiver.failed_requests = set()
+        receiver.receipt_mode_reqs = set()
+        receiver.receipt_deadlines = {}
+        order = []
+        receiver.receipt_provider = SimpleNamespace(
+            confirm_native_received=lambda *args: order.append("native-receive-fence"),
+            prepare_decode=lambda *args: order.append("install-consumer-dependency"),
+        )
+        ledger.lease = object()
+        receiver._maybe_publish = lc.KVCacheRecvingLayerThread._maybe_publish.__get__(receiver)
+        return receiver, ledger, required, order
+
+    def test_actual_publisher_confirms_receive_before_visibility_and_is_idempotent(self):
+        receiver, ledger, required, order = self.publisher()
+        ledger.record(lc.TransferResult(required[0], lc.Status.SUCCESS, True))
+        ledger.finish_rank(ledger.request, 0, lc.Status.SUCCESS, True)
+        receiver._maybe_publish(ledger.request.request_instance)
+        self.assertEqual(order, [])
+        ledger.record(lc.TransferResult(required[1], lc.Status.SUCCESS, True))
+        receiver._maybe_publish(ledger.request.request_instance)
+        self.assertEqual(order, ["native-receive-fence", "install-consumer-dependency"])
+        self.assertEqual(receiver.done_requests, {"external"})
+        receiver.done_requests.clear()
+        receiver._maybe_publish(ledger.request.request_instance)
+        self.assertEqual(len(order), 2)
+
+    def test_actual_watchdog_keeps_late_quiescence_without_late_decode(self):
+        receiver, ledger, required, order = self.publisher()
+        instance = ledger.request.request_instance
+        receiver.receipt_deadlines[instance] = 0
+        receiver._sweep_receipt_deadlines()
+        receiver.forget_request("external", failed=True)
+        self.assertIs(receiver.ledger_by_req[instance], ledger)
+        for key in required:
+            ledger.record(lc.TransferResult(key, lc.Status.SUCCESS, True))
+        ledger.finish_rank(ledger.request, 0, lc.Status.SUCCESS, True)
+        receiver._maybe_publish(instance)
+        self.assertTrue(ledger.remote_quiesced())
+        self.assertFalse(receiver.done_requests)
+        self.assertEqual(order, [])
+
+    def test_actual_terminal_failure_fails_bounded_before_watchdog(self):
+        receiver, ledger, _, order = self.publisher()
+        ledger.finish_rank(ledger.request, 0, lc.Status.FAILED, False)
+        receiver._maybe_publish(ledger.request.request_instance)
+        self.assertEqual(receiver.failed_requests, {"external"})
+        self.assertFalse(ledger.remote_quiesced())
+        self.assertEqual(order, [])
+
     def fixture(self):
         request = lc.RequestKey("wire-entry-request", 5)
         required = tuple(
@@ -163,14 +216,89 @@ class TestEarlyTargetAdmission(unittest.TestCase):
         lease = SimpleNamespace(request=ledger.request, allocation=SimpleNamespace(group_block_ids=((1, 3),)))
         worker._install_admitted_target(request_id, lease, ledger)
         external = lc.get_external_request_id(request_id)
-        self.assertEqual(worker.request_map[external], request_id)
+        self.assertEqual(worker.request_map[request_id], request_id)
+        self.assertNotIn(external, worker.request_map)
         self.assertIs(worker.kv_recv_layer_thread.ledger_by_req[ledger.request.request_instance], ledger)
         self.assertEqual(worker._admitted_target_blocks[request_id], ((1, 3),))
         with self.assertRaises(lc.ContractError):
             worker._install_admitted_target(request_id, lease, ledger)
 
+    def test_reused_external_id_keeps_both_engine_lifetimes_until_their_own_retirement(self):
+        worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
+        worker.request_map = {}
+        worker.kv_recv_layer_thread = SimpleNamespace(
+            lock=threading.RLock(), ledger_by_req={}, instance_to_req={}, receipt_mode_reqs=set(), receipt_deadlines={}
+        )
+        instances = []
+        for suffix in ("12345678", "abcdefgh"):
+            _, ledger, _ = TestExactReceiverProtocol().fixture()
+            ledger.request = lc.RequestKey(suffix, 0)
+            request_id = "same-external-" + suffix
+            lease = SimpleNamespace(request=ledger.request, allocation=SimpleNamespace(group_block_ids=((1, 3),)))
+            worker._install_admitted_target(request_id, lease, ledger)
+            instances.append((request_id, lease, ledger))
+        self.assertEqual(len(worker.request_map), 2)
+        worker._retire_admitted_target(*instances[0])
+        request_id, lease, ledger = instances[1]
+        self.assertEqual(worker.request_map, {request_id: request_id})
+        self.assertIs(worker.kv_recv_layer_thread.ledger_by_req[lease.request.request_instance], ledger)
+        self.assertIn("same-external", worker.kv_recv_layer_thread.receipt_mode_reqs)
+        worker._retire_admitted_target(*instances[1])
+        self.assertFalse(worker.request_map)
+        self.assertFalse(worker.kv_recv_layer_thread.receipt_mode_reqs)
+
+
+class TestReceiptFailureIdentity(unittest.TestCase):
+    def test_actual_transfer_results_report_receipt_failure_by_request_without_numeric_block_invalidation(self):
+        worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
+        worker.vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
+        )
+        failed = "failed-request-12345678"
+        other = "ordinary-request-abcdefgh"
+        worker.request_map = {failed: failed, "ordinary-request": other}
+        worker._admitted_target_blocks = {failed: ((1, 3), (1, 3))}
+        worker._invalid_block_ids = set()
+        worker._failed_receives = set()
+        worker._recving_metadata = {other: SimpleNamespace(local_block_ids=[[1, 3], [1, 3]])}
+        worker.virtual_request = set()
+        worker.kv_recv_layer_thread = SimpleNamespace(
+            get_and_clear_done_requests=lambda: set(),
+            get_and_clear_failed_requests=lambda: {failed},
+            forget_request=Mock(),
+        )
+        connector = object.__new__(lc.MooncakeLayerwiseConnector)
+        connector.connector_worker = worker
+        result = connector.get_transfer_results(set())
+        self.assertEqual(result.failed_recving, {failed})
+        self.assertEqual(result.finished_recving, {failed})
+        self.assertFalse(worker.get_block_ids_with_load_errors())
+        self.assertEqual(worker.request_map, {failed: failed, "ordinary-request": other})
+        self.assertIn(failed, worker._admitted_target_blocks)
+        worker.kv_recv_layer_thread.forget_request.assert_called_once_with(failed, failed=True)
+        self.assertFalse(worker.take_failed_receives())
+
 
 class TestSourceReadyPreparation(unittest.TestCase):
+    def test_actual_runner_context_uses_registered_owner_and_preserves_ordinary_mode(self):
+        from contextlib import nullcontext
+
+        from vllm_ascend.worker import model_runner_v1 as mr
+
+        output = SimpleNamespace(num_scheduled_tokens={"internal": 1})
+        context = nullcontext()
+        group = SimpleNamespace(requires_target_owner=True, target_use_context=Mock(return_value=context))
+        runner = object.__new__(mr.NPUModelRunner)
+        with (
+            patch.object(mr, "has_kv_transfer_group", return_value=True),
+            patch.object(mr, "get_kv_transfer_group", return_value=group),
+        ):
+            self.assertIs(runner.receipt_target_use_context(output), context)
+            group.target_use_context.assert_called_once_with(("internal",))
+            group.requires_target_owner = False
+            runner.receipt_target_use_context(output)
+            self.assertEqual(group.target_use_context.call_count, 1)
+
     def worker(self):
         worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
         worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_producer=True))

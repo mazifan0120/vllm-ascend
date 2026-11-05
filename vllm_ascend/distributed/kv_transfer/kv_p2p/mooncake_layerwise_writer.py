@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     ContractError,
     Status,
+    TargetClosedError,
     TransferResult,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import ManifestWritePlan, plan_layer_writes
@@ -200,7 +201,7 @@ class ManifestSourceWriter:
                     native_started = True
                     quiesced = False
                     result = engine.batch_transfer_sync_write(endpoint, sources, destinations, lengths)
-                    if type(result) is not int or result < 0:
+                    if type(result) is not int or result != 0:
                         raise ContractError(f"Native component WRITE did not complete successfully: {result!r}")
                     quiesced = True
                     native_started = False
@@ -208,6 +209,11 @@ class ManifestSourceWriter:
                     (TransferResult(write.key, Status.SUCCESS, True), write.receiver_ranks) for write in writes
                 )
         except Exception as caught:
+            if isinstance(caught, TargetClosedError) and not native_started:
+                with self._lock:
+                    job.state.cancelled = job.state.closed = True
+                self._finish_job(job, tuple(results), None, True)
+                return
             error = caught
             # A failed fence/lookup/plan has submitted no source reader. A
             # failing or raising native call has an unknown DMA outcome.

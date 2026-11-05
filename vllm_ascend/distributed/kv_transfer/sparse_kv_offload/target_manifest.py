@@ -23,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_catalog import
 
 CANONICAL_MAIN_RANK = 0
 TARGET_DTYPE_BYTES = (("int8", 1), ("float16", 2), ("bfloat16", 2), ("float32", 4))
+MAX_TARGET_ENTRY_DIMENSIONS = 8
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ class RankTarget:
         return self.catalog.rank
 
 
-def _validate_entry_geometry(entry, view, region, block_ids, prompt_tokens) -> None:
+def _validate_entry_geometry(entry, view, region, block_ids, prompt_tokens, block_validation_cache) -> None:
     itemsize = next((size for name, size in TARGET_DTYPE_BYTES if view.dtype.removeprefix("torch.") == name), None)
     if (
         itemsize is None
@@ -44,11 +45,11 @@ def _validate_entry_geometry(entry, view, region, block_ids, prompt_tokens) -> N
         or entry.entry < 0
         or type(entry.group) is not int
         or entry.group < 0
-        or len(entry.shape) < 2
+        or not 2 <= len(entry.shape) <= MAX_TARGET_ENTRY_DIMENSIONS
         or len(entry.strides_bytes) != len(entry.shape)
         or any(type(v) is not int or v < 1 for v in (*entry.shape, *entry.strides_bytes))
         or view.block_capacity < 1
-        or not view.strides_bytes
+        or not 1 <= len(view.strides_bytes) <= MAX_TARGET_ENTRY_DIMENSIONS
         or entry.strides_bytes[0] != view.strides_bytes[0]
     ):
         raise ContractError("Invalid target entry type, shape, dtype or stride")
@@ -61,16 +62,22 @@ def _validate_entry_geometry(entry, view, region, block_ids, prompt_tokens) -> N
         or entry.strides_bytes[0] < page_bytes
         or end > region.length_bytes
         or any(entry.strides_bytes[i] != math.prod(entry.shape[i + 1 :]) * itemsize for i in range(1, len(entry.shape)))
-        or len(block_ids) * view.manager_block_size_tokens < prompt_tokens
-        or len(set(block_ids)) != len(block_ids)
-        or any(type(block) is not int or not 0 <= block < view.block_capacity for block in block_ids)
     ):
         raise ContractError("Target entry footprint or request blocks exceed registered capacity")
+    identity = (id(block_ids), view.block_capacity, view.manager_block_size_tokens, prompt_tokens)
+    if identity not in block_validation_cache:
+        if (
+            len(block_ids) * view.manager_block_size_tokens < prompt_tokens
+            or any(type(block) is not int or not 0 <= block < view.block_capacity for block in block_ids)
+            or len(set(block_ids)) != len(block_ids)
+        ):
+            raise ContractError("Target entry footprint or request blocks exceed registered capacity")
+        block_validation_cache.add(identity)
     if view.component is Component.MAIN and view.dtype.removeprefix("torch.") != "bfloat16":
         raise ContractError("Shared Host Main target requires BF16")
 
 
-def _validate_rank(target: RankTarget, tp_size: int) -> None:
+def _validate_rank(target: RankTarget, tp_size: int, block_validation_cache) -> None:
     if (
         type(target) is not RankTarget
         or type(target.catalog) is not TargetCatalog
@@ -124,6 +131,7 @@ def _validate_rank(target: RankTarget, tp_size: int) -> None:
             regions[view.region_binding],
             lease.allocation.group_block_ids[entry.group],
             lease.allocation.prompt_tokens,
+            block_validation_cache,
         )
         expected_view = replace(view, block_ids=lease.allocation.group_block_ids[entry.group])
         if expected_view in expected:
@@ -178,8 +186,9 @@ def aggregate_rank_targets(targets: tuple[RankTarget, ...]) -> TargetLease:
     if type(targets) is not tuple or not targets:
         raise ContractError("Manifest requires all TP owner targets")
     tp_size = len(targets)
+    block_validation_cache = set()
     for target in targets:
-        _validate_rank(target, tp_size)
+        _validate_rank(target, tp_size, block_validation_cache)
     if tuple(target.rank for target in targets) != tuple(range(tp_size)):
         raise ContractError("Manifest must contain every TP rank exactly once in rank order")
     canonical = targets[CANONICAL_MAIN_RANK]

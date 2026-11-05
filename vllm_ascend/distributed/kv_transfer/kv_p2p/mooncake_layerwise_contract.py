@@ -35,6 +35,10 @@ class ContractError(Exception):
     """
 
 
+class TargetClosedError(ContractError):
+    """The exact retained delivery is closed; no new native source reads may start."""
+
+
 def _require_int(name: str, value: object, minimum: int | None = None, maximum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ContractError(f"{name} must be an int (bool is not accepted), got {type(value).__name__}")
@@ -575,6 +579,7 @@ __all__ = [
     "RequestKey",
     "Status",
     "TargetLease",
+    "TargetClosedError",
     "TargetProvider",
     "TargetScope",
     "TokenRange",

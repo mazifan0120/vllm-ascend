@@ -7,12 +7,10 @@ allocation owner's process (or a real transport to it), never on pickled tensor
 references. Missing retention, visibility or release guarantees fail closed.
 """
 
-import hashlib
-import json
 import threading
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
@@ -334,8 +332,9 @@ class RegisteredTargetProvider:
 
     @staticmethod
     def _fingerprint(lease: TargetLease) -> str:
-        data = json.dumps(asdict(lease), sort_keys=True, separators=(",", ":")).encode()
-        return hashlib.sha256(data).hexdigest()
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import lease_fingerprint
+
+        return lease_fingerprint(lease)
 
     def release_target(self, lease: TargetLease) -> None:
         with self._lock:

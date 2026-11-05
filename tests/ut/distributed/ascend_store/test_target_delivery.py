@@ -48,8 +48,7 @@ class TestTargetDelivery(unittest.TestCase):
             provider = MultiRankTargetProvider(tuple(TargetProviderClient(t) for t in transports))
             lease = provider.acquire_target(request, allocation)
             manifest = provider.manifest(lease)
-            with self.assertRaises(ContractError):
-                provider.delivery_status(lease)
+            self.assertEqual(provider.delivery_status(lease), {"ready": False, "remote_quiesced": True})
             provider.admit_target(manifest, "internal-request")
             with self.assertRaises(ContractError):
                 provider.admit_target(manifest, "changed-internal-request")
@@ -108,8 +107,7 @@ class TestTargetDelivery(unittest.TestCase):
             control.admit_target(manifest, "internal")
         with self.assertRaises(ContractError):
             control.admit_target(manifest, "internal")
-        with self.assertRaises(ContractError):
-            control.delivery_status(manifest.for_rank(0).lease)
+        self.assertEqual(control.delivery_status(manifest.for_rank(0).lease), {"ready": False, "remote_quiesced": True})
         self.assertEqual(len(calls), 1)
         provider.release_target(lease)
 

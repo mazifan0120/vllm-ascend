@@ -12,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     assert_pd_consistent,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
+    TARGET_LEASE_WIRE_VERSION,
     target_lease_from_wire,
     target_lease_to_wire,
 )
@@ -34,13 +35,33 @@ class TestLayerwiseTargetWire(unittest.TestCase):
         self.assertTrue(all(region.transport_endpoint for region in restored.regions))
 
     def test_schema_versions_are_checked_without_bool_coercion(self):
-        for field in ("wire_version", "contract_version"):
-            for wrong in (True, 2, "1"):
+        for field, invalid in (
+            ("wire_version", (True, TARGET_LEASE_WIRE_VERSION + 1, "2")),
+            ("contract_version", (True, 2, "1")),
+        ):
+            for wrong in invalid:
                 with self.subTest(field=field, wrong=wrong):
                     wire = copy.deepcopy(self.wire)
                     wire[field] = wrong
                     with self.assertRaises(ContractError):
                         target_lease_from_wire(wire)
+
+    def test_block_maps_are_shared_with_allocation_and_legacy_arrays_still_decode(self):
+        self.assertTrue(all(type(view["block_ids"]) is dict for view in self.wire["views"]))
+        old = copy.deepcopy(self.wire)
+        old["wire_version"] = 1
+        for view in old["views"]:
+            group = view["block_ids"]["allocation_group"]
+            view["block_ids"] = list(self.lease.allocation.group_block_ids[group])
+        self.assertEqual(target_lease_from_wire(old), self.lease)
+        for invalid in (True, -1, len(self.lease.allocation.group_block_ids), "0"):
+            wire = copy.deepcopy(self.wire)
+            wire["views"][0]["block_ids"] = {"allocation_group": invalid}
+            with self.subTest(group=invalid), self.assertRaises(ContractError):
+                target_lease_from_wire(wire)
+        old["views"][0]["block_ids"] = {"allocation_group": 0}
+        with self.assertRaises(ContractError):
+            target_lease_from_wire(old)
 
     def test_mismatched_request_identity_is_rejected(self):
         wire = copy.deepcopy(self.wire)

@@ -38,7 +38,10 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
     TargetProviderClient,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import SchedulerRetentionRegistry
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_runtime import OwnerTargetRuntime
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_runtime import (
+    OwnerTargetRuntime,
+    ReceivedTargetWrites,
+)
 
 
 class DeviceDescriptor:
@@ -74,6 +77,14 @@ class ThreadedStreams:
         self.dependency = None
         self.pending = []
         self.installs = 0
+        self.receive_confirms = 0
+
+    def confirmed_receive_dependency(self, lease):
+        # CPU-only stand-in: the runtime's call order is under test, not DMA.
+        self.receive_confirms += 1
+        host = threading.Event()
+        host.set()
+        return ReceivedTargetWrites(lease, host, Completion(True))
 
     def install_visibility(self, dependency):
         self.dependency = dependency.indexer_event

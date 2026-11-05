@@ -33,7 +33,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import T
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_wire import RetentionOp, RetentionResult
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_provider import TargetBinding
 
-OWNER_WIRE_VERSION = 1
+OWNER_WIRE_VERSION = 2
+SUPPORTED_OWNER_WIRE_VERSIONS = (1, OWNER_WIRE_VERSION)
 MAX_OWNER_FRAME_BYTES = 8 * 1024 * 1024
 MAX_OWNER_WIRE_DEPTH = 64
 MAX_OWNER_WIRE_NODES = 500_000
@@ -66,8 +67,12 @@ OWNER_ENUM_TYPES = (Component, Status)
 
 
 class _ValueCodec:
-    def __init__(self) -> None:
+    def __init__(self, *, references=True) -> None:
         self._remaining = MAX_OWNER_WIRE_NODES
+        self._references = references
+        self._encoded_tuples = {}
+        self._encoded_tuple_ids = {}
+        self._decoded_tuples = {}
 
     def _visit(self, depth: int) -> None:
         self._remaining -= 1
@@ -81,6 +86,25 @@ class _ValueCodec:
             return value
         if kind in OWNER_ENUM_TYPES:
             return ["enum", kind.__name__, value.value]
+        if self._references and kind is tuple and id(value) in self._encoded_tuple_ids:
+            if value and depth >= MAX_OWNER_WIRE_DEPTH:
+                raise ContractError("Owner wire value exceeds traversal limits")
+            return ["tuple_ref", self._encoded_tuple_ids[id(value)][1]]
+        if self._references and kind is tuple and all(type(v) in (str, int, bool, type(None)) for v in value):
+            # Block IDs recur in every view and rank. Only immutable primitive
+            # tuples can be referenced; lists/records/local objects never can.
+            # Include each primitive's type: Python equates (True,) and (1,).
+            identity = tuple((type(v), v) for v in value)
+            if identity in self._encoded_tuples:
+                if value and depth >= MAX_OWNER_WIRE_DEPTH:
+                    raise ContractError("Owner wire value exceeds traversal limits")
+                index = self._encoded_tuples[identity]
+                self._encoded_tuple_ids[id(value)] = (value, index)
+                return ["tuple_ref", index]
+            index = len(self._encoded_tuples)
+            self._encoded_tuples[identity] = index
+            self._encoded_tuple_ids[id(value)] = (value, index)
+            return ["tuple_def", index, [self.encode(v, depth + 1) for v in value]]
         if kind in (tuple, list):
             return ["tuple" if kind is tuple else "list", [self.encode(v, depth + 1) for v in value]]
         if kind is dict:
@@ -96,6 +120,26 @@ class _ValueCodec:
         if type(value) is not list or not value or type(value[0]) is not str:
             raise ContractError("Malformed owner wire value")
         tag = value[0]
+        if self._references and tag in ("tuple_ref", "tuple_def"):
+            if len(value) < 2 or type(value[1]) is not int or value[1] < 0:
+                raise ContractError("Malformed owner primitive tuple reference")
+            index = value[1]
+            if tag == "tuple_ref":
+                if len(value) != 2 or index not in self._decoded_tuples:
+                    raise ContractError("Unknown or forward owner primitive tuple reference")
+                if self._decoded_tuples[index] and depth >= MAX_OWNER_WIRE_DEPTH:
+                    raise ContractError("Owner wire value exceeds traversal limits")
+                return self._decoded_tuples[index]
+            if (
+                len(value) != 3
+                or index != len(self._decoded_tuples)
+                or type(value[2]) is not list
+                or any(type(item) not in (str, int, bool, type(None)) for item in value[2])
+            ):
+                raise ContractError("Duplicate, unordered or non-primitive owner tuple definition")
+            result = tuple(self.decode(item, depth + 1) for item in value[2])
+            self._decoded_tuples[index] = result
+            return result
         if tag == "enum" and len(value) == 3:
             kind = next((t for t in OWNER_ENUM_TYPES if t.__name__ == value[1]), None)
             if kind is None or type(value[2]) is not str:
@@ -141,9 +185,9 @@ def decode_owner_value(frame: bytes):
             type(envelope) is not list
             or len(envelope) != 2
             or type(envelope[0]) is not int
-            or envelope[0] != OWNER_WIRE_VERSION
+            or envelope[0] not in SUPPORTED_OWNER_WIRE_VERSIONS
         ):
             raise ContractError("Owner wire protocol version mismatch")
-        return _ValueCodec().decode(envelope[1])
+        return _ValueCodec(references=envelope[0] >= 2).decode(envelope[1])
     except (TypeError, ValueError, RecursionError, UnicodeError, KeyError, AttributeError, IndexError) as error:
         raise ContractError(f"Cannot decode owner wire value: {error}") from error

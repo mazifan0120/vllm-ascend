@@ -15,6 +15,7 @@ from vllm import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_ascend.core.receipt_scheduler import ReceiptScheduler
@@ -70,6 +71,7 @@ def _fixture(name):
     scheduler.kv_cache_manager = manager
     scheduler._target_registry = registry
     scheduler._retained_finished = set()
+    scheduler._target_recv_pending = set()
     scheduler.requests = {name: request}
     scheduler.running = [request]
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
@@ -83,6 +85,7 @@ def _fixture(name):
     scheduler.prev_step_scheduled_req_ids = {name}
     scheduler.failed_recving_kv_req_ids = set()
     scheduler.finished_recving_kv_req_ids = set()
+    scheduler.recompute_kv_load_failures = False
     request.status = RequestStatus.RUNNING
     return scheduler, request, allocation, proof, calls, raw
 
@@ -90,6 +93,48 @@ def _fixture(name):
 def exercise_scheduler_lifetime():
     # Proofs below authorize CPU-only unused blocks, not real remote transfers.
     passed = []
+    scheduler, request, _, proof, _, raw = _fixture("all-rank-receive")
+    visible = threading.Event()
+    outputs = []
+    scheduler.connector.is_target_ready = lambda req: visible.is_set()
+    scheduler.connector.update_connector_output = lambda output: outputs.append(output)
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.running.clear()
+    scheduler.waiting.add_request(request)
+    original = KVConnectorOutput(finished_recving={request.request_id}, expected_finished_count=16)
+    scheduler._update_from_kv_xfer_finished(original)
+    assert original.finished_recving == {request.request_id}, "Do not mutate worker output shared with other consumers"
+    assert request.request_id in scheduler._target_recv_pending
+    assert request.request_id not in scheduler.finished_recving_kv_req_ids
+    assert not outputs[0].finished_recving and outputs[0].expected_finished_count == 16
+    scheduler._poll_target_receives()
+    assert request.request_id not in scheduler.finished_recving_kv_req_ids
+    visible.set()
+    scheduler._poll_target_receives()
+    assert request.request_id in scheduler.finished_recving_kv_req_ids
+    assert not scheduler._target_recv_pending
+    scheduler._poll_target_receives()
+    assert len(outputs) == 2, "The worker's one-shot completion must be delivered once after all ranks prepare"
+    proof.set()
+    request.status = RequestStatus.FINISHED_ABORTED
+    scheduler._free_blocks(request)
+    passed.append("all_rank_ready_preserves_one_shot_worker_completion")
+
+    scheduler, request, _, proof, _, raw = _fixture("cancel-pending-receive")
+    scheduler.connector.is_target_ready = lambda req: False
+    scheduler.connector.update_connector_output = lambda output: None
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={request.request_id}))
+    request.status = RequestStatus.FINISHED_ABORTED
+    scheduler._poll_target_receives()
+    assert request.request_id not in scheduler.finished_recving_kv_req_ids
+    assert raw.get_block_ids(request.request_id)[0], "Cancelled receiver still needs its native retirement proof"
+    assert request.request_id in scheduler._retained_finished
+    proof.set()
+    scheduler._drain_retained_finished()
+    assert raw.block_pool.get_num_free_blocks() == 15
+    passed.append("cancelled_pending_receive_never_becomes_decode_ready")
+
     scheduler, request, allocation, proof, calls, raw = _fixture("retained-preempt")
     original_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
     for method in (scheduler.kv_cache_manager.free, scheduler.kv_cache_manager.pop_blocks_for_free):
@@ -165,6 +210,19 @@ def exercise_scheduler_lifetime():
     assert request.status == RequestStatus.WAITING
     assert raw.block_pool.get_num_free_blocks() == 15
     passed.append("failed_receive_cannot_bypass_retention")
+
+    scheduler, request, _, proof, _, raw = _fixture("late-receive-failure")
+    assert scheduler._handle_failed_recving({request.request_id, "unrelated"}) == {request.request_id}
+    assert request.status == RequestStatus.RUNNING
+    assert raw.get_block_ids(request.request_id)[0], "Failure reporting must not free retained targets"
+    request.status = RequestStatus.FINISHED_ERROR
+    assert not scheduler._handle_failed_recving({request.request_id})
+    scheduler._free_blocks(request)
+    assert raw.get_block_ids(request.request_id)[0]
+    proof.set()
+    scheduler._drain_retained_finished()
+    assert raw.block_pool.get_num_free_blocks() == 15
+    passed.append("late_running_receive_failure_preserves_target_until_proof")
     print(json.dumps({"status": "PASS", "real_scheduler_cases": passed, "model_or_dma_test": False}), flush=True)
 
 

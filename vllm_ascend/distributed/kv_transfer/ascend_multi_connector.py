@@ -1,3 +1,4 @@
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -204,6 +205,21 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             for c in self._connectors
             if callable(getattr(c, "prepare_target_free", None))
         )
+
+    def is_target_ready(self, request) -> bool:
+        return all(
+            connector.is_target_ready(request)
+            for connector in self._connectors
+            if callable(getattr(connector, "is_target_ready", None))
+        )
+
+    @contextmanager
+    def target_use_context(self, request_ids):
+        with ExitStack() as stack:
+            for connector in self._connectors:
+                if getattr(connector, "requires_target_owner", False):
+                    stack.enter_context(connector.target_use_context(request_ids))
+            yield
 
     def _receipt_restore_only_requests(self):
         """Collect request ids marked restore-only across layerwise child metadata.

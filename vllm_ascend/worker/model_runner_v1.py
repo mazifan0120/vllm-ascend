@@ -290,6 +290,7 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
+from vllm_ascend.core.receipt_execution import use_receipt_targets
 
 v41_metadata_builder_type: type[AscendDSAV41MetadataBuilder] = AscendDSAV41MetadataBuilder
 v41_cache_layer_type: type[DeepseekV41CacheLayer] = DeepseekV41CacheLayer
@@ -2223,7 +2224,19 @@ class NPUModelRunner(GPUModelRunner):
         )
         return cut_tokens
 
+    def receipt_target_use_context(self, scheduler_output):
+        if not has_kv_transfer_group():
+            return nullcontext()
+        connector = get_kv_transfer_group()
+        if not getattr(connector,"requires_target_owner",False):
+            return nullcontext()
+        use = getattr(connector,"target_use_context",None)
+        if not callable(use):
+            raise RuntimeError("Receipt target connector must cover actual model execution")
+        return use(tuple(scheduler_output.num_scheduled_tokens))
+
     @torch.inference_mode()
+    @use_receipt_targets
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",

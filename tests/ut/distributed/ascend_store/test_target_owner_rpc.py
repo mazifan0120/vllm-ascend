@@ -25,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec import (
     MAX_OWNER_WIRE_DEPTH,
+    OWNER_WIRE_VERSION,
     decode_owner_value,
     encode_owner_value,
 )
@@ -81,7 +82,7 @@ class TestOwnerValueCodec(unittest.TestCase):
     def test_unknown_types_bad_versions_duplicates_and_malformed_records_fail_closed(self):
         frames = (
             [True, None],
-            [2, None],
+            [OWNER_WIRE_VERSION + 1, None],
             [1, ["record", "LocalRegion", []]],
             [1, ["record", "RequestKey", []]],
             [1, ["enum", "Component", "typo"]],
@@ -99,6 +100,48 @@ class TestOwnerValueCodec(unittest.TestCase):
             value = (value,)
         with self.assertRaises(ContractError):
             encode_owner_value(value)
+
+    def test_primitive_tuple_references_preserve_bool_int_types_and_share_only_immutable_values(self):
+        value = ((True,), (1,), (True,), (1,), [1], [1])
+        decoded = decode_owner_value(encode_owner_value(value))
+        self.assertEqual(decoded, value)
+        self.assertIs(type(decoded[0][0]), bool)
+        self.assertIs(type(decoded[1][0]), int)
+        self.assertIs(decoded[0], decoded[2])
+        self.assertIs(decoded[1], decoded[3])
+        self.assertIsNot(decoded[4], decoded[5])
+        self.assertEqual(decode_owner_value(b'[1,["tuple",[1,true,"old"]]]'), (1, True, "old"))
+
+    def test_tuple_references_reject_forward_duplicate_mutable_and_legacy_definitions(self):
+        for value in (
+            ["tuple_ref", 0],
+            ["tuple_ref", True],
+            ["tuple_def", True, []],
+            ["tuple_def", 1, []],
+            ["tuple_def", 0, [["tuple_ref", 0]]],
+            ["tuple_def", 0, [{}]],
+            ["tuple", [["tuple_def", 0, [1]], ["tuple_def", 0, [2]]]],
+            ["tuple", [["tuple_def", 0, [1]], ["tuple_ref", 1]]],
+            ["tuple", [["tuple_def", 0, [1]], ["tuple_ref", 0, "extra"]]],
+        ):
+            with self.subTest(value=value), self.assertRaises(ContractError):
+                decode_owner_value(json.dumps([OWNER_WIRE_VERSION, value]).encode())
+        with self.assertRaises(ContractError):
+            decode_owner_value(b'[1,["tuple_def",0,[1]]]')
+
+    def test_shared_tuple_references_do_not_bypass_logical_depth_limit(self):
+        block = (1,)
+        nested = block
+        for _ in range(MAX_OWNER_WIRE_DEPTH - 1):
+            nested = (nested,)
+        with self.assertRaises(ContractError):
+            encode_owner_value((block, nested))
+        nested_wire = ["tuple_ref", 0]
+        for _ in range(MAX_OWNER_WIRE_DEPTH - 1):
+            nested_wire = ["tuple", [nested_wire]]
+        frame = [OWNER_WIRE_VERSION, ["tuple", [["tuple_def", 0, [1]], nested_wire]]]
+        with self.assertRaises(ContractError):
+            decode_owner_value(json.dumps(frame).encode())
 
 
 class TestOwnerRpc(unittest.TestCase):

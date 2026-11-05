@@ -6,6 +6,59 @@
 本次已纳入远端增量并修复一批入口、元数据和失败路径；模型端到端功能及性能尚未验证。
 早期 A1/A2 的原生资源验证仍然有效，但不等于完整 PD 验收。
 
+## 第五阶段：D 消费与回收接线、元数据容量（2026-11-05）
+
+本阶段仍未切换模型部署。新增生产接线已通过控制测试，真实远端 WRITE 与模型验收仍待运行。
+
+- 精确逐 entry 结果及全部 P terminal 成功、静止后，receiver 才调用 worker 本地
+  `confirm_native_received()`，记录实际 D consumption stream 的 NPU event 并建立 Host
+  可见性依赖，再走 `prepare_decode()`。这个入口不向 scheduler owner RPC 暴露；
+  不能用 request end 代替原生完成。sync WRITE 的真实 Host／NPU 可见性仍需设备验证。
+- 实际 `NPUModelRunner.execute_model()` 用 `use_receipt_targets` 包住整个调用，覆盖
+  异常和返回 None 的分支。MultiConnector 逐 owner 进入 runtime.use，退出时记录
+  compute／manager writeback stream 尾部事件，不能在 Python 返回时直接丢引用。
+  普通模式只经过空上下文。必须覆盖整个 runner 调用，是因为逐层 hook 不能涵盖
+  forward 外的预处理和异步写回；这里采用现有 runner 的显式入口，没有全局 monkey patch。
+  实际 NPU 开销及兼容性尚需模型回归，不据控制测试宣称性能无影响。
+- `ReceiptScheduler` 保存单次 finished_recving 通知，全部 TP owner ready 后才交给基类；
+  后续空闲调度继续轮询，不丢掉较早完成 rank 的通知。回收必须有所有 owner 的
+  remote_quiesced、真实 GPU 处理 fence 和 owner stream 静止，之后才签发 ReleaseAck
+  并 retire 原分配。未 admission／未暴露地址的目标可由关闭 lookup gate 证明没有写者。
+- exact target 使用带 EngineCore 后缀的内部请求 ID，完成接收后保留 ledger、block map
+  和失败归属直至 owner retirement；同一外部 ID 的两个不同生命周期不会互相覆盖。
+  watchdog／显式失败永久取消 decode，但继续接收迟到的静止 proof。真实 vLLM
+  `failed_recving` 按请求报告失败，不用不同 Main／Indexer pool 可能重叠的数字 block ID。
+  已进入 RUNNING 的 retained 请求也会被迟到失败命中；未知 DMA 继续保留资源。
+- 地址 lookup 在 worker 本地 gate 下检查 lease／generation／terminal／abort／retirement；
+  closed 目标的首次 lookup 被拒绝，P 在尚未提交 native WRITE 时按安全取消处理。
+  **这尚未关闭 P 已缓存地址后的全部未来写者，不等于 D→P 远端取消协议完成。**
+- owner codec v2 仅引用不可变 primitive tuple，保留类型、深度和所有既有限额；
+  HTTP target lease v2 的 view block map 引用 allocation group。两种 decoder 都接受 v1。
+  TP16×78 层、32K／64K／128K prompt 的合法 manifest 通过 owner 与 HTTP 往返；
+  未扩大 8 MiB／500k node 限额。旧版 reader 不识别 v2，P／D／scheduler／worker 须一致升级。
+
+启用此路径的 D 引擎必须选择
+`vllm_ascend.core.receipt_scheduler.ReceiptScheduler`、`kv_load_failure_policy: fail`，
+并在 D connector extra config 配置 `layerwise_receipt_mode: true`、
+`target_owner_rpc_base_port` 和 `target_retention_rpc_port`（端口须空闲）；
+P 仍由请求 manifest 触发。现有普通部署配置不自动改成 receipt 模式。
+
+待验证／待完成：新 bounded 注册路径和真实 RoCE WRITE→Host／NPU read；D→P
+关闭未来写者并取得静止证明；P restore-only 的真实 Store coverage／调度选择；
+全模型短请求→32K／64K、持续 decode／写回、并发取消／抢占／重分配／失败及普通兼容性；
+匹配配置的性能和关键路径分析。当前跨 owner release 部分成功后 RPC 失败仍保持内存
+保守持有，但正在运行的抢占候选可能需要隔离／恢复；不能宣称请求级故障恢复已完整。
+
+本阶段组合 CPU 回归 284 项／76 子用例通过（1 项运行时限定 skip），P 聚焦
+141 项通过。原 P 容器独立进程内 749 个候选生产 Python 源文件内存加载、
+15 项真实 connector 方法及 7 条真实 vLLM scheduler 控制路径通过，最终源码摘要匹配。
+这些测试没有远端 DMA 或模型计算；Host 注册选择另由实际 CPU storage／recording TE 检查。
+变更文件 manual hooks 全通过；隔离副本全仓 CI 因未改动基线 lint／拼写失败，
+自动格式化的 7 个基线文件与交付无交集，没有复制回源码。四个原容器身份、image、
+owner、脚本及各 10 个已部署源码摘要匹配，健康 200、running／waiting 均为零。
+
+证据：`artifacts/p-main-buffer-reuse/pd-transfer-decode-wiring-20261105/`。
+
 ## 第四阶段：SourceReady 直接发送与 exact epoch（2026-11-05）
 
 - 新增 `ManifestSourceWriter`，`prepare_layerwise_step()` 先登记 manifest 请求，

@@ -6,7 +6,11 @@ import math
 import msgspec
 import zmq
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import CONTRACT_VERSION, ContractError
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
+    CONTRACT_VERSION,
+    ContractError,
+    TargetClosedError,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import RegionAddress
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import target_lease_to_wire
 
@@ -119,6 +123,8 @@ def target_peer_call(host: str, port: int, message: tuple, *, timeout: float) ->
         socket.send(msgspec.msgpack.encode(message))
         response = msgspec.msgpack.decode(socket.recv(), type=tuple)
         if response and response[0] == TARGET_PEER_ERROR:
+            if len(response) > 1 and response[1] == "TargetClosedError":
+                raise TargetClosedError("Target peer closed this exact delivery")
             raise ContractError(f"Target peer rejected the operation: {response[1:]}")
         return response
     except (zmq.ZMQError, msgspec.DecodeError) as error:

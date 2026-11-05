@@ -77,6 +77,9 @@ class TargetOwner:
     def publish_received(self, lease, host_visible, indexer_event) -> None:
         self.runtime.publish_received(lease, ReceivedTargetWrites(lease, host_visible, indexer_event))
 
+    def confirm_native_received(self, lease, receipt) -> None:
+        self.runtime.confirm_native_received(lease, receipt)
+
     @contextmanager
     def use(self, lease):
         with self.runtime.use(lease):
@@ -162,6 +165,10 @@ class DeferredTargetProvider:
         with self._operation() as owner:
             owner.publish_received(lease, host_visible, indexer_event)
 
+    def confirm_native_received(self, lease, receipt) -> None:
+        with self._operation() as owner:
+            owner.confirm_native_received(lease, receipt)
+
     @contextmanager
     def use(self, lease):
         with self._operation() as owner, owner.use(lease):
@@ -238,17 +245,23 @@ class TargetOwnerReply:
     error_message: str = ""
 
 
-def _assert_wire_value(value) -> None:
+def _assert_wire_value(value, checked=None) -> None:
+    if checked is None:
+        checked = {}
     if value is None or isinstance(value, (str, int, bool, Enum)):
         return
     if isinstance(value, (tuple, list)):
+        if type(value) is tuple and id(value) in checked:
+            return
         for item in value:
-            _assert_wire_value(item)
+            _assert_wire_value(item, checked)
+        if type(value) is tuple and all(type(item) in (str, int, bool, type(None)) for item in value):
+            checked[id(value)] = value
         return
     if isinstance(value, dict):
         for key, item in value.items():
-            _assert_wire_value(key)
-            _assert_wire_value(item)
+            _assert_wire_value(key, checked)
+            _assert_wire_value(item, checked)
         return
     if is_dataclass(value) and value.__class__.__module__ in (
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract",
@@ -258,7 +271,7 @@ def _assert_wire_value(value) -> None:
         __name__,
     ):
         for field in fields(value):
-            _assert_wire_value(getattr(value, field.name))
+            _assert_wire_value(getattr(value, field.name), checked)
         return
     raise TypeError("Owner IPC accepts only typed catalog/lease/receipt values, not local runtime objects")
 
@@ -292,6 +305,8 @@ class TargetOwnerDispatcher:
             method = getattr(self._delivery if self._delivery is not None else self._facade, operation, None)
             if callable(method):
                 operations[operation] = method
+        if self._delivery is not None:
+            operations["release"] = self._delivery.release_target
         try:
             _assert_wire_value(call.arguments)
             if call.operation not in operations:

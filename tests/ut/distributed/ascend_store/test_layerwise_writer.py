@@ -10,7 +10,11 @@ from types import SimpleNamespace
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 from tests.ut.distributed.ascend_store.test_layerwise_plan import MemoryFixture
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import ContractError, Status
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
+    ContractError,
+    Status,
+    TargetClosedError,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_source_consumer import LayerwiseSourceConsumer
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_writer import ManifestSourceWriter
 
@@ -40,6 +44,25 @@ def metadata(fixture):
 
 
 class TestSourceWriter(unittest.TestCase):
+    def test_closed_remote_target_before_address_lookup_cancels_without_native_reads(self):
+        def resolve(*args):
+            raise TargetClosedError("D cancelled before exposing addresses")
+
+        fixture, writer, work, proofs = self.make(resolve=resolve)
+        source, request = fixture.source(0)
+        done = []
+        engine = CpuEngine()
+        try:
+            job = writer.prepare_job(source, request, SimpleNamespace(synchronize=lambda: None))
+            job.publish(lambda *args: done.append(args))
+            work.get_nowait().execute(engine)
+            writer._proof_queue.join()
+            self.assertEqual(engine.calls, [])
+            self.assertEqual(done, [(None, True)])
+            self.assertEqual(proofs[-1][2], (Status.CANCELLED, True))
+        finally:
+            self.stop(writer)
+
     def test_failed_proof_delivery_does_not_repeat_timeout_for_every_layer_or_hold_source(self):
         calls = []
 
@@ -170,7 +193,7 @@ class TestSourceWriter(unittest.TestCase):
             self.stop(writer)
 
     def test_native_failure_or_exception_has_unknown_quiescence_and_no_successful_terminal(self):
-        for result in (-1, RuntimeError("unknown native failure")):
+        for result in (-1, 1, RuntimeError("unknown native failure"), TargetClosedError("error during native call")):
             fixture, writer, work, proofs = self.make()
             source, request = fixture.source(0)
             done = []

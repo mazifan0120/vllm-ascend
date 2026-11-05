@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Owner-side target lifetime and real stream dependencies for D offload.
 
-The connector supplies the actual remote Host-visible fence and device write
-completion event. This runtime never creates an already-completed receive
-fence. B still owns remote-DMA quiescence and scheduler block-free permission.
+The connector supplies receive dependencies directly, or confirms exact native
+sync-WRITE receipts before this runtime records the D consumption dependency.
+Request end alone never proves completion. The connector still owns remote-DMA
+quiescence and scheduler block-free permission.
 """
 
 import math
@@ -77,6 +78,20 @@ class NpuTargetStreams:
             raise ContractError("Indexer visibility event has not been recorded")
         with self._npu.device(self._device_id):
             self._stream.wait_event(dependency.indexer_event)
+
+    def confirmed_receive_dependency(self, lease: TargetLease) -> ReceivedTargetWrites:
+        """Called only after exact entry receipts prove remote sync WRITE completion.
+
+        The Host fence reflects that observed native completion, not a guessed
+        request state. Record a native event on the actual D consumption stream
+        for future work; no synthetic already-completed device event is used.
+        """
+        with self._npu.device(self._device_id), self._npu.stream(self._stream):
+            indexer_event = self._npu.Event()
+            indexer_event.record()
+        host_visible = threading.Event()
+        host_visible.set()
+        return ReceivedTargetWrites(lease, host_visible, indexer_event)
 
     def record_use(self) -> tuple:
         # Sparse fused writeback can run on a distinct stream. Fence every
@@ -227,6 +242,38 @@ class OwnerTargetRuntime:
             if state.closing or state.preparing or state.visible or state.dependency is not None:
                 raise ContractError("Receive dependencies cannot replace an active target generation")
             state.dependency = dependency
+
+    def confirm_native_received(self, lease: TargetLease, receipt: ReceiveReceipt) -> None:
+        """Worker-local bridge from judged native results to real receive fences.
+
+        Not an owner RPC operation. Only the actual receive ledger may supply
+        this receipt; a scheduler cannot manufacture a native receive fence.
+        """
+        if (
+            receipt.request != lease.request
+            or receipt.target_generation != lease.allocation.allocation_generation
+            or receipt.visible
+            or not (receipt.main_union_ok and receipt.indexer_ranks_ok and receipt.terminals_ok)
+        ):
+            raise ContractError("Native receive confirmation requires the exact complete entry receipt")
+        with self._lock:
+            state = self._state(lease)
+            if state.closing or state.preparing:
+                raise ContractError("Target receive confirmation races with lifecycle closure")
+            if state.dependency is not None:
+                return
+            state.preparing = True
+        try:
+            state.retention.validate()
+            self._resources.validate(lease)
+            dependency = self._streams.confirmed_receive_dependency(lease)
+            if type(dependency) is not ReceivedTargetWrites or dependency.lease != lease:
+                raise ContractError("Native receive dependency belongs to another target")
+            with self._lock:
+                state.dependency = dependency
+        finally:
+            with self._lock:
+                state.preparing = False
 
     def make_visible(self, lease: TargetLease, receipt: ReceiveReceipt) -> None:
         if (

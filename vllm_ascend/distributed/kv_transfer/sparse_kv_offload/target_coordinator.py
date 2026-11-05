@@ -6,11 +6,9 @@ contexts and allocation refs stay in their worker. Partial or uncertain owner
 operations remain recorded; they cannot turn into an acknowledgement to free.
 """
 
-import hashlib
-import json
 import threading
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     CONTRACT_VERSION,
@@ -42,7 +40,9 @@ class _CoordinatedTarget:
 
 
 def _fingerprint(lease: TargetLease) -> str:
-    return hashlib.sha256(json.dumps(asdict(lease), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import lease_fingerprint
+
+    return lease_fingerprint(lease)
 
 
 class MultiRankTargetProvider:
@@ -167,8 +167,6 @@ class MultiRankTargetProvider:
     def delivery_status(self, lease) -> dict:
         with self._lock:
             target = self._target(lease)
-            if target.admitted != set(range(len(self._owners))):
-                raise ContractError("All TP receive owners must admit before a delivery proof is available")
             statuses = tuple(owner.delivery_status(target.acquired[rank]) for rank, owner in enumerate(self._owners))
             if any(
                 type(status) is not dict

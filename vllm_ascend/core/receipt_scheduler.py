@@ -9,8 +9,11 @@ for receipt Decode engines, not for ordinary deployments.
 
 import threading
 import time
+from dataclasses import replace
 
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import ContractError
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import SerializedKVCacheManager
@@ -19,6 +22,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention impo
 class ReceiptScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.recompute_kv_load_failures:
+            raise ContractError("Receipt Decode requires kv_load_failure_policy='fail'")
         configure = getattr(self.connector, "configure_receipt_scheduler_runtime", None)
         if not callable(configure):
             raise ContractError("ReceiptScheduler requires a receipt-capable target connector")
@@ -33,6 +38,48 @@ class ReceiptScheduler(Scheduler):
         self.kv_cache_manager = manager
         self._target_registry = registry
         self._retained_finished: set[str] = set()
+        self._target_recv_pending: set[str] = set()
+
+    def _ready_target_receives(self):
+        ready = set()
+        pending = getattr(self, "_target_recv_pending", set())
+        for request_id in tuple(pending):
+            request = self.requests.get(request_id)
+            if request is None:
+                pending.discard(request_id)
+            elif request.is_finished():
+                ready.add(request_id)
+                pending.discard(request_id)
+            elif request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if self.connector.is_target_ready(request):
+                    ready.add(request_id)
+                    pending.discard(request_id)
+            else:
+                pending.discard(request_id)  # Stale duplicate from a preempted/running lifetime.
+        return ready
+
+    def _update_from_kv_xfer_finished(self, kv_connector_output):
+        self._target_recv_pending.update(kv_connector_output.finished_recving or ())
+        # Preserve one-shot completions while other TP owners prepare. All
+        # other fields (errors, stats, worker metadata) still flow normally.
+        filtered = replace(kv_connector_output, finished_recving=self._ready_target_receives())
+        super()._update_from_kv_xfer_finished(filtered)
+
+    def _poll_target_receives(self):
+        ready = self._ready_target_receives()
+        if ready:
+            super()._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving=ready))
+
+    def _handle_failed_recving(self, failed_req_ids):
+        affected = super()._handle_failed_recving(failed_req_ids)
+        # The base only handles WAITING_FOR_REMOTE_KVS. A late contradictory
+        # proof must also fail an already-running retained target by request
+        # identity, without evicting another pool's overlapping numeric IDs.
+        for request_id in failed_req_ids:
+            request = self.requests.get(request_id)
+            if request is not None and not request.is_finished() and self._target_registry.has_request(request_id):
+                affected.add(request_id)
+        return affected
 
     def _target_can_free(self, request) -> bool:
         registry = getattr(self, "_target_registry", None)
@@ -67,8 +114,12 @@ class ReceiptScheduler(Scheduler):
                 self._free_blocks(request)
 
     def schedule(self):
+        self._poll_target_receives()
         self._drain_retained_finished()
         return super().schedule()
+
+    def has_finished_requests(self):
+        return bool(self._retained_finished or self._target_recv_pending) or super().has_finished_requests()
 
     def _preempt_request(self, request, timestamp, drop_stale_output=False):
         if not self._request_blocks_can_be_freed(request):

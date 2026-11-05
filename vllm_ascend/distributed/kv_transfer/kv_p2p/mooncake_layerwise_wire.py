@@ -6,6 +6,7 @@ Keep the network schema separate from owner-local resources and reconstruct
 the contract types before a producer consumes the descriptor.
 """
 
+import hashlib
 import json
 from dataclasses import fields
 
@@ -28,7 +29,14 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec im
     encode_owner_value,
 )
 
-TARGET_LEASE_WIRE_VERSION = 1
+TARGET_LEASE_WIRE_VERSION = 2
+SUPPORTED_TARGET_LEASE_WIRE_VERSIONS = (1, TARGET_LEASE_WIRE_VERSION)
+
+
+def lease_fingerprint(lease: TargetLease) -> str:
+    """Canonical compact identity; never expand every view's repeated blocks."""
+    payload = _lease_wire_payload(lease)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def target_manifest_to_wire(manifest: TargetManifest):
@@ -71,7 +79,7 @@ def _record(value):
     return {field.name: getattr(value, field.name) for field in fields(value)}
 
 
-def target_lease_to_wire(lease: TargetLease) -> dict:
+def _lease_wire_payload(lease: TargetLease) -> dict:
     """Publish identities, geometry and block IDs; never owner-local pointers."""
     if not isinstance(lease, TargetLease):
         raise ContractError("Target publication requires a TargetLease")
@@ -80,8 +88,14 @@ def target_lease_to_wire(lease: TargetLease) -> dict:
     assert_lease_consistent(lease, lease.request)
     views = []
     for view in lease.views:
+        if any(type(block) is not int or block < 0 or block >= view.block_capacity for block in view.block_ids):
+            raise ContractError("Target view contains an invalid block ID")
         record = _record(view)
         record["component"] = view.component.value
+        for group, block_ids in enumerate(lease.allocation.group_block_ids):
+            if view.block_ids == block_ids:
+                record["block_ids"] = {"allocation_group": group}
+                break
         views.append(record)
     payload = {
         "wire_version": TARGET_LEASE_WIRE_VERSION,
@@ -100,6 +114,11 @@ def target_lease_to_wire(lease: TargetLease) -> dict:
         },
     }
     result = _plain(payload)
+    return result
+
+
+def target_lease_to_wire(lease: TargetLease) -> dict:
+    result = _lease_wire_payload(lease)
     # Apply the same validation in both directions, including constructor
     # checks that a WriterPlan's inner dictionaries do not perform themselves.
     if target_lease_from_wire(result) != lease:
@@ -114,7 +133,7 @@ def target_lease_from_wire(payload: dict) -> TargetLease:
         ("wire_version", "contract_version", "request", "rank", "allocation", "regions", "views", "writer_plan"),
         "lease",
     )
-    if type(value["wire_version"]) is not int or value["wire_version"] != TARGET_LEASE_WIRE_VERSION:
+    if type(value["wire_version"]) is not int or value["wire_version"] not in SUPPORTED_TARGET_LEASE_WIRE_VERSIONS:
         raise ContractError("Unsupported target lease wire version")
     if type(value["contract_version"]) is not int or value["contract_version"] != CONTRACT_VERSION:
         raise ContractError("Unsupported target lease contract version")
@@ -134,6 +153,13 @@ def target_lease_from_wire(payload: dict) -> TargetLease:
     views = []
     for record in _items(value["views"], "views"):
         record = dict(_object(record, tuple(field.name for field in fields(CacheView)), "view"))
+        if type(record["block_ids"]) is dict:
+            if value["wire_version"] < 2:
+                raise ContractError("Legacy target views cannot reference allocation groups")
+            group = _object(record["block_ids"], ("allocation_group",), "block map reference")["allocation_group"]
+            if type(group) is not int or not 0 <= group < len(allocation.group_block_ids):
+                raise ContractError("Target view references an unknown allocation group")
+            record["block_ids"] = allocation.group_block_ids[group]
         try:
             record["component"] = Component(record["component"])
         except (TypeError, ValueError) as error:

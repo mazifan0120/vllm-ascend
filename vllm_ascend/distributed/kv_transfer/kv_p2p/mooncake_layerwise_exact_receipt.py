@@ -84,6 +84,7 @@ class ExactReceiptLedger:
         self._ranges: dict[TransferKey, set[tuple[int, int]]] = {}
         self._terminals: dict[int, tuple[Status, bool]] = {}
         self._visible = False
+        self._aborted = False
         self._protocol_errors = 0
         self._stale_dropped = 0
 
@@ -151,13 +152,47 @@ class ExactReceiptLedger:
     def build_receipt(self) -> ReceiveReceipt | None:
         with self._lock:
             if (
-                not self.remote_quiesced()
+                self._aborted
+                or not self.remote_quiesced()
                 or any(status is not Status.SUCCESS for status, _ in self._terminals.values())
                 or any(result.status is not Status.SUCCESS for result in self._results.values())
                 or any(not _covers(span, self._ranges.get(scope, ())) for scope, span in self._required.items())
             ):
                 return None
             return ReceiveReceipt(self.request, self.target_generation, True, True, True, self._visible)
+
+    def abort_delivery(self) -> None:
+        """Prevent decode permanently; continue judging late DMA completion."""
+        with self._lock:
+            self._aborted = True
+
+    @property
+    def delivery_aborted(self):
+        with self._lock:
+            return self._aborted
+
+    @property
+    def visibility_installed(self):
+        with self._lock:
+            return self._visible
+
+    @property
+    def failed(self):
+        with self._lock:
+            return bool(
+                self._protocol_errors
+                or any(r.status is not Status.SUCCESS for r in self._results.values())
+                or any(status is not Status.SUCCESS for status, _ in self._terminals.values())
+            )
+
+    def accepts_source_lookup(self, writer_rank: int) -> bool:
+        with self._lock:
+            return (
+                not self._aborted
+                and not self._protocol_errors
+                and writer_rank in self.expected_ranks
+                and writer_rank not in self._terminals
+            )
 
     def mark_visible(self, rank: int) -> None:
         with self._lock:

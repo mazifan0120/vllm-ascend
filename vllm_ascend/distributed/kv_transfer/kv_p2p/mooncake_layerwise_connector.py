@@ -933,6 +933,15 @@ class KVCacheRecvingLayerThread(threading.Thread):
             if ledger is None or req_id is None or req_id in self.done_requests:
                 return
         receipt = ledger.build_receipt()
+        if isinstance(ledger, ExactReceiptLedger):
+            if ledger.delivery_aborted or ledger.should_publish():
+                return
+            if ledger.failed:
+                ledger.abort_delivery()
+                with self.lock:
+                    self.failed_requests.add(req_id)
+                    self.receipt_deadlines.pop(instance, None)
+                return
         if receipt is None:
             return  # data conditions not met yet
         provider = self.receipt_provider
@@ -953,6 +962,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 self.receipt_deadlines.pop(instance, None)
             return
         try:
+            if isinstance(ledger, ExactReceiptLedger):
+                provider.confirm_native_received(lease, receipt)
             provider.prepare_decode(lease, receipt)
         except Exception as e:
             logger.error(
@@ -967,27 +978,33 @@ class KVCacheRecvingLayerThread(threading.Thread):
             # Keep receipt_mode_reqs (request-lifetime): late versioned DONE
             # after publish must stay recognized as normal.
             self.receipt_mode_reqs.add(req_id)
-            self.ledger_by_req.pop(instance, None)
-            self.instance_to_req.pop(instance, None)
+            if not isinstance(ledger, ExactReceiptLedger):
+                self.ledger_by_req.pop(instance, None)
+                self.instance_to_req.pop(instance, None)
             self.receipt_deadlines.pop(instance, None)
             self.done_requests.add(req_id)
         logger.info("Receipt-mode request %s (instance=%s) published after prepare_decode", req_id, instance)
 
-    def forget_request(self, req_id: str) -> None:
-        """Drop all receipt-mode state for one request id — called on every
-        exit path (publish, failure, cancel, preempt) from get_finished."""
+    def forget_request(self, req_id: str, *, failed=False) -> None:
+        """Clean legacy receives; retain exact proof identity until owner retirement."""
         with self.lock:
             stale = [i for i, r in self.instance_to_req.items() if r == req_id]
             for instance in stale:
+                ledger = self.ledger_by_req.get(instance)
+                if isinstance(ledger, ExactReceiptLedger):
+                    if failed:
+                        ledger.abort_delivery()
+                    continue  # Keep late quiescence proof until actual owner retirement.
                 self.instance_to_req.pop(instance, None)
                 self.ledger_by_req.pop(instance, None)
                 self.receipt_deadlines.pop(instance, None)
-            self.receipt_mode_reqs.discard(req_id)
+            if req_id not in self.instance_to_req.values():
+                self.receipt_mode_reqs.discard(req_id)
 
     def _sweep_receipt_deadlines(self) -> None:
         """Bounded-failure watchdog sweep (B5): fail receipt requests whose
-        ledger was installed but never published within the deadline. Late
-        messages after a sweep are dropped by the unknown-instance path."""
+        ledger was installed but never published within the deadline. Exact
+        ledgers continue accepting late quiescence proofs, without decoding."""
         now = time.monotonic()
         expired: list[tuple[str, str]] = []
         with self.lock:
@@ -996,8 +1013,12 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 if now >= deadline and req_id is not None:
                     expired.append((instance, req_id))
             for instance, req_id in expired:
-                self.ledger_by_req.pop(instance, None)
-                self.instance_to_req.pop(instance, None)
+                ledger = self.ledger_by_req.get(instance)
+                if isinstance(ledger, ExactReceiptLedger):
+                    ledger.abort_delivery()
+                else:
+                    self.ledger_by_req.pop(instance, None)
+                    self.instance_to_req.pop(instance, None)
                 self.receipt_deadlines.pop(instance, None)
                 self.failed_requests.add(req_id)
         for instance, req_id in expired:
@@ -1049,7 +1070,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             if len(msg) != 2 or self.receipt_provider is None:
                                 raise ContractError("Target region lookup has no registered owner")
                             lease = target_lease_from_wire(msg[1])
-                            handles = self.receipt_provider.resolve_target_regions(lease)
+                            delivery = getattr(self, "target_delivery", None)
+                            if delivery is None:
+                                raise ContractError("Target region lookup has no admitted writer gate")
+                            with delivery.source_lookup(lease):
+                                handles = self.receipt_provider.resolve_target_regions(lease)
                             response = encode_target_addresses(lease, handles)
                         except Exception as error:
                             response = (TARGET_PEER_ERROR, type(error).__name__, str(error))
@@ -1293,6 +1318,17 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             return True
         return self.connector_scheduler._release_target_if_any(request)
 
+    def is_target_ready(self, request) -> bool:
+        return self.connector_scheduler is None or self.connector_scheduler._is_target_ready(request)
+
+    def target_use_context(self, request_ids):
+        delivery = getattr(self.connector_worker, "_target_delivery", None)
+        if delivery is None:
+            if self.target_provider is not None and self.target_provider.ready:
+                raise ContractError("Registered target owner has no model-use admission registry")
+            return contextlib.nullcontext()  # Allocation/profile phase has no admitted target.
+        return delivery.use_context(request_ids)
+
     def shutdown(self) -> None:
         writer = getattr(self.connector_worker, "_manifest_source_writer", None)
         if writer is not None:
@@ -1406,8 +1442,12 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import TargetOwnerDispatcher
 
             self.connector_worker._target_delivery = WorkerTargetDelivery(
-                self.connector_worker.tp_rank, facade, self.connector_worker._install_admitted_target
+                self.connector_worker.tp_rank,
+                facade,
+                self.connector_worker._install_admitted_target,
+                retire=self.connector_worker._retire_admitted_target,
             )
+            self.connector_worker.kv_recv_layer_thread.target_delivery = self.connector_worker._target_delivery
             self._target_owner_dispatcher = TargetOwnerDispatcher(
                 facade, delivery=self.connector_worker._target_delivery
             )
@@ -1419,6 +1459,13 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
+
+    def get_transfer_results(self, finished_req_ids):
+        results = super().get_transfer_results(finished_req_ids)
+        failures = self.connector_worker.take_failed_receives()
+        results.failed_recving.update(failures)
+        results.finished_recving.update(failures)
+        return results
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get the block ids that have load errors."""
@@ -1763,6 +1810,7 @@ class MooncakeLayerwiseConnectorScheduler:
         self._pending_receipt_specs: dict[str, tuple] = {}
         self._request_leases: dict[str, Any] = {}
         self._target_release_acks: dict[RequestKey, ReleaseAck] = {}
+        self._ready_targets: set[RequestKey] = set()
         # Scheduler-owned retention authority, bound via
         # bind_scheduler_retention() by the deployment's scheduler wrapper.
         # Receipt-mode admission fails closed until it is bound: a non-empty
@@ -2026,6 +2074,21 @@ class MooncakeLayerwiseConnectorScheduler:
         # worker step has not entered yet.
         return self._has_retained_target(request), None
 
+    def _is_target_ready(self, request) -> bool:
+        instance = (request.kv_transfer_params or {}).get("request_instance")
+        lease = getattr(self, "_request_leases", {}).get(instance)
+        if lease is None:
+            return True
+        if lease.request in self._ready_targets:
+            return True
+        try:
+            if self._target_provider.delivery_status(lease)["ready"]:
+                self._ready_targets.add(lease.request)
+                return True
+        except Exception as error:
+            logger.warning("All-rank target visibility is not established for %s: %s", request.request_id, error)
+        return False
+
     def _has_retained_target(self, request) -> bool:
         instance = (request.kv_transfer_params or {}).get("request_instance")
         return instance in getattr(self, "_request_leases", {})
@@ -2050,6 +2113,20 @@ class MooncakeLayerwiseConnectorScheduler:
         if lease is None:
             return True
         ack = getattr(self, "_target_release_acks", {}).get(lease.request)
+        if ack is None:
+            status = getattr(provider, "delivery_status", None)
+            if not callable(status):
+                return False
+            try:
+                if not status(lease)["remote_quiesced"]:
+                    return False
+            except Exception as error:
+                logger.warning("Remote DMA quiescence is not established for %s: %s", request.request_id, error)
+                return False
+            ack = ReleaseAck(
+                True, lease.allocation.retention_token, "All admitted TP native writers closed and quiescent"
+            )
+            self._target_release_acks[lease.request] = ack
         if ack is None or not ack.safe_to_release or ack.retention_token != lease.allocation.retention_token:
             # Request completion/cancellation is not remote DMA quiescence.
             # A worker/control-path proof must precede local owner release.
@@ -2091,6 +2168,7 @@ class MooncakeLayerwiseConnectorScheduler:
         # sees no lease and incorrectly authorizes the ordinary free path.
         leases.pop(instance, None)
         self._target_release_acks.pop(lease.request, None)
+        getattr(self, "_ready_targets", set()).discard(lease.request)
         logger.info("Released target for %s (instance=%s)", request.request_id, instance)
         return True
 
@@ -2224,6 +2302,7 @@ class MooncakeLayerwiseConnectorWorker:
         self.v_buffer: torch.Tensor | None = None
         self.virtual_request: set[str] = set()
         self._invalid_block_ids: set[int] = set()
+        self._failed_receives: set[str] = set()
         self._recving_metadata: dict[str, ReqMeta] = {}
 
     def _init_layerwise_reuse_state(self) -> None:
@@ -2655,6 +2734,9 @@ class MooncakeLayerwiseConnectorWorker:
             ready_event.wait()
 
     def get_finished(self, finished_req_ids=None) -> tuple[set[str], set[str]]:
+        delivery = getattr(self, "_target_delivery", None)
+        if delivery is not None and finished_req_ids:
+            delivery.abort_requests(finished_req_ids)
         writer = getattr(self, "_manifest_source_writer", None)
         if writer is not None and finished_req_ids:
             writer.finish_requests(finished_req_ids)
@@ -2675,27 +2757,35 @@ class MooncakeLayerwiseConnectorWorker:
         )
         failed_recving = {self.request_map[s] for s in failed_recving if s in self.request_map}
         for req_id in failed_recving:
+            if req_id in getattr(self, "_admitted_target_blocks", {}):
+                # Main/Indexer pool IDs may overlap. The deployed vLLM
+                # transfer-results API carries unambiguous request failures.
+                self._failed_receives.add(req_id)
+                continue
             if meta := self._recving_metadata.get(req_id):
                 self._invalid_block_ids.update(block_id for group in meta.local_block_ids for block_id in group)
-            elif allocation := getattr(self, "_admitted_target_blocks", {}).get(req_id):
-                self._invalid_block_ids.update(block_id for group in allocation for block_id in group)
         for req_id in done_recving.union(failed_recving):
-            org_req_id = req_id[:-9]
-            self.request_map.pop(org_req_id, None)
             self._recving_metadata.pop(req_id, None)
-            getattr(self, "_admitted_target_blocks", {}).pop(req_id, None)
+            exact_target = req_id in getattr(self, "_admitted_target_blocks", {})
+            if not exact_target:
+                self.request_map.pop(get_external_request_id(req_id), None)
             if self.kv_recv_layer_thread is not None:
-                # Clear receipt-mode state on EVERY exit path (done / failed /
-                # cancel / preempt) so a reused request id is never ignored by
-                # stale ledger or instance mappings. The thread indexes its
-                # maps by external id while req_id here still carries the
-                # EngineCore suffix: strip it before the lookup.
-                self.kv_recv_layer_thread.forget_request(get_external_request_id(req_id))
+                # Exact targets retain their internal identity and block map
+                # until owner retirement: late failure/quiescence proofs must
+                # not be lost or attributed to another EngineCore lifetime.
+                self.kv_recv_layer_thread.forget_request(
+                    req_id if exact_target else get_external_request_id(req_id), failed=req_id in failed_recving
+                )
         if len(done_recving) > 0:
             logger.info(
                 "Number of completed KV cache recv requests: %s, receive requests: %s", len(done_recving), done_recving
             )
         return set(), done_recving
+
+    def take_failed_receives(self):
+        result = self._failed_receives
+        self._failed_receives = set()
+        return result
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -2879,7 +2969,8 @@ class MooncakeLayerwiseConnectorWorker:
                     continue
                 external_req_id = get_external_request_id(req_id)
                 assert self.kv_recv_layer_thread is not None
-                self.request_map[external_req_id] = req_id
+                mapping_key = req_id if req_id in getattr(self, "_admitted_target_blocks", {}) else external_req_id
+                self.request_map[mapping_key] = req_id
                 self._recving_metadata[req_id] = meta
             specs = getattr(metadata, "receipt_specs", None)
             if specs:
@@ -2893,17 +2984,35 @@ class MooncakeLayerwiseConnectorWorker:
         instance = lease.request.request_instance
         external_req_id = get_external_request_id(req_id)
         with thread.lock:
-            if instance in thread.ledger_by_req or external_req_id in self.request_map:
+            if instance in thread.ledger_by_req or req_id in self.request_map:
                 raise ContractError("Target receive request identity is already installed")
             if not hasattr(self, "_admitted_target_blocks"):
                 self._admitted_target_blocks = {}
             ledger.lease = lease
-            self.request_map[external_req_id] = req_id
+            self.request_map[req_id] = req_id
             self._admitted_target_blocks[req_id] = lease.allocation.group_block_ids
             thread.ledger_by_req[instance] = ledger
-            thread.instance_to_req[instance] = external_req_id
+            thread.instance_to_req[instance] = req_id
             thread.receipt_mode_reqs.add(external_req_id)
             thread.receipt_deadlines[instance] = time.monotonic() + RECEIPT_WATCHDOG_SECONDS
+
+    def _retire_admitted_target(self, req_id, lease, ledger):
+        thread = self.kv_recv_layer_thread
+        instance = lease.request.request_instance
+        external = get_external_request_id(req_id)
+        with thread.lock:
+            if thread.ledger_by_req.get(instance) is ledger:
+                thread.ledger_by_req.pop(instance, None)
+                thread.instance_to_req.pop(instance, None)
+                thread.receipt_deadlines.pop(instance, None)
+                thread.receipt_mode_reqs.discard(req_id)
+                if not any(get_external_request_id(r) == external for r in thread.instance_to_req.values()):
+                    thread.receipt_mode_reqs.discard(external)
+            if self.request_map.get(req_id) == req_id:
+                self.request_map.pop(req_id, None)
+            if self.request_map.get(external) == req_id:
+                self.request_map.pop(external, None)
+            getattr(self, "_admitted_target_blocks", {}).pop(req_id, None)
 
     def _install_receipt_specs(self, specs: dict) -> None:
         """Build the D-side ReceiptLedger per request from the scheduler-built
