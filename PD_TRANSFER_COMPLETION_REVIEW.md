@@ -2,9 +2,95 @@
 
 核对日期：2026-11-05。工作分支始终为 `p-main-buffer-reuse`，没有切换分支或 push。
 
+交接入口：[完整项目交接](PROJECT_HANDOFF.md)。原功能目标现已由用户暂停。
+2026-11-05 最新独立只读审计确认四引擎健康空闲、相关候选全部停止；r22 旧监督状态
+停留 waiting-health，不能据此重复重启。审计见部署工作区
+`artifacts/p-main-buffer-reuse/pd-transfer-handoff-20261105/runtime-audit.json`。
+
 **远端 `feat/layerwise-receipt` 尚未补齐完整 PD 链路，不能直接据此开启服务。**
 本次已纳入远端增量并修复一批入口、元数据和失败路径；模型端到端功能及性能尚未验证。
 早期 A1/A2 的原生资源验证仍然有效，但不等于完整 PD 验收。
+
+## 第六阶段：真实 WRITE／读取与生命周期小探针通过（2026-11-05）
+
+**TP1、两层、23 个有效 token 的底层探针 PASS；完整模型 PD 仍为 NOT_RUN。**
+探针采用第五阶段 `4204f545d` 的 749 个生产 Python 文件，摘要逐文件匹配。
+D0 同机两个独立进程分别使用 NPU1 发送、NPU0 接收，真实 bounded 注册产生 5 个目标 MR；
+生产 `ManifestSourceWriter` 提交 Mooncake 原生 WRITE，走实际地址查询与批量回执，
+D 的 exact ledger 驱动真实 `confirm_native_received()`／`prepare_decode()`。
+原生日志确认 device RoCE 通道。没有替换传输引擎或注册方法。
+
+- 全部 8 个 Main／Indexer entry 的有效 token、未对齐尾部、其他未写 block／token
+  的实际 Host／NPU 字节均匹配；Main 的同一对源 buffer 在两层之间复用。
+- 真实 owner-use 上下文覆盖消费；独立 manager writeback stream 上确有未完成工作时，
+  release 被拒绝，等待真实完成后再释放、retire、注销并关闭 Host pool，通过。
+- 源进程保持 tensor／NPU context 存活，先等 D 完成字节校验，再显式注销和析构 TE；
+  源、目标进程均正常退出。该轮改变了清理时序，支持退出顺序关联，但没有隔离到
+  具体 native free 地址，不证明 HBM double free，也尚未修改生产 shutdown 行为。
+- 本轮没有真实 GLM forward／decode、TP 共享身份或跨节点 WRITE，不能外推完整模型
+  正确性、并发、取消、抢占、重分配或性能。
+
+可审阅测试：`tests/e2e/kv_transfer/receipt_transfer_npu.py`。实测原脚本快照保留于
+证据目录；入仓版做 Ruff 格式化、import 排序／unused 清理，并移除一条与原生传输无关的
+pickle catalog 往返断言以满足导入规则；其余非 import AST 一致。测试要求独占 NPU0／1、实际依赖与匹配的 VLLM_HOST_IP／RoCE 设置；应通过
+身份校验的受控容器运行，不直接占用正在服务的设备。
+
+运行证据：`artifacts/p-main-buffer-reuse/pd-transfer-native-order-20261105/`。
+原 D 容器对已由后续独立只读审计确认恢复；r22 旧 supervisor-state 未更新终态，
+当前以本页顶部交接审计为准。
+此前 r21 发生控制脚本准备竞争：复制未完成就检查，尚未提交 NPU 工作却触发多余
+D 重启；原服务随后健康恢复。新监督已串行完成 prepare／hash／imports，再允许 stop，
+准备失败仅清理候选容器。五条 CPU 生命周期回归覆盖无原服务改动、部分停止恢复与成功顺序。
+
+## 首轮原生探针 r20：整轮失败（2026-11-05，历史记录）
+
+第五阶段源码已在原分支提交 `4204f545d`，未 push。随后使用独立 r20 容器运行新
+bounded 注册与生产 `ManifestSourceWriter` 的真实跨进程、跨 NPU 探针，没有使用 copy
+engine 或替代注册方法。实际注册完成，writer 的两个 layer 均报告原生成功及静止，
+D receiver 已执行 `prepare_decode()` 并发布完成。Mooncake 原生日志明确为
+`roce_mode=true, use_fabric_mem=false`，GlobalResourceConfig 为 `roce:device`。
+
+**整轮 FAIL**：P 进程在原生 engine disconnect 后的清理／退出阶段出现
+`malloc(): unsorted double linked list corrupted`，退出码 -6；父进程因此断言失败并
+以 139 退出。目标逐字节校验和后续 use／writeback／retirement 验证尚未执行，
+不能将成功返回或 D 发布完成视为这轮通过，根因仍待定位。
+
+探针的 finally 恢复已完成，原 D 容器 ID／镜像／启动脚本恢复，四引擎健康 200
+且 running／waiting 均为零，r20 已停止，P 未停止。恢复终态见
+`supervisor-state.json` 和 `restoration-audit.json`。
+证据：`artifacts/p-main-buffer-reuse/pd-transfer-native-write-20261105/`。
+完整模型功能和性能仍为 NOT_RUN；下面第五阶段的 NOT_RUN 是该提交时的历史边界。
+
+## 代码检视：明确尚未闭环的功能（2026-11-05）
+
+这些条目是代码路径的实际缺口，不用“尚未测过”代替实现状态。
+
+1. **D→P 取消**：`target_delivery.py::abort_requests()` 只封 D 的 ledger／lookup；
+   `ManifestSourceWriter` 在首次 lookup 后缓存目标地址，后续 job 不再查询 D gate。
+   尚无 D→P 关闭未来 writer 并确认已在途 native 操作静止的控制协议。当前通过保留
+   目标避免误回收，但取消可能继续消耗完整 P 计算／传输，proof 丢失时无法自行回收。
+2. **restore-only 调度**：已有显式 Store restore driver，元数据仍直接接受请求的
+   `restore_only` 字段；没有基于实际已提交 Store 覆盖、完整有效尾部和命中结果的
+   scheduler 决策，亦未接入实际跳过 model forward 的调度生命周期。D lease 容量
+   不证明 P Store 有完整 KV，旧注释声称 D 已自动选择 restore-only 与现有路径不符。
+3. **混合 batch**：`AscendMultiConnector.start_load_kv()` 只要发现任意 restore-only
+   请求就对整份 Store metadata 调 driver 并直接 return，其他普通请求的 child
+   start_load_kv 被整体跳过；必须按请求拆分并保留普通 forward／load 路径。
+4. **跨 rank 部分 release／故障恢复**：`ReceiptScheduler` 的可回收检查会真正调用
+   provider release；`MultiRankTargetProvider` 逐 owner 释放。若前一个 rank 已释放、
+   后一个 RPC 失败，块仍保守保留，但抢占尚未移出 running 的请求可能已失去部分
+   owner。缺少一致的停止使用、隔离／重试或分阶段回收，不能称请求级恢复完整。
+5. **Ansible 启动闭环**：当前 D 模板仍固定 `kv_load_failure_policy: recompute`，
+   而 ReceiptScheduler 要求 fail；模板／profile 未提供 receipt mode、custom scheduler
+   及 owner／retention RPC 端口接入。现有部署档不会自动覆盖本次新 receipt 路径。
+6. **长期状态回收**：provider／delivery／coordinator 的 retired tombstone 及 source
+   writer 的 target-owner 历史目前按进程保留。需要结合 actor／generation 的有界
+   replay 窗口清理，不能简单删除记录后允许旧 target 被重新打开。
+
+另有需要继续证明的边界：同一请求抢占／重分配代际下的 sparse residency／membership
+失效。现有 sparse attention 已按 request ID 和重写 token window 做失效，不能仅因
+owner 没有显式 invalidation hook 就断言它完全缺失；必须核对同 ID 新分配的完整路径。
+当前原生退出崩溃是独立的运行时问题，以上缺口在解决该崩溃后仍然存在。
 
 ## 第五阶段：D 消费与回收接线、元数据容量（2026-11-05）
 

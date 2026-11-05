@@ -6,7 +6,9 @@
 SourceReady 已接 manifest writer／exact epoch；D 接收依赖、整个 model invocation 的 owner-use、
 all-rank readiness／ReleaseAck 和晚到 proof 保留已接线并通过控制测试。
 TP16×78 层的 32K／64K／128K 元数据容量回归通过，保持原 wire 限额。
-真实新注册／远端 WRITE、D→P 取消、restore-only 调度及完整模型功能和性能尚未验证。
+TP1 两层的小探针已通过实际新注册、同机跨进程／跨 NPU 的 RoCE WRITE→Host／NPU
+字节读取和异步写回／回收；没有真实模型 forward。D→P 取消、restore-only 调度等
+功能缺口仍待补齐，完整模型功能和性能尚未验证。
 当前清单与验证边界见 [最新补齐审查](PD_TRANSFER_COMPLETION_REVIEW.md)。
 下文保留 2026-11-04 的整理记录，不以旧的分工或接口测试代替完整端到端验收。
 
