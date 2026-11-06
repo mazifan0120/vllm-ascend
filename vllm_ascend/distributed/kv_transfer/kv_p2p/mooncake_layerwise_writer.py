@@ -195,8 +195,9 @@ class ManifestSourceWriter:
         error = None
         try:
             with self._lock:
-                if job.state.failed:
-                    raise ContractError("Producer request closed after an earlier write failure")
+                state = job.state
+                if state.failed:
+                    raise ContractError("Producer request closed after an earlier write failure") from state.first_error
             # Both address lookup and geometry planning are control work, not
             # source reads. No native submission may precede this real fence.
             job.ready_event.synchronize()
@@ -243,6 +244,7 @@ class ManifestSourceWriter:
 
     def _finish_job(self, job, results, error, quiesced) -> None:
         terminal = None
+        first_failure = False
         with self._lock:
             state = job.state
             state.pending -= 1
@@ -251,6 +253,7 @@ class ManifestSourceWriter:
             if error is not None:
                 if state.first_error is None:
                     state.first_error = error
+                    first_failure = True
                 state.failed = True
                 state.closed = True
             if not quiesced:
@@ -271,6 +274,17 @@ class ManifestSourceWriter:
             if state.finished and state.closed and not state.pending and not state.unknown:
                 self._requests.pop(state.request_id, None)
             self._callbacks_in_progress += 1
+        if first_failure:
+            logger.error(
+                "Receipt write failed: request=%s rank=%d layer=%d span=[%d,%d) quiesced=%s",
+                state.request_id,
+                self.rank,
+                job.source.layer,
+                job.request.start_token,
+                job.request.end_token,
+                quiesced,
+                exc_info=(type(error), error, error.__traceback__),
+            )
         # The exact epoch read ends on native completion. Peer ACK/D decode
         # must never keep the physical P slot busy (design I4).
         try:

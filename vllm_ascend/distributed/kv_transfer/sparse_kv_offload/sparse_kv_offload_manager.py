@@ -797,13 +797,12 @@ class SparseKVOffloadManager:
         parallel = config.parallel_config
         if (
             not config.model_config.enforce_eager
-            or config.speculative_config is not None
             or any(
                 getattr(parallel, name, 1) != 1
                 for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
             )
         ):
-            raise ContractError("Registered D targets require eager, PP/CP/DCP=1 and no speculative/MTP")
+            raise ContractError("Registered D targets require eager and PP/CP/DCP=1")
         components, identities, block_tokens = self.get_target_cache_identities()
         with self._target_owner_lock:
             if self._target_owner_facade is not None:
@@ -835,8 +834,13 @@ class SparseKVOffloadManager:
         from vllm.v1.worker.utils import extract_layer_index
 
         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import Component, ContractError
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
+            Component,
+            ContractError,
+            receipt_mtp_layer_count,
+        )
 
+        model_layers = self.num_target_layers + receipt_mtp_layer_count(self.vllm_config)
         components, identities, block_tokens = {}, {}, {}
         for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
             for name in group.layer_names:
@@ -850,14 +854,14 @@ class SparseKVOffloadManager:
                 else:
                     raise ContractError("D target catalog encountered an unsupported cache component")
                 layer = extract_layer_index(name)
-                if not 0 <= layer < self.num_target_layers or name in components:
+                if not 0 <= layer < model_layers or name in components:
                     raise ContractError("D target layer identity is extra, duplicate or out of range")
                 components[name] = component
                 identities[name] = (layer, group_id)
                 block_tokens[name] = spec.block_size
         main_layers = {identities[name][0] for name, component in components.items() if component is Component.MAIN}
-        if main_layers != set(range(self.num_target_layers)):
-            raise ContractError("D target catalog does not cover every model Main layer")
+        if main_layers != set(range(model_layers)):
+            raise ContractError("D target catalog does not cover every model and resident MTP Main layer")
         return components, identities, block_tokens
 
     def get_target_transfer_caches(self, kv_caches):

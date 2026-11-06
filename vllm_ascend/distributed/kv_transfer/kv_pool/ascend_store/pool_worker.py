@@ -2834,8 +2834,7 @@ class KVPoolWorker:
         if not request.request_instance or block_index < 0:
             raise ValueError("Invalid Main snapshot request identity")
         if generation is None and end_token is None:
-            # Complete blocks have immutable content for this request (MTP is
-            # rejected). This fallback is independent of chunk boundaries.
+            # Full prompt blocks remain valid for this request across chunks.
             identity = f"private_full_v1:{request.request_instance}:block:{block_index}"
         else:
             if type(generation) is not int or generation < 1 or type(end_token) is not int or end_token <= 0:
@@ -2871,7 +2870,9 @@ class KVPoolWorker:
         # key, full-key slot (None for partial), logical block, valid token end
         slots = [
             (
-                self._make_mooncake_layerwise_key(block_hash_to_str(hashes[index])),
+                self._main_snapshot_key(request, index)
+                if self.use_eagle
+                else self._make_mooncake_layerwise_key(block_hash_to_str(hashes[index])),
                 index - start,
                 index,
                 (index + 1) * self.block_size,
@@ -2888,10 +2889,10 @@ class KVPoolWorker:
             return
         with self._put_started_keys_lock:
             started = {key for key, _, _, _ in slots} & self._put_started_keys
-        public = [key for key, slot, _, _ in slots if slot is not None and key not in started]
-        missing_public = set(self._filter_pool_existing_keys(public)) if public else set()
-        readable = set(public) - missing_public
-        pending = [key for key, slot, _, _ in slots if key not in started and (slot is None or key in missing_public)]
+        full_keys = [key for key, slot, _, _ in slots if slot is not None and key not in started]
+        missing_full = set(self._filter_pool_existing_keys(full_keys)) if full_keys else set()
+        readable = set(full_keys) - missing_full
+        pending = [key for key, slot, _, _ in slots if key not in started and (slot is None or key in missing_full)]
         try:
             codes = self._start_layerwise_put_keys(pending, self._layerwise_object_size_bytes()) if pending else []
             new = {key for key, code in zip(pending, codes, strict=True) if code == 0}
@@ -2903,8 +2904,8 @@ class KVPoolWorker:
             for key, slot, index, _ in slots:
                 if key not in rejected:
                     continue
-                if slot is None:
-                    raise RuntimeError("Main private partial snapshot allocation failed")
+                if slot is None or self.use_eagle:
+                    raise RuntimeError("Main private snapshot allocation failed")
                 # Another P may own the public hash session. Do not wait for
                 # it while holding other unfilled sessions: use a private,
                 # immutable full-block fallback instead.
@@ -3071,12 +3072,12 @@ class KVPoolWorker:
             group_block_hashes = get_block_hashes(request.block_hashes, self.block_size, self.hash_block_size)
             end_block = min(cached_full_blocks, len(group_block_hashes))
             for block_index in range(start_block, end_block):
-                current_entries.append(
-                    (
-                        self._make_mooncake_layerwise_key(block_hash_to_str(group_block_hashes[block_index])),
-                        block_index,
-                    )
-                )
+                if main_reuse and self.use_eagle:
+                    key = self._main_snapshot_key(request, block_index)
+                    self._layerwise_session_tracker.register_private_snapshot(key, (block_index + 1) * self.block_size)
+                else:
+                    key = self._make_mooncake_layerwise_key(block_hash_to_str(group_block_hashes[block_index]))
+                current_entries.append((key, block_index))
             needs_last_block = cached_tokens % self.block_size != 0 or (
                 cached_tokens > 0 and end_block < cached_full_blocks
             )

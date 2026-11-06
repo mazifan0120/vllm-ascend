@@ -407,6 +407,15 @@ class TestSourceReadyPreparation(unittest.TestCase):
         self.assertIs(metadata.requests["internal-source"], before)
         worker._align_remote_block_ids.assert_not_called()
 
+    def test_real_prepare_sizes_compute_events_for_registered_draft_layer(self):
+        worker, metadata = self.worker()
+        worker._compute_done_events = [None] * 78
+        worker._no_compute_layers = {0}
+        worker.total_layers = 79
+        worker.prepare_layerwise_step(metadata)
+        self.assertEqual(worker._compute_done_events, [None] * 79)
+        self.assertFalse(worker._no_compute_layers)
+
     def test_real_prepare_rejects_unwired_source_contract_before_any_transfer_job(self):
         worker, metadata = self.worker()
         worker._source_contract_bound = False

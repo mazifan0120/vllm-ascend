@@ -1092,7 +1092,7 @@ class NPUWorker(WorkerBase):
         get_reuse_memory_info = getattr(protocol, "get_reuse_memory_info", None)
         if callable(get_reuse_memory_info):
             base_layers = self.model_config.get_num_layers(self.parallel_config)
-            return get_reuse_memory_info(kv_cache_spec, base_layers, extra_config)
+            return get_reuse_memory_info(kv_cache_spec, base_layers, extra_config, vllm_config=self.vllm_config)
         # Match the allocation planner: persistent draft pages are not target
         # scratch slots and must be counted once each in the physical budget.
         excluded_layer_names = (excluded_layer_names or set()) & kv_cache_spec.keys()

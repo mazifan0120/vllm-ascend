@@ -622,6 +622,12 @@ class KVPoolScheduler:
         self.load_specs.pop(request.request_id, None)
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
+        if self.use_block_key_layerwise and self.layerwise_offload and self.use_eagle:
+            # The MTP draft cache at a block boundary depends on the next
+            # token. Main-only reuse keeps those snapshots request-private.
+            if num_computed_tokens:
+                raise RuntimeError("Main-only MTP reuse cannot restore a cross-request local prefix")
+            return 0, False
 
         prompt_token_len = len(request.prompt_token_ids)
         if self.use_block_key_layerwise:

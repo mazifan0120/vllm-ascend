@@ -40,6 +40,21 @@ class TargetClosedError(ContractError):
     """The exact retained delivery is closed; no new native source reads may start."""
 
 
+def receipt_mtp_layer_count(vllm_config: Any) -> int:
+    """Resolve the resident cache layer for GLM's single-layer MTP."""
+    speculative = getattr(vllm_config, "speculative_config", None)
+    if speculative is None:
+        return 0
+    text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    if (
+        getattr(speculative, "method", None) != "mtp"
+        or getattr(text_config, "model_type", None) != "glm_moe_dsa"
+        or getattr(text_config, "num_nextn_predict_layers", None) != 1
+    ):
+        raise NotImplementedError("Layerwise receipt only supports the single resident GLM MTP layer")
+    return 1
+
+
 def _require_int(name: str, value: object, minimum: int | None = None, maximum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ContractError(f"{name} must be an int (bool is not accepted), got {type(value).__name__}")

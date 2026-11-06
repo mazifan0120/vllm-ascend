@@ -247,6 +247,54 @@ class TestMainOnlyCachePlan(unittest.TestCase):
         self.assertEqual(config.kv_cache_tensors, list(expected.tensors))
         self.assertEqual(config.num_blocks, 4)
 
+    def test_glm_mtp_keeps_a_private_main_and_indexer_without_moving_target_slots(self):
+        config, main, indexer = self.make_config(layers=9)
+        specs = {group.layer_names[0]: group.kv_cache_spec for group in config.kv_cache_groups}
+        config.kv_cache_groups = [
+            KVCacheGroupSpec(
+                layer_names=list(specs),
+                kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
+            )
+        ]
+        runtime = self.vllm_config()
+        runtime.speculative_config = SimpleNamespace(method="mtp")
+        runtime.model_config.hf_text_config = SimpleNamespace(model_type="glm_moe_dsa", num_nextn_predict_layers=1)
+        extra = runtime.kv_transfer_config.kv_connector_extra_config
+        runtime.cache_config = SimpleNamespace(enable_prefix_caching=True)
+        with self.assertRaisesRegex(NotImplementedError, "requires prefix caching disabled"):
+            mooncake_layerwise.build_cache_plan(config, runtime, extra)
+        runtime.cache_config.enable_prefix_caching = False
+        plan = mooncake_layerwise.build_cache_plan(config, runtime, extra)
+        baseline, _, _ = self.make_config()
+        baseline_plan = build_main_only_kv_cache_plan(baseline, 8, extra)
+
+        self.assertEqual(plan.layout.buffer_slots, (*baseline_plan.layout.buffer_slots, (8,)))
+        self.assertEqual(plan.layout.independent_layers, [0, 7, 8])
+        self.assertEqual(plan.layout.prefetch_layer_map, baseline_plan.layout.prefetch_layer_map)
+        self.assertIn(["model.layers.8.attn"], [tensor.layers for tensor in plan.tensors])
+        self.assertIn(["model.layers.8.lookup"], [tensor.layers for tensor in plan.tensors])
+        self.assertEqual(
+            plan.bytes_per_block, baseline_plan.bytes_per_block + main.page_size_bytes + indexer.page_size_bytes
+        )
+        layers, slots, factor = mooncake_layerwise.get_reuse_memory_info(specs, 8, extra, vllm_config=runtime)
+        self.assertEqual((layers, slots), (9, 4))
+        self.assertEqual(factor, sum(spec.page_size_bytes for spec in specs.values()) / plan.bytes_per_block)
+
+    def test_glm_mtp_store_keys_are_separate_from_target_only_keys(self):
+        runtime = self.vllm_config()
+        runtime.parallel_config.tensor_parallel_size = 16
+        runtime.model_config.hf_text_config = SimpleNamespace(model_type="glm_moe_dsa", num_nextn_predict_layers=1)
+        runtime.model_config.get_total_num_hidden_layers = lambda: 8
+        runtime.model_config.get_layers_start_end_indices = lambda parallel: (0, 8)
+        runtime.model_config.compute_hash = lambda: "glm"
+        runtime.cache_config = SimpleNamespace(block_size=2, cache_dtype="auto", compute_hash=lambda: "cache")
+
+        self.assertEqual(mooncake_layerwise.layerwise_topology_namespace(runtime), "")
+        runtime.speculative_config = SimpleNamespace(method="mtp", compute_hash=lambda: "mtp")
+        self.assertTrue(mooncake_layerwise.layerwise_topology_namespace(runtime))
+        runtime.kv_transfer_config.kv_connector_extra_config.pop("layerwise_num_shared_buffers")
+        self.assertEqual(mooncake_layerwise.layerwise_topology_namespace(runtime), "")
+
     def test_disabled_mooncake_reuse_keeps_original_descriptors(self):
         config, _, _ = self.make_config()
         original = config.kv_cache_tensors

@@ -1,6 +1,22 @@
 # P buffer reuse 与 layerwise receipt：实现现状及剩余工作
 
-2026-11-05 最新核对：已实际 fetch 并在原 `p-main-buffer-reuse` 纳入 receipt
+## 2026-11-07 A3 GLM MTP 验证
+
+在 `c76f087d2` 镜像上叠加本次 Python 源码后，GLM-5.2 的第 79 个逻辑层使用独立
+的 draft KV。D 将该层纳入 Host receipt，draft forward 也记录实际的设备流完成事件。
+P 启用 DSA-CP、57,344 token budget 和 MTP1。MTP 路径关闭跨请求前缀缓存，同一
+请求仍可用 Store 快照恢复跨 chunk 的 KV。
+
+D 使用 TP16×DP2、eager、CP/DCP=1、MTP5、每引擎 16 条序列和每步 32 token。
+55K 输入、700 输出、并发 10 的 40 条请求全部完成，每条都通过 16 个 TP rank 的
+receipt 和目标释放检查。TPOT P50 为 112.80 ms，无 MTP 对照为 349.91 ms，
+原始 INT8 档为 44.11 ms。32 token 预算下，79 层 TopK 缓冲区占 33.33 GiB/卡。
+每步 96 token 的候选在分配 TopK 时触发 OOM。部署镜像仍为上述基线，MTP 验证
+使用 Ansible 候选容器和源码叠加。后续章节是首版接线的历史记录。
+
+## 2026-11-05 接线核对
+
+原 `p-main-buffer-reuse` 纳入 receipt
 `fa5aec40b` 的 12 个新增提交。已接生产 owner RPC／scheduler 门禁、Host 目标注册
 选择、manifest 逐 entry 计划、精确 receipt 与通知 P 前的全 TP receive admission。
 SourceReady 已接 manifest writer／exact epoch；D 接收依赖、整个 model invocation 的 owner-use、

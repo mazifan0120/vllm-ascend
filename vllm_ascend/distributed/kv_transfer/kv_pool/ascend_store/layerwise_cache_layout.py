@@ -346,21 +346,23 @@ def build_main_only_reuse_layout(
     layer_specs: dict[str, KVCacheSpec],
     base_layers: int,
     extra_config: dict[str, Any],
+    *,
+    resident_mtp_layers: int = 0,
 ) -> LayerwiseReuseLayout:
     """The shared source of component identity and Main slot assignments."""
     if type(base_layers) is not int or base_layers < 1:
         raise ValueError("Main-only reuse requires a positive base layer count")
     main_specs: dict[str, KVCacheSpec] = {}
+    resident_mtp: dict[int, NamedKVCacheSpec] = {}
     indexers: dict[int, NamedKVCacheSpec] = {}
     main_layers: set[int] = set()
     for name, spec in layer_specs.items():
-        # The generic parser also accepts draft names; this plan intentionally
-        # accepts only explicit target layers and never folds an MTP cache.
+        # The GLM MTP layer follows the last target layer in model.layers.
         match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
         if match is None or re.search(r"(?:^|\.)mtp(?:\.|$)", name):
-            raise NotImplementedError(f"Main-only reuse requires a target layer cache: {name}")
+            raise NotImplementedError(f"Main-only reuse requires an explicit model layer cache: {name}")
         layer = int(match.group(1))
-        if layer >= base_layers:
+        if layer >= base_layers + resident_mtp_layers:
             raise NotImplementedError(f"Main-only reuse does not support draft/extra layer {name}")
         if isinstance(spec, AscendSFAIndexerCacheSpec):
             if layer in indexers:
@@ -372,30 +374,42 @@ def build_main_only_reuse_layout(
             if layer in main_layers:
                 raise NotImplementedError(f"Main-only reuse has multiple Main components at layer {layer}")
             main_layers.add(layer)
-            main_specs[name] = spec
+            if layer < base_layers:
+                main_specs[name] = spec
+            else:
+                resident_mtp[layer] = NamedKVCacheSpec(name, spec)
         else:
             raise NotImplementedError(f"Main-only reuse does not support {type(spec).__name__}: {name}")
         if type(spec.page_size_bytes) is not int or spec.page_size_bytes <= 0:
             raise ValueError(f"Invalid physical cache page for {name}")
-    if main_layers != set(range(base_layers)):
-        raise ValueError("Main-only reuse requires one Main cache for every target layer")
+    if main_layers != set(range(base_layers + resident_mtp_layers)):
+        raise ValueError("Main-only reuse requires one Main cache for every model and resident MTP layer")
     if len({spec.block_size for spec in layer_specs.values()}) != 1:
         raise NotImplementedError("Main-only reuse requires matching manager block sizes")
 
     layout = build_layerwise_reuse_layout(main_specs, base_layers, extra_config)
-    layout = replace(
+    # Resolve negative independent indices against the target layers. Draft
+    # KV persists between forwards and has a private slot after those layers.
+    return replace(
         layout,
         layer_cache_specs={
-            layer: replace(specs, indexer=indexers.get(layer)) for layer, specs in layout.layer_cache_specs.items()
+            **{layer: replace(specs, indexer=indexers.get(layer)) for layer, specs in layout.layer_cache_specs.items()},
+            **{
+                layer: LayerwiseLayerCacheSpecs(main=spec, indexer=indexers.get(layer))
+                for layer, spec in resident_mtp.items()
+            },
         },
+        buffer_slots=layout.buffer_slots + tuple((layer,) for layer in resident_mtp),
+        independent_layers=[*layout.independent_layers, *resident_mtp],
     )
-    return layout
 
 
 def build_main_only_kv_cache_plan(
     kv_cache_config: KVCacheConfig,
     base_layers: int,
     extra_config: dict[str, Any],
+    *,
+    resident_mtp_layers: int = 0,
 ) -> MainOnlyCachePlan:
     """Describe shared Main slots and private Indexers at fixed block capacity.
 
@@ -409,7 +423,9 @@ def build_main_only_kv_cache_plan(
         raise ValueError("Main-only reuse cache names must belong to exactly one manager group")
     if any(getattr(group, "host_resident", False) for group in kv_cache_config.kv_cache_groups):
         raise NotImplementedError("Main-only P reuse does not support Host cache groups")
-    layout = build_main_only_reuse_layout(layer_specs, base_layers, extra_config)
+    layout = build_main_only_reuse_layout(
+        layer_specs, base_layers, extra_config, resident_mtp_layers=resident_mtp_layers
+    )
     indexers = {layer: specs.indexer for layer, specs in layout.layer_cache_specs.items() if specs.indexer is not None}
     # Validate input placement before replacing any descriptors, including
     # resident Indexers. Original Indexer aliases need a separate lifetime
@@ -472,12 +488,16 @@ def get_main_only_reuse_memory_info(
     layer_specs: dict[str, KVCacheSpec],
     base_layers: int,
     extra_config: dict[str, Any],
+    *,
+    resident_mtp_layers: int = 0,
 ) -> tuple[int, int, float]:
     """Logical budget multiplier matching shared Main plus all private Indexers."""
     if not build_layerwise_cache_layout(base_layers, extra_config).has_layer_reuse:
         layers = len({get_layerwise_physical_layer_index(name, base_layers) for name in layer_specs})
         return layers, layers, 1.0
-    layout = build_main_only_reuse_layout(layer_specs, base_layers, extra_config)
+    layout = build_main_only_reuse_layout(
+        layer_specs, base_layers, extra_config, resident_mtp_layers=resident_mtp_layers
+    )
     physical = sum(layout.layer_cache_specs[slot[0]].main.spec.page_size_bytes for slot in layout.buffer_slots)
     physical += sum(
         specs.indexer.spec.page_size_bytes for specs in layout.layer_cache_specs.values() if specs.indexer is not None

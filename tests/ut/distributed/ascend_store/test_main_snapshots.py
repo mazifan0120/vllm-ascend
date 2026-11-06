@@ -210,6 +210,22 @@ class TestMainSnapshotVersions(unittest.TestCase):
         self.assertEqual(second.load_block_keys[0], first.save_block_keys[0])
         self.assertIn(first.save_last_block_key, second.load_keys)
 
+    def test_mtp_full_snapshot_is_request_private_and_restored_by_every_rank(self):
+        owner, published = self.make_worker(published={"model@6830@0"})
+        reader, _ = self.make_worker(published=published)
+        owner.use_eagle = reader.use_eagle = True
+        reader.tp_rank, reader.put_step = 1, 16
+        first = self.request(20, 1)
+        owner._prepare_layerwise_put_session(first)
+        self.assertIn("@private_full_v1:", first.save_block_keys[0])
+        self.commit(owner, published, first)
+        second = self.request(32, 2, previous=20)
+        self.open(reader, second)
+        self.assertEqual(second.load_keys, [first.save_block_keys[0], first.save_last_block_key])
+        other = self.request(20, 1, instance="instance-B", req_id="r2")
+        owner._prepare_layerwise_put_session(other)
+        self.assertNotEqual(other.save_block_keys[0], first.save_block_keys[0])
+
     def test_missing_restore_plan_fails_even_when_load_spec_is_absent(self):
         worker, _ = self.make_worker()
         request = self.request(20, 1)
@@ -340,6 +356,7 @@ class TestMainSnapshotMetadata(unittest.TestCase):
             with self.subTest(hit=hit):
                 scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
                 scheduler.layerwise_offload = scheduler.use_block_key_layerwise = scheduler.use_layerwise = True
+                scheduler.use_eagle = False
                 scheduler.kv_role = "kv_producer"
                 scheduler.load_specs = {}
                 scheduler.cache_transfer_granularity = 16
@@ -348,3 +365,17 @@ class TestMainSnapshotMetadata(unittest.TestCase):
                 request = SimpleNamespace(request_id="r1", prompt_token_ids=list(range(48)), num_tokens=48)
                 with self.assertRaisesRegex(RuntimeError, "not fully recoverable"):
                     scheduler.get_num_new_matched_tokens(request, 32)
+
+    def test_main_only_mtp_skips_cross_request_lookup(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
+
+        scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+        scheduler.layerwise_offload = scheduler.use_block_key_layerwise = scheduler.use_eagle = True
+        scheduler.kv_role = "kv_producer"
+        scheduler.load_specs = {}
+        scheduler._get_block_key_layerwise_hit_tokens = MagicMock()
+        request = SimpleNamespace(request_id="r1")
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
+        with self.assertRaisesRegex(RuntimeError, "cannot restore a cross-request local prefix"):
+            scheduler.get_num_new_matched_tokens(request, 16)
+        scheduler._get_block_key_layerwise_hit_tokens.assert_not_called()

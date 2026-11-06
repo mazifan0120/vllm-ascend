@@ -3109,6 +3109,9 @@ class MooncakeLayerwiseConnectorWorker:
         self.current_layer = 0
         self._cache_write_events = [None] * self.total_layers
         if self.vllm_config.kv_transfer_config.is_kv_producer:
+            # Registration can extend the layer count to include resident MTP KV.
+            self._compute_done_events = [None] * self.total_layers
+            self._no_compute_layers = set()
             self._source_request_metadata = dict(metadata.requests)
             # update trans info
             update_metadata = {}
