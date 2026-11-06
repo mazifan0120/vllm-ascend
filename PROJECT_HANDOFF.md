@@ -9,9 +9,12 @@
 - TP16、32,784 chunk、513 blocks 的匹配样本中，同步完整 P/D 冷 TTFT 中位数 24.00 s，
   一体纯 HBM 为 20.03 s。回放 TTFT 分别为 5.36 s（Mooncake Store 命中）和 0.55 s（本地 HBM 命中）。
 - 独立 D 异步调度候选的冷 TTFT 为 23.98 s。62K 的 29-token 样本在首 token 后的中位时长由同步的
-  12.87 s 降到 8.91 s，一体纯 HBM 为 5.46 s。异步实现只在候选快照中验证。
+  12.87 s 降到 8.91 s，一体纯 HBM 为 5.46 s。
+- `AsyncReceiptScheduler` 已接入 receipt 源码和 Ansible profile。D 直接用进程内协调器的清单生成 HTTP
+  数据，等所有 owner 登记成功后才通知 P。与上一轮异步候选对照，62K 冷目标准备从 1.36 s 降到
+  0.75 s，冷／回放 TTFT 中位数为 23.31／4.67 s。实机九条请求正确并完成全 rank 回收。
 
-详细配置、样本及计时口径见部署工作区 `docs/m1-buffer-reuse-runbook.md` §11.57–11.59。
+详细配置、样本及计时口径见部署工作区 `docs/m1-buffer-reuse-runbook.md` §11.57–11.60。
 
 ## 2026-11-05 四节点实机验证更新
 

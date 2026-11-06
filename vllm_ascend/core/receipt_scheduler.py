@@ -11,6 +11,7 @@ import threading
 import time
 from dataclasses import replace
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
@@ -144,3 +145,7 @@ class ReceiptScheduler(Scheduler):
                 self._preempt_request(request, time.monotonic(), drop_stale_output=True)
                 self.prev_step_scheduled_req_ids.discard(request.request_id)
         return super().reset_prefix_cache(False, reset_connector)
+
+
+class AsyncReceiptScheduler(ReceiptScheduler, AsyncScheduler):
+    """Retain receipt lifetime gates with vLLM's async token scheduling."""

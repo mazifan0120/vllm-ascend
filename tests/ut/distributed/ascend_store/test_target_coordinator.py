@@ -19,6 +19,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TokenRange,
     WriterPlan,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import ManifestWritePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
     target_manifest_from_wire,
     target_manifest_to_wire,
@@ -200,6 +201,29 @@ class TestMultiRankTargets(unittest.TestCase):
             self.assertEqual(client.get_target_manifest(lease), expected)
         finally:
             client.release_target(lease)
+
+    def test_local_publication_checks_sender_count_and_admits_each_exact_owner(self):
+        provider, owners, request, allocation = coordinated()
+        admissions = {}
+        for rank, owner in enumerate(owners):
+            owner.admit_target = lambda *args, rank=rank: admissions.setdefault(rank, args)
+        lease = provider.acquire_target(request, allocation)
+        try:
+            manifest = provider.manifest(lease)
+            with self.assertRaisesRegex(ContractError, "Producer and consumer TP sizes"):
+                provider.publish_target(lease, "engine-request", 1)
+            self.assertFalse(admissions)
+            wire = provider.publish_target(lease, "engine-request", 2)
+            self.assertEqual(wire, target_manifest_to_wire(manifest))
+            plan = ManifestWritePlan(manifest)
+            self.assertEqual(
+                admissions,
+                {rank: (manifest.for_rank(rank).lease, "engine-request", plan.receive_keys(rank)) for rank in range(2)},
+            )
+            wire.clear()
+            self.assertEqual(provider.manifest(lease), manifest)
+        finally:
+            provider.release_target(lease)
 
     def test_parallel_delivery_poll_requires_every_owner_proof(self):
         _, owners, request, allocation = coordinated()

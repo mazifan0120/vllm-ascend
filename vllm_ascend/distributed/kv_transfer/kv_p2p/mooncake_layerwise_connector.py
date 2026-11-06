@@ -1314,6 +1314,8 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self.connector_scheduler is None or self.target_provider is None:
             raise ContractError("Target owner transport is only available on receipt Decode schedulers")
+        if self.target_provider.ready:
+            raise ContractError("Target provider is already bound to an owner transport")
         if transport is None:
             if self._target_rpc_config is None:
                 raise ContractError("Receipt schedulers require explicit RPC ports or an injected owner transport")
@@ -1323,6 +1325,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
                 self._target_rpc_config, self.connector_scheduler._retention_registry
             )
             transport = self._scheduler_target_rpc.transport
+            self.connector_scheduler._publish_local_target = self._scheduler_target_rpc.provider.publish_target
         self.target_provider.bind_transport(transport)
 
     def configure_receipt_scheduler_runtime(self, manager, allocation_lock):
@@ -1605,6 +1608,7 @@ class MooncakeLayerwiseConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int], list[list[int]]]] = {}
         self._reqs_need_send_layerwise: dict[str, SendReqInfo] = {}
+        self._publish_local_target = None
         self.need_truncate = self._has_attn_mamba_hybrid_cache(kv_cache_config)
         self.executor = ThreadPoolExecutor(32)
         tls_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("tls_config", {})
@@ -1855,7 +1859,7 @@ class MooncakeLayerwiseConnectorScheduler:
             raise ContractError("Cannot replace an active scheduler retention authority")
         self._retention_registry = SchedulerRetentionRegistry(kv_cache_manager, allocation_lock=allocation_lock)
 
-    def _maybe_publish_target(self, request: "Request", kv_transfer_params: dict, local_block_ids) -> None:
+    def _maybe_publish_target(self, request: "Request", kv_transfer_params: dict, local_block_ids) -> bool:
         """Acquire the D-side target right after allocation and
         create the request's ReceiptLedger. Plain mode (no provider attached)
         is a no-op that counts as publishable: returns True when the caller
@@ -1897,16 +1901,12 @@ class MooncakeLayerwiseConnectorScheduler:
         self._request_leases[request_instance] = lease
         assert_lease_consistent(lease, request_key)
         wire_lease = target_lease_to_wire(lease)
-        manifest = provider.get_target_manifest(lease)
-        wire_manifest = target_manifest_to_wire(manifest)
         # P/D consistency: the producer must cover every writer rank the lease
         # assigns, Main must be BF16 (an INT8 producer Main cannot splice into
         # the BF16 D Host pool), and v1 requires one region per backing. The
         # producer TP comes from the lease's sender ranks; the block sizes and
         # Main dtype are the D catalog's own, which the lease views mirror.
         sender_ranks = kv_transfer_params.get("remote_tp_size") or self.vllm_config.parallel_config.tensor_parallel_size
-        if sender_ranks != len(manifest.targets):
-            raise ContractError("Producer and consumer TP sizes must match the rank-explicit manifest")
         assert_pd_consistent(
             lease,
             producer_tp_size=sender_ranks,
@@ -1941,7 +1941,14 @@ class MooncakeLayerwiseConnectorScheduler:
         )
         # All real owner receive maps/ledgers must be installed before the
         # metaserver can start P, including its zero-compute Store-hit path.
-        provider.admit_target(manifest, request.request_id)
+        if self._publish_local_target is not None:
+            wire_manifest = self._publish_local_target(lease, request.request_id, sender_ranks)
+        else:
+            manifest = provider.get_target_manifest(lease)
+            if sender_ranks != len(manifest.targets):
+                raise ContractError("Producer and consumer TP sizes must match the rank-explicit manifest")
+            wire_manifest = target_manifest_to_wire(manifest)
+            provider.admit_target(manifest, request.request_id)
         # Carry the target's mooncake transport endpoint and writer plan to the
         # producer so it can open a session without a separate zmq handshake
         # and apply the lease's Main-writer / Indexer-per-rank分工. Per-engine,

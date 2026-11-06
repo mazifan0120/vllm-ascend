@@ -15,11 +15,12 @@ import torch
 from vllm import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
-from vllm_ascend.core.receipt_scheduler import ReceiptScheduler
+from vllm_ascend.core.receipt_scheduler import AsyncReceiptScheduler, ReceiptScheduler
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     BlockAllocation,
     ContractError,
@@ -32,7 +33,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention impo
 )
 
 
-def _fixture(name):
+def _fixture(name, scheduler_cls=ReceiptScheduler):
     # Only scheduler metadata is constructed; no worker or KV tensor exists.
     config = KVCacheConfig(
         num_blocks=16,
@@ -68,7 +69,7 @@ def _fixture(name):
         registry.retire(allocation, ReleaseAck(True, allocation.retention_token, "CPU no-DMA proof fixture"))
         return True
 
-    scheduler = object.__new__(ReceiptScheduler)
+    scheduler = object.__new__(scheduler_cls)
     scheduler.kv_cache_manager = manager
     scheduler._target_registry = registry
     scheduler._retained_finished = set()
@@ -95,7 +96,7 @@ def exercise_scheduler_lifetime():
     # Proofs below authorize CPU-only unused blocks, not real remote transfers.
     passed = []
     scheduler, *_ = _fixture("throttle-prefills")
-    with patch.object(ReceiptScheduler.__mro__[1], "schedule", autospec=True) as schedule:
+    with patch.object(Scheduler, "schedule", autospec=True) as schedule:
         assert scheduler.schedule(True) is schedule.return_value
         schedule.assert_called_once_with(scheduler, True)
         schedule.reset_mock()
@@ -233,6 +234,33 @@ def exercise_scheduler_lifetime():
     scheduler._drain_retained_finished()
     assert raw.block_pool.get_num_free_blocks() == 15
     passed.append("late_running_receive_failure_preserves_target_until_proof")
+
+    scheduler, request, _, proof, calls, raw = _fixture("async-placeholders", AsyncReceiptScheduler)
+    scheduler.use_v2_model_runner = False
+    scheduler.num_sampled_tokens_per_step = 1
+    request.is_prefill_chunk = False
+    output = SimpleNamespace(
+        num_spec_tokens_to_schedule=0,
+        num_scheduled_tokens={request.request_id: 1},
+        scheduled_spec_decode_tokens={},
+        pending_structured_output_tokens=False,
+    )
+    with patch.object(Scheduler, "_update_after_schedule", autospec=True) as update:
+        scheduler._update_after_schedule(output)
+        update.assert_called_once_with(scheduler, output)
+    assert request.num_output_placeholders == 1
+    scheduler.defer_block_free = True
+    scheduler.processed_step_seq = 0
+    request.last_sched_seq = 1
+    request.status = RequestStatus.FINISHED_ABORTED
+    proof.set()
+    scheduler._free_blocks(request)
+    assert not calls and raw.get_block_ids(request.request_id)[0]
+    scheduler.processed_step_seq = 1
+    scheduler._drain_retained_finished()
+    assert calls == [request.request_id]
+    assert raw.block_pool.get_num_free_blocks() == 15
+    passed.append("async_placeholders_preserve_receipt_and_gpu_free_gates")
     print(json.dumps({"status": "PASS", "real_scheduler_cases": passed, "model_or_dma_test": False}), flush=True)
 
 

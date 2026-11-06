@@ -164,6 +164,21 @@ class MultiRankTargetProvider:
                         memo[id(blocks)] = blocks
             return deepcopy(target.manifest, memo)
 
+    def publish_target(self, lease: TargetLease, request_id: str, sender_ranks: int) -> list:
+        """Build the HTTP value and admit every worker from the same private snapshot."""
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import target_manifest_to_wire
+
+        with self._lock:
+            target = self._target(lease)
+            if target.error is not None or target.released:
+                raise ContractError("Cannot publish a failed or partially released TP target")
+            manifest = target.manifest
+            if sender_ranks != len(manifest.targets):
+                raise ContractError("Producer and consumer TP sizes must match the rank-explicit manifest")
+            wire = target_manifest_to_wire(manifest)
+            self.admit_target(manifest, request_id)
+            return wire
+
     def prepare_decode(self, lease, receipt) -> None:
         with self._lock:
             target = self._target(lease)
