@@ -9,6 +9,7 @@ decoding. Transport limits apply before JSON parsing and during tree traversal.
 
 import json
 from dataclasses import fields
+from types import MappingProxyType
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     BlockAllocation,
@@ -64,6 +65,11 @@ OWNER_RECORD_TYPES = (
     TargetManifest,
 )
 OWNER_ENUM_TYPES = (Component, Status)
+_OWNER_RECORD_FIELDS = MappingProxyType(
+    {kind: tuple(field.name for field in fields(kind)) for kind in OWNER_RECORD_TYPES}
+)
+_OWNER_RECORDS_BY_NAME = MappingProxyType({kind.__name__: kind for kind in OWNER_RECORD_TYPES})
+_OWNER_ENUMS_BY_NAME = MappingProxyType({kind.__name__: kind for kind in OWNER_ENUM_TYPES})
 
 
 class _ValueCodec:
@@ -109,8 +115,9 @@ class _ValueCodec:
             return ["tuple" if kind is tuple else "list", [self.encode(v, depth + 1) for v in value]]
         if kind is dict:
             return ["dict", [[self.encode(k, depth + 1), self.encode(v, depth + 1)] for k, v in value.items()]]
-        if kind in OWNER_RECORD_TYPES:
-            return ["record", kind.__name__, [self.encode(getattr(value, f.name), depth + 1) for f in fields(kind)]]
+        record_fields = _OWNER_RECORD_FIELDS.get(kind)
+        if record_fields is not None:
+            return ["record", kind.__name__, [self.encode(getattr(value, name), depth + 1) for name in record_fields]]
         raise ContractError("Owner wire accepts only explicitly whitelisted protocol values")
 
     def decode(self, value, depth=0):
@@ -141,13 +148,13 @@ class _ValueCodec:
             self._decoded_tuples[index] = result
             return result
         if tag == "enum" and len(value) == 3:
-            kind = next((t for t in OWNER_ENUM_TYPES if t.__name__ == value[1]), None)
+            kind = _OWNER_ENUMS_BY_NAME.get(value[1]) if type(value[1]) is str else None
             if kind is None or type(value[2]) is not str:
                 raise ContractError("Unknown owner wire enum")
             return kind(value[2])
         if tag == "record" and len(value) == 3:
-            kind = next((t for t in OWNER_RECORD_TYPES if t.__name__ == value[1]), None)
-            if kind is None or type(value[2]) is not list or len(value[2]) != len(fields(kind)):
+            kind = _OWNER_RECORDS_BY_NAME.get(value[1]) if type(value[1]) is str else None
+            if kind is None or type(value[2]) is not list or len(value[2]) != len(_OWNER_RECORD_FIELDS[kind]):
                 raise ContractError("Unknown or malformed owner wire record")
             return kind(*(self.decode(v, depth + 1) for v in value[2]))
         if tag in ("tuple", "list", "dict") and len(value) == 2 and type(value[1]) is list:

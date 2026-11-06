@@ -81,8 +81,8 @@ class TargetOwner:
         self.runtime.confirm_native_received(lease, receipt)
 
     @contextmanager
-    def use(self, lease):
-        with self.runtime.use(lease):
+    def use(self, lease, *, scheduled_allocation=None):
+        with self.runtime.use(lease, scheduled_allocation=scheduled_allocation):
             yield
 
     def close(self) -> None:
@@ -170,8 +170,8 @@ class DeferredTargetProvider:
             owner.confirm_native_received(lease, receipt)
 
     @contextmanager
-    def use(self, lease):
-        with self._operation() as owner, owner.use(lease):
+    def use(self, lease, *, scheduled_allocation=None):
+        with self._operation() as owner, owner.use(lease, scheduled_allocation=scheduled_allocation):
             yield
 
     def close(self) -> None:
@@ -283,9 +283,10 @@ class TargetOwnerDispatcher:
     worker installs them locally and the scheduler only receives pure values.
     """
 
-    def __init__(self, facade: DeferredTargetProvider, *, delivery=None) -> None:
+    def __init__(self, facade: DeferredTargetProvider, *, delivery=None, copy_reply=True) -> None:
         self._facade = facade
         self._delivery = delivery
+        self._copy_reply = copy_reply
 
     def dispatch(self, call: TargetOwnerCall) -> TargetOwnerReply:
         if not isinstance(call, TargetOwnerCall) or not call.call_id:
@@ -311,7 +312,9 @@ class TargetOwnerDispatcher:
             _assert_wire_value(call.arguments)
             if call.operation not in operations:
                 raise ContractError("Unsupported target owner operation")
-            result = deepcopy(operations[call.operation](*call.arguments))
+            result = operations[call.operation](*call.arguments)
+            if self._copy_reply:
+                result = deepcopy(result)
             _assert_wire_value(result)
             return TargetOwnerReply(call.call_id, result)
         except Exception as error:
@@ -394,8 +397,9 @@ class TargetProviderClient:
             raise ContractError("Target owner did not return the matching rank-explicit manifest")
         return result
 
-    def admit_target(self, manifest, request_id) -> None:
-        if self._call("admit_target", manifest, request_id) is not None:
+    def admit_target(self, target, request_id, required_keys=None) -> None:
+        arguments = (target, request_id) if required_keys is None else (target, request_id, required_keys)
+        if self._call("admit_target", *arguments) is not None:
             raise ContractError("Target owner admission returned a malformed acknowledgement")
 
     def delivery_status(self, lease) -> dict:

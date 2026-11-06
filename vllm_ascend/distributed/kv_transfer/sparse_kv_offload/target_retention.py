@@ -7,6 +7,7 @@ extra cache references can incorrectly trigger decode copy-on-write.
 """
 
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Protocol
 from uuid import uuid4
@@ -110,6 +111,21 @@ class SchedulerRetentionRegistry:
     def validate(self, allocation: BlockAllocation) -> None:
         with self._lock:
             self._record(allocation)
+
+    def validate_scheduled(self, request_ids: Iterable[str]) -> dict[str, BlockAllocation]:
+        """Validate each retained allocation once for this scheduler output."""
+        with self._lock:
+            allocations = {}
+            for request_id in request_ids:
+                token = self._internal_requests.get(request_id)
+                if token is None:
+                    continue  # A local request has no receipt lease.
+                record = self._records[token]
+                if not record.guards:
+                    raise ContractError("Scheduled receipt target has no active owner retention")
+                self._check_blocks(record.allocation, request_id)
+                allocations[request_id] = record.allocation
+            return allocations
 
     def retain(self, allocation: BlockAllocation) -> RetentionGuard:
         with self._lock:

@@ -215,11 +215,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
 
     @contextmanager
-    def target_use_context(self, request_ids):
+    def target_use_context(self, request_ids, metadata=None):
+        child_metadata = getattr(metadata, "metadata", ())
         with ExitStack() as stack:
-            for connector in self._connectors:
+            for index, connector in enumerate(self._connectors):
                 if getattr(connector, "requires_target_owner", False):
-                    stack.enter_context(connector.target_use_context(request_ids))
+                    child = child_metadata[index] if index < len(child_metadata) else None
+                    stack.enter_context(connector.target_use_context(request_ids, child))
             yield
 
     def _receipt_restore_only_requests(self):

@@ -2,6 +2,7 @@
 """Request-bound data-plane control frames on the existing D side channel."""
 
 import math
+import time
 
 import msgspec
 import zmq
@@ -21,6 +22,7 @@ LAYER_RESULTS_MSG = b"layer_results_v1"
 PROOF_ACK = b"ACK"
 PROOF_ACK_TARGET_CLOSED = b"ACK_TARGET_CLOSED"
 MAX_PROOF_BATCH_FRAMES = 64
+MAX_PROOF_SEND_ATTEMPTS = 3
 TARGET_PEER_TIMEOUT_SECONDS = 30.0
 
 
@@ -158,30 +160,52 @@ class ManifestPeerProofs:
         self._timeout_ms = max(1, math.ceil(timeout * 1000))
         self._sockets = {}
 
-    def _send(self, host, port, message) -> bool:
-        endpoint = f"tcp://{host}:{port}"
-        encoded = msgspec.msgpack.encode(message)
-        for attempt in range(3):
-            socket = self._sockets.get(endpoint)
-            if socket is None:
-                socket = zmq.Context.instance().socket(zmq.REQ)
-                socket.setsockopt(zmq.LINGER, 0)
-                socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
-                socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-                socket.connect(endpoint)
-                self._sockets[endpoint] = socket
-            try:
-                socket.send(encoded)
-                response = socket.recv()
-                if response == PROOF_ACK:
-                    return False
-                if response == PROOF_ACK_TARGET_CLOSED:
-                    return True
-                raise ContractError("Peer did not acknowledge the exact completion proof")
-            except (zmq.ZMQError, ContractError):
-                self._sockets.pop(endpoint).close(linger=0)
-                if attempt == 2:
-                    raise
+    def _socket(self, endpoint):
+        socket = self._sockets.get(endpoint)
+        if socket is None:
+            socket = zmq.Context.instance().socket(zmq.REQ)
+            self._sockets[endpoint] = socket
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
+            socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
+            socket.connect(endpoint)
+        return socket
+
+    def _send_batches(self, messages) -> bool:
+        pending = {endpoint: msgspec.msgpack.encode(message) for endpoint, message in messages.items()}
+        cancelled = False
+        last_error = None
+        for _ in range(MAX_PROOF_SEND_ATTEMPTS):
+            awaiting = {}
+            # Dispatch to every receiver before waiting for ACKs. A D worker
+            # may install its visibility dependency before acknowledging.
+            for endpoint, encoded in pending.items():
+                try:
+                    socket = self._socket(endpoint)
+                    socket.send(encoded)
+                    awaiting[endpoint] = socket
+                except zmq.ZMQError as error:
+                    last_error = error
+                    socket = self._sockets.pop(endpoint, None)
+                    if socket is not None:
+                        socket.close(linger=0)
+            deadline = time.monotonic() + self._timeout_ms / 1000
+            for endpoint, socket in awaiting.items():
+                try:
+                    remaining = max(0, math.ceil((deadline - time.monotonic()) * 1000))
+                    if not socket.poll(remaining):
+                        raise ContractError(f"Completion proof ACK timed out for {endpoint}")
+                    response = socket.recv()
+                    if response not in (PROOF_ACK, PROOF_ACK_TARGET_CLOSED):
+                        raise ContractError(f"Peer {endpoint} did not acknowledge the exact completion proof")
+                    cancelled |= response == PROOF_ACK_TARGET_CLOSED
+                    pending.pop(endpoint)
+                except (zmq.ZMQError, ContractError) as error:
+                    last_error = error
+                    self._sockets.pop(endpoint).close(linger=0)
+            if not pending:
+                return cancelled
+        raise ContractError(f"Manifest completion proof was not acknowledged: {last_error}") from last_error
 
     def __call__(self, metadata, results, terminal) -> bool:
         batches = {}
@@ -221,13 +245,16 @@ class ManifestPeerProofs:
                         quiesced,
                     )
                 )
-        cancelled = False
-        for rank, frames in batches.items():
-            closed = self._send(
-                metadata.remote_host, metadata.remote_port + rank, (LAYER_RESULTS_MSG, CONTRACT_VERSION, tuple(frames))
-            )
-            cancelled |= closed
-        return cancelled
+        return self._send_batches(
+            {
+                f"tcp://{metadata.remote_host}:{metadata.remote_port + rank}": (
+                    LAYER_RESULTS_MSG,
+                    CONTRACT_VERSION,
+                    tuple(frames),
+                )
+                for rank, frames in batches.items()
+            }
+        )
 
     def close(self):
         for socket in self._sockets.values():

@@ -12,14 +12,15 @@ import threading
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from copy import deepcopy
 from dataclasses import dataclass, field
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
+    BlockAllocation,
     ContractError,
     ReceiveReceipt,
     RequestKey,
     TargetLease,
+    copy_target_lease,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import RetentionAuthority
 
@@ -42,7 +43,7 @@ class ReceivedTargetWrites:
             raise TypeError("A real Host-visible completion fence is required")
         if not callable(getattr(self.indexer_event, "query", None)):
             raise TypeError("A real Indexer device completion event is required")
-        object.__setattr__(self, "lease", deepcopy(self.lease))
+        object.__setattr__(self, "lease", copy_target_lease(self.lease))
 
     def __getstate__(self):
         raise TypeError("Receive dependencies must stay in the target owner process")
@@ -196,7 +197,7 @@ class OwnerTargetRuntime:
             if not callable(getattr(resource_pin, "release", None)):
                 raise TypeError("Target resource owner did not return a real pin")
             with self._lock:
-                self._states[lease.request] = _TargetUse(deepcopy(lease), resource_pin, guard)
+                self._states[lease.request] = _TargetUse(copy_target_lease(lease), resource_pin, guard)
         except Exception:
             try:
                 if resource_pin is not None:
@@ -305,15 +306,23 @@ class OwnerTargetRuntime:
                 state.preparing = False
 
     @contextmanager
-    def use(self, lease: TargetLease):
+    def use(self, lease: TargetLease, *, scheduled_allocation: BlockAllocation | None = None):
         """Cover a real model use, including its queued asynchronous writeback."""
         with self._lock:
             state = self._state(lease)
             if not state.visible or state.closing or state.preparing:
                 raise ContractError("Target is not available for decode")
+            if scheduled_allocation is not None and (
+                type(scheduled_allocation) is not BlockAllocation or scheduled_allocation != state.lease.allocation
+            ):
+                raise ContractError("Scheduler step allocation does not match the retained target")
             state.users += 1
         try:
-            state.retention.validate()
+            # Production scheduler metadata has already validated the block
+            # map for this step. The local live lease and users gate retain
+            # both owner resources and the scheduler guard during execution.
+            if scheduled_allocation is None:
+                state.retention.validate()
             self._resources.validate(lease)
             with self._streams.consumption():
                 self._streams.install_visibility(state.dependency)

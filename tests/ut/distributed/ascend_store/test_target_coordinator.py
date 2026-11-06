@@ -4,6 +4,7 @@
 import unittest
 from copy import deepcopy
 from dataclasses import replace
+from threading import Barrier
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
@@ -33,6 +34,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec im
     decode_owner_value,
     encode_owner_value,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_factory import DispatcherOwnerTransport
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_provider import (
     RegisteredTargetProvider,
     TargetBinding,
@@ -42,12 +44,22 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_provider impor
 class DescriptorOwner:
     """Real provider state machine over declared, non-allocated test geometry."""
 
-    def __init__(self, rank, tp_size, layers=2):
+    def __init__(self, rank, tp_size, layers=2, *, block_capacity=4, block_size=16):
         self.rank = rank
         self.retains, self.prepares, self.releases = [], [], []
         self.fail_release = False
+        main_entry_bytes = block_capacity * 64
+        main_layer_bytes = 2 * main_entry_bytes
         host = RegisteredRegion(
-            f"owner-{rank}", 1, f"host-{rank}", "shared-host", 3, 0, layers * 512, "host", f"node:{10000 + rank}"
+            f"owner-{rank}",
+            1,
+            f"host-{rank}",
+            "shared-host",
+            3,
+            0,
+            layers * main_layer_bytes,
+            "host",
+            f"node:{10000 + rank}",
         )
         regions = [host]
         entries = []
@@ -56,10 +68,11 @@ class DescriptorOwner:
                 for entry in range(2):
                     if component is Component.MAIN:
                         region = host
-                        dtype, shape, strides, page_bytes = "bfloat16", (4, 16, 2), (64, 4, 2), 64
-                        offset, page_tokens = layer * 512 + entry * 256, 16
+                        dtype, shape, strides, page_bytes = "bfloat16", (block_capacity, 16, 2), (64, 4, 2), 64
+                        offset, page_tokens = layer * main_layer_bytes + entry * main_entry_bytes, block_size
                     else:
                         stride = 32 if entry == 0 else 16
+                        indexer_pages = 2 * block_capacity
                         region = RegisteredRegion(
                             f"owner-{rank}",
                             1,
@@ -67,17 +80,26 @@ class DescriptorOwner:
                             f"device-{rank}-{layer}-{entry}",
                             1,
                             0,
-                            8 * stride,
+                            indexer_pages * stride,
                             "device",
                             f"node:{10000 + rank}",
                         )
                         regions.append(region)
                         dtype = "int8" if entry == 0 else "float16"
-                        shape = (8, 8, 4 if entry == 0 else 1)
+                        shape = (indexer_pages, 8, 4 if entry == 0 else 1)
                         strides = (stride, 4, 1) if entry == 0 else (stride, 2, 2)
-                        page_bytes, offset, page_tokens = stride, 0, 8
+                        page_bytes, offset, page_tokens = stride, 0, block_size // 2
                     view = CacheView(
-                        component, layer, region.region_id, dtype, (strides[0],), page_tokens, 16, 4, offset, ()
+                        component,
+                        layer,
+                        region.region_id,
+                        dtype,
+                        (strides[0],),
+                        page_tokens,
+                        block_size,
+                        block_capacity,
+                        offset,
+                        (),
                     )
                     binding = TargetBinding(view, 0, page_bytes)
                     entries.append(
@@ -85,7 +107,7 @@ class DescriptorOwner:
                             f"layer.{layer}.{component.value}", component, layer, 0, entry, shape, strides, binding
                         )
                     )
-        plan = WriterPlan({"shared-host": (0,)}, {"shared-host": (TokenRange(0, 64),)})
+        plan = WriterPlan({"shared-host": (0,)}, {"shared-host": (TokenRange(0, block_capacity * block_size),)})
         required = {component: tuple(range(layers)) for component in Component}
         self.descriptor = TargetCatalog(CONTRACT_VERSION, rank, tp_size, tuple(regions), tuple(entries), required, plan)
         self.provider = RegisteredTargetProvider(
@@ -162,8 +184,49 @@ class TestMultiRankTargets(unittest.TestCase):
         self.assertEqual(client.get_target_views(lease), lease.views)
         client.release_target(lease)
 
+    def test_scheduler_local_manifest_isolated_after_removing_duplicate_copy(self):
+        provider, _, request, allocation = coordinated()
+        exported_catalogs = provider.catalogs()
+        exported_catalogs[0].required_layers.clear()
+        client = TargetProviderClient(DispatcherOwnerTransport(TargetOwnerDispatcher(provider, copy_reply=False)))
+        lease = client.acquire_target(request, allocation)
+        try:
+            expected = client.get_target_manifest(lease)
+            published = client.get_target_manifest(lease)
+            published.lease.writer_plan.writers_by_backing.clear()
+            published.for_rank(0).catalog.required_layers.clear()
+
+            self.assertNotEqual(published, expected)
+            self.assertEqual(client.get_target_manifest(lease), expected)
+        finally:
+            client.release_target(lease)
+
+    def test_parallel_delivery_poll_requires_every_owner_proof(self):
+        _, owners, request, allocation = coordinated()
+        provider = MultiRankTargetProvider(owners, parallel_owner_calls=True)
+        lease = provider.acquire_target(request, allocation)
+        barrier = Barrier(len(owners), timeout=5)
+
+        def ready(_):
+            barrier.wait()
+            return {"ready": True, "remote_quiesced": True}
+
+        def pending(_):
+            barrier.wait()
+            return {"ready": False, "remote_quiesced": True}
+
+        owners[0].delivery_status = ready
+        owners[1].delivery_status = pending
+        self.assertEqual(provider.delivery_status(lease), {"ready": False, "remote_quiesced": True})
+        owners[1].delivery_status = ready
+        self.assertEqual(provider.delivery_status(lease), {"ready": True, "remote_quiesced": True})
+        provider.release_target(lease)
+
     def test_tp16_model_sized_manifest_round_trip_fits_transport_limits(self):
-        provider, _, request, allocation = coordinated(tp=16, layers=78)
+        owners = tuple(DescriptorOwner(rank, 16, 78, block_capacity=513, block_size=128) for rank in range(16))
+        provider = MultiRankTargetProvider(owners)
+        request = RequestKey("model-sized", 0)
+        allocation = BlockAllocation(request, 9, (tuple(range(1, 490)),), 128, 62474, "descriptor-fixture-retention")
         lease = provider.acquire_target(request, allocation)
         manifest = provider.manifest(lease)
         frame = encode_owner_value(manifest)
@@ -197,6 +260,41 @@ class TestMultiRankTargets(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "unresolved"):
             provider.acquire_target(request, allocation)
 
+    def test_parallel_acquire_publishes_all_owner_leases(self):
+        _, owners, request, allocation = coordinated()
+        provider = MultiRankTargetProvider(owners, parallel_owner_calls=True)
+        barrier = Barrier(len(owners), timeout=5)
+
+        def synchronized_acquire(acquire):
+            def acquire_after_barrier(request, allocation):
+                barrier.wait()
+                return acquire(request, allocation)
+
+            return acquire_after_barrier
+
+        for owner in owners:
+            owner.acquire_target = synchronized_acquire(owner.acquire_target)
+
+        lease = provider.acquire_target(request, allocation)
+        manifest = provider.manifest(lease)
+        self.assertEqual(tuple(target.lease for target in manifest.targets), tuple(o.retains[0] for o in owners))
+        provider.release_target(lease)
+
+    def test_parallel_acquire_records_other_leases_after_an_unresolved_rank(self):
+        _, owners, request, allocation = coordinated()
+        provider = MultiRankTargetProvider(owners, parallel_owner_calls=True)
+
+        def unresolved(*args):
+            raise TimeoutError("RPC reply not observed")
+
+        owners[0].acquire_target = unresolved
+        with self.assertRaisesRegex(ContractError, "remain retained"):
+            provider.acquire_target(request, allocation)
+        target = provider._targets[request]
+        self.assertIsNone(target.manifest)
+        self.assertEqual(target.acquired, {1: owners[1].retains[0]})
+        self.assertEqual(owners[1].releases, [])
+
     def test_partial_release_does_not_ack_or_lose_unreleased_rank(self):
         provider, owners, request, allocation = coordinated()
         lease = provider.acquire_target(request, allocation)
@@ -210,6 +308,23 @@ class TestMultiRankTargets(unittest.TestCase):
         owners[1].fail_release = False
         provider.release_target(lease)
         self.assertEqual([len(owner.releases) for owner in owners], [1, 1])
+
+    def test_parallel_release_retries_only_unresolved_ranks(self):
+        _, owners, request, allocation = coordinated()
+        provider = MultiRankTargetProvider(owners, parallel_owner_calls=True)
+        lease = provider.acquire_target(request, allocation)
+        owners[0].fail_release = True
+
+        with self.assertRaisesRegex(ContractError, "stay retained"):
+            provider.release_target(lease)
+        self.assertEqual(provider._targets[request].released, {1})
+        with self.assertRaisesRegex(ContractError, "active, partial or uncertain"):
+            provider.assert_can_close()
+
+        owners[0].fail_release = False
+        provider.release_target(lease)
+        self.assertEqual([len(owner.releases) for owner in owners], [1, 1])
+        provider.assert_can_close()
 
     def test_shared_main_identity_and_offsets_must_match_before_publish(self):
         for changed in ("backing", "offset", "entry", "consumer"):

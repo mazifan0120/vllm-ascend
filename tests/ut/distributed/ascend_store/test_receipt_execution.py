@@ -5,6 +5,7 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 from tests.ut.distributed.ascend_store.test_target_owner_runtime import OwnerFixture
@@ -117,6 +118,35 @@ class TestReceiptExecution(unittest.TestCase):
             ledger.finish_rank(lease.request, 0, Status.SUCCESS, True)
             self.assertIsNone(ledger.build_receipt())
             self.assertEqual(control.delivery_status(lease), {"ready": False, "remote_quiesced": True})
+            control.release_target(lease)
+        finally:
+            fixture.finish(lease)
+
+    def test_scheduled_proof_avoids_per_rank_rpc_and_preserves_the_runtime_use_gate(self):
+        fixture, lease, manifest, control, ledger, _ = delivery_fixture()
+        try:
+            complete(fixture, lease, manifest, ledger)
+            allocations = fixture.retention.validate_scheduled(("internal", "ordinary"))
+            with (
+                self.assertRaisesRegex(ContractError, "no validated allocation"),
+                control.use_context(("internal",), {}),
+            ):
+                pass
+            changed = replace(allocations["internal"], allocation_generation=99)
+            with (
+                self.assertRaisesRegex(ContractError, "does not match the retained target"),
+                control.use_context(("internal",), {"internal": changed}),
+            ):
+                pass
+            state = fixture.runtime._states[lease.request]
+            with patch.object(state.retention, "validate", wraps=state.retention.validate) as validate:
+                with control.use_context(("internal", "ordinary"), allocations):
+                    self.assertEqual(state.users, 1)
+                validate.assert_not_called()
+                with control.use_context(("internal",)):
+                    self.assertEqual(state.users, 1)
+                validate.assert_called_once_with()
+            self.assertTrue(state.events)
             control.release_target(lease)
         finally:
             fixture.finish(lease)

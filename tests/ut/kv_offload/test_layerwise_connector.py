@@ -28,6 +28,69 @@ def _encode_decode(msg):
     return decoder.decode(encoder.encode(msg))
 
 
+def test_producer_decodes_the_remote_target_only_on_the_first_chunk():
+    identity = lc.RequestKey("instance", 0)
+    lease = SimpleNamespace(request=identity, writer_plan=None)
+    manifest = SimpleNamespace(lease=lease)
+    request = SimpleNamespace(
+        all_token_ids=[1] * 384,
+        kv_transfer_params={
+            "do_remote_decode": True,
+            "request_instance": identity.request_instance,
+            "remote_target_lease": {"lease": True},
+            "remote_target_manifest": {"manifest": True},
+        },
+    )
+    scheduler = lc.MooncakeLayerwiseConnectorScheduler.__new__(lc.MooncakeLayerwiseConnectorScheduler)
+    scheduler.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=False))
+    scheduler.block_size = [128]
+    scheduler._reqs_need_send_layerwise = {"req": lc.SendReqInfo([[0]], 0, 0, request)}
+    cached = SimpleNamespace(req_ids=["req"], new_block_ids=[None], num_computed_tokens=[0])
+    step = SimpleNamespace(
+        scheduled_cached_reqs=cached,
+        scheduled_new_reqs=[],
+        scheduled_spec_decode_tokens={},
+        num_scheduled_tokens={"req": 128},
+    )
+    with (
+        patch.object(lc, "target_lease_from_wire", return_value=lease) as parse_lease,
+        patch.object(lc, "target_manifest_from_wire", return_value=manifest) as parse_manifest,
+    ):
+        first = scheduler.build_connector_meta(step).requests["req"]
+        cached.num_computed_tokens = [128]
+        second = scheduler.build_connector_meta(step).requests["req"]
+
+    assert first.remote_target_manifest is second.remote_target_manifest is manifest
+    assert first.local_computed_tokens == 128 and second.local_computed_tokens == 256
+    assert second.local_transed_tokens == 128
+    parse_lease.assert_called_once_with(request.kv_transfer_params["remote_target_lease"])
+    parse_manifest.assert_called_once_with(request.kv_transfer_params["remote_target_manifest"])
+
+
+def test_consumer_publishes_retention_proof_in_scheduler_step_metadata():
+    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import SchedulerRetentionRegistry
+
+    block_ids = ((1, 3),)
+    registry = SchedulerRetentionRegistry(SimpleNamespace(get_block_ids=lambda _: block_ids))
+    allocation = registry.issue("internal", lc.BlockAllocation(lc.RequestKey("instance", 0), 2, block_ids, 16, 23))
+    scheduler = object.__new__(lc.MooncakeLayerwiseConnectorScheduler)
+    scheduler.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True))
+    scheduler._retention_registry = registry
+    scheduler._reqs_need_recv = {}
+    step = SimpleNamespace(num_scheduled_tokens={"internal": 1, "ordinary": 1})
+    guard = registry.retain(allocation)
+    try:
+        metadata = scheduler.build_connector_meta(step)
+        assert metadata.scheduled_target_allocations == {"internal": allocation}
+        connector = object.__new__(lc.MooncakeLayerwiseConnector)
+        delivery = SimpleNamespace(use_context=Mock())
+        connector.connector_worker = SimpleNamespace(_target_delivery=delivery)
+        connector.target_use_context(tuple(step.num_scheduled_tokens), metadata)
+        delivery.use_context.assert_called_once_with(("internal", "ordinary"), {"internal": allocation})
+    finally:
+        guard.release()
+
+
 class TestExactReceiverProtocol(unittest.TestCase):
     def publisher(self):
         receiver, ledger, required = self.fixture()
@@ -299,7 +362,8 @@ class TestSourceReadyPreparation(unittest.TestCase):
 
         from vllm_ascend.worker import model_runner_v1 as mr
 
-        output = SimpleNamespace(num_scheduled_tokens={"internal": 1})
+        metadata = object()
+        output = SimpleNamespace(num_scheduled_tokens={"internal": 1}, kv_connector_metadata=metadata)
         context = nullcontext()
         group = SimpleNamespace(requires_target_owner=True, target_use_context=Mock(return_value=context))
         runner = object.__new__(mr.NPUModelRunner)
@@ -308,7 +372,7 @@ class TestSourceReadyPreparation(unittest.TestCase):
             patch.object(mr, "get_kv_transfer_group", return_value=group),
         ):
             self.assertIs(runner.receipt_target_use_context(output), context)
-            group.target_use_context.assert_called_once_with(("internal",))
+            group.target_use_context.assert_called_once_with(("internal",), metadata)
             group.requires_target_owner = False
             runner.receipt_target_use_context(output)
             self.assertEqual(group.target_use_context.call_count, 1)

@@ -15,6 +15,7 @@ this module (and its unit tests) run in CPU-only CI.
 """
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
@@ -320,6 +321,18 @@ class TargetLease:
                 raise ContractError(f"TargetLease.views[{i}] must be CacheView, got {type(v).__name__}")
         if not isinstance(self.writer_plan, WriterPlan):
             raise ContractError(f"TargetLease.writer_plan must be WriterPlan, got {type(self.writer_plan).__name__}")
+
+
+def copy_target_lease(lease: TargetLease) -> TargetLease:
+    # Deepcopy revisits tuples of immutable scalars. A lease can reference the
+    # same allocation map from every layer, so share those verified tuples
+    # while still copying the views and mutable writer plan.
+    memo = {}
+    for view in lease.views:
+        blocks = view.block_ids
+        if id(blocks) not in memo and type(blocks) is tuple and all(type(block) is int for block in blocks):
+            memo[id(blocks)] = blocks
+    return deepcopy(lease, memo)
 
 
 @dataclass

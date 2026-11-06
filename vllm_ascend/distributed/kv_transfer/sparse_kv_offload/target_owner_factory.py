@@ -72,8 +72,12 @@ class SchedulerTargetRpc:
                 OwnerRpcClient(endpoint, timeout=config.timeout, context=self._context)
                 for endpoint in config.owner_endpoints
             )
-            self.provider = MultiRankTargetProvider(tuple(TargetProviderClient(client) for client in self._clients))
-            self.transport = DispatcherOwnerTransport(TargetOwnerDispatcher(self.provider))
+            self.provider = MultiRankTargetProvider(
+                tuple(TargetProviderClient(client) for client in self._clients), parallel_owner_calls=True
+            )
+            # The scheduler-local coordinator already returns defensive
+            # snapshots. A second copy is unnecessary on this transport.
+            self.transport = DispatcherOwnerTransport(TargetOwnerDispatcher(self.provider, copy_reply=False))
         except Exception:
             for client in self._clients:
                 client.close()

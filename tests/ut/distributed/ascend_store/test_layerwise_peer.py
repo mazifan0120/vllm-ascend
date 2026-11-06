@@ -92,6 +92,54 @@ class TestTargetPeer(unittest.TestCase):
             self.assertEqual(errors, [])
             provider.release_target(manifest.lease)
 
+    def test_proof_fanout_sends_all_receivers_before_waiting_and_retries_only_failures(self):
+        ready = threading.Event()
+        endpoints, messages, errors = [], [], []
+
+        def serve():
+            context = zmq.Context()
+            sockets = tuple(context.socket(zmq.ROUTER) for _ in range(2))
+            try:
+                for socket in sockets:
+                    socket.bind("tcp://127.0.0.1:*")
+                    endpoints.append(socket.getsockopt_string(zmq.LAST_ENDPOINT))
+                ready.set()
+                identities = []
+                # Hold both ACKs until both receivers have the proof.
+                for socket in sockets:
+                    if not socket.poll(2000):
+                        raise TimeoutError("Both D ranks must receive proofs before ACKs are awaited")
+                    identity, _, payload = socket.recv_multipart()
+                    identities.append(identity)
+                    messages.append(msgspec.msgpack.decode(payload))
+                sockets[0].send_multipart((identities[0], b"", PROOF_ACK))
+                sockets[1].send_multipart((identities[1], b"", b"INVALID"))
+                if not sockets[1].poll(2000):
+                    raise TimeoutError("D rank with invalid ACK did not receive a retry")
+                identity, _, payload = sockets[1].recv_multipart()
+                messages.append(msgspec.msgpack.decode(payload))
+                sockets[1].send_multipart((identity, b"", PROOF_ACK_TARGET_CLOSED))
+                self.assertFalse(sockets[0].poll(50))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                for socket in sockets:
+                    socket.close(linger=0)
+                context.term()
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        proofs = ManifestPeerProofs(0, timeout=1)
+        try:
+            self.assertTrue(ready.wait(1))
+            self.assertTrue(proofs._send_batches({endpoints[0]: "rank-0", endpoints[1]: "rank-1"}))
+        finally:
+            proofs.close()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(messages, ["rank-0", "rank-1", "rank-1"])
+
     def test_registered_address_lookup_uses_real_retained_owner_and_msgpack(self):
         fixture = OwnerFixture()
         lease = fixture.acquire()

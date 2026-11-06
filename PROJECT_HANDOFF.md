@@ -1,5 +1,18 @@
 # Prefill KV buffer reuse 与 Mooncake PD transfer 项目交接
 
+## 2026-11-06 性能验证更新
+
+- 已验证的优化覆盖 TP16 owner 并行获取、登记、就绪查询和回收，缩减逐 rank 的登记载荷和租约复制，
+  并在 P 的同一发送请求内复用解析后的目标描述。保留全 rank 回执及失败保留门禁。
+- D scheduler 按实际 block manager 为每个已调度 step 校验一次保留分配。D worker 核对当前 step 的分配
+  和已安装 lease，继续持有本地 guard 及 stream fence。实机九条 62K 请求正确并回收。
+- TP16、32,784 chunk、513 blocks 的匹配样本中，同步完整 P/D 冷 TTFT 中位数 24.00 s，
+  一体纯 HBM 为 20.03 s。回放 TTFT 分别为 5.36 s（Mooncake Store 命中）和 0.55 s（本地 HBM 命中）。
+- 独立 D 异步调度候选的冷 TTFT 为 23.98 s。62K 的 29-token 样本在首 token 后的中位时长由同步的
+  12.87 s 降到 8.91 s，一体纯 HBM 为 5.46 s。异步实现只在候选快照中验证。
+
+详细配置、样本及计时口径见部署工作区 `docs/m1-buffer-reuse-runbook.md` §11.57–11.59。
+
 ## 2026-11-05 四节点实机验证更新
 
 - Ansible 复现了 `4204f545d` 的 TP1 原生探针。随后在 P r05／D r03 镜像上加载本次修复，完成

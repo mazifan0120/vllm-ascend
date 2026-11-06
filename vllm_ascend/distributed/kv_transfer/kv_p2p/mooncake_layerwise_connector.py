@@ -69,6 +69,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     ReleaseAck,
     RequestKey,
     Status,
+    TargetLease,
     TargetScope,
     TokenRange,
     TransferKey,
@@ -204,6 +205,7 @@ class SendReqInfo:
     local_transferred_tokens: int
     local_computed_tokens: int
     request: "Request"
+    remote_target: tuple[TargetLease | None, TargetManifest | None] | None = None
 
     def extend_local_block_ids(self, new_block_ids: list[list[int]]) -> None:
         """extend local block ids for this step"""
@@ -1155,10 +1157,10 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
         self.send_task: SendTask = SendTask()
-        # instance -> (req_id, expected_ranks, backings, prompt_len, lease);
-        # built by the D scheduler, consumed by the D worker's start_load_kv
-        # (multiproc-safe receipt ledger transport).
+        # Older metadata can carry receipt specs. Current receipt targets
+        # install their ledgers synchronously over the owner RPC.
         self.receipt_specs: dict[str, tuple] = {}
+        self.scheduled_target_allocations: dict[str, BlockAllocation] | None = None
 
     def add_new_req(
         self,
@@ -1171,13 +1173,17 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
         remote_cache_tokens: int = 0,
         local_computed_tokens: int = 0,
         local_transed_tokens: int = 0,
+        remote_target: tuple[TargetLease | None, TargetManifest | None] | None = None,
     ):
-        wire_lease = kv_transfer_params.get("remote_target_lease")
-        lease = target_lease_from_wire(wire_lease) if wire_lease is not None else None
-        wire_manifest = kv_transfer_params.get("remote_target_manifest")
-        manifest = target_manifest_from_wire(wire_manifest) if wire_manifest is not None else None
-        if manifest is not None and manifest.lease != lease:
-            raise ContractError("Published manifest and aggregate lease do not identify the same target")
+        if remote_target is None:
+            wire_lease = kv_transfer_params.get("remote_target_lease")
+            lease = target_lease_from_wire(wire_lease) if wire_lease is not None else None
+            wire_manifest = kv_transfer_params.get("remote_target_manifest")
+            manifest = target_manifest_from_wire(wire_manifest) if wire_manifest is not None else None
+            if manifest is not None and manifest.lease != lease:
+                raise ContractError("Published manifest and aggregate lease do not identify the same target")
+        else:
+            lease, manifest = remote_target
         instance = kv_transfer_params.get("request_instance", "")
         if lease is not None and lease.request.request_instance != instance:
             raise ContractError("Published target lease belongs to another request instance")
@@ -1336,13 +1342,14 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def is_target_ready(self, request) -> bool:
         return self.connector_scheduler is None or self.connector_scheduler._is_target_ready(request)
 
-    def target_use_context(self, request_ids):
+    def target_use_context(self, request_ids, metadata=None):
         delivery = getattr(self.connector_worker, "_target_delivery", None)
         if delivery is None:
             if self.target_provider is not None and self.target_provider.ready:
                 raise ContractError("Registered target owner has no model-use admission registry")
             return contextlib.nullcontext()  # Allocation/profile phase has no admitted target.
-        return delivery.use_context(request_ids)
+        allocations = getattr(metadata, "scheduled_target_allocations", None)
+        return delivery.use_context(request_ids, allocations)
 
     def shutdown(self) -> None:
         writer = getattr(self.connector_worker, "_manifest_source_writer", None)
@@ -1822,7 +1829,6 @@ class MooncakeLayerwiseConnectorScheduler:
         target state published via _maybe_publish_target."""
         assert_provider_capabilities(provider)
         self._target_provider = provider
-        self._pending_receipt_specs: dict[str, tuple] = {}
         self._request_leases: dict[str, Any] = {}
         self._target_release_acks: dict[RequestKey, ReleaseAck] = {}
         self._ready_targets: set[RequestKey] = set()
@@ -1933,18 +1939,6 @@ class MooncakeLayerwiseConnectorScheduler:
                 if region.region_id == view.region_binding
             )
         )
-        # Ledger construction happens on the WORKER side (the receive thread is
-        # its sole writer); the scheduler ships a plain-data spec through
-        # connector metadata, which vLLM serializes across processes.
-        # The lease must be picklable: pure data (contract TargetLease).
-        spec = (
-            request.request_id,
-            tuple(range(sender_ranks)),
-            backings,
-            prompt_len,
-            manifest,
-        )
-        self._pending_receipt_specs[request_instance] = spec
         # All real owner receive maps/ledgers must be installed before the
         # metaserver can start P, including its zero-compute Store-hit path.
         provider.admit_target(manifest, request.request_id)
@@ -1974,6 +1968,9 @@ class MooncakeLayerwiseConnectorScheduler:
         meta = MooncakeLayerwiseConnectorMetadata()
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
+            registry = getattr(self, "_retention_registry", None)
+            if registry is not None:
+                meta.scheduled_target_allocations = registry.validate_scheduled(scheduler_output.num_scheduled_tokens)
             # Loop through scheduled reqs and convert to ReqMeta.
             for req_id, (req, token_ids, block_ids) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
@@ -1987,12 +1984,6 @@ class MooncakeLayerwiseConnectorScheduler:
                     token_ids=token_ids,
                 )
 
-            # Ship receipt specs created this step to the worker process via
-            # the connector metadata (multiproc-safe).
-            pending_specs = getattr(self, "_pending_receipt_specs", None)
-            if pending_specs:
-                meta.receipt_specs = dict(pending_specs)
-                self._pending_receipt_specs = {}
             # Clear the list once workers start the transfers
             self._reqs_need_recv.clear()
         else:
@@ -2038,7 +2029,16 @@ class MooncakeLayerwiseConnectorScheduler:
                             prompt_len=len(request.all_token_ids),
                             local_computed_tokens=local_computed_tokens,
                             local_transed_tokens=local_transed_tokens,
+                            remote_target=send_req_info.remote_target,
                         )
+                        if send_req_info.remote_target is None:
+                            request_meta = meta.requests[req_id]
+                            # Target identity and geometry are fixed for this
+                            # send lifetime; only step progress changes.
+                            send_req_info.remote_target = (
+                                request_meta.remote_target_lease,
+                                request_meta.remote_target_manifest,
+                            )
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
                                 "MooncakeLayerwiseConnector build_connector_meta: req_id=%r prompt_len=%s "

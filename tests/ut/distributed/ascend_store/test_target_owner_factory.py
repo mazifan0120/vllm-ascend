@@ -73,6 +73,22 @@ def _registry():
 
 
 class TestSerializedAllocationAuthority(unittest.TestCase):
+    def test_schedule_validates_live_owner_allocation_and_accepts_only_appended_blocks(self):
+        raw, _, registry, _, allocation = _registry()
+        with self.assertRaisesRegex(ContractError, "no active owner retention"):
+            registry.validate_scheduled(("internal",))
+        guard = registry.retain(allocation)
+        try:
+            raw.ids["internal"] = ((1, 3, 7),)
+            self.assertEqual(registry.validate_scheduled(("ordinary", "internal")), {"internal": allocation})
+            raw.ids["internal"] = ((3, 1, 7),)
+            with self.assertRaisesRegex(ContractError, "no longer owns"):
+                registry.validate_scheduled(("internal",))
+        finally:
+            raw.ids["internal"] = allocation.group_block_ids
+            guard.release()
+        registry.retire(allocation, ReleaseAck(True, allocation.retention_token))
+
     def test_free_and_pop_require_retirement_even_after_last_guard_release(self):
         raw, manager, registry, _, allocation = _registry()
         request = SimpleNamespace(request_id="internal")

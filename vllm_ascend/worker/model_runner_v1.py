@@ -2233,7 +2233,7 @@ class NPUModelRunner(GPUModelRunner):
         use = getattr(connector,"target_use_context",None)
         if not callable(use):
             raise RuntimeError("Receipt target connector must cover actual model execution")
-        return use(tuple(scheduler_output.num_scheduled_tokens))
+        return use(tuple(scheduler_output.num_scheduled_tokens), scheduler_output.kv_connector_metadata)
 
     @torch.inference_mode()
     @use_receipt_targets

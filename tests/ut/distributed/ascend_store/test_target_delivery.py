@@ -25,6 +25,26 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_rpc impo
 
 
 class TestTargetDelivery(unittest.TestCase):
+    def test_compact_admission_rejects_missing_or_foreign_entries(self):
+        provider, owners, request, allocation = coordinated()
+        lease = provider.acquire_target(request, allocation)
+        manifest = provider.manifest(lease)
+        local = manifest.for_rank(1).lease
+        plan = ManifestWritePlan(manifest)
+        entries = plan.receive_keys(1)
+        installed = []
+        control = WorkerTargetDelivery(1, owners[1], lambda *args: installed.append(args))
+        try:
+            with self.assertRaisesRegex(ContractError, "cover the local registered views"):
+                control.admit_target(local, "internal", entries[:-1])
+            with self.assertRaisesRegex(ContractError, "cover the local registered views"):
+                control.admit_target(local, "internal", plan.receive_keys(0))
+            self.assertEqual(installed, [])
+            control.admit_target(local, "internal", entries)
+            self.assertEqual(len(installed), 1)
+        finally:
+            provider.release_target(lease)
+
     def test_abort_after_address_lookup_retains_target_until_all_writers_quiesce(self):
         provider, owners, request, allocation = coordinated()
         lease = provider.acquire_target(request, allocation)

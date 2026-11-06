@@ -28,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     WriterPlan,
     assert_lease_consistent,
     assert_registered_regions,
+    copy_target_lease,
 )
 
 
@@ -188,6 +189,10 @@ class RegisteredTargetProvider:
     def _build_lease(self, request: RequestKey, allocation: BlockAllocation) -> TargetLease:
         if allocation.request != request or not allocation.retention_token:
             raise ContractError("Target acquisition requires matching identity and live scheduler retention")
+        needed = (allocation.prompt_tokens + allocation.manager_block_size_tokens - 1) // (
+            allocation.manager_block_size_tokens
+        )
+        checked_groups = set()
         views = []
         for binding in self._bindings:
             view = binding.view
@@ -196,15 +201,15 @@ class RegisteredTargetProvider:
             if binding.group >= len(allocation.group_block_ids):
                 raise ContractError("Allocation is missing a component group")
             ids = allocation.group_block_ids[binding.group]
-            needed = (
-                allocation.prompt_tokens + allocation.manager_block_size_tokens - 1
-            ) // allocation.manager_block_size_tokens
-            if (
-                len(ids) < needed
-                or len(set(ids)) != len(ids)
-                or any(type(block) is not int or block < 0 or block >= view.block_capacity for block in ids)
-            ):
-                raise ContractError("Target block capacity cannot cover the complete prompt")
+            group = (binding.group, view.block_capacity)
+            if group not in checked_groups:
+                if (
+                    len(ids) < needed
+                    or len(set(ids)) != len(ids)
+                    or any(type(block) is not int or block < 0 or block >= view.block_capacity for block in ids)
+                ):
+                    raise ContractError("Target block capacity cannot cover the complete prompt")
+                checked_groups.add(group)
             views.append(replace(view, block_ids=ids))
         main_backings = {
             r.backing_id
@@ -260,16 +265,16 @@ class RegisteredTargetProvider:
             previous = self._states.get(request)
             if previous is not None:
                 if previous.phase in ("ACQUIRED", "READY") and previous.lease == lease:
-                    return deepcopy(previous.lease)
+                    return copy_target_lease(previous.lease)
                 raise ContractError("Request identity already acquired, changed or retired")
             blocks = self._blocks(lease)
             if any(block in self._block_owners for block in blocks):
                 raise ContractError("Target blocks still belong to an earlier lease")
-            state = _LeaseState(deepcopy(lease), "ACQUIRING")
+            state = _LeaseState(copy_target_lease(lease), "ACQUIRING")
             self._states[request] = state
             self._block_owners.update({block: request for block in blocks})
         try:
-            self._runtime.retain(deepcopy(lease))
+            self._runtime.retain(copy_target_lease(lease))
         except Exception:
             with self._lock:
                 self._states.pop(request)
@@ -321,7 +326,7 @@ class RegisteredTargetProvider:
                 raise ContractError("Target cannot install this receipt visibility dependency")
             state.phase = "PREPARING"
         try:
-            self._runtime.make_visible(deepcopy(lease), deepcopy(receipt))
+            self._runtime.make_visible(copy_target_lease(lease), deepcopy(receipt))
         except Exception as error:
             with self._lock:
                 state.phase, state.error = "FAILED", error
@@ -348,7 +353,7 @@ class RegisteredTargetProvider:
             previous_phase = state.phase
             state.phase = "RELEASING"
         try:
-            self._runtime.release(deepcopy(lease))
+            self._runtime.release(copy_target_lease(lease))
         except Exception as error:
             with self._lock:
                 state.phase, state.error = previous_phase, error

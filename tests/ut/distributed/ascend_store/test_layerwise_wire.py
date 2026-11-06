@@ -4,6 +4,7 @@
 import copy
 import json
 import unittest
+from dataclasses import replace
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 from tests.ut.distributed.ascend_store.test_target_owner_runtime import OwnerFixture
@@ -62,6 +63,18 @@ class TestLayerwiseTargetWire(unittest.TestCase):
         old["views"][0]["block_ids"] = {"allocation_group": 0}
         with self.assertRaises(ContractError):
             target_lease_from_wire(old)
+
+    def test_shared_block_map_is_revalidated_at_each_distinct_capacity(self):
+        wire = copy.deepcopy(self.wire)
+        last_view = self.lease.views[-1]
+        self.assertIs(self.lease.views[0].block_ids, last_view.block_ids)
+        block_capacity = max(last_view.block_ids)
+        wire["views"][-1]["block_capacity"] = block_capacity
+        with self.assertRaisesRegex(ContractError, "invalid block ID"):
+            target_lease_from_wire(wire)
+        invalid = replace(self.lease, views=(*self.lease.views[:-1], replace(last_view, block_capacity=block_capacity)))
+        with self.assertRaisesRegex(ContractError, "invalid block ID"):
+            target_lease_to_wire(invalid)
 
     def test_mismatched_request_identity_is_rejected(self):
         wire = copy.deepcopy(self.wire)

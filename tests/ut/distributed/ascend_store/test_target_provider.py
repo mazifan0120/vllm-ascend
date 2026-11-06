@@ -79,6 +79,17 @@ class TestRegisteredTargetProvider(unittest.TestCase):
                 provider.acquire_target(request, invalid)
         self.runtime.retain.assert_not_called()
 
+    def test_shared_block_group_still_checks_the_smaller_component_capacity(self):
+        _, request, allocation = self.make()
+        main, index = self.bindings
+        self.bindings = (main, replace(index, group=0, view=replace(index.view, block_capacity=4)))
+        provider = self.construct()
+        invalid = replace(allocation, group_block_ids=((1, 5),))
+
+        with self.assertRaisesRegex(ContractError, "Target block capacity"):
+            provider.acquire_target(request, invalid)
+        self.runtime.retain.assert_not_called()
+
     def test_idempotent_acquire_cannot_change_allocation(self):
         provider, request, allocation = self.make()
         lease = provider.acquire_target(request, allocation)
@@ -147,7 +158,11 @@ class TestRegisteredTargetProvider(unittest.TestCase):
     def test_returned_mutable_writer_plan_cannot_change_registered_identity(self):
         provider, request, allocation = self.make()
         lease = provider.acquire_target(request, allocation)
+        retained = self.runtime.retain.call_args.args[0]
+        self.assertIs(retained.views[0].block_ids, lease.views[0].block_ids)
+        self.assertIs(retained.views[1].block_ids, lease.views[1].block_ids)
         lease.writer_plan.writers_by_backing.clear()
+        self.assertTrue(retained.writer_plan.writers_by_backing)
         with self.assertRaises(ContractError):
             provider.get_target_views(lease)
         good = provider.acquire_target(request, allocation)

@@ -79,6 +79,14 @@ def _record(value):
     return {field.name: getattr(value, field.name) for field in fields(value)}
 
 
+def _validate_view_block_ids(view: CacheView, checked: set[tuple[int, int]]) -> None:
+    identity = (id(view.block_ids), view.block_capacity)
+    if identity not in checked:
+        if any(type(block) is not int or block < 0 or block >= view.block_capacity for block in view.block_ids):
+            raise ContractError("Target view contains an invalid block ID")
+        checked.add(identity)
+
+
 def _lease_wire_payload(lease: TargetLease) -> dict:
     """Publish identities, geometry and block IDs; never owner-local pointers."""
     if not isinstance(lease, TargetLease):
@@ -87,9 +95,9 @@ def _lease_wire_payload(lease: TargetLease) -> dict:
         raise ContractError("Target publication requires scheduler retention")
     assert_lease_consistent(lease, lease.request)
     views = []
+    checked_blocks = set()
     for view in lease.views:
-        if any(type(block) is not int or block < 0 or block >= view.block_capacity for block in view.block_ids):
-            raise ContractError("Target view contains an invalid block ID")
+        _validate_view_block_ids(view, checked_blocks)
         record = _record(view)
         record["component"] = view.component.value
         for group, block_ids in enumerate(lease.allocation.group_block_ids):
@@ -151,6 +159,7 @@ def target_lease_from_wire(payload: dict) -> TargetLease:
         for region in _items(value["regions"], "regions")
     )
     views = []
+    checked_blocks = set()
     for record in _items(value["views"], "views"):
         record = dict(_object(record, tuple(field.name for field in fields(CacheView)), "view"))
         if type(record["block_ids"]) is dict:
@@ -167,8 +176,7 @@ def target_lease_from_wire(payload: dict) -> TargetLease:
         view = CacheView(**record)
         if not view.strides_bytes or any(type(stride) is not int or stride < 1 for stride in view.strides_bytes):
             raise ContractError("Target view strides must be positive integer byte strides")
-        if any(type(block) is not int or block < 0 or block >= view.block_capacity for block in view.block_ids):
-            raise ContractError("Target view contains an invalid block ID")
+        _validate_view_block_ids(view, checked_blocks)
         views.append(view)
     plan = _object(value["writer_plan"], ("writers_by_backing", "ranges_by_backing"), "writer plan")
     if type(plan["writers_by_backing"]) is not dict or type(plan["ranges_by_backing"]) is not dict:
