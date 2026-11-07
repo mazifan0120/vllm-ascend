@@ -139,6 +139,17 @@ class _TargetUse:
     needs_recovery_fence: bool = False
 
 
+@dataclass(frozen=True, eq=False)
+class _BoundTargetUse:
+    """Owner-local admission result; never accepted across an RPC boundary."""
+
+    runtime: object
+    state: _TargetUse
+
+    def __getstate__(self):
+        raise TypeError("Bound target uses must stay in their owner process")
+
+
 class OwnerTargetRuntime:
     """Concrete retain/visibility/release implementation over registered memory.
 
@@ -156,7 +167,7 @@ class OwnerTargetRuntime:
         ):
             raise ValueError("Target runtime needs a positive bounded wait timeout")
         for owner, methods in (
-            (resources, ("retain", "validate")),
+            (resources, ("retain", "validate", "validate_allocation")),
             (retention, ("retain",)),
             (streams, ("consumption", "install_visibility", "record_use", "wait_quiescent")),
         ):
@@ -307,25 +318,57 @@ class OwnerTargetRuntime:
 
     @contextmanager
     def use(self, lease: TargetLease, *, scheduled_allocation: BlockAllocation | None = None):
-        """Cover a real model use, including its queued asynchronous writeback."""
+        """Validate an external lease before entering the local batch path."""
+        with self.use_batch(((self.bind_use(lease), scheduled_allocation),)):
+            yield
+
+    def bind_use(self, lease: TargetLease) -> _BoundTargetUse:
+        """Compare the full descriptor once when a local delivery is admitted."""
         with self._lock:
             state = self._state(lease)
-            if not state.visible or state.closing or state.preparing:
-                raise ContractError("Target is not available for decode")
-            if scheduled_allocation is not None and (
-                type(scheduled_allocation) is not BlockAllocation or scheduled_allocation != state.lease.allocation
-            ):
-                raise ContractError("Scheduler step allocation does not match the retained target")
-            state.users += 1
+            if state.closing:
+                raise ContractError("Target admission races with lifecycle closure")
+            return _BoundTargetUse(self, state)
+
+    @contextmanager
+    def use_batch(self, entries):
+        """Validate shared resources and fence actual model work once per batch.
+
+        Bound state identity avoids repeating full lease/view comparisons. The
+        scheduler's allocation map is still checked once for each request, and
+        stale handles fail after release or a new allocation generation.
+        """
+        entries = tuple(entries)
+        if not entries:
+            yield
+            return
+        states = []
+        with self._lock:
+            seen = set()
+            for handle, allocation in entries:
+                if type(handle) is not _BoundTargetUse or handle.runtime is not self:
+                    raise ContractError("Target use binding belongs to another owner")
+                state = handle.state
+                if self._states.get(state.lease.request) is not state or id(state) in seen:
+                    raise ContractError("Target use binding is stale or duplicated")
+                if not state.visible or state.closing or state.preparing:
+                    raise ContractError("Target is not available for decode")
+                if allocation is not None and (
+                    type(allocation) is not BlockAllocation or allocation != state.lease.allocation
+                ):
+                    raise ContractError("Scheduler step allocation does not match the retained target")
+                seen.add(id(state))
+                states.append(state)
+            for state in states:
+                state.users += 1
         try:
-            # Production scheduler metadata has already validated the block
-            # map for this step. The local live lease and users gate retain
-            # both owner resources and the scheduler guard during execution.
-            if scheduled_allocation is None:
-                state.retention.validate()
-            self._resources.validate(lease)
+            for state, (_, allocation) in zip(states, entries):
+                if allocation is None:
+                    state.retention.validate()
+            self._resources.validate_allocation()
             with self._streams.consumption():
-                self._streams.install_visibility(state.dependency)
+                for state in states:
+                    self._streams.install_visibility(state.dependency)
                 yield
         finally:
             try:
@@ -333,14 +376,17 @@ class OwnerTargetRuntime:
                 if not events:
                     raise RuntimeError("Target consumption produced no real completion fences")
                 with self._lock:
-                    state.events.extend(events)
+                    for state in states:
+                        state.events.extend(events)
             except Exception:
                 with self._lock:
-                    state.needs_recovery_fence = True
+                    for state in states:
+                        state.needs_recovery_fence = True
                 raise
             finally:
                 with self._lock:
-                    state.users -= 1
+                    for state in states:
+                        state.users -= 1
 
     def release(self, lease: TargetLease) -> None:
         with self._lock:

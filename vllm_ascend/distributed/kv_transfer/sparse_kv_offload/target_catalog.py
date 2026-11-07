@@ -99,6 +99,8 @@ class RegisteredTargetResources:
         self._snapshot = te.registration_snapshot()
         self._permanent_pins = self._pin()
         self._tensors = []
+        self._kv_caches = kv_caches
+        self._cache_tensors = {}
         self._storage_refs = []
         self._tensor_signatures = []
         self._base_addresses = {}
@@ -107,6 +109,7 @@ class RegisteredTargetResources:
         self._catalog = None
         try:
             self._build(kv_caches, components, layer_groups, block_tokens, num_blocks)
+            self._view_signatures = self._view_signature(entry.binding.view for entry in self._catalog.entries)
         except Exception:
             self._permanent_pins.release()
             raise
@@ -133,6 +136,7 @@ class RegisteredTargetResources:
             tensors = tuple(tensors) if isinstance(tensors, (tuple, list)) else (tensors,)
             if not tensors:
                 raise ContractError("Target cache has no physical entries")
+            self._cache_tensors[name] = (component, tensors)
             for position, tensor in enumerate(tensors):
                 shape = tuple(tensor.shape)
                 strides = tuple(tensor.stride())
@@ -273,7 +277,15 @@ class RegisteredTargetResources:
 
     @staticmethod
     def _tensor_signature(tensor) -> tuple:
-        return (int(tensor.data_ptr()), tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype))
+        storage = tensor.untyped_storage()
+        return (
+            int(tensor.data_ptr()),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            str(tensor.dtype),
+            int(storage.data_ptr()),
+            storage.nbytes(),
+        )
 
     def build_provider(self, runtime):
         catalog = self.catalog()
@@ -289,34 +301,50 @@ class RegisteredTargetResources:
             runtime=runtime,
         )
 
-    def validate(self, lease: TargetLease) -> None:
+    def validate_allocation(self) -> None:
+        """Check live registration and tensor layout once for the entire batch."""
         with self._lock:
             if self._closed or self._te.registration_snapshot() != self._snapshot:
                 raise ContractError("Target registration is no longer the retained owner generation")
+            for name, (component, expected) in self._cache_tensors.items():
+                actual = (
+                    self._manager.get_local_host_kv_views(name)
+                    if component is Component.MAIN
+                    else self._kv_caches.get(name)
+                )
+                actual = tuple(actual) if isinstance(actual, (tuple, list)) else (actual,)
+                if len(actual) != len(expected) or any(a is not b for a, b in zip(actual, expected)):
+                    raise ContractError("Target tensor allocation or layout changed after registration")
             if [self._tensor_signature(tensor) for tensor in self._tensors] != self._tensor_signatures:
                 raise ContractError("Target tensor allocation or layout changed after registration")
+
+    @staticmethod
+    def _view_signature(views):
+        return sorted(
+            (
+                v.component.value,
+                v.logical_layer,
+                v.region_binding,
+                v.region_offset_bytes,
+                v.dtype,
+                v.strides_bytes,
+                v.page_size_tokens,
+                v.manager_block_size_tokens,
+                v.block_capacity,
+            )
+            for v in views
+        )
+
+    def validate(self, lease: TargetLease) -> None:
+        """Full descriptor validation at acquisition/admission boundaries."""
+        with self._lock:
+            self.validate_allocation()
             catalog = self._catalog
             if lease.rank != catalog.rank or lease.regions != catalog.regions:
                 raise ContractError("Lease regions do not belong to this owner catalog")
-            actual = tuple(entry.binding.view for entry in catalog.entries)
-            expected = tuple(lease.views)
             # The existing factory orders Indexer then Main; compare value
             # identities rather than order and ignore only request block IDs.
-            signatures = lambda views: sorted(
-                (
-                    v.component.value,
-                    v.logical_layer,
-                    v.region_binding,
-                    v.region_offset_bytes,
-                    v.dtype,
-                    v.strides_bytes,
-                    v.page_size_tokens,
-                    v.manager_block_size_tokens,
-                    v.block_capacity,
-                )
-                for v in views
-            )
-            if signatures(actual) != signatures(expected):
+            if self._view_signature(lease.views) != self._view_signatures:
                 raise ContractError("Lease views changed after target registration")
 
     def retain(self, lease: TargetLease):
@@ -340,6 +368,8 @@ class RegisteredTargetResources:
                 self._permanent_pins.release()
                 self._closed = True
                 self._tensors.clear()
+                self._cache_tensors.clear()
+                self._kv_caches = None
                 self._storage_refs.clear()
                 self._tensor_signatures.clear()
 

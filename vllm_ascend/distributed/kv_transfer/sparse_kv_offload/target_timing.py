@@ -79,7 +79,8 @@ class ReceiptHostTiming:
 
     def install(self, runtime, delivery):
         self._wrap_method(runtime, "_state", "lease_state")
-        self._wrap_method(runtime._resources, "validate", "resources_validate")
+        resources_method = "validate_allocation" if hasattr(runtime._resources, "validate_allocation") else "validate"
+        self._wrap_method(runtime._resources, resources_method, "resources_validate")
         self._wrap_method(runtime._resources, "_tensor_signature", "tensor_signature")
         self._wrap_method(runtime._resources._te, "registration_snapshot", "registration_snapshot")
         self._wrap_method(runtime._streams, "install_visibility", "visibility")

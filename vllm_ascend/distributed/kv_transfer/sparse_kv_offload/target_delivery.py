@@ -8,7 +8,7 @@ delivery. No registration address is accepted or returned by these controls.
 
 import threading
 from collections import Counter
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
@@ -32,6 +32,7 @@ class _Delivery:
     request_id: str
     lease: TargetLease
     ledger: ExactReceiptLedger
+    use_binding: object = None
     installed: bool = False
     lookup_issued: bool = False
     aborted: bool = False
@@ -93,7 +94,11 @@ class WorkerTargetDelivery:
                 target_generation=lease.allocation.allocation_generation,
                 visibility_rank=self._rank,
             )
-            delivery = _Delivery(required_keys, request_id, lease, ledger)
+            bind = getattr(self._provider, "bind_use", None)
+            # Descriptor-only providers can exercise admission proofs without
+            # a model runtime. Actual execution requires an owner-local binding.
+            binding = bind(lease) if callable(bind) else None
+            delivery = _Delivery(required_keys, request_id, lease, ledger, binding)
             self._deliveries[lease.request] = delivery
             self._by_request_id[request_id] = lease.request
             # This installer is a worker-local dictionary update, with no
@@ -130,7 +135,7 @@ class WorkerTargetDelivery:
     @contextmanager
     def use_context(self, request_ids, scheduled_allocations=None):
         with self._lock:
-            leases = []
+            entries = []
             for request_id in request_ids:
                 key = self._by_request_id.get(request_id)
                 allocation = None if scheduled_allocations is None else scheduled_allocations.get(request_id)
@@ -148,12 +153,15 @@ class WorkerTargetDelivery:
                     raise ContractError("Model execution reached an unready remote target")
                 if scheduled_allocations is not None and allocation is None:
                     raise ContractError("Scheduled receipt target has no validated allocation")
-                leases.append((delivery.lease, allocation))
-        # Runtime.use can validate reverse retention and record native events;
+                if delivery.use_binding is None:
+                    raise ContractError("Target delivery has no owner-local execution binding")
+                entries.append((delivery.use_binding, allocation))
+        # Runtime can validate reverse retention and record native events;
         # neither it nor model execution may run under the delivery state lock.
-        with ExitStack() as stack:
-            for lease, allocation in leases:
-                stack.enter_context(self._provider.use(lease, scheduled_allocation=allocation))
+        if not entries:
+            yield
+            return
+        with self._provider.use_batch(entries):
             yield
 
     @contextmanager

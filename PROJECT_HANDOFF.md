@@ -574,3 +574,32 @@ this candidate. Use the deployment workspace's recorded `graph.yml` override.
 No1M or50%-hit performance rerun is claimed. User permits enlarging D Host KV
 up to1TB if needed; this matched comparison retained100GiB/DP. Full evidence,
 limits and commands: deployment runbook§11.76 and artifacts directory above.
+
+### 2026-11-07 PR review hot-path candidate (NPU validation pending)
+
+With decode graphs enabled, measured target+draft receipt host time is7.40ms
+atC10(~7.5–8% of the step) and11.20ms atC20(~10.6%). Lease lookups/deep
+comparison account for2.89/4.46ms, registered-resource checks3.21/4.72ms.
+Both40-request55K/700 samples passed complete SSE/token accounting and all
+8-rank receipt/release audit. P/Master/proxy stayed running; the original
+uninstrumented D containers were restored. Evidence is in the deployment
+workspace's artifacts/d-graph-host-timing-20261107.
+
+The new candidate binds an owner-local, nonserializable execution capability
+at admission. Decode validates its live state identity rather than comparing
+every CacheView/block map again. It still compares the scheduler's actual
+allocation once per request, including group block IDs; this is not merely a
+generation-only acceptance check. Full wire/admission descriptor validation
+remains enabled. A batch checks the shared registered allocation once and
+records one completion-event tuple shared by its actual request users; each
+request still installs its receive visibility dependency and waits for real
+completion before release. Stale/foreign/duplicate capabilities fail closed.
+
+Registration snapshots, tensor address/shape/stride/dtype and storage extent
+remain checked at batch boundaries. Replaced entries in the actual cache
+mapping are now detected as well. Cached catalog view signatures avoid sorting
+immutable owner geometry repeatedly. CPU regression:196passed,1skipped,
+100subtests on real torch2.10 CPU, including forged/stale handles, changed
+allocation maps, shared fences, failed compute/fence recovery and teardown
+protection. Ruff passes. This candidate is not yet a native NPU acceptance;
+MTP5 graph lifecycle remains to be verified separately from the current MTP3.

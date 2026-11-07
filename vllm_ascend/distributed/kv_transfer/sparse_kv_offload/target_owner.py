@@ -104,6 +104,12 @@ class TargetOwner:
         with self.runtime.use(lease, scheduled_allocation=scheduled_allocation):
             yield
 
+    def bind_use(self, lease):
+        return self.runtime.bind_use(lease)
+
+    def use_batch(self, entries):
+        return self.runtime.use_batch(entries)
+
     def close(self) -> None:
         self.runtime.assert_can_close()
         self.resources.close()
@@ -191,6 +197,15 @@ class DeferredTargetProvider:
     @contextmanager
     def use(self, lease, *, scheduled_allocation=None):
         with self._operation() as owner, owner.use(lease, scheduled_allocation=scheduled_allocation):
+            yield
+
+    def bind_use(self, lease):
+        with self._operation() as owner:
+            return owner.bind_use(lease)
+
+    @contextmanager
+    def use_batch(self, entries):
+        with self._operation() as owner, owner.use_batch(entries):
             yield
 
     def close(self) -> None:
