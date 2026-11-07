@@ -530,3 +530,47 @@ Evidence and deployment overrides: deployment repository
 suite:93passed,60subtests. The diagnostic deployment's initial short smoke
 returned `MAPLEPAMAPLE` on short-2 (540input/7output, normalstop); preserve this
 unexplained semantic anomaly separately from random-input performance samples.
+
+### 2026-11-07 D graph performance validation completed
+
+The candidate above (`e9bd1ce19`) captured decode graphs successfully on all
+four D engines (38–39s,7.75GiB/rank); Host capacity remains9174blocks and
+1,174,272tokens per DP. P remains eager/Main B2/MTP1 and D Host100GiB/MTP3/
+AsyncReceiptScheduler. All receipt visibility, lease/registration validation
+and completion/release fences remain enabled.
+
+Matched55K/700,40-request,zero-prefix-hit samples compared with today's earlier
+uninstrumented eager baseline (same prompt hash vector,2,197,493input and
+28,000output per arm):
+
+| Concurrency | TPOT P50 eager→graph(ms) | TPOT P99 eager→graph(ms) | Output throughput eager→graph(token/s) |
+| --- | --- | --- | --- |
+| 10 | 118.51→31.15 | 157.59→39.98 | 67.76→183.40 |
+| 20 | 120.62→47.51 | 150.66→70.65 | 111.10→210.37 |
+
+MTP mean acceptance remains similar(2.96→2.96 atC10,3.01→2.94 atC20).
+An additional matched20-request C10 control also improved117.63→32.09ms.
+This supports eager host execution/dispatch as the primary D degradation,
+not the receipt checks measured at~2.6% of the original eager step. Graph
+performance runs have both host diagnostics and NPU profiling disabled.
+These40-request arms were not back-to-back with the earlier baseline;
+onsite load/scheduling variation remains a limitation. TTFT P50 did not
+improve(10.81→11.54s atC10,17.23→19.99s atC20).
+
+All100 random benchmark requests returned700tokens and passed all8-rank
+receipt/release audit. Later12 dedicated short/multichunk/prefix-replay probes
+all passed semantic and lifecycle checks. Eight engines/proxy are healthy,
+idle,KV usage0,engine log ERROR0. P/D success counters each113 include the
+initial one-request semantic anomaly; no error/abort. The initial graph smoke
+returnedMAPLEPMAPLE, akin to the earlier eager MAPLEPAMAPLE anomaly: its cause
+is still unexplained, not declared fixed by the successful later probes.
+
+Runtime is the experimental `...-dgraph` containers and image
+`glm52-vllm-ascend:0.30.0-layerwise-guide-e9bd1ce19-cann92`, image ID
+`sha256:4c7a55de5cdc31eab28a8b97c8f7af099d30825957824d3de67e2e5f6180099d`.
+Default Ansible inventory intentionally remains `fe559c440` eager until the
+initial semantic anomaly is understood. Do not redeploy defaults expecting
+this candidate. Use the deployment workspace's recorded `graph.yml` override.
+No1M or50%-hit performance rerun is claimed. User permits enlarging D Host KV
+up to1TB if needed; this matched comparison retained100GiB/DP. Full evidence,
+limits and commands: deployment runbook§11.76 and artifacts directory above.
