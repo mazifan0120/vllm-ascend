@@ -633,3 +633,47 @@ deduplication and inclusion of the graph update stream. CPU regression:
 202 passed, 1 skipped, 107 subtests; scoped Ruff passes. Native follow-up
 including MTP5 remains pending; the current57c1b306e MTP3 sample validates
 the batch execution change, not this additional stream wiring.
+
+### 2026-11-07 PR review native acceptance and refactor audit
+
+57c1b306e MTP3/FULL_DECODE_ONLY/async native sample:20 independent functional
+requests and80 fixed-hash55K/700 performance requests passed full8-rank
+receipt/release across4D. Target+actual-draft receipt host time fell from
+7.40/11.20 to2.51/2.59ms/step atC10/C20, about66%/77% lower; TPOT P50
+32.26/38.28ms did not improve over the prior timed31.02/36.90ms. This proves
+less repeated CPU work, not end-to-end acceleration. All32workers show one
+resource check and one record_use per batch, individual visibility waits,
+and no hot full-lease equality checks.
+
+bb679f01d additionally passed native MTP5/FULL_DECODE_ONLY/compile3/async:
+20 functional requests,8 concurrent55K/700 requests and2 mid-generation
+client disconnects;30 exact all8-rank receipt/release audits across4D.
+Target graphs captured in38s/7.77GiB; all32workers report draft_graph=False
+because the current GLM family guard keeps this draft eager, even in mode3.
+No target+draft dual-graph claim is made. Proposal metrics are1695drafts and
+8475draft tokens, exactly5/proposal. Host windows cover both actual model
+contexts and batch size2. Native event recording/release passed with the
+runner's graph update stream included. Native delayed-DMA/registration-reset
+fault injection remains untested; CPU regressions cover delayed completion,
+failed fences, partial preparation and quarantine.
+
+The first disconnect harness incorrectly required a frontend abort-success
+counter increment and failed; original evidence is preserved. Exact target
+release and idle state already completed. The additional instrumented
+disconnect proves only8proposals/40draft tokens (output bound48, far below
+forced4096length), no successful completion, zero KV and idle queues, with
+all-rank receipt/release. No service change was made for the harness failure.
+The earlier first-short-request repeated-word anomaly remains unexplained;
+subsequent successful probes do not establish a fix.
+
+Deployment workspace docs/receipt-code-refactor-audit-20261107.md records the
+first structural audit:~10.35K runtime additions,~9.94K tests and~2.20K docs
+since4234a1f18. Priorities:remove test-only co-located global prototype;
+separate transport-neutral retention protocol from Pipe/RPC; consolidate
+connector request-state and lock ownership before splitting files; compact
+stream-fence and retired-request histories only with explicit ordering/replay
+proofs. The image overlay currently preserves deleted Python files, so fix
+staging/managed-file cleanup before deleting modules. No broad restructuring
+has been applied. Evidence:deployment artifacts/review-fixes-20261107 and
+runbook11.78. Final uninstrumented runtime identity is recorded there; default
+inventory remains fe559c440/eager and must not be confused with the candidate.
