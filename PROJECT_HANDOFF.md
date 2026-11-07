@@ -508,3 +508,25 @@ python3 tools/run_prefill_reuse_ut.py --pytest \
 先前全匹配 glob 的 collection 曾因此失败，不能补几个 mock 就把真实运行时能力算作已测。
 源码仓新增环境变量须走 `envs.py`，避免新 mutable globals；提交要求 Conventional Commit＋Signed-off-by。
 任何 runner／scheduler 改动要解释必要性和实际调用范围，并在真实 NPU 上按对应范围验证。
+
+### 2026-11-07 D decode graph candidate (pending NPU validation)
+
+Unprofiled receipt timing on all 32 D workers places target+draft receipt
+entry/exit at about 2.6% of a decode step; target body wall is about327ms,
+draft20ms, step370ms at55K/C10. An independent8-step NPU trace shows heavy
+host dispatch (TP0:36,680 kernel launches) and rank-dependent idle/communication
+waits. Trace overhead means its absolute latency is not a benchmark result.
+
+Registered D targets now admit `FULL_DECODE_ONLY` as well as eager, retaining
+PP/CP/DCP=1. Startup capture has no admitted request leases. Actual target and
+draft replay remain enclosed by receipt use contexts; visibility precedes replay
+on the consumption stream and completion events follow on consumption and sparse
+manager auxiliary streams. No lease/resource/retention checks are removed. P Main
+reuse remains eager. Other graph modes still fail closed. This is a candidate
+until real graph capture, receipt lifecycle and matched performance pass.
+
+Evidence and deployment overrides: deployment repository
+`artifacts/d-decode-performance-20261107/`. CPU mode-gate and receipt regression
+suite:93passed,60subtests. The diagnostic deployment's initial short smoke
+returned `MAPLEPAMAPLE` on short-2 (540input/7output, normalstop); preserve this
+unexplained semantic anomaly separately from random-input performance samples.

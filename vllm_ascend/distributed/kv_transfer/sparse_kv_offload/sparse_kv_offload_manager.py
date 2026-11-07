@@ -791,18 +791,10 @@ class SparseKVOffloadManager:
         from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
             DeferredTargetProvider,
             create_registered_target_owner,
+            validate_registered_target_execution,
         )
 
-        config = self.vllm_config
-        parallel = config.parallel_config
-        if (
-            not config.model_config.enforce_eager
-            or any(
-                getattr(parallel, name, 1) != 1
-                for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
-            )
-        ):
-            raise ContractError("Registered D targets require eager and PP/CP/DCP=1")
+        validate_registered_target_execution(self.vllm_config)
         components, identities, block_tokens = self.get_target_cache_identities()
         with self._target_owner_lock:
             if self._target_owner_facade is not None:

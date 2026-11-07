@@ -28,6 +28,25 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_runtime import
 )
 
 
+def validate_registered_target_execution(config) -> None:
+    """Keep receipt admission outside graphs and fence replay on its stream.
+
+    FULL_DECODE_ONLY captures stable model buffers during startup, before any
+    request lease exists. At runtime the execute/draft receipt contexts still
+    wrap graph replay, and NpuTargetStreams records completion after replay on
+    the consumption stream and the manager's auxiliary streams. Other graph
+    modes have not been validated with registered Host targets.
+    """
+    mode = getattr(getattr(config, "compilation_config", None), "cudagraph_mode", None)
+    if not config.model_config.enforce_eager and getattr(mode, "name", None) != "FULL_DECODE_ONLY":
+        raise ContractError("Registered D targets require eager or FULL_DECODE_ONLY")
+    if any(
+        getattr(config.parallel_config, name, 1) != 1
+        for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
+    ):
+        raise ContractError("Registered D targets require PP/CP/DCP=1")
+
+
 class TargetOwner:
     contract_version = CONTRACT_VERSION
     visibility_contract = VISIBILITY_CONTRACT
