@@ -326,3 +326,30 @@ provider构造必须传入 `TargetRuntime`，当前只有协议，没有会默�
 自身provider／测试的Ruff检查通过；导入契约保留原样，其两个`str, Enum`继承触发当前本地Ruff的UP042建议，未做可能改变共享枚举行为的unsafe fix。
 
 本轮没有运行D模型或真实P/D链路，不能沿用此前P独立1M或受控读者64K结果证明TargetProvider运行时正确。
+
+
+## 12. Main reuse + P MTP1 的跨请求 Store 前缀（2026-11-07）
+
+Main reuse 与 P MTP1 现在允许通过 Mooncake block-key 路径恢复跨请求前缀。
+本地 HBM prefix caching 仍须关闭：共享 Main 槽不能作为跨请求物理驻留证明。
+P 的多步 MTP 或其他 draft 方法暂时维持禁用外部前缀查询。
+
+公共完整块使用 `mtp_prefix_v1:<block_index>:<successor_chain_hash>`。
+MTP 块尾消耗下一输入 token，因此使用下一完整块的链式 hash 作为保守身份，
+继承 vLLM 的 cache_salt 和 hash extras，不与 target-only 公共对象混用。
+只共享 prompt 内有完整后继块的完整 KV；最后一个完整块、部分块和生成区间
+继续保留请求私有身份，最终生成点仍重算。比纯 Main 前缀最多少命中一块。
+新请求查询、保存与恢复必须使用同一个身份函数，查询要求所有对应 rank 可读。
+
+同一请求跨 chunk 仍优先使用成功提交的快照。公共 PUT 争用时使用请求私有
+完整块回退，其他 TP rank 通过相同 instance/index 推导该回退；不等待未提交
+公共 writer。跨请求 GET 后对象若被淘汰则在 attention 前失败，不借用其他
+请求的私有版本。清理只处理私有 key，公共前缀继续由 Store 管理。
+
+控制机聚焦测试 40 项及 10 个子用例通过，覆盖 successor 身份隔离、最终块
+重算、生成区间私有、跨请求和跨 rank 恢复、PUT 争用与 GET 淘汰。
+完整 scheduler 测试中的 6 个失败在原始 HEAD 上同样复现，另 74 项通过；
+涉及 mock 缺失的 parser 及既有 receive-registration 断言。
+真实 P/D 命中、MTP 继续执行、并发行为和性能仍待新镜像环境验证，不能用
+本节单测结果代替运行时验收。证据写入部署仓库
+`artifacts/mtp-prefix-20261107/`。

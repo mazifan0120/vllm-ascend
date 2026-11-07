@@ -835,6 +835,19 @@ def block_hash_to_str(block_hash: BlockHash | str) -> str:
     return block_hash if isinstance(block_hash, str) else block_hash.hex()
 
 
+def mtp_prefix_block_hash(block_hashes: Sequence[BlockHash], block_index: int) -> str | None:
+    """Name a portable single-step MTP block using its successor's chain hash.
+
+    Draft KV at the block's last position consumes the next input token. The
+    successor hash conservatively includes that entire next block, including
+    cache_salt and other vLLM hash extras. No successor means a private tail.
+    This namespace must never alias ordinary target-only block objects.
+    """
+    if block_index < 0 or block_index + 1 >= len(block_hashes):
+        return None
+    return f"mtp_prefix_v1:{block_index}:{block_hash_to_str(block_hashes[block_index + 1])}"
+
+
 def block_hash_to_bytes(block_hash: BlockHash | str) -> bytes:
     if isinstance(block_hash, str):
         if len(block_hash) == 64:

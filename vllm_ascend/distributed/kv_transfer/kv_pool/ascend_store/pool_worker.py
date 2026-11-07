@@ -98,6 +98,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_tp_mismatch_info,
     is_kv_save_role,
     masked_block_runs,
+    mtp_prefix_block_hash,
     uses_hybrid_kv_cache,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
@@ -257,6 +258,11 @@ class KVPoolWorker:
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
+        self.main_reuse_mtp_prefix = (
+            self.use_eagle
+            and getattr(speculative_config, "method", None) == "mtp"
+            and getattr(speculative_config, "num_speculative_tokens", None) == 1
+        )
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
         self._dspark_draft_layer_names = (
             set(getattr(kv_cache_config, "dspark_draft_layer_names", ())) if self.use_layerwise_transfer else set()
@@ -2845,6 +2851,19 @@ class KVPoolWorker:
             )
         return self._make_mooncake_layerwise_key(identity)
 
+    def _main_full_block_key(self, request: ReqMeta, block_index: int, hashes: Sequence[BlockHash]) -> str:
+        if not self.use_eagle:
+            return self._make_mooncake_layerwise_key(block_hash_to_str(hashes[block_index]))
+        if (
+            getattr(self, "main_reuse_mtp_prefix", False)
+            and (block_index + 2) * self.block_size <= request.num_prompt_tokens
+        ):
+            # Never expose generated-token snapshots under prompt identities.
+            identity = mtp_prefix_block_hash(hashes, block_index)
+            if identity is not None:
+                return self._make_mooncake_layerwise_key(identity)
+        return self._main_snapshot_key(request, block_index)
+
     def _prepare_main_reuse_put_session(self, request: ReqMeta) -> None:
         self._bind_main_reuse_request(request)
         request.save_block_keys = []
@@ -2870,9 +2889,7 @@ class KVPoolWorker:
         # key, full-key slot (None for partial), logical block, valid token end
         slots = [
             (
-                self._main_snapshot_key(request, index)
-                if self.use_eagle
-                else self._make_mooncake_layerwise_key(block_hash_to_str(hashes[index])),
+                self._main_full_block_key(request, index, hashes),
                 index - start,
                 index,
                 (index + 1) * self.block_size,
@@ -2904,7 +2921,7 @@ class KVPoolWorker:
             for key, slot, index, _ in slots:
                 if key not in rejected:
                     continue
-                if slot is None or self.use_eagle:
+                if slot is None or "@private_" in key:
                     raise RuntimeError("Main private snapshot allocation failed")
                 # Another P may own the public hash session. Do not wait for
                 # it while holding other unfilled sessions: use a private,
@@ -3073,8 +3090,11 @@ class KVPoolWorker:
             end_block = min(cached_full_blocks, len(group_block_hashes))
             for block_index in range(start_block, end_block):
                 if main_reuse and self.use_eagle:
-                    key = self._main_snapshot_key(request, block_index)
-                    self._layerwise_session_tracker.register_private_snapshot(key, (block_index + 1) * self.block_size)
+                    key = self._main_full_block_key(request, block_index, group_block_hashes)
+                    if "@private_" in key:
+                        self._layerwise_session_tracker.register_private_snapshot(
+                            key, (block_index + 1) * self.block_size
+                        )
                 else:
                     key = self._make_mooncake_layerwise_key(block_hash_to_str(group_block_hashes[block_index]))
                 current_entries.append((key, block_index))

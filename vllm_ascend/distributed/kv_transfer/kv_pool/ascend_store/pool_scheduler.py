@@ -54,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_group_block_sizes,
     infer_group_cache_families,
     infer_tp_mismatch_info,
+    mtp_prefix_block_hash,
     normalize_block_ids_by_group,
     uses_hybrid_kv_cache,
 )
@@ -122,6 +123,11 @@ class KVPoolScheduler:
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
+        self.main_reuse_mtp_prefix = (
+            self.use_eagle
+            and getattr(speculative_config, "method", None) == "mtp"
+            and getattr(speculative_config, "num_speculative_tokens", None) == 1
+        )
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
         self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
         cacheable_block_sizes = [self.original_block_size[i] for i in self.cacheable_group_ids]
@@ -550,9 +556,17 @@ class KVPoolScheduler:
         )
         if not block_hashes:
             return 0
-        keys_by_block = [
-            self._make_layerwise_hit_check_keys(0, block_hash_to_str(block_hash)) for block_hash in block_hashes
-        ]
+        if self.layerwise_offload and self.use_eagle:
+            # Only blocks with a full, matching successor are portable. The
+            # request-private tail is never a cross-request cache hit.
+            keys_by_block = [
+                self._make_layerwise_hit_check_keys(0, mtp_prefix_block_hash(block_hashes, index))
+                for index in range(len(block_hashes) - 1)
+            ]
+        else:
+            keys_by_block = [
+                self._make_layerwise_hit_check_keys(0, block_hash_to_str(block_hash)) for block_hash in block_hashes
+            ]
         block_hits = self._query_layerwise_block_hits(keys_by_block)
         num_hit_blocks = 0
         for hit in block_hits:
@@ -623,11 +637,10 @@ class KVPoolScheduler:
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
         if self.use_block_key_layerwise and self.layerwise_offload and self.use_eagle:
-            # The MTP draft cache at a block boundary depends on the next
-            # token. Main-only reuse keeps those snapshots request-private.
             if num_computed_tokens:
                 raise RuntimeError("Main-only MTP reuse cannot restore a cross-request local prefix")
-            return 0, False
+            if not getattr(self, "main_reuse_mtp_prefix", False):
+                return 0, False
 
         prompt_token_len = len(request.prompt_token_ids)
         if self.use_block_key_layerwise:

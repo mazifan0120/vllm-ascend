@@ -7,7 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import LoadSpec, ReqMeta, RequestTracker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    LoadSpec,
+    ReqMeta,
+    RequestTracker,
+    mtp_prefix_block_hash,
+)
 
 
 class TestMainSnapshotVersions(unittest.TestCase):
@@ -64,6 +69,7 @@ class TestMainSnapshotVersions(unittest.TestCase):
             request_instance=instance,
             snapshot_generation=generation,
             target_token_len=end,
+            num_prompt_tokens=end,
             save_end_token=end // 16 * 16,
             save_start_token=previous // 16 * 16,
             restore_end_token=previous,
@@ -226,6 +232,60 @@ class TestMainSnapshotVersions(unittest.TestCase):
         owner._prepare_layerwise_put_session(other)
         self.assertNotEqual(other.save_block_keys[0], first.save_block_keys[0])
 
+    def test_mtp_prefix_hash_requires_successor_and_isolates_different_lookahead(self):
+        hashes = [b"prefix", b"successor", b"tail"]
+        self.assertEqual(mtp_prefix_block_hash(hashes, 0), "mtp_prefix_v1:0:737563636573736f72")
+        self.assertIsNone(mtp_prefix_block_hash(hashes, 2))
+        self.assertIsNone(mtp_prefix_block_hash(hashes, -1))
+        changed = [b"prefix", b"different successor", b"tail"]
+        self.assertNotEqual(mtp_prefix_block_hash(hashes, 0), mtp_prefix_block_hash(changed, 0))
+
+    def test_mtp_prefix_is_public_but_prompt_tail_and_generated_blocks_stay_private(self):
+        worker, published = self.make_worker()
+        worker.use_eagle = worker.main_reuse_mtp_prefix = True
+        request = self.request(64, 1)
+        request.num_prompt_tokens = 48
+        worker._prepare_layerwise_put_session(request)
+        keys = self.commit(worker, published, request)
+        self.assertTrue(all("@mtp_prefix_v1:" in key for key in keys[:2]))
+        self.assertTrue(all("@private_full_v1:" in key for key in keys[2:]))
+        peer, _ = self.make_worker(published=published)
+        peer.use_eagle = peer.main_reuse_mtp_prefix = True
+        replay = self.request(64, 1, instance="instance-B", req_id="r2")
+        replay.num_prompt_tokens = 48
+        replay.restore_end_token = 32
+        replay.load_spec = LoadSpec(0, 32, can_load=True)
+        self.open(peer, replay)
+        self.assertEqual(replay.load_keys, keys[:2])
+        worker._layerwise_session_tracker.release_terminal({"r1"})
+        worker._cleanup_main_private_snapshots()
+        self.assertTrue(set(keys[:2]).issubset(published))
+
+    def test_mtp_public_contention_falls_back_privately_and_other_rank_can_restore(self):
+        public = "model@mtp_prefix_v1:0:6831@0"
+        owner, published = self.make_worker(blocked_public={public})
+        owner.use_eagle = owner.main_reuse_mtp_prefix = True
+        first = self.request(32, 1)
+        owner._prepare_layerwise_put_session(first)
+        self.assertIn("@private_full_v1:", first.save_block_keys[0])
+        self.commit(owner, published, first)
+        reader, _ = self.make_worker(published=published)
+        reader.use_eagle = reader.main_reuse_mtp_prefix = True
+        reader.tp_rank, reader.put_step = 1, 16
+        second = self.request(40, 2, previous=32)
+        self.open(reader, second)
+        self.assertEqual(second.load_block_keys, first.save_block_keys)
+
+    def test_mtp_public_eviction_fails_before_attention_without_borrowing_private_versions(self):
+        worker, _ = self.make_worker()
+        worker.use_eagle = worker.main_reuse_mtp_prefix = True
+        request = self.request(48, 1, instance="instance-B", req_id="r2")
+        request.restore_end_token = 16
+        request.load_spec = LoadSpec(0, 16, can_load=True)
+        with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
+            self.open(worker, request)
+        self.assertTrue(worker._layer_load_aborted.is_set())
+
     def test_missing_restore_plan_fails_even_when_load_spec_is_absent(self):
         worker, _ = self.make_worker()
         request = self.request(20, 1)
@@ -379,3 +439,33 @@ class TestMainSnapshotMetadata(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot restore a cross-request local prefix"):
             scheduler.get_num_new_matched_tokens(request, 16)
         scheduler._get_block_key_layerwise_hit_tokens.assert_not_called()
+
+    def test_main_only_mtp_prefix_lookup_loads_matching_successors_only(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
+
+        scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+        scheduler.layerwise_offload = scheduler.use_block_key_layerwise = scheduler.use_layerwise = True
+        scheduler.use_eagle = scheduler.main_reuse_mtp_prefix = True
+        scheduler.block_key_hybrid = scheduler.load_async = False
+        scheduler.kv_role = "kv_producer"
+        scheduler.load_specs = {}
+        scheduler.cache_transfer_granularity = scheduler.lcm_block_size = scheduler._block_size = 16
+        scheduler.hash_block_size = 16
+        scheduler.original_block_size = [16]
+        scheduler.cacheable_group_ids = [0]
+        scheduler._make_layerwise_hit_check_keys = lambda group, identity: [identity]
+        scheduler._query_layerwise_block_hits = MagicMock(return_value=[True, False])
+        request = SimpleNamespace(
+            request_id="r1", prompt_token_ids=list(range(48)), num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+        )
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (16, False))
+        scheduler._query_layerwise_block_hits.assert_called_once_with(
+            [[mtp_prefix_block_hash(request.block_hashes, 0)], [mtp_prefix_block_hash(request.block_hashes, 1)]]
+        )
+        self.assertEqual(scheduler.load_specs["r1"].kvpool_cached_tokens, 16)
+        # Even if the last query hits, the request-private final block is
+        # recomputed so its hidden state and next-token draft stay current.
+        scheduler._query_layerwise_block_hits.return_value = [True, True]
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (32, False))
+        with self.assertRaisesRegex(RuntimeError, "cannot restore a cross-request local prefix"):
+            scheduler.get_num_new_matched_tokens(request, 16)
