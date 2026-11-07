@@ -1,5 +1,9 @@
 # receipt 逐层链路交接（connector side → target side）
 
+> 历史接口交接记录：当前接线、MTP/图支持与2026-11-08重构状态请以
+> [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md)最新日期条目及部署仓库runbook§11.78–79为准。
+> 下文的初版测试计数和未实现清单不代表当前状态。
+
 2026-11-05 集成核对：本文保留远端交接记录，部分“已实现”指代码入口存在，
 完整生产调用仍未闭合。针对 `fa5aec40b` 的实际缺口、集成修复和验证范围见
 [PD transfer 最新审查](PD_TRANSFER_COMPLETION_REVIEW.md)。完整模型 PD 尚未验收。

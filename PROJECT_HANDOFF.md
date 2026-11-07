@@ -742,3 +742,65 @@ in the deployment runbook; do not use old mode0 artifact profiles as runbooks.
 
 Compiled-graph gate regression:203 passed,1 skipped,112 subtests; scoped
 Ruff passes. The deployment generator also rejects mode0 before any cutover.
+
+### 2026-11-08 receipt refactor
+
+The development branch remains `p-main-buffer-reuse`. Production Pipe/global
+rendezvous prototypes were removed in080220d72; explicit Pipe fault fixtures
+now live only under tests. RPC and tests share transport-neutral retention
+records, guards and dispatch. Codec v1/v2 record names remain compatible.
+
+cf4ad2e31 extracts `ReceiptReceiver`, `ReceiveRequestIndex` and shared control
+constants. One receiver record owns a generation's ledger/deadline/aliases;
+worker admission no longer copies retained blocks into parallel dictionaries.
+Lock order is delivery -> receive index -> ledger. Provider/runtime callbacks
+and native waits run outside the receive lock, with live-state/cancellation
+checks before publication. Pure receiver tests use real msgspec on CPU; SDK
+imports are not replaced by backend mocks (b2c4c5e1d).
+
+f72583434 records owner-local stream fences with monotone sequence numbers and
+retains only the newest per actual stream. Out-of-order context returns cannot
+roll back a frontier; distinct streams/owners and opaque dependencies remain.
+Failed records preserve disappeared streams until proven quiescent. Unreadable
+stream identities quarantine the adapter (d634632f6). Event destruction happens
+outside the runtime state lock. There is no new per-step device synchronization.
+
+Provider descriptor/block exclusivity, delivery DMA admission, and runtime
+reader/native completion remain separate proofs. Defensive lease snapshots
+protect mutable WriterPlan maps across injectable runtime callbacks. Removing
+unused provider exception storage avoids retaining traceback-local buffers.
+Common dtype sizes/block bounds now live in the pure contract; whitelist and
+external wire schemas remain distinct (a32335a55). Release removes live internal
+request-ID aliases. Compact replay fingerprints remain unbounded until a replay
+horizon or owner-generation rollover is defined; no arbitrary TTL/LRU was added.
+
+Focused CPU regression:227 passed,1 skipped,112 subtests; legacy ledger37 passed.
+Real-SDK connector regression in the final d634632f6 image:48 passed. A real
+NPU probe verified1000steps/two streams with two retained frontier fences and
+correct tensor values. The same image subsequently passed40 semantic requests
+(fresh and historical failed prompts, multichunk, concurrency and prefix replay)
+and41 all-8-rank receipt/release audits including generation disconnect.
+These are MTP3/mode3 tests, not new MTP5/1M-input or native fault-injection evidence. Deployment progress and exact commands/evidence:
+`docs/receipt-refactor-progress-20261108.md` and runbook11.79 in deploy-glm52.
+The original P/e9bd1ce19 and D/dfb52bd0a mode3/MTP3 were preserved for the matched
+C10/C20 control. Default inventory is not the experimental runtime profile.
+
+The accepted refactor runtime uses D-only `...-refactor-r3` containers, image
+`glm52-vllm-ascend:0.30.0-layerwise-guide-d634632f6-cann92`, same image ID
+`0ac34e9dd889ed5c254fa9285d4521298c9730c45e345a316012672b9435aede` on both D.
+P container IDs/images/start times and Master/proxy PIDs remain unchanged.
+Matched55K/700, N40/C10 and N40/C20 samples completed before/after the
+refactor:80/80 per arm passed strict SSE/700-token and all-8-rank release audits;
+prompt hashes and input lengths match, unique salts yield zero external hits.
+C10/C20 TTFT P50:13.32->13.46s /23.57->25.12s; TPOT P50:32.81->31.44ms /
+41.95->39.60ms. These single sequential samples show no TTFT improvement and do
+not establish a stable latency speedup. Structural memory/lifecycle improvements
+must not be conflated with end-to-end performance.
+All eight engines/proxy remain healthy and idle with zero KV use. D application
+logs have zero ERROR/Traceback/thread exceptions/timing markers; target capture
+completed on all four engines,32 workers report mode3/MTP3 and draft eager.
+ACL logs are outside that zero-error claim. Intermediate r1/r2 candidates, old D,
+and the CPU benchmark client are stopped; refactor-r3 D remains running.
+Final evidence is in deployment artifacts/receipt-refactor-20261108 and runbook11.79.
+Historical semantic anomalies, MTP5/1M-input and native delayed-DMA/reset cases
+are not newly proven by this refactor acceptance.

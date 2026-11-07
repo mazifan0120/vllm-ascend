@@ -1,5 +1,9 @@
 # A1/A2：D target owner 运行时交接
 
+> 历史接口交接记录：当前接线、MTP/图支持与2026-11-08重构状态请以
+> [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md)最新日期条目及部署仓库runbook§11.78–79为准。
+> 下文的初版测试计数和未实现清单不代表当前状态。
+
 2026-11-04。当前开发与交付分支为原 `p-main-buffer-reuse`，本地位置
 `deploy-glm52/src/vllm-ascend-reuse`。A1/A2 依赖已纳入的 receipt 基线 `6c233175d`；
 初始隔离工作区现仅作历史验证快照。本次只实现 A1/A2；B 的 sender、receipt

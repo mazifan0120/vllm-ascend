@@ -1,5 +1,9 @@
 # P侧共享KV缓冲区与PD传输交接
 
+> 历史接口交接记录：当前接线、MTP/图支持与2026-11-08重构状态请以
+> [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md)最新日期条目及部署仓库runbook§11.78–79为准。
+> 下文的初版测试计数和未实现清单不代表当前状态。
+
 > 2026-11-04 两分支整理入口：[实现现状与剩余工作](PD_TRANSFER_IMPLEMENTATION_STATUS.md)。
 > 本分支现包含 receipt 基线及 A1/A2 owner 实现，见 [owner 交接](TARGET_OWNER_RUNTIME_HANDOFF.md)。
 > sender、生产 IPC 与完整生命周期仍待接线，详见清单。
