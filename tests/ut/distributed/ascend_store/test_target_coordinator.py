@@ -18,6 +18,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     RequestKey,
     TokenRange,
     WriterPlan,
+    block_ids_in_capacity,
+    target_dtype_size,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import ManifestWritePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
@@ -147,6 +149,17 @@ def coordinated(tp=2, layers=2):
 
 
 class TestMultiRankTargets(unittest.TestCase):
+    def test_shared_geometry_primitives_keep_bounds_separate_from_coverage(self):
+        for dtype, size in (("int8", 1), ("float16", 2), ("bfloat16", 2), ("float32", 4)):
+            self.assertEqual(target_dtype_size(dtype), size)
+            self.assertEqual(target_dtype_size("torch." + dtype), size)
+        self.assertIsNone(target_dtype_size("float64"))
+        self.assertTrue(block_ids_in_capacity((0, 3), 4))
+        self.assertTrue(block_ids_in_capacity((1, 1), 4))  # Uniqueness belongs to the admission proof.
+        self.assertTrue(block_ids_in_capacity((), 0))  # Coverage belongs to the caller.
+        for blocks in ((True,), (-1,), (4,), ("1",), (1.0,)):
+            self.assertFalse(block_ids_in_capacity(blocks, 4))
+
     def test_aggregate_has_single_main_and_every_rank_indexer_with_original_owner_leases(self):
         provider, owners, request, allocation = coordinated()
         lease = provider.acquire_target(request, allocation)

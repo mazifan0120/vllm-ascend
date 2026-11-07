@@ -22,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TokenRange,
     WriterPlan,
     assert_lease_consistent,
+    block_ids_in_capacity,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import TargetManifest
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec import (
@@ -82,7 +83,7 @@ def _record(value):
 def _validate_view_block_ids(view: CacheView, checked: set[tuple[int, int]]) -> None:
     identity = (id(view.block_ids), view.block_capacity)
     if identity not in checked:
-        if any(type(block) is not int or block < 0 or block >= view.block_capacity for block in view.block_ids):
+        if not block_ids_in_capacity(view.block_ids, view.block_capacity):
             raise ContractError("Target view contains an invalid block ID")
         checked.add(identity)
 

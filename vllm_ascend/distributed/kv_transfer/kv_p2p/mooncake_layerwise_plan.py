@@ -19,12 +19,12 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TargetScope,
     TokenRange,
     TransferKey,
+    target_dtype_size,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.reuse_source import LayerSource, RequestSource, SourceView
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_catalog import TargetEntry
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import (
     CANONICAL_MAIN_RANK,
-    TARGET_DTYPE_BYTES,
     TargetManifest,
 )
 
@@ -124,7 +124,7 @@ class ManifestWritePlan:
 
 def _source_layout(view: SourceView) -> DsaCacheLayout:
     dtype = view.dtype.removeprefix("torch.")
-    itemsize = next((size for name, size in TARGET_DTYPE_BYTES if name == dtype), None)
+    itemsize = target_dtype_size(dtype)
     if (
         itemsize is None
         or type(view.address) is not int

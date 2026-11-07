@@ -9,6 +9,7 @@ from tests.ut.distributed.ascend_store.test_target_coordinator import coordinate
 from tests.ut.distributed.ascend_store.test_target_owner_factory import _endpoints
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     ContractError,
+    RequestKey,
     Status,
     TargetClosedError,
     TransferResult,
@@ -25,6 +26,35 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_rpc impo
 
 
 class TestTargetDelivery(unittest.TestCase):
+    def test_retirement_clears_live_aliases_without_weakening_replay_rejection(self):
+        provider, owners, _, template = coordinated()
+        control = WorkerTargetDelivery(0, owners[0], lambda *args: None)
+        for generation in range(64):
+            request = RequestKey(f"retirement-{generation}", generation)
+            allocation = replace(template, request=request, allocation_generation=generation)
+            lease = provider.acquire_target(request, allocation)
+            manifest = provider.manifest(lease)
+            local = manifest.for_rank(0).lease
+            # Reusing an internal ID after release must not revive its old lease.
+            control.admit_target(manifest, "reused-internal-id")
+            control.abort_requests({"reused-internal-id"})
+            control.release_target(local)
+            control.release_target(local)  # Exact replay stays idempotent.
+            self.assertFalse(control._by_request_id)
+            self.assertFalse(control._deliveries)
+            with self.assertRaises(TargetClosedError):
+                control.admit_target(local, "new-alias", ManifestWritePlan(manifest).receive_keys(0))
+            with self.assertRaises(ContractError):
+                control.release_target(replace(local, allocation=replace(allocation, retention_token="changed")))
+            with (
+                self.assertRaises(ContractError),
+                control.use_context(["reused-internal-id"], {"reused-internal-id": allocation}),
+            ):
+                self.fail("Retired scheduled target executed")
+            provider.release_target(lease)
+        # Compact identities remain: no replay horizon has been negotiated.
+        self.assertEqual(len(control._retired), 64)
+
     def test_compact_admission_rejects_missing_or_foreign_entries(self):
         provider, owners, request, allocation = coordinated()
         lease = provider.acquire_target(request, allocation)

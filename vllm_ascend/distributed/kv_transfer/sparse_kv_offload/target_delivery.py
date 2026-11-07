@@ -79,9 +79,7 @@ class WorkerTargetDelivery:
                     raise ContractError("Target admission is changed or incompletely installed")
                 return
             if request_id in self._by_request_id:
-                old = self._by_request_id[request_id]
-                if old not in self._retired:
-                    raise ContractError("A live target request ID cannot change allocation generation")
+                raise ContractError("A live target request ID cannot change allocation generation")
             if lease.request in self._retired:
                 raise TargetClosedError("Target delivery was already retired")
             if self._provider.get_target_views(lease) != lease.views:
@@ -218,6 +216,8 @@ class WorkerTargetDelivery:
         with self._lock:
             self._retired[lease.request] = lease_fingerprint(lease)
             self._deliveries.pop(lease.request, None)
+            if delivery is not None and self._by_request_id.get(delivery.request_id) == lease.request:
+                del self._by_request_id[delivery.request_id]
         if delivery is not None and callable(self._retire):
             self._retire(delivery.request_id, lease, delivery.ledger)
 

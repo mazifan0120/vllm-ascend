@@ -18,11 +18,12 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TokenRange,
     WriterPlan,
     assert_lease_consistent,
+    block_ids_in_capacity,
+    target_dtype_size,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_catalog import TargetCatalog, TargetEntry
 
 CANONICAL_MAIN_RANK = 0
-TARGET_DTYPE_BYTES = (("int8", 1), ("float16", 2), ("bfloat16", 2), ("float32", 4))
 MAX_TARGET_ENTRY_DIMENSIONS = 8
 
 
@@ -37,7 +38,7 @@ class RankTarget:
 
 
 def _validate_entry_geometry(entry, view, region, block_ids, prompt_tokens, block_validation_cache) -> None:
-    itemsize = next((size for name, size in TARGET_DTYPE_BYTES if view.dtype.removeprefix("torch.") == name), None)
+    itemsize = target_dtype_size(view.dtype)
     if (
         itemsize is None
         or not entry.layer_name
@@ -68,7 +69,7 @@ def _validate_entry_geometry(entry, view, region, block_ids, prompt_tokens, bloc
     if identity not in block_validation_cache:
         if (
             len(block_ids) * view.manager_block_size_tokens < prompt_tokens
-            or any(type(block) is not int or not 0 <= block < view.block_capacity for block in block_ids)
+            or not block_ids_in_capacity(block_ids, view.block_capacity)
             or len(set(block_ids)) != len(block_ids)
         ):
             raise ContractError("Target entry footprint or request blocks exceed registered capacity")

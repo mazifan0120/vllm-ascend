@@ -28,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     WriterPlan,
     assert_lease_consistent,
     assert_registered_regions,
+    block_ids_in_capacity,
     copy_target_lease,
 )
 
@@ -103,7 +104,6 @@ class TargetRuntime(Protocol):
 class _LeaseState:
     lease: TargetLease
     phase: str
-    error: Exception | None = None
 
 
 class RegisteredTargetProvider:
@@ -112,7 +112,10 @@ class RegisteredTargetProvider:
     Catalog replacement requires a new provider/registration generation.
     Callbacks are made without holding the state lock. A single request cannot
     acquire/prepare/release concurrently; those races fail explicitly.
-    Released identities remain tombstoned to reject stale callbacks.
+    Released identities remain tombstoned to reject stale callbacks. This
+    descriptor/block ownership machine deliberately remains distinct from the
+    runtime's active readers, visibility dependencies and native completion.
+    Callback arguments are copied: injected runtimes cannot mutate this state.
     """
 
     contract_version = CONTRACT_VERSION
@@ -206,7 +209,7 @@ class RegisteredTargetProvider:
                 if (
                     len(ids) < needed
                     or len(set(ids)) != len(ids)
-                    or any(type(block) is not int or block < 0 or block >= view.block_capacity for block in ids)
+                    or not block_ids_in_capacity(ids, view.block_capacity)
                 ):
                     raise ContractError("Target block capacity cannot cover the complete prompt")
                 checked_groups.add(group)
@@ -327,9 +330,9 @@ class RegisteredTargetProvider:
             state.phase = "PREPARING"
         try:
             self._runtime.make_visible(copy_target_lease(lease), deepcopy(receipt))
-        except Exception as error:
+        except Exception:
             with self._lock:
-                state.phase, state.error = "FAILED", error
+                state.phase = "FAILED"
             raise
         with self._lock:
             state.phase = "READY"
@@ -354,9 +357,9 @@ class RegisteredTargetProvider:
             state.phase = "RELEASING"
         try:
             self._runtime.release(copy_target_lease(lease))
-        except Exception as error:
+        except Exception:
             with self._lock:
-                state.phase, state.error = previous_phase, error
+                state.phase = previous_phase
             raise
         with self._lock:
             for block in self._blocks(lease):

@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 CONTRACT_VERSION = 1
 VISIBILITY_CONTRACT = "stream-dependency"
+TARGET_DTYPE_BYTES = (("int8", 1), ("float16", 2), ("bfloat16", 2), ("float32", 4))
 
 _MEMORY_KINDS = ("host", "device")
 
@@ -38,6 +39,16 @@ class ContractError(Exception):
 
 class TargetClosedError(ContractError):
     """The exact retained delivery is closed; no new native source reads may start."""
+
+
+def target_dtype_size(dtype: str) -> int | None:
+    """Physical element size shared by registered targets and producer layouts."""
+    return next((size for name, size in TARGET_DTYPE_BYTES if name == dtype.removeprefix("torch.")), None)
+
+
+def block_ids_in_capacity(block_ids: tuple, capacity: int) -> bool:
+    """Bounds only; each caller still proves coverage and uniqueness as required."""
+    return all(type(block) is int and 0 <= block < capacity for block in block_ids)
 
 
 def receipt_mtp_layer_count(vllm_config: Any) -> int:

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import pickle
 import threading
 import unittest
+import weakref
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -154,6 +156,30 @@ class TestRegisteredTargetProvider(unittest.TestCase):
             provider.prepare_decode(lease, self.receipt(request))
         provider.release_target(lease)
         self.runtime.release.assert_called_once_with(lease)
+
+    def test_failed_callbacks_do_not_retain_unused_traceback_objects(self):
+        provider, request, allocation = self.make()
+        lease = provider.acquire_target(request, allocation)
+        references = []
+
+        class CallbackBuffer:
+            pass
+
+        def fail(*args):
+            buffer = CallbackBuffer()
+            references.append(weakref.ref(buffer))
+            raise RuntimeError("callback failed")
+
+        self.runtime.make_visible.side_effect = fail
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            provider.prepare_decode(lease, self.receipt(request))
+        self.runtime.release.side_effect = fail
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            provider.release_target(lease)
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in references))
+        self.runtime.release.side_effect = None
+        provider.release_target(lease)
 
     def test_returned_mutable_writer_plan_cannot_change_registered_identity(self):
         provider, request, allocation = self.make()
