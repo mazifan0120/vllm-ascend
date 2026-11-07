@@ -1,5 +1,18 @@
 # P buffer reuse 与 layerwise receipt：实现现状及剩余工作
 
+## 2026-11-07 TP8×DP4 与长 prefill 超时
+
+独立 Ansible 档已启动 P/D 各 TP8×DP4，保留 Main reuse、Host receipt、
+P MTP1 和 D MTP3。四个 D 的短请求、约 33K 多 chunk 并发和重复前缀请求
+共 12 条返回预期结果，并验证每条的 8 rank receipt 与目标释放。
+P 的 79 个逻辑层使用 5 个 Main 槽，MTP 路径保持跨请求 prefix caching 关闭。
+
+实际 1,047,256 token 请求触发了原来的 300 秒 receipt watchdog。
+新增连接器 extra config `layerwise_receipt_timeout_s`，默认值为 300 秒，
+接受正的有限数值。该预算覆盖目标登记到全层交付完成，1M 部署配置为
+7,200 秒。过期仍走现有的有界失败与晚到 quiescence 处理。
+默认、自定义期限及非法值已有回归测试，完整长请求复测结果以部署 runbook 为准。
+
 ## 2026-11-07 A3 GLM MTP 验证
 
 在 `c76f087d2` 镜像上叠加本次 Python 源码后，GLM-5.2 的第 79 个逻辑层使用独立

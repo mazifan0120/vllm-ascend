@@ -728,8 +728,17 @@ class KVCacheRecvingLayerThread(threading.Thread):
         local_engine_id: str,
         metadata: MooncakeAgentMetadata,
         ready_event: threading.Event,
+        *,
+        receipt_timeout_s: float = RECEIPT_WATCHDOG_SECONDS,
     ):
+        if (
+            type(receipt_timeout_s) not in (int, float)
+            or not math.isfinite(receipt_timeout_s)
+            or receipt_timeout_s <= 0
+        ):
+            raise ValueError("kv_connector_extra_config.layerwise_receipt_timeout_s must be positive and finite")
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
+        self.receipt_timeout_s = float(receipt_timeout_s)
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.pd_head_ratio = pd_head_ratio
@@ -1044,7 +1053,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 "Receipt watchdog: request %s (instance=%s) did not publish within %.0fs; failing bounded",
                 req_id,
                 instance,
-                RECEIPT_WATCHDOG_SECONDS,
+                self.receipt_timeout_s,
             )
 
     def run(self):
@@ -2751,6 +2760,9 @@ class MooncakeLayerwiseConnectorWorker:
                 self.engine_id,
                 metadata,
                 ready_event,
+                receipt_timeout_s=self.vllm_config.kv_transfer_config.get_from_extra_config(
+                    "layerwise_receipt_timeout_s", RECEIPT_WATCHDOG_SECONDS
+                ),
             )
             self.kv_recv_layer_thread.start()
             ready_event.wait()
@@ -3016,7 +3028,7 @@ class MooncakeLayerwiseConnectorWorker:
             thread.ledger_by_req[instance] = ledger
             thread.instance_to_req[instance] = req_id
             thread.receipt_mode_reqs.add(external_req_id)
-            thread.receipt_deadlines[instance] = time.monotonic() + RECEIPT_WATCHDOG_SECONDS
+            thread.receipt_deadlines[instance] = time.monotonic() + thread.receipt_timeout_s
 
     def _retire_admitted_target(self, req_id, lease, ledger):
         thread = self.kv_recv_layer_thread
@@ -3076,7 +3088,7 @@ class MooncakeLayerwiseConnectorWorker:
                 thread.ledger_by_req[instance] = ledger
                 thread.instance_to_req[instance] = external_req_id
                 thread.receipt_mode_reqs.add(external_req_id)
-                thread.receipt_deadlines[instance] = time.monotonic() + RECEIPT_WATCHDOG_SECONDS
+                thread.receipt_deadlines[instance] = time.monotonic() + thread.receipt_timeout_s
             logger.debug(
                 "Installed receipt ledger for req %s (instance=%s, expected=%s)", req_id, instance, expected_ranks
             )

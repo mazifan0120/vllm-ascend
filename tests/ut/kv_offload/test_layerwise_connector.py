@@ -99,6 +99,7 @@ class TestExactReceiverProtocol(unittest.TestCase):
         receiver.failed_requests = set()
         receiver.receipt_mode_reqs = set()
         receiver.receipt_deadlines = {}
+        receiver.receipt_timeout_s = lc.RECEIPT_WATCHDOG_SECONDS
         order = []
         receiver.receipt_provider = SimpleNamespace(
             confirm_native_received=lambda *args: order.append("native-receive-fence"),
@@ -281,12 +282,49 @@ class TestExactReceiverProtocol(unittest.TestCase):
         self.assertFalse(ledger.remote_quiesced())
 
 
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True, "7200", None])
+def test_receipt_timeout_rejects_invalid_values(timeout):
+    with pytest.raises(ValueError, match="layerwise_receipt_timeout_s"):
+        lc.KVCacheRecvingLayerThread(
+            0, 57000, 1, 1, "engine", SimpleNamespace(), threading.Event(), receipt_timeout_s=timeout
+        )
+
+
+@pytest.mark.parametrize("timeout", [lc.RECEIPT_WATCHDOG_SECONDS, 7200.0])
+def test_admitted_target_uses_configured_receipt_deadline(timeout):
+    with patch.object(lc, "get_ip", return_value="127.0.0.1"):
+        receiver = lc.KVCacheRecvingLayerThread(
+            0, 57000, 1, 1, "engine", SimpleNamespace(), threading.Event(), receipt_timeout_s=timeout
+        )
+    worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
+    worker.request_map = {}
+    worker.kv_recv_layer_thread = receiver
+    _, ledger, _ = TestExactReceiverProtocol().fixture()
+    request_id = "long-prefill-12345678"
+    lease = SimpleNamespace(request=ledger.request, allocation=SimpleNamespace(group_block_ids=((1, 3),)))
+    with patch.object(lc.time, "monotonic", return_value=100):
+        worker._install_admitted_target(request_id, lease, ledger)
+    assert receiver.receipt_deadlines[ledger.request.request_instance] == 100 + timeout
+    with patch.object(lc.time, "monotonic", return_value=401):
+        receiver._sweep_receipt_deadlines()
+    assert bool(receiver.failed_requests) == (timeout <= 301)
+    with patch.object(lc.time, "monotonic", return_value=101 + timeout):
+        receiver._sweep_receipt_deadlines()
+    assert receiver.failed_requests == {request_id}
+    assert not receiver.done_requests
+
+
 class TestEarlyTargetAdmission(unittest.TestCase):
     def test_actual_install_maps_early_completions_before_scheduler_metadata(self):
         worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
         worker.request_map = {}
         worker.kv_recv_layer_thread = SimpleNamespace(
-            lock=threading.RLock(), ledger_by_req={}, instance_to_req={}, receipt_mode_reqs=set(), receipt_deadlines={}
+            lock=threading.RLock(),
+            ledger_by_req={},
+            instance_to_req={},
+            receipt_mode_reqs=set(),
+            receipt_deadlines={},
+            receipt_timeout_s=lc.RECEIPT_WATCHDOG_SECONDS,
         )
         _, ledger, _ = TestExactReceiverProtocol().fixture()
         request_id = "early-request-12345678"
@@ -304,7 +342,12 @@ class TestEarlyTargetAdmission(unittest.TestCase):
         worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
         worker.request_map = {}
         worker.kv_recv_layer_thread = SimpleNamespace(
-            lock=threading.RLock(), ledger_by_req={}, instance_to_req={}, receipt_mode_reqs=set(), receipt_deadlines={}
+            lock=threading.RLock(),
+            ledger_by_req={},
+            instance_to_req={},
+            receipt_mode_reqs=set(),
+            receipt_deadlines={},
+            receipt_timeout_s=lc.RECEIPT_WATCHDOG_SECONDS,
         )
         instances = []
         for suffix in ("12345678", "abcdefgh"):
@@ -725,14 +768,15 @@ class TestPrefixHitNoCompute:
         worker.current_layer = 0
         worker.total_layers = 4
         worker.index_to_name = {0: ["layer0"]}
-        worker.layer_metadata = {}
+        worker.layer_metadata = {"layer0": SimpleNamespace(tensor_group_idx=(0,))}
         worker._slot_ledger = None
         worker._slot_ledger_active = False
         worker._layer_keys = {}
         worker._compute_done_events = [None] * 4
         worker._no_compute_layers = set()
         worker._cache_write_events = [None] * 4
-        worker.kv_send_layer_thread = None
+        worker.kv_send_layer_thread = Mock()
+        worker._mark_layer_reuse_pending = Mock()
         worker._reqs_need_send_layerwise = {}
         worker.use_mla = False
         worker.kv_cache_specs = []
@@ -771,9 +815,12 @@ class TestPrefixHitNoCompute:
         metadata = lc.MooncakeLayerwiseConnectorMetadata()
         metadata.requests["req-1"] = req
         worker.vllm_config = _Cfg()
+        worker.update_decoder_info = Mock(return_value=req)
         worker.save_kv_layer("layer0", [], None, metadata)
         assert 0 in worker._no_compute_layers
         assert worker._compute_done_events[0] is None  # no compute-done event recorded
+        worker.kv_send_layer_thread.send_queue.put.assert_called_once()
+        worker._mark_layer_reuse_pending.assert_called_once_with(0)
 
 
 if __name__ == "__main__":
