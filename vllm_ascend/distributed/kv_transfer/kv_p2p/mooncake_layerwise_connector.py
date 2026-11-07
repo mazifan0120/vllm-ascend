@@ -1260,6 +1260,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         self._scheduler_target_rpc = None
         self._target_rpc_config = None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        self._receipt_timing_config = {k: v for k, v in extra.items() if k.startswith("receipt_timing_")}
         requested = extra.get("layerwise_receipt_mode", False)
         if type(requested) is not bool:
             raise ContractError("layerwise_receipt_mode must be a boolean")
@@ -1481,6 +1482,17 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
                 self.connector_worker._install_admitted_target,
                 retire=self.connector_worker._retire_admitted_target,
             )
+            timing_config = getattr(self, "_receipt_timing_config", {})
+            if timing_config.get("receipt_timing_interval", 0):
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_timing import (
+                    install_receipt_host_timing,
+                )
+
+                install_receipt_host_timing(
+                    facade,
+                    self.connector_worker._target_delivery,
+                    timing_config,
+                )
             self.connector_worker.kv_recv_layer_thread.target_delivery = self.connector_worker._target_delivery
             self._target_owner_dispatcher = TargetOwnerDispatcher(
                 facade, delivery=self.connector_worker._target_delivery
