@@ -1734,15 +1734,25 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
                     )
                     self.assertEqual(load.partial_load_gva_per_group, [0, 0, 0])
 
-    def test_set_external_slot_release_waiter_gated_on_layerwise_transfer(self):
+    def test_set_external_slot_release_waiter_gated_on_receiver_data_plane(self):
         waiter = MagicMock()
 
         worker = self._make_worker()
         worker.use_layerwise_transfer = False
+        worker.use_block_key_layerwise = False
         self.assertFalse(worker.set_external_slot_release_waiter(waiter))
         self.assertIsNone(worker.external_slot_release_waiter)
 
         worker.use_layerwise_transfer = True
+        self.assertTrue(worker.set_external_slot_release_waiter(waiter))
+        self.assertIs(worker.external_slot_release_waiter, waiter)
+
+    def test_block_key_layerwise_accepts_external_slot_release_waiter(self):
+        worker = make_worker(self, extra_config={"backend": "mooncake"}, use_layerwise=True)
+        self.assertTrue(worker.use_block_key_layerwise)
+        self.assertFalse(worker.use_layerwise_transfer)
+        waiter = MagicMock()
+
         self.assertTrue(worker.set_external_slot_release_waiter(waiter))
         self.assertIs(worker.external_slot_release_waiter, waiter)
 
@@ -1751,15 +1761,16 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             KVCacheStoreLayerRecvingThread,
         )
 
-        waiter = MagicMock()
-
-        worker = self._make_worker()
-        worker.use_layerwise_transfer = True
-        worker.kv_recv_thread = MagicMock(spec=KVCacheStoreLayerRecvingThread)
-        self.assertTrue(worker.set_external_slot_release_waiter(waiter))
-        # A waiter registered after the receive thread started is handed
-        # over to the thread directly, not just stored on the worker.
-        self.assertIs(worker.kv_recv_thread.external_slot_release_waiter, waiter)
+        for data_plane in ("gva", "block_key"):
+            with self.subTest(data_plane=data_plane):
+                waiter = MagicMock()
+                worker = self._make_worker()
+                worker.use_layerwise_transfer = data_plane == "gva"
+                worker.use_block_key_layerwise = data_plane == "block_key"
+                worker.kv_recv_thread = MagicMock(spec=KVCacheStoreLayerRecvingThread)
+                self.assertTrue(worker.set_external_slot_release_waiter(waiter))
+                # Late registration must reach the active receiver on both planes.
+                self.assertIs(worker.kv_recv_thread.external_slot_release_waiter, waiter)
 
     def test_process_layer_data_empty_requests(self):
         worker = self._make_worker()
@@ -2577,10 +2588,6 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         )
 
     def test_committed_blocks_are_skipped_and_missing_blocks_allocated(self):
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
-            LAYERWISE_READ_LEASE_TTL_MS,
-        )
-
         worker = self._make_gva_worker()
         fresh_key = worker._make_layerwise_full_key(0, "h0")
         worker.m_store.batch_is_exist.side_effect = lambda keys: [0 if key == fresh_key else 1 for key in keys]

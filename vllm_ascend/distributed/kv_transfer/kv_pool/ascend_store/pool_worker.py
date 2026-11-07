@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
+    AttentionComputeCompletion,
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
 )
@@ -97,10 +98,17 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_tp_mismatch_info,
     is_kv_save_role,
     masked_block_runs,
+    mtp_prefix_block_hash,
     uses_hybrid_kv_cache,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.reuse_source import (
+    RequestSource,
+    ReuseSourceRegistry,
+    SourceConsumer,
+    SourceView,
 )
 from vllm_ascend.distributed.kv_transfer.load_failure_registry import (
     record_failed_load,
@@ -130,6 +138,7 @@ MEMCACHE_UNMATCHED_STATE = -3101
 PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
 SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
+PRIVATE_SNAPSHOT_CLEANUP_RETRY_INTERVAL_S = 1.0
 
 
 class KVPoolWorker:
@@ -249,6 +258,11 @@ class KVPoolWorker:
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
+        self.main_reuse_mtp_prefix = (
+            self.use_eagle
+            and getattr(speculative_config, "method", None) == "mtp"
+            and getattr(speculative_config, "num_speculative_tokens", None) == 1
+        )
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
         self._dspark_draft_layer_names = (
             set(getattr(kv_cache_config, "dspark_draft_layer_names", ())) if self.use_layerwise_transfer else set()
@@ -476,12 +490,16 @@ class KVPoolWorker:
         self.kv_recv_thread: KVTransferThread | None = None
         self._previous_save_batch: KVCacheStoreBatch | None = None
         self._transfer_threads_started = False
+        self._reuse_source_consumer: SourceConsumer | None = None
+        self._reuse_source_registry: ReuseSourceRegistry | None = None
+        self._reuse_source_requests: tuple[RequestSource, ...] = ()
         self.external_slot_release_waiter: Callable[[int], None] | None = None
         self._put_started_keys: set[str] = set()
         self._put_started_keys_lock = threading.Lock()
         self._load_session_lock = threading.Lock()
         self._layer_load_aborted = threading.Event()
         self._layerwise_session_tracker = LayerwiseSessionTracker()
+        self._private_snapshot_cleanup_retry_at = 0.0
         self._current_layerwise_request_ids: set[str] = set()
         self._current_layerwise_last_chunk_req_ids: set[str] = set()
         # (tag, req_id, group_id, start_block, end_block) -> runs, cleared per
@@ -497,6 +515,9 @@ class KVPoolWorker:
         self.physical_layer_to_group_layers: dict[int, list[tuple[int, int]]] = {}
         self._global_to_local_layer: dict[int, int] = {}
         self._layerwise_reuse_layout: LayerwiseReuseLayout | None = None
+        self._main_buffer_layer_slots: dict[int, int] = {}
+        self._main_layer_compute_done: dict[int, AttentionComputeCompletion] = {}
+        self._main_slot_compute_tail: dict[int, AttentionComputeCompletion] = {}
         self._recurrent_layers: set[int] = set()
         # Defaults for partial initialization (unit tests construct the worker
         # without the full _init_parallelism_info path).
@@ -549,6 +570,12 @@ class KVPoolWorker:
                     # pool for prefix storage and load/save addressing.
                     self._dspark_draft_layer_names = draft_names = set()
                     target_specs = layer_specs
+            elif getattr(self, "use_block_key_layerwise", False):
+                reuse_config = self.layerwise_protocol.extract_layout_config(self._extra_config)
+                if reuse_config is not None:
+                    self._layerwise_reuse_layout = self.layerwise_protocol.build_cache_plan(
+                        self.kv_cache_config, self.vllm_config, reuse_config
+                    ).layout
             physical_layers = {
                 self._extract_physical_layer_index(layer_name)
                 for group_spec in self.kv_cache_config.kv_cache_groups
@@ -611,7 +638,7 @@ class KVPoolWorker:
         self.layerwise_offload = False
         self.independent_layers: list[int] = []
         self.prefetch_layer_map: dict[int, int] = {}
-        if self.use_layerwise_transfer:
+        if self.use_layerwise_transfer or self._layerwise_reuse_layout is not None:
             if self._layerwise_reuse_layout is None:
                 cache_layout = build_layerwise_cache_layout(
                     self.num_layers,
@@ -635,6 +662,12 @@ class KVPoolWorker:
                     self.independent_layers = layout.independent_layers
                 self.layerwise_offload = layout.has_layer_reuse
                 self.num_prefetch_layers = layout.num_prefetch_layers
+                if getattr(self, "use_block_key_layerwise", False) and layout.has_layer_reuse:
+                    self._main_buffer_layer_slots = {
+                        self._global_to_local_layer[layer]: slot
+                        for slot, layers in enumerate(layout.buffer_slots)
+                        for layer in layers
+                    }
         else:
             self.num_prefetch_layers = 2
             if self.use_layerwise:
@@ -743,6 +776,7 @@ class KVPoolWorker:
         for thread in threads:
             if thread.is_alive():
                 thread.join()
+        self.drain_reuse_sources()
         try:
             if self._step_load_keys:
                 result = self.m_store.batch_remove_lease(list(self._step_load_keys))
@@ -756,12 +790,14 @@ class KVPoolWorker:
     def set_external_slot_release_waiter(self, waiter: Callable[[int], None]) -> bool:
         """Accept the MultiConnector composite slot-release waiter.
 
-        Only the layerwise transfer mode has receive threads waiting on an
-        externally supplied slot-release callback, so the gate lives here
-        (at the data-plane consumer) instead of at the connector proxy.
+        Both GVA and block-key layerwise modes use the range-capable receiver
+        with an external slot-release callback. Keep this gate aligned with
+        _start_kv_transfer_threads, rather than restricting it to GVA.
         """
-        if not self.use_layerwise_transfer:
+        if not (self.use_layerwise_transfer or self.use_block_key_layerwise):
             return False
+        if not callable(waiter):
+            raise TypeError("External slot-release waiter must be callable")
         self.external_slot_release_waiter = waiter
         # The receive thread snapshots the waiter at construction; if it is
         # already running, hand the waiter over directly so a late
@@ -770,7 +806,116 @@ class KVPoolWorker:
             self.kv_recv_thread.external_slot_release_waiter = waiter
         return True
 
+    def set_reuse_source_consumer(self, consumer: SourceConsumer) -> None:
+        """Install the new source contract before KV registration, never mid-flight."""
+        if self._transfer_threads_started:
+            raise RuntimeError("Install the source consumer before KV registration")
+        for name in ("open_source", "source_ready", "seal_source", "wait_source", "abort_source"):
+            if not callable(getattr(consumer, name, None)):
+                raise TypeError(f"Source consumer is missing {name}")
+        self._reuse_source_consumer = consumer
+
+    def _register_reuse_source_views(self) -> None:
+        consumer = getattr(self, "_reuse_source_consumer", None)
+        if consumer is None:
+            return
+        if not self._main_buffer_layer_slots or self._layerwise_reuse_layout is None:
+            raise RuntimeError("Source consumer requires the supported Main reuse layout")
+        views = {}
+        for layer, specs in self._layerwise_reuse_layout.layer_cache_specs.items():
+            local_layer = self._global_to_local_layer[layer]
+            entries = []
+            for component, named in (("MAIN", specs.main), ("INDEXER", specs.indexer)):
+                if named is None:
+                    continue
+                group = next(
+                    i for i, g in enumerate(self.kv_cache_config.kv_cache_groups) if named.layer_name in g.layer_names
+                )
+                for entry, cache in enumerate(self._as_cache_tuple(self.kv_caches[named.layer_name])):
+                    _, _, span, scale = self._get_cache_block_metadata(cache)
+                    if named.spec.block_size % scale:
+                        raise ValueError("Manager block must contain integral physical pages")
+                    slot = (
+                        f"main:{self._main_buffer_layer_slots[local_layer]}"
+                        if component == "MAIN"
+                        else f"indexer:{self._get_storage_key(cache)}"
+                    )
+                    entries.append(
+                        SourceView(
+                            local_layer,
+                            component,
+                            group,
+                            slot,
+                            cache.data_ptr(),
+                            span,
+                            tuple(cache.shape),
+                            tuple(x * cache.element_size() for x in cache.stride()),
+                            str(cache.dtype),
+                            named.spec.block_size,
+                            named.spec.block_size // scale,
+                            entry,
+                        )
+                    )
+            views[local_layer] = tuple(entries)
+        self._reuse_source_registry = ReuseSourceRegistry(views, consumer)
+
+    def abort_reuse_sources(self, error: Exception) -> None:
+        registry = getattr(self, "_reuse_source_registry", None)
+        if registry is not None:
+            registry.fail(error)
+
+    def drain_reuse_sources(self) -> None:
+        """Do not release source allocations before external readers quiesce."""
+        registry = getattr(self, "_reuse_source_registry", None)
+        if registry is not None:
+            registry.drain()
+
+    def _publish_reuse_source(self, layer: int) -> None:
+        registry = getattr(self, "_reuse_source_registry", None)
+        if registry is not None:
+            ready = torch.npu.Event()
+            ready.record()
+            registry.publish(layer, self._reuse_source_requests, ready)
+
+    def restore_kv_for_transfer(self, metadata: AscendConnectorMetadata) -> None:
+        """Explicit restore-only entry, after target admission, without model hooks.
+
+        Caller must not also bind/run a normal forward for this metadata. Every
+        token to be published must be covered by the Store restore plan. This
+        does not infer a scheduler decision or mark D requests complete.
+        """
+        if getattr(self, "_reuse_source_registry", None) is None:
+            raise RuntimeError("Restore-only transfer requires a registered source consumer")
+        for request in metadata.requests:
+            valid_end = getattr(request, "target_token_len", request.token_len_chunk)
+            if not request.request_instance or request.restore_end_token != valid_end:
+                raise ValueError("Restore-only requires the entire valid source range, with no new tokens")
+        self.drain_reuse_sources()
+        self.prepare_layerwise_step(metadata)
+        for _ in range(self.num_layers):
+            self.wait_for_layer_load()
+            # No attention read exists. Record KV-ready and the post-restore
+            # completion on the current stream; never forge device completion.
+            get_attention_compute_start_gate().record()
+            if self.current_layer not in self._attention_saved_layers:
+                self._submit_attention_save(self.current_layer)
+            self.save_kv_layer(metadata)
+        self.drain_reuse_sources()
+
+    def assert_reuse_wired(self) -> None:
+        """Refuse Main reuse without a real Store-side external release sink."""
+        if not getattr(self, "_main_buffer_layer_slots", None):
+            return
+        if not callable(self.external_slot_release_waiter):
+            raise RuntimeError("Mooncake Main buffer reuse requires an external slot-release waiter")
+        if self._transfer_threads_started and (
+            not isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread)
+            or self.kv_recv_thread.external_slot_release_waiter is not self.external_slot_release_waiter
+        ):
+            raise RuntimeError("Mooncake Main buffer reuse waiter is not installed on the Store receiver")
+
     def _start_kv_transfer_threads(self) -> None:
+        self.assert_reuse_wired()
         if self._transfer_threads_started:
             return
 
@@ -1360,26 +1505,56 @@ class KVPoolWorker:
         self.m_store.register_buffer(ptrs, lengths)
         if self.use_block_key_layerwise:
             self.m_store.validate_layerwise_support()
+        self._register_reuse_source_views()
         self._start_kv_transfer_threads()
 
     def prepare_layerwise_step(self, metadata: AscendConnectorMetadata) -> None:
         """Prepare per-step hook state when the runner binds metadata."""
         assert self.use_layerwise
+        self.drain_reuse_sources()
         self._drain_deferred_last_save()
         # The final-layer fence drains this rank only. Readers of replicated
         # KV must also wait for the writer before querying the previous step.
         # Use configuration, never local requests/tasks, to gate the collective.
-        if self.use_layerwise_transfer and self.layerwise_offload and self.tp_size > 1:
+        if (
+            (self.use_layerwise_transfer or getattr(self, "_main_buffer_layer_slots", None))
+            and self.layerwise_offload
+            and self.tp_size > 1
+        ):
             get_tp_group().barrier()
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         self.next_layer_to_submit = 0
         reset_attention_compute_start_gate()
         self._attention_saved_layers = set()
+        if getattr(self, "_main_buffer_layer_slots", None):
+            # Old tasks retain the old objects; a late record cannot release a
+            # new step's compute dependency. Slot tails survive step boundaries.
+            self._main_layer_compute_done = {
+                layer: AttentionComputeCompletion() for layer in self._main_buffer_layer_slots
+            }
         self._save_disabled.clear()
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
+        if getattr(self, "_reuse_source_registry", None) is not None:
+            self._reuse_source_requests = self._source_requests(metadata.requests)
         self.process_layer_data(metadata.requests)
+
+    @staticmethod
+    def _source_requests(requests) -> tuple[RequestSource, ...]:
+        # Public Store save_end is block-aligned. A PD reader must also see
+        # the valid partial tail already written by this step, while private
+        # Store request/snapshot identity stays independent of PD identity.
+        return tuple(
+            RequestSource(
+                request.req_id,
+                request.request_instance or "",
+                0,
+                getattr(request, "target_token_len", request.token_len_chunk),
+                tuple(tuple(ids) for ids in request.block_ids_by_group),
+            )
+            for request in requests
+        )
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         if self.use_layerwise:
@@ -2186,6 +2361,7 @@ class KVPoolWorker:
                 request.block_gvas_np = all_group_gvas[0]
                 request.gva_block_offset = 0
         return None
+
     def _prepare_load_gvas(self, requests: list[ReqMeta]) -> None:
         for request in requests:
             if self._prepare_load_gvas_for_request([request]) is False:
@@ -2647,7 +2823,187 @@ class KVPoolWorker:
         self._current_layerwise_request_ids.difference_update(req_ids)
         self._current_layerwise_last_chunk_req_ids.difference_update(req_ids)
 
+    def _bind_main_reuse_request(self, request: ReqMeta) -> None:
+        if not request.request_instance:
+            raise RuntimeError("Main reuse requires a scheduler-generated request instance")
+        retired = self._layerwise_session_tracker.bind_request_instance(request.req_id, request.request_instance)
+        self._end_layerwise_load_keys(retired)
+
+    def _main_snapshot_key(
+        self,
+        request: ReqMeta,
+        block_index: int,
+        *,
+        generation: int | None = None,
+        end_token: int | None = None,
+    ) -> str:
+        if not request.request_instance or block_index < 0:
+            raise ValueError("Invalid Main snapshot request identity")
+        if generation is None and end_token is None:
+            # Full prompt blocks remain valid for this request across chunks.
+            identity = f"private_full_v1:{request.request_instance}:block:{block_index}"
+        else:
+            if type(generation) is not int or generation < 1 or type(end_token) is not int or end_token <= 0:
+                raise ValueError("Main partial snapshot requires an explicit generation and valid token end")
+            identity = (
+                f"private_snapshot_v1:{request.request_instance}:generation:{generation}:"
+                f"block:{block_index}:end:{end_token}"
+            )
+        return self._make_mooncake_layerwise_key(identity)
+
+    def _main_full_block_key(self, request: ReqMeta, block_index: int, hashes: Sequence[BlockHash]) -> str:
+        if not self.use_eagle:
+            return self._make_mooncake_layerwise_key(block_hash_to_str(hashes[block_index]))
+        if (
+            getattr(self, "main_reuse_mtp_prefix", False)
+            and (block_index + 2) * self.block_size <= request.num_prompt_tokens
+        ):
+            # Never expose generated-token snapshots under prompt identities.
+            identity = mtp_prefix_block_hash(hashes, block_index)
+            if identity is not None:
+                return self._make_mooncake_layerwise_key(identity)
+        return self._main_snapshot_key(request, block_index)
+
+    def _prepare_main_reuse_put_session(self, request: ReqMeta) -> None:
+        self._bind_main_reuse_request(request)
+        request.save_block_keys = []
+        request.save_last_block_key = None
+        if not self._is_layerwise_save_owner() or not request.can_save:
+            return
+        start = request.save_start_token // self.block_size
+        if (
+            request.load_spec is not None
+            and request.load_spec.can_load
+            and not request.load_spec.layerwise_previous_step
+        ):
+            start = max(
+                start,
+                (request.load_spec.kvpool_store_skip_tokens or request.load_spec.kvpool_cached_tokens)
+                // self.block_size,
+            )
+        hashes = get_block_hashes(request.block_hashes, self.block_size, self.hash_block_size)
+        end = min(request.save_end_token // self.block_size, len(hashes), len(request.block_ids))
+        start = min(start, end)
+        request.save_key_block_offset = start
+        request.save_block_keys = [None] * (end - start)
+        # key, full-key slot (None for partial), logical block, valid token end
+        slots = [
+            (
+                self._main_full_block_key(request, index, hashes),
+                index - start,
+                index,
+                (index + 1) * self.block_size,
+            )
+            for index in range(start, end)
+        ]
+        if request.partial_block_index is not None:
+            index = request.partial_block_index
+            key = self._main_snapshot_key(
+                request, index, generation=request.snapshot_generation, end_token=request.target_token_len
+            )
+            slots.append((key, None, index, request.target_token_len))
+        if not slots:
+            return
+        with self._put_started_keys_lock:
+            started = {key for key, _, _, _ in slots} & self._put_started_keys
+        full_keys = [key for key, slot, _, _ in slots if slot is not None and key not in started]
+        missing_full = set(self._filter_pool_existing_keys(full_keys)) if full_keys else set()
+        readable = set(full_keys) - missing_full
+        pending = [key for key, slot, _, _ in slots if key not in started and (slot is None or key in missing_full)]
+        try:
+            codes = self._start_layerwise_put_keys(pending, self._layerwise_object_size_bytes()) if pending else []
+            new = {key for key, code in zip(pending, codes, strict=True) if code == 0}
+            with self._put_started_keys_lock:
+                self._put_started_keys.update(new)
+            started.update(new)
+            rejected = {key for key, code in zip(pending, codes, strict=True) if code != 0}
+            replacements = {}
+            for key, slot, index, _ in slots:
+                if key not in rejected:
+                    continue
+                if slot is None or "@private_" in key:
+                    raise RuntimeError("Main private snapshot allocation failed")
+                # Another P may own the public hash session. Do not wait for
+                # it while holding other unfilled sessions: use a private,
+                # immutable full-block fallback instead.
+                replacements[key] = self._main_snapshot_key(request, index)
+            fallback = list(dict.fromkeys(replacements.values()))
+            if fallback:
+                missing = self._filter_pool_existing_keys(fallback)
+                readable.update(set(fallback) - set(missing))
+                codes = self._start_layerwise_put_keys(missing, self._layerwise_object_size_bytes()) if missing else []
+                new = {key for key, code in zip(missing, codes, strict=True) if code == 0}
+                with self._put_started_keys_lock:
+                    self._put_started_keys.update(new)
+                started.update(new)
+                if any(code != 0 for code in codes):
+                    raise RuntimeError("Main private full-block fallback allocation failed")
+        except Exception:
+            self._layer_load_aborted.set()
+            raise
+        for original, slot, index, valid_end in slots:
+            key = replacements.get(original, original)
+            if "@private_" in key and (key in started or key in readable):
+                self._layerwise_session_tracker.register_private_snapshot(key, valid_end)
+            if key in started:
+                if slot is None:
+                    request.save_last_block_key = key
+                    logger.info(
+                        "Main reuse partial snapshot: instance=%s generation=%d block=%d valid_tokens=%d",
+                        request.request_instance,
+                        request.snapshot_generation,
+                        index,
+                        valid_end,
+                    )
+                else:
+                    request.save_block_keys[slot] = key
+                self._layerwise_session_tracker.register_put_keys(request.req_id, [(key, index)])
+            elif key in readable:
+                self._layerwise_session_tracker.prepare_load_entries(request.req_id, [(key, index)])
+
+    def _open_main_reuse_get_sessions(self, slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
+        keys = list(dict.fromkeys(key for _, key, _, _ in slots))
+        try:
+            codes = dict(zip(keys, self._start_layerwise_get_keys(keys), strict=True))
+            failed = {}
+            replacements = {}
+            for request, key, _, index in slots:
+                if codes[key] == 0:
+                    continue
+                failed.setdefault(key, set()).add(request.req_id)
+                if index is not None and request.load_spec is not None and request.load_spec.layerwise_previous_step:
+                    if "@private_" not in key:
+                        replacements[(request.req_id, key)] = self._main_snapshot_key(request, index)
+            self._release_failed_layerwise_get_attempts(failed)
+            fallback = list(dict.fromkeys(replacements.values()))
+            fallback_codes = (
+                dict(zip(fallback, self._start_layerwise_get_keys(fallback), strict=True)) if fallback else {}
+            )
+            invalid = []
+            for request, key, block_id, index in slots:
+                resolved = key if codes[key] == 0 else replacements.get((request.req_id, key))
+                if resolved is None or (resolved != key and fallback_codes[resolved] != 0):
+                    invalid.append(block_id)
+                    continue
+                if resolved != key:
+                    self._layerwise_session_tracker.register_private_snapshot(resolved, (index + 1) * self.block_size)
+                    request.load_block_keys[index] = resolved
+                self._layerwise_session_tracker.record_get_result(resolved, [request.req_id], succeeded=True)
+                self._layerwise_session_tracker.prepare_load_entries(request.req_id, [(resolved, index)])
+                if resolved not in request.load_keys:
+                    request.load_keys.append(resolved)
+            if invalid:
+                self._record_layerwise_invalid_blocks(invalid)
+                raise RuntimeError("Main reuse could not open the complete committed Store prefix")
+        except Exception:
+            self._layer_load_aborted.set()
+            self._release_layerwise_requests_for_retry({request.req_id for request, _, _, _ in slots})
+            raise
+
     def _prepare_layerwise_put_session(self, request: ReqMeta) -> None:
+        if getattr(self, "_main_buffer_layer_slots", None):
+            self._prepare_main_reuse_put_session(request)
+            return
         request.save_block_keys = []
         request.save_last_block_key = None
         if not self._is_layerwise_save_owner() or not request.can_save:
@@ -2716,37 +3072,94 @@ class KVPoolWorker:
         request.load_keys = []
         current_entries: list[tuple[str, int]] = []
         load_spec = request.load_spec
+        main_reuse = bool(getattr(self, "_main_buffer_layer_slots", None))
+        if main_reuse:
+            self._bind_main_reuse_request(request)
+            if request.restore_end_token > 0 and (load_spec is None or not load_spec.can_load):
+                raise RuntimeError("Shared Main prefix has no Store restore plan")
         if load_spec is not None and load_spec.can_load:
             cached_tokens = load_spec.kvpool_cached_tokens
             if not self.use_eagle and load_spec.kvpool_store_skip_tokens is not None:
                 cached_tokens = load_spec.kvpool_store_skip_tokens
-            start_block = load_spec.vllm_cached_tokens // self.block_size
+            # Logical prefix residency is insufficient for a shared Main slot.
+            # Select the full Store prefix; independent layers can still skip
+            # their resident HBM tail when building per-layer transfer ranges.
+            start_block = 0 if self.layerwise_offload else load_spec.vllm_cached_tokens // self.block_size
             cached_full_blocks = cached_tokens // self.block_size
             group_block_hashes = get_block_hashes(request.block_hashes, self.block_size, self.hash_block_size)
             end_block = min(cached_full_blocks, len(group_block_hashes))
             for block_index in range(start_block, end_block):
-                current_entries.append(
-                    (
-                        self._make_mooncake_layerwise_key(block_hash_to_str(group_block_hashes[block_index])),
-                        block_index,
-                    )
-                )
+                if main_reuse and self.use_eagle:
+                    key = self._main_full_block_key(request, block_index, group_block_hashes)
+                    if "@private_" in key:
+                        self._layerwise_session_tracker.register_private_snapshot(
+                            key, (block_index + 1) * self.block_size
+                        )
+                else:
+                    key = self._make_mooncake_layerwise_key(block_hash_to_str(group_block_hashes[block_index]))
+                current_entries.append((key, block_index))
             needs_last_block = cached_tokens % self.block_size != 0 or (
                 cached_tokens > 0 and end_block < cached_full_blocks
             )
             partial_block_index = cached_full_blocks if cached_tokens % self.block_size else cached_full_blocks - 1
             if needs_last_block and 0 <= partial_block_index < len(request.block_ids):
+                if main_reuse and load_spec.layerwise_previous_step:
+                    if (
+                        load_spec.layerwise_snapshot_generation is None
+                        or load_spec.layerwise_snapshot_end_token is None
+                    ):
+                        raise RuntimeError("Main partial restore requires an explicit committed snapshot identity")
+                    key = self._main_snapshot_key(
+                        request,
+                        partial_block_index,
+                        generation=load_spec.layerwise_snapshot_generation,
+                        end_token=load_spec.layerwise_snapshot_end_token,
+                    )
+                    self._layerwise_session_tracker.register_private_snapshot(
+                        key, load_spec.layerwise_snapshot_end_token
+                    )
+                else:
+                    key = self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock")
                 current_entries.append(
                     (
-                        self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock"),
+                        key,
                         partial_block_index,
                     )
                 )
 
-        load_entries = self._layerwise_session_tracker.prepare_load_entries(request.req_id, current_entries)
+        load_entries = self._layerwise_session_tracker.prepare_load_entries(
+            request.req_id,
+            current_entries,
+            prefer_committed=main_reuse and bool(load_spec and load_spec.layerwise_previous_step),
+            record_current=not main_reuse,
+        )
         valid_entries = [
             (key, block_index) for key, block_index in load_entries if 0 <= block_index < len(request.block_ids)
         ]
+        if main_reuse:
+            required = max(
+                request.restore_end_token,
+                (load_spec.kvpool_store_skip_tokens or load_spec.kvpool_cached_tokens)
+                if load_spec is not None and load_spec.can_load
+                else 0,
+            )
+            by_index = {index: key for key, index in valid_entries}
+            candidates = {index: key for key, index in current_entries}
+            for index in range(math.ceil(required / self.block_size)):
+                key = by_index.get(index)
+                end = self._layerwise_session_tracker.private_snapshot_end(key) if key is not None else None
+                minimum_end = min(required, (index + 1) * self.block_size)
+                if key is not None and end is not None and end < minimum_end:
+                    # Non-saving ranks last observed the old partial version.
+                    # Once that block becomes full, use the current full-block
+                    # candidate (or its private full fallback), not that stale
+                    # short version. Promotion remains staged until GET succeeds.
+                    key = candidates.get(index)
+                    end = self._layerwise_session_tracker.private_snapshot_end(key) if key is not None else None
+                if key is None or (end is not None and end < minimum_end):
+                    raise RuntimeError("Shared Main snapshot does not cover the required prefix")
+                by_index[index] = key
+            valid_entries = [(by_index[index], index) for _, index in valid_entries]
         if not valid_entries:
             return []
         request.load_key_block_offset = 0
@@ -2759,6 +3172,9 @@ class KVPoolWorker:
 
     def _open_layerwise_get_sessions(self, request_key_slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
         if not request_key_slots:
+            return
+        if getattr(self, "_main_buffer_layer_slots", None):
+            self._open_main_reuse_get_sessions(request_key_slots)
             return
         keys = list(dict.fromkeys(key for _, key, _, _ in request_key_slots))
         request_ids_by_key: dict[str, set[str]] = {}
@@ -2805,14 +3221,60 @@ class KVPoolWorker:
         self._layer_load_aborted.clear()
         self._current_layerwise_request_ids = {request.req_id for request in requests}
         self._current_layerwise_last_chunk_req_ids = {request.req_id for request in requests if request.is_last_chunk}
-        get_key_slots: list[tuple[ReqMeta, str, int, int | None]] = []
-        for request in requests:
-            get_key_slots.extend(
-                (request, key, block_id, slot) for key, block_id, slot in self._prepare_layerwise_get_session(request)
+        with self._put_started_keys_lock:
+            previous = self._put_started_keys.copy()
+        try:
+            get_key_slots: list[tuple[ReqMeta, str, int, int | None]] = []
+            for request in requests:
+                get_key_slots.extend(
+                    (request, key, block_id, slot)
+                    for key, block_id, slot in self._prepare_layerwise_get_session(request)
+                )
+            self._open_layerwise_get_sessions(get_key_slots)
+            for request in requests:
+                self._prepare_layerwise_put_session(request)
+        except Exception:
+            if getattr(self, "_main_buffer_layer_slots", None):
+                self._layer_load_aborted.set()
+                with self._put_started_keys_lock:
+                    pending = list(self._put_started_keys - previous)
+                self._queue_layerwise_revoke_keys(pending)
+                self._finish_current_layerwise_load_sessions()
+            raise
+
+    def _cleanup_main_private_snapshots(self) -> None:
+        if not getattr(self, "_main_buffer_layer_slots", None):
+            return
+        # Do not end leases or remove objects while a GET/PUT can still use
+        # them. Metadata retirement alone is not a source-quiescence signal.
+        for thread in (self.kv_recv_thread, self.kv_send_thread):
+            if thread is not None:
+                thread.raise_if_failed()
+                if thread.request_queue.unfinished_tasks:
+                    return
+        tracker = self._layerwise_session_tracker
+        self._end_layerwise_load_keys(tracker.collect_obsolete_private_sessions())
+        if time.monotonic() < self._private_snapshot_cleanup_retry_at:
+            return
+        keys = tracker.private_cleanup_candidates()
+        if not keys:
+            return
+        try:
+            codes = require_aligned_batch_results(
+                "remove_private_snapshots", keys, self.m_store.remove_private_snapshots(keys)
             )
-        self._open_layerwise_get_sessions(get_key_slots)
-        for request in requests:
-            self._prepare_layerwise_put_session(request)
+            tracker.acknowledge_private_cleanup(key for key, code in zip(keys, codes, strict=True) if code == 0)
+            failed = [code for code in codes if code != 0]
+            if failed:
+                self._private_snapshot_cleanup_retry_at = time.monotonic() + PRIVATE_SNAPSHOT_CLEANUP_RETRY_INTERVAL_S
+                logger.warning(
+                    "Keeping %d private KV snapshots pending cleanup, Store remove codes=%s",
+                    len(failed),
+                    sorted(set(failed)),
+                )
+        except Exception:
+            self._private_snapshot_cleanup_retry_at = time.monotonic() + PRIVATE_SNAPSHOT_CLEANUP_RETRY_INTERVAL_S
+            logger.exception("Private KV snapshot cleanup failed; retaining retry records")
 
     def _build_shared_save_data(self) -> None:
         """Build shared block data once and attach to all layer save tasks.
@@ -3055,6 +3517,7 @@ class KVPoolWorker:
                     group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
                 )
         self._build_shared_load_data()
+
     def _check_hybrid_load_errors(self) -> None:
         # Memcache reports invalid blocks through the existing scheduler policy.
         if self.use_layerwise_transfer:
@@ -3083,6 +3546,7 @@ class KVPoolWorker:
         sync_save_events = self.sync_save_events
         save_finished_events = self.layer_save_finished_events
         send_thread = self.kv_send_thread
+        self._publish_reuse_source(layer_id)
         self._attention_saved_layers.add(layer_id)
         sync_save_events[layer_id].record()
         tasks = self.layer_save_tasks[layer_id]
@@ -3158,8 +3622,14 @@ class KVPoolWorker:
 
         def submit_layer_load(layer_id: int) -> bool:
             reuse_source = self.prefetch_layer_map.get(layer_id)
-            if not self.layer_load_tasks[layer_id] and reuse_source is None:
+            main_reuse = bool(getattr(self, "_main_buffer_layer_slots", None))
+            if not self.layer_load_tasks[layer_id] and reuse_source is None and not main_reuse:
                 return False
+            previous_compute_done = None
+            if main_reuse:
+                slot = self._main_buffer_layer_slots[layer_id]
+                previous_compute_done = self._main_slot_compute_tail.get(slot)
+                self._main_slot_compute_tail[slot] = self._main_layer_compute_done[layer_id]
             attention_start_gate = None
             if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()
@@ -3169,6 +3639,13 @@ class KVPoolWorker:
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
+                    previous_compute_done=previous_compute_done,
+                    slot_write_failed=self.abort_reuse_sources,
+                    before_slot_write=(
+                        (lambda layer=layer_id: self._reuse_source_registry.begin_write(layer))
+                        if getattr(self, "_reuse_source_registry", None) is not None
+                        else None
+                    ),
                 )
             )
             return True
@@ -3201,7 +3678,9 @@ class KVPoolWorker:
                 boundary.synchronize()
             self._submit_ready_layer_loads()
             should_wait = (
-                bool(self.layer_load_tasks[self.current_layer]) or self.current_layer in self.prefetch_layer_map
+                bool(self.layer_load_tasks[self.current_layer])
+                or self.current_layer in self.prefetch_layer_map
+                or bool(getattr(self, "_main_buffer_layer_slots", None))
             )
             if should_wait:
                 while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
@@ -3255,7 +3734,12 @@ class KVPoolWorker:
         assert self.kv_send_thread is not None
         send_thread = self.kv_send_thread
         send_thread.raise_if_failed()
+        if getattr(self, "_main_buffer_layer_slots", None):
+            # This is the post-attention hook, distinct from the KV-ready save
+            # submitted by the attention start gate on hybrid block-key paths.
+            self._main_layer_compute_done[self.current_layer].record()
         if self.current_layer not in self._attention_saved_layers:
+            self._publish_reuse_source(self.current_layer)
             self.sync_save_events[self.current_layer].record()
             if self.layer_save_tasks[self.current_layer]:
                 for task in self.layer_save_tasks[self.current_layer]:
@@ -3297,6 +3781,7 @@ class KVPoolWorker:
             send_thread.raise_if_failed()
             logger.info("Layerwise %d save not done, keep waiting", num_local - 1)
         send_thread.raise_if_failed()
+        reuse_source_layers = set(self.prefetch_layer_map.values())
         if self.block_key_hybrid:
             # An empty final layer signals completion without waiting for PUTs
             # from earlier layers. Drain those before the next step reuses KV.
@@ -3306,10 +3791,14 @@ class KVPoolWorker:
             # of earlier queued PUTs. Drain at the step boundary before source
             # blocks can be reused. Layer-to-layer overlap remains unchanged.
             for layer_id in range(num_local - 1):
+                # Reuse already consumed and cleared this layer's event before
+                # the later layer wrote its slot. The drained PUT queue above
+                # proves completion; waiting again can never be satisfied.
+                if layer_id in reuse_source_layers:
+                    continue
                 while not save_finished_events[layer_id].wait(timeout=10):
                     send_thread.raise_if_failed()
             send_thread.raise_if_failed()
-        reuse_source_layers = set(self.prefetch_layer_map.values())
         for layer_id in range(num_local):
             if layer_id in reuse_source_layers:
                 continue
@@ -3725,6 +4214,7 @@ class KVPoolWorker:
             len(done_recving),
             self.tp_rank,
         )
+        self._cleanup_main_private_snapshots()
         return done_sending, done_recving
 
     def ensure_store_initialized(self) -> None:

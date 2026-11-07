@@ -17,7 +17,10 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 from vllm_ascend import envs
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
+    AttentionComputeCompletion,
+    AttentionComputeStartGate,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
     Backend,
     require_aligned_batch_results,
@@ -589,7 +592,7 @@ class KVTransferThread(threading.Thread):
 
     def _wait_for_event(
         self,
-        event: threading.Event | AttentionComputeStartGate,
+        event: threading.Event | AttentionComputeStartGate | AttentionComputeCompletion,
         failure_checker: Callable[[], None] | None = None,
     ) -> bool:
         while not self._stopping.is_set():
@@ -1816,6 +1819,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
                 self._active_put_keys.difference_update(failed_keys)
+                if self.raise_on_transfer_failure:
+                    raise RuntimeError("Mooncake range PUT failed; refusing unsafe KV buffer reuse")
 
         if not (layer_id == self.final_layer_id if final_group_layer is None else final_group_layer):
             return
@@ -1836,6 +1841,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if self._session_tracker is not None:
                 self._session_tracker.commit_put_keys(committed_keys)
             self._remove_started_keys(active_keys)
+            if failed_keys and self.raise_on_transfer_failure:
+                raise RuntimeError("Mooncake range commit failed; refusing an uncommitted KV snapshot")
         self._active_put_keys = None
 
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
@@ -2113,6 +2120,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if failed_indices:
                 self._mark_invalid_range_indices(req_meta, failed_indices)
                 self._active_load_indices.difference_update(failed_indices)
+                if self.raise_on_transfer_failure:
+                    raise RuntimeError("Mooncake range GET failed; refusing incomplete KV")
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids, shared.is_last_chunks, strict=True):
@@ -2132,11 +2141,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.sync_save_events[wait_for_save].synchronize()
                 self.layer_save_finished_events[wait_for_save].clear()
 
+            if data.previous_compute_done is not None:
+                if not self._wait_for_event(data.previous_compute_done, self.save_failure_checker):
+                    raise RuntimeError("Receiver stopped before previous attention completed")
             if data.attention_start_gate is not None:
                 if not self._wait_for_event(data.attention_start_gate):
                     return
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             for task in data.transfer_tasks:
                 shared = task.shared_block_data
                 if shared is None:
@@ -2151,6 +2165,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
         except Exception as exc:
             self._fatal_error = exc
+            if data.slot_write_failed is not None:
+                try:
+                    data.slot_write_failed(exc)
+                except Exception:
+                    logger.exception("Source consumer failed to acknowledge a load failure")
             if self._active_load_indices is not None:
                 self._active_load_indices.clear()
             self._mark_invalid_transfer_task_blocks(data.transfer_tasks)
@@ -2188,6 +2207,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self._mark_failed_requests([br.request for task in data.transfer_tasks for br in task.block_ranges])
         except Exception as exc:
             self._fatal_error = exc
+            if data.slot_write_failed is not None:
+                data.slot_write_failed(exc)
             raise
         finally:
             self.layer_load_finished_events[data.layer_id].set()
@@ -2214,7 +2235,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             logger.debug("Layer save event cleared: layer %d", wait_for_save)
             self.layer_save_finished_events[wait_for_save].clear()
 
+        if data.previous_compute_done is not None:
+            if not self._wait_for_event(data.previous_compute_done, self.save_failure_checker):
+                raise RuntimeError("Receiver stopped before previous attention completed")
         if self.load_disabled.is_set():
+            if data.before_slot_write is not None:
+                raise RuntimeError("Refusing to open a source epoch after a failed load")
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
             return False
@@ -2222,6 +2248,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if len(transfer_tasks) == 0:
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             return True
@@ -2247,6 +2275,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if not task_metas:
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             return True
@@ -2275,6 +2305,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
         if self.external_slot_release_waiter is not None:
             self.external_slot_release_waiter(layer_id)
+        if data.before_slot_write is not None:
+            data.before_slot_write()
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,

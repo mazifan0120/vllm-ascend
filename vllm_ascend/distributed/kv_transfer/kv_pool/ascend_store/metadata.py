@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import compress
 from typing import Any, cast
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -15,7 +16,10 @@ from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
+    AttentionComputeCompletion,
+    AttentionComputeStartGate,
+)
 
 
 def is_kv_save_role(kv_role: str, consumer_is_to_put: bool) -> bool:
@@ -831,6 +835,19 @@ def block_hash_to_str(block_hash: BlockHash | str) -> str:
     return block_hash if isinstance(block_hash, str) else block_hash.hex()
 
 
+def mtp_prefix_block_hash(block_hashes: Sequence[BlockHash], block_index: int) -> str | None:
+    """Name a portable single-step MTP block using its successor's chain hash.
+
+    Draft KV at the block's last position consumes the next input token. The
+    successor hash conservatively includes that entire next block, including
+    cache_salt and other vLLM hash extras. No successor means a private tail.
+    This namespace must never alias ordinary target-only block objects.
+    """
+    if block_index < 0 or block_index + 1 >= len(block_hashes):
+        return None
+    return f"mtp_prefix_v1:{block_index}:{block_hash_to_str(block_hashes[block_index + 1])}"
+
+
 def block_hash_to_bytes(block_hash: BlockHash | str) -> bytes:
     if isinstance(block_hash, str):
         if len(block_hash) == 64:
@@ -864,6 +881,7 @@ class LoadSpec:
     layerwise_previous_step: bool = False
     # First block stored under request-scoped keys, including unhashed full blocks.
     layerwise_snapshot_start_block: int | None = None
+    layerwise_snapshot_generation: int | None = None
 
 
 @dataclass(init=False)
@@ -895,6 +913,8 @@ class RequestTracker:
     last_layerwise_snapshot_end_token: int | None = None
     last_layerwise_snapshot_block_index: int | None = None
     last_layerwise_snapshot_start_block: int | None = None
+    request_instance: str
+    snapshot_generation: int = 0
 
     # Number of speculative scratch blocks for each Mamba cache group.
     num_speculative_blocks_by_group: dict[int, int] | None = None
@@ -919,8 +939,12 @@ class RequestTracker:
         last_layerwise_snapshot_end_token: int | None = None,
         last_layerwise_snapshot_block_index: int | None = None,
         last_layerwise_snapshot_start_block: int | None = None,
+        request_instance: str | None = None,
+        snapshot_generation: int = 0,
     ) -> None:
         self.req_id = req_id
+        self.request_instance = request_instance if request_instance is not None else uuid4().hex
+        self.snapshot_generation = snapshot_generation
         self.token_len = token_len
         self.num_speculative_blocks_by_group = num_speculative_blocks_by_group
         block_ids = allocated_block_ids_by_group
@@ -998,6 +1022,9 @@ class RequestTracker:
 class ReqMeta:
     # Request id
     req_id: str
+    request_instance: str | None = None
+    snapshot_generation: int = 0
+    restore_end_token: int = 0
     # End token for full-block KV save.
     save_end_token: int
     # Token length after this scheduled step finishes.
@@ -1066,10 +1093,16 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        request_instance: str | None = None,
+        snapshot_generation: int = 0,
+        restore_end_token: int = 0,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
         self.req_id = req_id
+        self.request_instance = request_instance
+        self.snapshot_generation = snapshot_generation
+        self.restore_end_token = restore_end_token
         self.token_len_chunk = token_len_chunk
         self.save_end_token = token_len_chunk if save_end_token is None else save_end_token
         self.target_token_len = token_len_chunk if target_token_len is None else target_token_len
@@ -1154,6 +1187,7 @@ class ReqMeta:
         kv_cache_group_families: list[str] | None = None,
         save_partial_block: bool = False,
         hash_block_size: int | None = None,
+        restore_end_token: int = 0,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         if block_hashes is None:
@@ -1202,6 +1236,12 @@ class ReqMeta:
         should_save_partial_block = save_partial_block and (
             target_token_len % cache_transfer_granularity != 0 or full_block_count > available_full_block_count
         )
+        if should_save_partial_block:
+            # Block-key snapshots do not allocate a GVA. They still need an
+            # explicit partial slot in the metadata sent to every TP worker.
+            partial_block_index = (
+                full_block_count if target_token_len % cache_transfer_granularity else full_block_count - 1
+            )
         skip_save = skip_save or (
             num_tokens_to_save < chunk_boundary and partial_block_index is None and not should_save_partial_block
         )
@@ -1215,6 +1255,8 @@ class ReqMeta:
             return None
 
         if not skip_save:
+            if save_partial_block:
+                tracker.snapshot_generation += 1
             tracker.num_saved_tokens = max(
                 tracker.num_saved_tokens,
                 num_tokens_to_save,
@@ -1245,6 +1287,9 @@ class ReqMeta:
         logger.debug("request:%s, meta save spec:%s, meta load spec:%s", tracker.req_id, not skip_save, load_spec)
         return ReqMeta(
             req_id=tracker.req_id,
+            request_instance=tracker.request_instance if save_partial_block else None,
+            snapshot_generation=tracker.snapshot_generation if save_partial_block else 0,
+            restore_end_token=restore_end_token,
             token_len_chunk=num_tokens_to_save,
             save_end_token=num_tokens_to_save,
             target_token_len=target_token_len,
@@ -1359,6 +1404,9 @@ class LayerLoadTask:
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
     attention_start_gate: AttentionComputeStartGate | None = None
+    previous_compute_done: AttentionComputeCompletion | None = None
+    before_slot_write: Callable[[], None] | None = None
+    slot_write_failed: Callable[[Exception], None] | None = None
 
 
 @dataclass(init=False)

@@ -111,6 +111,62 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
 
 
 class TestMooncakeLayerSaveSession(unittest.TestCase):
+    def test_range_put_and_commit_failures_honor_strict_policy(self):
+        for phase in ("put", "commit"):
+            for strict in (False, True):
+                with self.subTest(phase=phase, strict=strict):
+                    store = MagicMock()
+                    store.batch_copy_put.return_value = [-1] if phase == "put" else [30]
+                    store.batch_commit.return_value = [-1] if phase == "commit" else [0]
+                    store.batch_revoke.return_value = [0]
+                    layer = 0 if phase == "put" else 1
+                    builder = MagicMock()
+                    builder.build_addrs.return_value = LayerRangeReqMeta(
+                        req_ids=["r1"],
+                        layer_id=layer,
+                        block_ids=[2],
+                        keys=["key"],
+                        all_buffers=[[100]],
+                        all_sizes=[[30]],
+                        all_offsets=[[0]],
+                    )
+                    finished = [threading.Event(), threading.Event()]
+                    thread = KVCacheStoreLayerSendingThread(
+                        m_store=store,
+                        token_database=make_token_database(),
+                        block_size=16,
+                        tp_rank=0,
+                        tp_size=1,
+                        dcp_size=1,
+                        page_size_bytes=60,
+                        ready_event=threading.Event(),
+                        num_layers=2,
+                        layer_save_finished_events=finished,
+                        sync_save_events=[MagicMock(), MagicMock()],
+                        group_builders=[builder],
+                        put_started_keys={"key"},
+                        raise_on_transfer_failure=strict,
+                    )
+                    shared = SimpleNamespace(req_ids=["r1"], is_last_chunks=[False])
+                    task = LayerTransferTask(
+                        layer_id=layer,
+                        block_ranges=[],
+                        shared_block_data=shared,
+                        use_key_major_ranges=True,
+                    )
+                    thread.add_stored_request("r1")
+                    thread.request_queue.put([task])
+                    if strict:
+                        with self.assertRaisesRegex(RuntimeError, "Mooncake range"):
+                            thread._handle_request([task])
+                        with self.assertRaisesRegex(RuntimeError, "asynchronous transfer"):
+                            thread.raise_if_failed()
+                    else:
+                        thread._handle_request([task])
+                        thread.raise_if_failed()
+                    self.assertTrue(finished[layer].is_set())
+                    self.assertEqual(thread.request_queue.unfinished_tasks, 0)
+
     def test_final_layer_commits_after_all_ranges(self):
         store = MagicMock()
         # Range APIs may return the positive number of bytes moved on success.
@@ -237,6 +293,20 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         self.assertEqual(len(slots), 4)
         self.assertEqual(request.load_block_keys[-1], "model@6833@0")
         self.assertIsNone(request.load_last_block_key)
+
+    def test_shared_main_restores_local_prefix_from_block_zero(self):
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                worker = self._make_worker()
+                worker.layerwise_offload = reuse
+                request = ReqMeta(
+                    "r1",
+                    block_ids=[1, 2, 3],
+                    block_hashes=[b"h0", b"h1", b"h2"],
+                    load_spec=LoadSpec(16, 32, can_load=True),
+                )
+                slots = worker._prepare_layerwise_get_session(request)
+                self.assertEqual([slot[2] for slot in slots], [0, 1] if reuse else [1])
 
     def test_next_chunk_reloads_committed_prefix_without_new_load_spec(self):
         worker = self._make_worker()

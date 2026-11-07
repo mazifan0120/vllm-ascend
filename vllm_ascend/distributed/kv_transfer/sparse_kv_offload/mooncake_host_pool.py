@@ -1,15 +1,19 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 """Mooncake shared Host-memory pool for sparse KV offload."""
 
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import torch
 from vllm.logger import logger
+
+from vllm_ascend.distributed.kv_transfer.utils.allocation_lifetime import AllocationLifetime, AllocationPin
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -171,6 +175,9 @@ class MooncakeHostPool:
         self.topology = topology
         self._offset = 0
         self._closed = False
+        self._target_lifetime = AllocationLifetime("Mooncake Host pool")
+        self._target_identity_lock = threading.Lock()
+        self._target_backing_id: str | None = None
 
     @classmethod
     def allocate(
@@ -262,14 +269,53 @@ class MooncakeHostPool:
         )
         return self.region.segment_offset, self.nbytes, tuple(entries)
 
+    def target_backing_identity(self) -> tuple[str, int]:
+        """One identity for this actual shared allocation, agreed by TP owners.
+
+        Opt-in collective: every member of this pool's TP group must call when
+        creating its target catalog. Ordinary Host offload adds no collective.
+        """
+        with self._target_identity_lock:
+            if self._target_backing_id is None:
+                pin = self.retain_target_allocation()
+                try:
+                    proposal = uuid4().hex if self.topology.tp_rank == self.topology.owner_rank else None
+                    if self.topology.tp_size > 1:
+                        group = getattr(self.topology.tp_group, "cpu_group", None)
+                        if group is None:
+                            raise RuntimeError("Shared target backing requires the real TP CPU group")
+                        proposals = [None] * self.topology.tp_size
+                        torch.distributed.all_gather_object(proposals, proposal, group=group)
+                        expected = proposals[self.topology.owner_rank]
+                        if (
+                            not isinstance(expected, str)
+                            or not expected
+                            or any(
+                                value is not None
+                                for rank, value in enumerate(proposals)
+                                if rank != self.topology.owner_rank
+                            )
+                        ):
+                            raise RuntimeError("Invalid TP ownership of the shared target allocation")
+                        proposal = expected
+                    if not isinstance(proposal, str) or not proposal:
+                        raise RuntimeError("Target backing identity was not issued by the allocation owner")
+                    self._target_backing_id = "mooncake-host:" + proposal
+                finally:
+                    pin.release()
+            return self._target_backing_id, 0
+
+    def retain_target_allocation(self) -> AllocationPin:
+        """Keep the existing shared allocation registered/mapped for a target."""
+        return self._target_lifetime.retain()
+
     def close(self) -> None:
         if self._closed:
             return
-        self.region.release()
+        self._target_lifetime.close(self.region.release)
         self._closed = True
         logger.debug(
             "Mooncake HostPool closed rank=%s/%s",
             self.topology.tp_rank,
             self.topology.tp_size,
         )
-
