@@ -22,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TargetLease,
     copy_target_lease,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_completion import CompletionFrontier, StreamCompletion
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import RetentionAuthority
 
 
@@ -66,6 +67,11 @@ class NpuTargetStreams:
         self._device_id = device_id
         self._stream = consumption_stream
         self._npu = torch.npu
+        self._record_lock = threading.Lock()
+        self._fence_owner = object()
+        self._fence_sequence = 0
+        self._recovery_streams = {}
+        self._invalid_stream = False
 
     @contextmanager
     def consumption(self):
@@ -97,21 +103,46 @@ class NpuTargetStreams:
     def record_use(self) -> tuple:
         # Sparse fused writeback can run on a distinct stream. Fence every
         # stream that could have used this request before dropping owner refs.
-        streams = [self._stream, *self._manager.target_runtime_streams()]
-        events = []
-        seen = set()
-        with self._npu.device(self._device_id):
+        with self._record_lock, self._npu.device(self._device_id):
+            if self._invalid_stream:
+                raise RuntimeError("Target stream ownership is unresolved; keep allocations retained")
+            try:
+                streams = [self._stream, *self._manager.target_runtime_streams()]
+            except Exception:
+                self._invalid_stream = True  # Unknown users cannot be recovered by guessing a new stream set.
+                raise
+            selected = {}
             for stream in streams:
-                if stream is None or id(stream) in seen:
-                    continue
-                seen.add(id(stream))
-                if getattr(getattr(stream, "device", None), "index", None) != self._device_id:
-                    raise RuntimeError("Target manager exposed a stream from another NPU")
-                with self._npu.stream(stream):
-                    event = self._npu.Event()
-                    event.record()
-                    events.append(event)
-        return tuple(events)
+                if stream is not None:
+                    if getattr(getattr(stream, "device", None), "index", None) != self._device_id:
+                        self._invalid_stream = True
+                        raise RuntimeError("Target manager exposed a stream from another NPU")
+                    selected[getattr(stream, "npu_stream", id(stream))] = stream
+            required = {key: value[0] for key, value in self._recovery_streams.items()}
+            required.update(selected)
+            try:
+                # Only failed submissions need adapter-level recovery storage.
+                # Never forget a removed stream until its recorded tail completes.
+                for key, (_, event) in tuple(self._recovery_streams.items()):
+                    if event is not None and event.query():
+                        event.synchronize()
+                        self._recovery_streams.pop(key)
+                        if key not in selected:
+                            required.pop(key)
+                events = []
+                for key, stream in required.items():
+                    with self._npu.stream(stream):
+                        event = self._npu.Event()
+                        event.record()
+                    self._fence_sequence += 1
+                    events.append(StreamCompletion(self._fence_owner, stream, self._fence_sequence, event))
+                by_key = {getattr(f.stream, "npu_stream", id(f.stream)): f.event for f in events}
+                for key in self._recovery_streams:
+                    self._recovery_streams[key] = required[key], by_key[key]
+                return tuple(events)
+            except Exception:
+                self._recovery_streams.update((key, (stream, None)) for key, stream in required.items())
+                raise
 
     def wait_quiescent(self, events: Iterable, timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -135,7 +166,7 @@ class _TargetUse:
     closing: bool = False
     releasing: bool = False
     users: int = 0
-    events: list = field(default_factory=list)
+    events: CompletionFrontier = field(default_factory=CompletionFrontier)
     needs_recovery_fence: bool = False
 
 
@@ -375,9 +406,11 @@ class OwnerTargetRuntime:
                 events = self._streams.record_use()
                 if not events:
                     raise RuntimeError("Target consumption produced no real completion fences")
+                superseded = []
                 with self._lock:
                     for state in states:
-                        state.events.extend(events)
+                        superseded.extend(state.events.extend(events))
+                superseded.clear()
             except Exception:
                 with self._lock:
                     for state in states:
@@ -402,8 +435,9 @@ class OwnerTargetRuntime:
                 if not events:
                     raise RuntimeError("Cannot prove failed target use is quiescent")
                 with self._lock:
-                    state.events.extend(events)
+                    superseded = state.events.extend(events)
                     state.needs_recovery_fence = False
+                superseded.clear()
             # Also fence already queued manager work at the release boundary.
             # The connector must stop future submissions before requesting it.
             final_events = self._streams.record_use()
