@@ -62,6 +62,18 @@ def _rpc_owner_process(control):
 
 
 class TestOwnerValueCodec(unittest.TestCase):
+    def test_retention_record_module_move_keeps_old_frames_compatible(self):
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention_protocol import RetentionResult
+
+        # Existing v1/v2 peers name records by schema, not Python module path.
+        for version in (1, 2):
+            frame = f'[{version},["record","RetentionResult",["op",true,"",""]]]'.encode()
+            self.assertEqual(decode_owner_value(frame), RetentionResult("op", True))
+        self.assertEqual(
+            encode_owner_value(RetentionResult("op", True)),
+            b'[2,["record","RetentionResult",["op",true,"",""]]]',
+        )
+
     def test_actual_catalog_and_lease_round_trip_preserves_enum_keys_and_tuples(self):
         fixture = OwnerFixture()
         lease = fixture.acquire()

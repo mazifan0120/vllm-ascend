@@ -1,3 +1,12 @@
+> 2026-11-08 refactor in progress: removed the unused process-global owner
+> rendezvous and production Pipe assembly. Pipe process/fault adapters now
+> live only in tests; RPC and its codec depend on a transport-neutral retention
+> protocol. RetentionOp/Result names and wire versions are unchanged. Local
+> transport tests use explicit DispatcherOwnerTransport instances, including
+> simultaneous independent live owners. No NPU deployment of this refactor yet.
+> Image overlay cleanup must preserve the SDK's generated operator subtree,
+> include/lib64, native shared libraries and _version/_build_info metadata.
+
 > 2026-11-07 latest: runtime code dfb52bd0a requires eager or compiled
 > (VLLM_COMPILE/mode3) FULL_DECODE_ONLY receipt targets, PP/CP/DCP1.
 > Uncompiled mode0 is rejected: native semantic samples were17/20 and18/20,

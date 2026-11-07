@@ -31,8 +31,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_catalog import TargetCatalog, TargetEntry
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import RankTarget, TargetManifest
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import TargetOwnerCall, TargetOwnerReply
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_wire import RetentionOp, RetentionResult
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_provider import TargetBinding
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention_protocol import RetentionOp, RetentionResult
 
 OWNER_WIRE_VERSION = 2
 SUPPORTED_OWNER_WIRE_VERSIONS = (1, OWNER_WIRE_VERSION)

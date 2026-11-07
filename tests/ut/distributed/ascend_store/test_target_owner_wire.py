@@ -20,6 +20,14 @@ from dataclasses import replace
 from threading import Event, Thread
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+from tests.ut.distributed.ascend_store.owner_pipe import (
+    PipeOwnerTransport,
+    RetentionOp,
+    RetentionResult,
+    WireRetentionAuthority,
+    serve_owner_dispatch,
+    serve_retention_ops,
+)
 from tests.ut.distributed.ascend_store.test_target_owner_runtime import OwnerFixture
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     ContractError,
@@ -28,14 +36,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
     TargetOwnerDispatcher,
     TargetProviderClient,
-)
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_wire import (
-    PipeOwnerTransport,
-    RetentionOp,
-    RetentionResult,
-    WireRetentionAuthority,
-    serve_owner_dispatch,
-    serve_retention_ops,
 )
 
 
@@ -228,12 +228,12 @@ def _wire_worker_process(call_conn, retain_conn):
     scheduler side. The owner runtime's nested retain goes out the retain pipe
     to the scheduler's retention server.
     """
-    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
-        TargetOwnerDispatcher,
-    )
-    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_wire import (
+    from tests.ut.distributed.ascend_store.owner_pipe import (
         WireRetentionAuthority,
         serve_owner_dispatch,
+    )
+    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
+        TargetOwnerDispatcher,
     )
 
     fixture = OwnerFixture()

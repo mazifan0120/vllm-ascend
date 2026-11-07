@@ -23,11 +23,11 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec im
     decode_owner_value,
     encode_owner_value,
 )
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_wire import (
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention_protocol import (
+    RemoteRetentionAuthority,
     RetentionDispatcher,
     RetentionOp,
     RetentionResult,
-    WireRetentionAuthority,
 )
 
 RPC_POLL_MILLISECONDS = 100
@@ -105,11 +105,10 @@ class OwnerRpcClient:
                     self._context.term()
 
 
-class RpcRetentionAuthority(WireRetentionAuthority):
-    """Same guard semantics as the pipe protocol, without inherited FDs."""
+class RpcRetentionAuthority(RemoteRetentionAuthority):
+    """Reverse authority over RPC with transport-independent guard semantics."""
 
     def __init__(self, endpoint: str, *, timeout: float) -> None:
-        # Guard implementation depends on _invoke(), not on a pipe endpoint.
         self._client = OwnerRpcClient(endpoint, timeout=timeout)
 
     def _invoke(self, operation, allocation) -> None:
