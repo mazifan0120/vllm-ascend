@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import msgspec
 
-import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+import tests.ut.distributed.ascend_store._receipt_imports  # noqa: F401
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
     CONTRACT_VERSION,
     Component,
