@@ -106,6 +106,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_writer import ManifestSourceWriter, SourceWriteJob
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_manifest import TargetManifest
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.kv_transfer.utils.thread_ready import wait_for_thread_ready
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
     RegisterRegions,
@@ -2754,7 +2755,7 @@ class MooncakeLayerwiseConnectorWorker:
             )
             self.kv_send_layer_thread.start()
             self.kv_send_layer_thread.layer_result_sender = self.send_layer_result
-            ready_event.wait()
+            wait_for_thread_ready(self.kv_send_layer_thread, ready_event)
             self._manifest_source_writer = ManifestSourceWriter(
                 self.tp_rank,
                 self.kv_send_layer_thread.send_queue,
@@ -2777,7 +2778,7 @@ class MooncakeLayerwiseConnectorWorker:
                 ),
             )
             self.kv_recv_layer_thread.start()
-            ready_event.wait()
+            wait_for_thread_ready(self.kv_recv_layer_thread, ready_event)
 
     def get_finished(self, finished_req_ids=None) -> tuple[set[str], set[str]]:
         delivery = getattr(self, "_target_delivery", None)

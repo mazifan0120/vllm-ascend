@@ -603,3 +603,22 @@ immutable owner geometry repeatedly. CPU regression:196passed,1skipped,
 allocation maps, shared fences, failed compute/fence recovery and teardown
 protection. Ruff passes. This candidate is not yet a native NPU acceptance;
 MTP5 graph lifecycle remains to be verified separately from the current MTP3.
+
+### 2026-11-07 startup-listener failure found during candidate validation
+
+The first57c1b306e native startup stalled before receipt model use. DP3/TP7's
+receive thread failed to bind57031(address already in use); its main worker
+waited forever on ready_event. Other TP ranks waited for backing-identity
+all_gather, and other DP ranks waited at graph metadata all_reduce. Nonblocking
+stack dumps and the original thread traceback prove this chain; there were no
+business requests yet. The occupancy was transient and gone at inspection.
+The host ephemeral range is32768–60999. The candidate now uses KV24700 and
+owner/retention24100-based ports, checked free, without changing host sysctls
+or stopping unrelated services.
+
+Both send/receive startup waits now detect a dead transport thread and have
+a60-second readiness bound. A real conflicting ZMQ listener, dead-after-ready,
+live-unready timeout and invalid-timeout tests pass(5tests/7subtests). Receipt
+MTP startup logging reports target graph mode, actual draft graph decision and
+compile mode: speculative enforce_eager=false alone does not prove a draft
+graph is active. Native validation of this follow-up image remains pending.
