@@ -4718,6 +4718,9 @@ class NPUModelRunner(GPUModelRunner):
                     get_transfer_timeout_value,
                 )
 
+                # The target and MTP graphs share this parameter-update stream.
+                # Fence it explicitly along with compute and sparse writeback.
+                self.sparse_kv_offload_manager.target_graph_update_stream = getattr(self, "update_stream", None)
                 connector.configure_target_owner(
                     self.sparse_kv_offload_manager,
                     retention=None,

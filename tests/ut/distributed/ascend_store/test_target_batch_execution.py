@@ -3,7 +3,9 @@
 
 import pickle
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -22,9 +24,41 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import ManifestWritePlan
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_coordinator import MultiRankTargetProvider
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_delivery import WorkerTargetDelivery
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_runtime import NpuTargetStreams
 
 
 class TestTargetBatchExecution(unittest.TestCase):
+    def test_native_fence_adapter_covers_graph_update_and_deduplicates_streams(self):
+        recorded = []
+
+        class Npu:
+            current = None
+
+            @contextmanager
+            def device(self, ordinal):
+                yield
+
+            @contextmanager
+            def stream(self, stream):
+                previous, self.current = self.current, stream
+                try:
+                    yield
+                finally:
+                    self.current = previous
+
+            class Event:
+                def record(self):
+                    recorded.append(npu.current)
+
+        npu = Npu()
+        consume, update, writeback = [SimpleNamespace(device=SimpleNamespace(index=0)) for _ in range(3)]
+        manager = SimpleNamespace(target_runtime_streams=lambda: (update, writeback, update))
+        with patch.object(torch, "npu", npu):
+            streams = NpuTargetStreams(manager, 0, consume)
+            events = streams.record_use()
+        self.assertEqual(len(events), 3)
+        self.assertEqual([id(stream) for stream in recorded], [id(consume), id(update), id(writeback)])
+
     def test_delivery_binds_at_admission_and_uses_the_local_batch_path(self):
         f = OwnerFixture()
         provider = MultiRankTargetProvider((f.facade,))

@@ -622,3 +622,14 @@ live-unready timeout and invalid-timeout tests pass(5tests/7subtests). Receipt
 MTP startup logging reports target graph mode, actual draft graph decision and
 compile mode: speculative enforce_eager=false alone does not prove a draft
 graph is active. Native validation of this follow-up image remains pending.
+
+### 2026-11-07 graph stream ownership audit
+
+The receipt runtime now explicitly fences the runner's actual graph parameter
+update stream, shared by target and draft graphs, in addition to attention
+and Host writeback streams. Graph target binding fails closed if this stream
+was not wired. The native fence adapter regression checks stream identity
+deduplication and inclusion of the graph update stream. CPU regression:
+202 passed, 1 skipped, 107 subtests; scoped Ruff passes. Native follow-up
+including MTP5 remains pending; the current57c1b306e MTP3 sample validates
+the batch execution change, not this additional stream wiring.

@@ -584,6 +584,7 @@ class SparseKVOffloadManager:
         self.kv_cache_config = kv_cache_config
         self._target_owner_lock = threading.RLock()
         self._target_owner_facade = None
+        self.target_graph_update_stream = None
         self.sparse_kv_offload_config = sparse_kv_offload_config
 
         model_config = vllm_config.model_config
@@ -772,9 +773,12 @@ class SparseKVOffloadManager:
         return allocator
 
     def target_runtime_streams(self) -> tuple:
-        """Real streams used by sparse attention and asynchronous Host writeback."""
+        """Real attention, graph-parameter and asynchronous Host writeback streams."""
         streams = list(get_subscribed_compute_streams())
-        streams.extend(getattr(self, name, None) for name in ("current_kv_save_stream", "fused_plan_stream"))
+        streams.extend(
+            getattr(self, name, None)
+            for name in ("current_kv_save_stream", "fused_plan_stream", "target_graph_update_stream")
+        )
         return tuple(stream for stream in streams if stream is not None)
 
     def bind_registered_target_owner(
@@ -795,6 +799,8 @@ class SparseKVOffloadManager:
         )
 
         validate_registered_target_execution(self.vllm_config)
+        if not self.vllm_config.model_config.enforce_eager and self.target_graph_update_stream is None:
+            raise ContractError("Registered D graph targets require the actual graph update stream")
         components, identities, block_tokens = self.get_target_cache_identities()
         with self._target_owner_lock:
             if self._target_owner_facade is not None:
