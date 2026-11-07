@@ -40,6 +40,13 @@ def validate_registered_target_execution(config) -> None:
     mode = getattr(getattr(config, "compilation_config", None), "cudagraph_mode", None)
     if not config.model_config.enforce_eager and getattr(mode, "name", None) != "FULL_DECODE_ONLY":
         raise ContractError("Registered D targets require eager or FULL_DECODE_ONLY")
+    # FULL_DECODE_ONLY can capture even when the Ascend runner disables its
+    # compiled-graph setup. Native mode0 semantic probes failed in this path.
+    # Keep the accepted receipt graph configuration aligned with the runner.
+    compilation = getattr(config, "compilation_config", None)
+    compile_mode = getattr(compilation, "mode", None)
+    if not config.model_config.enforce_eager and getattr(compile_mode, "name", None) != "VLLM_COMPILE":
+        raise ContractError("Registered D graphs require VLLM_COMPILE; uncompiled full graphs are unsupported")
     if any(
         getattr(config.parallel_config, name, 1) != 1
         for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")

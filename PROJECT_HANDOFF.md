@@ -677,3 +677,26 @@ staging/managed-file cleanup before deleting modules. No broad restructuring
 has been applied. Evidence:deployment artifacts/review-fixes-20261107 and
 runbook11.78. Final uninstrumented runtime identity is recorded there; default
 inventory remains fe559c440/eager and must not be confused with the candidate.
+
+### 2026-11-07 acceptance correction: uncompiled FULL_DECODE_ONLY rejected
+
+The uninstrumented bb679f01d MTP3/mode0 final candidate was NOT accepted:
+17/20 semantic probes passed, including abnormal suffixes in short and
+multichunk requests; all20 receipt/release audits passed. An exact-prompt,
+new-salt mode0 comparison then passed18/20, failing two prefix replays.
+These failures are not restricted to the first cold request. Earlier
+mode0 performance numbers remain observations, not a semantically accepted
+deployment. Timing and compile-mode differences can mask races; no root
+cause or fix is claimed from a later passing sample.
+
+Receipt graph admission now requires parsed CompilationMode.VLLM_COMPILE
+in addition to FULL_DECODE_ONLY and PP/CP/DCP1; eager remains supported.
+The runner's _use_aclgraph predicate and graph-parameter initialization
+exclude uncompiled mode0, despite the inherited target capture path running.
+This configuration mismatch is a reason to reject mode0, not proof that it
+caused every semantic error (an earlier eager anomaly also exists).
+Same-code MTP3/mode3 native isolation and final runtime status are recorded
+in the deployment runbook; do not use old mode0 artifact profiles as runbooks.
+
+Compiled-graph gate regression:203 passed,1 skipped,112 subtests; scoped
+Ruff passes. The deployment generator also rejects mode0 before any cutover.
