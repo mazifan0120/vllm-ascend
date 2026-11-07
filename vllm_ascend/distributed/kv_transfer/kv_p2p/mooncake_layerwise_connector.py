@@ -73,23 +73,29 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TargetScope,
     TokenRange,
     TransferKey,
-    TransferResult,
     assert_lease_consistent,
     assert_pd_consistent,
     assert_provider_capabilities,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_exact_receipt import ExactReceiptLedger
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_metadata import LayerMetadata, ReqMeta
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_peer import (
     GET_TARGET_REGIONS_MSG,
     LAYER_RESULTS_MSG,
-    MAX_PROOF_BATCH_FRAMES,
-    PROOF_ACK,
-    PROOF_ACK_TARGET_CLOSED,
     TARGET_PEER_ERROR,
     ManifestPeerProofs,
     encode_target_addresses,
     resolve_manifest_addresses,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_protocol import (
+    LAYER_RESULT_MSG,
+    RANK_TERMINAL_MSG,
+    RECEIPT_WATCHDOG_SECONDS,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_protocol import (
+    PROOF_ACK as PROOF_ACK,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_protocol import (
+    PROOF_ACK_TARGET_CLOSED as PROOF_ACK_TARGET_CLOSED,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receipt import (
     ReceiptLedger,
@@ -97,6 +103,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receipt impor
     SlotLedger,
     is_no_compute_layer,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receiver import ReceiptReceiver
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import (
     target_lease_from_wire,
     target_lease_to_wire,
@@ -146,8 +153,6 @@ FAILED_SENDING_MSG = b"failed_sending_msg"
 # LAYER_RESULT per (layer, component, chunk span) plus one RANK_TERMINAL per
 # request after the last layer (empty payloads included); D judges readiness
 # by identity instead of counting DONE messages.
-LAYER_RESULT_MSG = b"layer_result_msg"
-RANK_TERMINAL_MSG = b"rank_terminal_msg"
 LAYERWISE_REUSE_WAIT_LOG_INTERVAL_SECONDS = 10.0
 # Upper bound for the slot-ledger reuse wait. The legacy event path
 # waits unbounded with a log heartbeat; the ledger path needs an explicit
@@ -156,7 +161,6 @@ LAYERWISE_SLOT_WAIT_TIMEOUT_SECONDS = 300.0
 # Receipt watchdog (B5): a receipt-mode request whose ledger was installed
 # but never published within this deadline fails loudly through the
 # bounded-failure channel instead of hanging forever.
-RECEIPT_WATCHDOG_SECONDS = 300.0
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -732,40 +736,22 @@ class KVCacheRecvingLayerThread(threading.Thread):
         *,
         receipt_timeout_s: float = RECEIPT_WATCHDOG_SECONDS,
     ):
-        if (
-            type(receipt_timeout_s) not in (int, float)
-            or not math.isfinite(receipt_timeout_s)
-            or receipt_timeout_s <= 0
-        ):
-            raise ValueError("kv_connector_extra_config.layerwise_receipt_timeout_s must be positive and finite")
+        self.receipts = ReceiptReceiver(receipt_timeout_s, logger, status=self)
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
-        self.receipt_timeout_s = float(receipt_timeout_s)
+        self.receipt_timeout_s = self.receipts.timeout
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.pd_head_ratio = pd_head_ratio
         self.local_engine_id = local_engine_id
         self.side_channel_host = get_ip()
         self.side_channel_port = side_channel_port
-        self.lock = threading.Lock()
+        self.lock = self.receipts.lock
         self.done_requests = set[str]()
         self.failed_requests = set[str]()
         self.task_tracker = dict[str, int]()
         self.ready_event = ready_event
         self.metadata = metadata
-        # Receipt-mode state one ReceiptLedger per
-        # in-flight request, published by the scheduler side after target
-        # acquisition. This receive thread is the sole ledger writer; keyed by
-        # request_instance (what P stamps into receipt messages).
-        self.ledger_by_req: dict[str, ReceiptLedger] = {}
-        self.instance_to_req: dict[str, str] = {}
-        # Request ids ever seen in receipt mode; kept for the request lifetime
-        # (not popped on publish) so a late versioned DONE after publish is
-        # recognized as normal instead of flagged as a mode mismatch.
-        self.receipt_mode_reqs: set[str] = set()
-        self.receipt_provider = None  # TargetProvider, set via the facade
-        # instance -> monotonic publish deadline, set at ledger install and
-        # swept once per second by the receive-thread loop (B5 watchdog).
-        self.receipt_deadlines: dict[str, float] = {}
+        self.receipt_provider = None
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -815,247 +801,23 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
 
-    def handle_proof_batch(self, msg: tuple) -> bytes:
-        if (
-            len(msg) != 3
-            or type(msg[1]) is not int
-            or msg[1] != CONTRACT_VERSION
-            or type(msg[2]) not in (tuple, list)
-            or not 0 < len(msg[2]) <= MAX_PROOF_BATCH_FRAMES
-        ):
-            raise ContractError("Malformed manifest completion proof batch")
-        identity = None
-        for frame in msg[2]:
-            if (
-                type(frame) not in (tuple, list)
-                or len(frame) < 4
-                or frame[0] not in (LAYER_RESULT_MSG, RANK_TERMINAL_MSG)
-            ):
-                raise ContractError("Manifest proof batch contains an unsupported operation")
-            frame_identity = RequestKey(frame[2], frame[3])
-            if identity is not None and frame_identity != identity:
-                raise ContractError("Manifest proof batch mixes request generations")
-            identity = frame_identity
-        for frame in msg[2]:
-            if frame[0] == LAYER_RESULT_MSG:
-                self.handle_layer_result(tuple(frame))
-            else:
-                self.handle_rank_terminal(tuple(frame))
-        with self.lock:
-            ledger = self.ledger_by_req.get(identity.request_instance)
-        if isinstance(ledger, ExactReceiptLedger) and ledger.request == identity and ledger.delivery_aborted:
-            return PROOF_ACK_TARGET_CLOSED
-        return PROOF_ACK
+    def handle_proof_batch(self, msg):
+        return self.receipts.handle_proof_batch(msg)
 
-    def handle_layer_result(self, msg: tuple) -> None:
-        """LAYER_RESULT_MSG: (type, version, instance, gen, rank,
-        layer, op_id, component, start, end, backing_id, backing_gen, status,
-        source_quiesced). Judged by identity in the ledger."""
-        try:
-            (
-                _,
-                version,
-                instance,
-                generation,
-                rank,
-                layer,
-                op_id,
-                component,
-                start,
-                end,
-                backing_id,
-                backing_gen,
-                status,
-                quiesced,
-            ) = msg
-        except Exception:
-            logger.error("Malformed LAYER_RESULT_MSG (expected 14 fields): %r", msg)
-            return
-        if type(version) is not int or version != CONTRACT_VERSION:
-            logger.error("LAYER_RESULT_MSG version mismatch: %s != %s", version, CONTRACT_VERSION)
-            return
-        with self.lock:
-            ledger = self.ledger_by_req.get(instance)
-        if ledger is None:
-            logger.debug("LAYER_RESULT for unknown instance %s (plain-mode or stale); dropped", instance)
-            return
-        # P does not know D's backing layout in v1 (manifest transport is a
-        # future rendezvous item): an empty backing_id resolves against the
-        # ledger's own registered identities for the component. Multi-backing
-        # layers need the manifest; unresolvable identities are dropped, never
-        # fabricated.
-        if not backing_id and not isinstance(ledger, ExactReceiptLedger):
-            if component == Component.MAIN.value and ledger.main_backings:
-                backing_id = ledger.main_backings[0]
-            elif component == Component.INDEXER.value and ledger.indexer_backings:
-                backing_id = ledger.indexer_backings[0]
-        if not backing_id:
-            logger.error(
-                "LAYER_RESULT for %s carries an unresolvable empty backing (component=%s); dropped",
-                instance,
-                component,
-            )
-            return
-        try:
-            key = TransferKey(
-                request=RequestKey(request_instance=instance, transfer_generation=generation),
-                rank=rank,
-                logical_layer=layer,
-                operation_id=op_id,
-                component=Component(component),
-                token_range=TokenRange(start=start, end=end),
-                target_scope=TargetScope(
-                    backing_id=backing_id,
-                    backing_generation=backing_gen,
-                    consumer_rank=None if component == Component.MAIN.value else rank,
-                ),
-            )
-            result = TransferResult(key=key, status=Status(status), source_quiesced=quiesced)
-        except Exception as e:
-            logger.error("Invalid LAYER_RESULT_MSG fields for %s: %s (msg=%r)", instance, e, msg)
-            return
-        ledger.record(result)
-        self._maybe_publish(instance)
+    def handle_layer_result(self, msg):
+        return self.receipts.handle_layer_result(msg)
 
-    def handle_rank_terminal(self, msg: tuple) -> None:
-        """RANK_TERMINAL_MSG: (type, version, instance, gen, rank,
-        status). Empty payloads must still terminal."""
-        try:
-            (_, version, instance, generation, rank, status) = msg[:6]
-            if len(msg) not in (6, 7):
-                raise ValueError("Unexpected terminal field count")
-        except Exception:
-            logger.error("Malformed RANK_TERMINAL_MSG (expected 6 fields): %r", msg)
-            return
-        if type(version) is not int or version != CONTRACT_VERSION:
-            logger.error("RANK_TERMINAL_MSG version mismatch: %s != %s", version, CONTRACT_VERSION)
-            return
-        with self.lock:
-            ledger = self.ledger_by_req.get(instance)
-        if ledger is None:
-            logger.warning("RANK_TERMINAL for unknown instance %s; dropped", instance)
-            return
-        try:
-            request = RequestKey(instance, generation)
-            if request != ledger.request:
-                return
-            if isinstance(ledger, ExactReceiptLedger):
-                if len(msg) != 7:
-                    raise ContractError("Manifest rank terminal is missing explicit DMA quiescence")
-                ledger.finish_rank(request, rank, Status(status), msg[6])
-            else:
-                ledger.finish_rank(rank, Status(status))
-        except (ContractError, ValueError) as error:
-            logger.error("Invalid rank terminal for %s: %s", instance, error)
-            return
-        self._maybe_publish(instance)
+    def handle_rank_terminal(self, msg):
+        return self.receipts.handle_rank_terminal(msg)
 
-    def _maybe_publish(self, instance: str) -> None:
-        """Visibility flow, run in the receive thread (sole writer):
-        data ready -> receipt(visible=False) -> provider.prepare_decode -> normal
-        return -> mark visible -> done_requests. Any prepare_decode error means
-        never visible, never published."""
-        with self.lock:
-            ledger = self.ledger_by_req.get(instance)
-            req_id = self.instance_to_req.get(instance)
-            if ledger is None or req_id is None or req_id in self.done_requests:
-                return
-        receipt = ledger.build_receipt()
-        if isinstance(ledger, ExactReceiptLedger):
-            if ledger.delivery_aborted or ledger.should_publish():
-                return
-            if ledger.failed:
-                ledger.abort_delivery()
-                with self.lock:
-                    self.failed_requests.add(req_id)
-                    self.receipt_deadlines.pop(instance, None)
-                return
-        if receipt is None:
-            return  # data conditions not met yet
-        provider = self.receipt_provider
-        lease = getattr(ledger, "lease", None)
-        if provider is None or lease is None:
-            # A receipt-mode request can never fall back to plain-mode
-            # publishing: without prepare_decode the consumer dependency is
-            # never wired and the target bytes are not safe to decode. Fail
-            # the request through the bounded-failure channel instead of
-            # silently releasing it as done.
-            logger.error(
-                "Receipt-mode request %s (instance=%s) has no provider or lease; failing instead of publishing",
-                req_id,
-                instance,
-            )
-            with self.lock:
-                self.failed_requests.add(req_id)
-                self.receipt_deadlines.pop(instance, None)
-            return
-        try:
-            if isinstance(ledger, ExactReceiptLedger):
-                provider.confirm_native_received(lease, receipt)
-            provider.prepare_decode(lease, receipt)
-        except Exception as e:
-            logger.error(
-                "prepare_decode failed for instance %s (req %s); not publishing. error=%s", instance, req_id, e
-            )
-            return
-        ranks = (ledger.visibility_rank,) if isinstance(ledger, ExactReceiptLedger) else sorted(ledger.expected_ranks)
-        for rank in ranks:
-            ledger.mark_visible(rank)
-        receipt.visible = True
-        with self.lock:
-            # Keep receipt_mode_reqs (request-lifetime): late versioned DONE
-            # after publish must stay recognized as normal.
-            self.receipt_mode_reqs.add(req_id)
-            if not isinstance(ledger, ExactReceiptLedger):
-                self.ledger_by_req.pop(instance, None)
-                self.instance_to_req.pop(instance, None)
-            self.receipt_deadlines.pop(instance, None)
-            self.done_requests.add(req_id)
-        logger.info("Receipt-mode request %s (instance=%s) published after prepare_decode", req_id, instance)
+    def _maybe_publish(self, instance):
+        return self.receipts._maybe_publish(instance)
 
-    def forget_request(self, req_id: str, *, failed=False) -> None:
-        """Clean legacy receives; retain exact proof identity until owner retirement."""
-        with self.lock:
-            stale = [i for i, r in self.instance_to_req.items() if r == req_id]
-            for instance in stale:
-                ledger = self.ledger_by_req.get(instance)
-                if isinstance(ledger, ExactReceiptLedger):
-                    if failed:
-                        ledger.abort_delivery()
-                    continue  # Keep late quiescence proof until actual owner retirement.
-                self.instance_to_req.pop(instance, None)
-                self.ledger_by_req.pop(instance, None)
-                self.receipt_deadlines.pop(instance, None)
-            if req_id not in self.instance_to_req.values():
-                self.receipt_mode_reqs.discard(req_id)
+    def forget_request(self, req_id, *, failed=False):
+        return self.receipts.forget_request(req_id, failed=failed)
 
-    def _sweep_receipt_deadlines(self) -> None:
-        """Bounded-failure watchdog sweep (B5): fail receipt requests whose
-        ledger was installed but never published within the deadline. Exact
-        ledgers continue accepting late quiescence proofs, without decoding."""
-        now = time.monotonic()
-        expired: list[tuple[str, str]] = []
-        with self.lock:
-            for instance, deadline in self.receipt_deadlines.items():
-                req_id = self.instance_to_req.get(instance)
-                if now >= deadline and req_id is not None:
-                    expired.append((instance, req_id))
-            for instance, req_id in expired:
-                ledger = self.ledger_by_req.get(instance)
-                if isinstance(ledger, ExactReceiptLedger):
-                    ledger.abort_delivery()
-                else:
-                    self.ledger_by_req.pop(instance, None)
-                    self.instance_to_req.pop(instance, None)
-                self.receipt_deadlines.pop(instance, None)
-                self.failed_requests.add(req_id)
-        for instance, req_id in expired:
-            logger.error(
-                "Receipt watchdog: request %s (instance=%s) did not publish within %.0fs; failing bounded",
-                req_id,
-                instance,
-                self.receipt_timeout_s,
-            )
+    def _sweep_receipt_deadlines(self):
+        return self.receipts._sweep_receipt_deadlines()
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -1119,7 +881,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             # scheduler synced the ledger maps. Plain
                             # requests keep the 4-tuple and reach
                             # update_done_task unchanged.
-                            if request_id in self.receipt_mode_reqs:
+                            if self.receipts.requests.in_receipt_mode(request_id):
                                 logger.debug("Receipt-mode request %s: DONE ignored, ledger owns publish", request_id)
                             else:
                                 # Diagnostic only, never gates: P has receipt
@@ -2793,7 +2555,7 @@ class MooncakeLayerwiseConnectorWorker:
             if self.vllm_config.kv_transfer_config.is_kv_consumer
             else set()
         )
-        done_recving = {self.request_map[s] for s in done_recving if s in self.request_map}
+        done_recving = self._map_received_requests(done_recving)
         done_recving.update(self.virtual_request)
         self.virtual_request = set()
 
@@ -2802,9 +2564,9 @@ class MooncakeLayerwiseConnectorWorker:
             if self.vllm_config.kv_transfer_config.is_kv_consumer and self.kv_recv_layer_thread is not None
             else set()
         )
-        failed_recving = {self.request_map[s] for s in failed_recving if s in self.request_map}
+        failed_recving = self._map_received_requests(failed_recving)
         for req_id in failed_recving:
-            if req_id in getattr(self, "_admitted_target_blocks", {}):
+            if self._has_admitted_target(req_id):
                 # Main/Indexer pool IDs may overlap. The deployed vLLM
                 # transfer-results API carries unambiguous request failures.
                 self._failed_receives.add(req_id)
@@ -2813,7 +2575,7 @@ class MooncakeLayerwiseConnectorWorker:
                 self._invalid_block_ids.update(block_id for group in meta.local_block_ids for block_id in group)
         for req_id in done_recving.union(failed_recving):
             self._recving_metadata.pop(req_id, None)
-            exact_target = req_id in getattr(self, "_admitted_target_blocks", {})
+            exact_target = self._has_admitted_target(req_id)
             if not exact_target:
                 self.request_map.pop(get_external_request_id(req_id), None)
             if self.kv_recv_layer_thread is not None:
@@ -3016,50 +2778,44 @@ class MooncakeLayerwiseConnectorWorker:
                     continue
                 external_req_id = get_external_request_id(req_id)
                 assert self.kv_recv_layer_thread is not None
-                mapping_key = req_id if req_id in getattr(self, "_admitted_target_blocks", {}) else external_req_id
-                self.request_map[mapping_key] = req_id
+                if not self._has_admitted_target(req_id):
+                    self.request_map[external_req_id] = req_id
                 self._recving_metadata[req_id] = meta
             specs = getattr(metadata, "receipt_specs", None)
             if specs:
                 self._install_receipt_specs(specs)
 
-    def _install_admitted_target(self, req_id, lease, ledger) -> None:
-        """Synchronous worker-ready acknowledgement, before any P notification."""
+    def _has_admitted_target(self, req_id):
+        thread = getattr(self, "kv_recv_layer_thread", None)
+        return thread is not None and thread.receipts.requests.retained_blocks(req_id) is not None
+
+    def _map_received_requests(self, request_ids):
+        return {
+            mapped for req_id in request_ids
+            if (mapped := req_id if self._has_admitted_target(req_id) else self.request_map.get(req_id)) is not None
+        }
+
+    def _install_admitted_target(self, req_id, lease, ledger):
+        """Delivery lock -> receive index lock; no native calls or waits here."""
         thread = self.kv_recv_layer_thread
         if thread is None:
             raise ContractError("Target receive thread must exist before manifest admission")
-        instance = lease.request.request_instance
-        external_req_id = get_external_request_id(req_id)
         with thread.lock:
-            if instance in thread.ledger_by_req or req_id in self.request_map:
+            if req_id in self.request_map:
                 raise ContractError("Target receive request identity is already installed")
-            if not hasattr(self, "_admitted_target_blocks"):
-                self._admitted_target_blocks = {}
             ledger.lease = lease
-            self.request_map[req_id] = req_id
-            self._admitted_target_blocks[req_id] = lease.allocation.group_block_ids
-            thread.ledger_by_req[instance] = ledger
-            thread.instance_to_req[instance] = req_id
-            thread.receipt_mode_reqs.add(external_req_id)
-            thread.receipt_deadlines[instance] = time.monotonic() + thread.receipt_timeout_s
+            thread.receipts.requests.install(
+                req_id, get_external_request_id(req_id), ledger, time.monotonic() + thread.receipt_timeout_s
+            )
 
     def _retire_admitted_target(self, req_id, lease, ledger):
         thread = self.kv_recv_layer_thread
-        instance = lease.request.request_instance
-        external = get_external_request_id(req_id)
         with thread.lock:
-            if thread.ledger_by_req.get(instance) is ledger:
-                thread.ledger_by_req.pop(instance, None)
-                thread.instance_to_req.pop(instance, None)
-                thread.receipt_deadlines.pop(instance, None)
-                thread.receipt_mode_reqs.discard(req_id)
-                if not any(get_external_request_id(r) == external for r in thread.instance_to_req.values()):
-                    thread.receipt_mode_reqs.discard(external)
-            if self.request_map.get(req_id) == req_id:
-                self.request_map.pop(req_id, None)
-            if self.request_map.get(external) == req_id:
-                self.request_map.pop(external, None)
-            getattr(self, "_admitted_target_blocks", {}).pop(req_id, None)
+            if not thread.receipts.requests.retire(lease.request.request_instance, ledger):
+                return
+            for key in (req_id, get_external_request_id(req_id)):
+                if self.request_map.get(key) == req_id:
+                    self.request_map.pop(key, None)
 
     def _install_receipt_specs(self, specs: dict) -> None:
         """Build the D-side ReceiptLedger per request from the scheduler-built
@@ -3097,11 +2853,9 @@ class MooncakeLayerwiseConnectorWorker:
             if lease is not None:
                 ledger.lease = lease  # consumed by prepare_decode on publish
             external_req_id = get_external_request_id(req_id)
-            with thread.lock:
-                thread.ledger_by_req[instance] = ledger
-                thread.instance_to_req[instance] = external_req_id
-                thread.receipt_mode_reqs.add(external_req_id)
-                thread.receipt_deadlines[instance] = time.monotonic() + thread.receipt_timeout_s
+            thread.receipts.requests.install(
+                external_req_id, external_req_id, ledger, time.monotonic() + thread.receipt_timeout_s
+            )
             logger.debug(
                 "Installed receipt ledger for req %s (instance=%s, expected=%s)", req_id, instance, expected_ranks
             )

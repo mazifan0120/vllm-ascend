@@ -1,3 +1,16 @@
+> 2026-11-08 refactor phase2: receipt parsing/visibility/watchdog now belongs
+> to ReceiptReceiver, using a ReceiveRequestIndex record shared by receive
+> messages and worker admission/retirement. Parallel ledger/request/deadline
+> maps and the worker's mirrored admitted-block map are removed. The ordinary
+> P/D map is unchanged; exact targets resolve through their registered record.
+> Lock order remains delivery -> receive index -> ledger; provider/runtime
+> callbacks and native waits execute outside the index lock. Delayed callback,
+> abort/visibility race and shared-external-ID cases have explicit regressions.
+> Protocol cases formerly gated by NPU imports now run with real msgpack0.22
+> on CPU:217 passed,1 skipped,112subtests; legacy ledger37/37. Native images
+> and full PD acceptance for this phase remain pending. The first-phase idle
+> images verified1395 SDK artifact hashes and absence of removed modules on2D.
+
 > 2026-11-08 refactor in progress: removed the unused process-global owner
 > rendezvous and production Pipe assembly. Pipe process/fault adapters now
 > live only in tests; RPC and its codec depend on a transport-neutral retention

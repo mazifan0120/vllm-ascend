@@ -19,7 +19,13 @@ npu = pytest.importorskip("torch_npu")
 msgspec = pytest.importorskip("msgspec")
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as lc  # noqa: E402
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_exact_receipt import ExactReceiptLedger  # noqa: E402
+
+
+def make_receiver_adapter():
+    adapter = SimpleNamespace(receipt_timeout_s=lc.RECEIPT_WATCHDOG_SECONDS)
+    adapter.receipts = lc.ReceiptReceiver(lc.RECEIPT_WATCHDOG_SECONDS, lc.logger, status=adapter)
+    adapter.lock = adapter.receipts.lock
+    return adapter
 
 
 def _encode_decode(msg):
@@ -91,195 +97,11 @@ def test_consumer_publishes_retention_proof_in_scheduler_step_metadata():
         guard.release()
 
 
-class TestExactReceiverProtocol(unittest.TestCase):
-    def publisher(self):
-        receiver, ledger, required = self.fixture()
-        receiver.instance_to_req = {ledger.request.request_instance: "external"}
-        receiver.done_requests = set()
-        receiver.failed_requests = set()
-        receiver.receipt_mode_reqs = set()
-        receiver.receipt_deadlines = {}
-        receiver.receipt_timeout_s = lc.RECEIPT_WATCHDOG_SECONDS
-        order = []
-        receiver.receipt_provider = SimpleNamespace(
-            confirm_native_received=lambda *args: order.append("native-receive-fence"),
-            prepare_decode=lambda *args: order.append("install-consumer-dependency"),
-        )
-        ledger.lease = object()
-        receiver._maybe_publish = lc.KVCacheRecvingLayerThread._maybe_publish.__get__(receiver)
-        return receiver, ledger, required, order
-
-    def test_actual_publisher_confirms_receive_before_visibility_and_is_idempotent(self):
-        receiver, ledger, required, order = self.publisher()
-        ledger.record(lc.TransferResult(required[0], lc.Status.SUCCESS, True))
-        ledger.finish_rank(ledger.request, 0, lc.Status.SUCCESS, True)
-        receiver._maybe_publish(ledger.request.request_instance)
-        self.assertEqual(order, [])
-        ledger.record(lc.TransferResult(required[1], lc.Status.SUCCESS, True))
-        receiver._maybe_publish(ledger.request.request_instance)
-        self.assertEqual(order, ["native-receive-fence", "install-consumer-dependency"])
-        self.assertEqual(receiver.done_requests, {"external"})
-        receiver.done_requests.clear()
-        receiver._maybe_publish(ledger.request.request_instance)
-        self.assertEqual(len(order), 2)
-
-    def test_actual_watchdog_keeps_late_quiescence_without_late_decode(self):
-        receiver, ledger, required, order = self.publisher()
-        instance = ledger.request.request_instance
-        receiver.receipt_deadlines[instance] = 0
-        receiver._sweep_receipt_deadlines()
-        receiver.forget_request("external", failed=True)
-        self.assertIs(receiver.ledger_by_req[instance], ledger)
-        for key in required:
-            ledger.record(lc.TransferResult(key, lc.Status.SUCCESS, True))
-        ledger.finish_rank(ledger.request, 0, lc.Status.SUCCESS, True)
-        receiver._maybe_publish(instance)
-        self.assertTrue(ledger.remote_quiesced())
-        self.assertFalse(receiver.done_requests)
-        self.assertEqual(order, [])
-
-    def test_actual_terminal_failure_fails_bounded_before_watchdog(self):
-        receiver, ledger, _, order = self.publisher()
-        ledger.finish_rank(ledger.request, 0, lc.Status.FAILED, False)
-        receiver._maybe_publish(ledger.request.request_instance)
-        self.assertEqual(receiver.failed_requests, {"external"})
-        self.assertFalse(ledger.remote_quiesced())
-        self.assertEqual(order, [])
-
-    def fixture(self):
-        request = lc.RequestKey("wire-entry-request", 5)
-        required = tuple(
-            lc.TransferKey(
-                request,
-                0,
-                0,
-                entry,
-                component,
-                lc.TokenRange(0, 23),
-                lc.TargetScope(
-                    "shared-main" if component is lc.Component.MAIN else "indexer",
-                    7,
-                    None if component is lc.Component.MAIN else 0,
-                ),
-            )
-            for entry, component in enumerate(lc.Component)
-        )
-        ledger = ExactReceiptLedger(request, required, expected_ranks=(0,), target_generation=8, visibility_rank=0)
-        receiver = object.__new__(lc.KVCacheRecvingLayerThread)
-        receiver.lock = threading.RLock()
-        receiver.ledger_by_req = {request.request_instance: ledger}
-        receiver._maybe_publish = Mock()
-        return receiver, ledger, required
-
-    def test_actual_message_handlers_preserve_generation_entries_and_explicit_quiescence(self):
-        receiver, ledger, required = self.fixture()
-        for key in required:
-            message = (
-                lc.LAYER_RESULT_MSG,
-                lc.CONTRACT_VERSION,
-                key.request.request_instance,
-                5,
-                0,
-                0,
-                key.operation_id,
-                key.component.value,
-                0,
-                23,
-                key.target_scope.backing_id,
-                7,
-                "success",
-                True,
-            )
-            receiver.handle_layer_result(_encode_decode(message))
-        terminal = (lc.RANK_TERMINAL_MSG, lc.CONTRACT_VERSION, ledger.request.request_instance, 5, 0, "success", True)
-        receiver.handle_rank_terminal(_encode_decode((*terminal[:3], 4, *terminal[4:])))
-        self.assertFalse(ledger.remote_quiesced())
-        receiver.handle_rank_terminal(_encode_decode(terminal[:-1]))
-        self.assertFalse(ledger.remote_quiesced())
-        receiver.handle_rank_terminal(_encode_decode(terminal))
-        self.assertTrue(ledger.remote_quiesced())
-        self.assertIsNotNone(ledger.build_receipt())
-
-    def test_truthy_untyped_quiescence_and_empty_backing_cannot_credit_a_manifest_entry(self):
-        receiver, ledger, required = self.fixture()
-        key = required[0]
-        message = (
-            lc.LAYER_RESULT_MSG,
-            lc.CONTRACT_VERSION,
-            ledger.request.request_instance,
-            5,
-            0,
-            0,
-            key.operation_id,
-            key.component.value,
-            0,
-            23,
-            key.target_scope.backing_id,
-            7,
-            "success",
-            1,
-        )
-        receiver.handle_layer_result(_encode_decode(message))
-        receiver.handle_layer_result(_encode_decode((message[0], True, *message[2:13], True)))
-        receiver.handle_layer_result(_encode_decode((*message[:10], "", *message[11:13], True)))
-        for key in required[1:]:
-            ledger.record(lc.TransferResult(key, lc.Status.SUCCESS, True))
-        ledger.finish_rank(ledger.request, 0, lc.Status.SUCCESS, True)
-        self.assertIsNone(ledger.build_receipt())
-
-    def test_actual_batch_handler_accepts_entry_results_and_explicit_cancel_terminal(self):
-        receiver, ledger, required = self.fixture()
-        frames = []
-        for key in required:
-            frames.append(
-                (
-                    lc.LAYER_RESULT_MSG,
-                    lc.CONTRACT_VERSION,
-                    key.request.request_instance,
-                    5,
-                    0,
-                    0,
-                    key.operation_id,
-                    key.component.value,
-                    0,
-                    23,
-                    key.target_scope.backing_id,
-                    7,
-                    "success",
-                    True,
-                )
-            )
-        frames.append(
-            (lc.RANK_TERMINAL_MSG, lc.CONTRACT_VERSION, ledger.request.request_instance, 5, 0, "cancelled", True)
-        )
-        batch = _encode_decode((lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, tuple(frames)))
-        self.assertEqual(receiver.handle_proof_batch(batch), lc.PROOF_ACK)
-        self.assertTrue(ledger.remote_quiesced())
-        self.assertIsNone(ledger.build_receipt())
-        ledger.abort_delivery()
-        self.assertEqual(receiver.handle_proof_batch(batch), lc.PROOF_ACK_TARGET_CLOSED)
-
-    def test_actual_batch_handler_rejects_invalid_envelope_before_crediting_any_frame(self):
-        receiver, ledger, _ = self.fixture()
-        terminal = (
-            lc.RANK_TERMINAL_MSG,
-            lc.CONTRACT_VERSION,
-            ledger.request.request_instance,
-            ledger.request.transfer_generation,
-            0,
-            "success",
-            True,
-        )
-        stale_terminal = (*terminal[:3], ledger.request.transfer_generation + 1, *terminal[4:])
-        for message in (
-            (lc.LAYER_RESULTS_MSG, True, ()),
-            (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, ()),
-            (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, ((b"unsupported",),)),
-            (lc.LAYER_RESULTS_MSG, lc.CONTRACT_VERSION, (terminal, stale_terminal)),
-        ):
-            with self.assertRaises(lc.ContractError):
-                receiver.handle_proof_batch(_encode_decode(message))
-        self.assertFalse(ledger.remote_quiesced())
+# Protocol parsing/lifecycle cases live in the CPU suite; use its fixture here
+# for tests which specifically exercise the real NPU connector adapter.
+from tests.ut.distributed.ascend_store.test_target_receipt_receiver import (  # noqa: E402
+    TestExactReceiverProtocol as ReceiverProtocolFixture,
+)
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True, "7200", None])
@@ -299,12 +121,12 @@ def test_admitted_target_uses_configured_receipt_deadline(timeout):
     worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
     worker.request_map = {}
     worker.kv_recv_layer_thread = receiver
-    _, ledger, _ = TestExactReceiverProtocol().fixture()
+    _, ledger, _ = ReceiverProtocolFixture().fixture()
     request_id = "long-prefill-12345678"
     lease = SimpleNamespace(request=ledger.request, allocation=SimpleNamespace(group_block_ids=((1, 3),)))
     with patch.object(lc.time, "monotonic", return_value=100):
         worker._install_admitted_target(request_id, lease, ledger)
-    assert receiver.receipt_deadlines[ledger.request.request_instance] == 100 + timeout
+    assert receiver.receipts.requests.get(ledger.request.request_instance).deadline == 100 + timeout
     with patch.object(lc.time, "monotonic", return_value=401):
         receiver._sweep_receipt_deadlines()
     assert bool(receiver.failed_requests) == (timeout <= 301)
@@ -318,54 +140,40 @@ class TestEarlyTargetAdmission(unittest.TestCase):
     def test_actual_install_maps_early_completions_before_scheduler_metadata(self):
         worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
         worker.request_map = {}
-        worker.kv_recv_layer_thread = SimpleNamespace(
-            lock=threading.RLock(),
-            ledger_by_req={},
-            instance_to_req={},
-            receipt_mode_reqs=set(),
-            receipt_deadlines={},
-            receipt_timeout_s=lc.RECEIPT_WATCHDOG_SECONDS,
-        )
-        _, ledger, _ = TestExactReceiverProtocol().fixture()
+        worker.kv_recv_layer_thread = make_receiver_adapter()
+        _, ledger, _ = ReceiverProtocolFixture().fixture()
         request_id = "early-request-12345678"
         lease = SimpleNamespace(request=ledger.request, allocation=SimpleNamespace(group_block_ids=((1, 3),)))
         worker._install_admitted_target(request_id, lease, ledger)
         external = lc.get_external_request_id(request_id)
-        self.assertEqual(worker.request_map[request_id], request_id)
+        self.assertNotIn(request_id, worker.request_map)
         self.assertNotIn(external, worker.request_map)
-        self.assertIs(worker.kv_recv_layer_thread.ledger_by_req[ledger.request.request_instance], ledger)
-        self.assertEqual(worker._admitted_target_blocks[request_id], ((1, 3),))
+        self.assertIs(worker.kv_recv_layer_thread.receipts.requests.get(ledger.request.request_instance).ledger, ledger)
+        self.assertEqual(worker.kv_recv_layer_thread.receipts.requests.retained_blocks(request_id), ((1, 3),))
         with self.assertRaises(lc.ContractError):
             worker._install_admitted_target(request_id, lease, ledger)
 
     def test_reused_external_id_keeps_both_engine_lifetimes_until_their_own_retirement(self):
         worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
         worker.request_map = {}
-        worker.kv_recv_layer_thread = SimpleNamespace(
-            lock=threading.RLock(),
-            ledger_by_req={},
-            instance_to_req={},
-            receipt_mode_reqs=set(),
-            receipt_deadlines={},
-            receipt_timeout_s=lc.RECEIPT_WATCHDOG_SECONDS,
-        )
+        worker.kv_recv_layer_thread = make_receiver_adapter()
         instances = []
         for suffix in ("12345678", "abcdefgh"):
-            _, ledger, _ = TestExactReceiverProtocol().fixture()
+            _, ledger, _ = ReceiverProtocolFixture().fixture()
             ledger.request = lc.RequestKey(suffix, 0)
             request_id = "same-external-" + suffix
             lease = SimpleNamespace(request=ledger.request, allocation=SimpleNamespace(group_block_ids=((1, 3),)))
             worker._install_admitted_target(request_id, lease, ledger)
             instances.append((request_id, lease, ledger))
-        self.assertEqual(len(worker.request_map), 2)
+        self.assertFalse(worker.request_map)
         worker._retire_admitted_target(*instances[0])
         request_id, lease, ledger = instances[1]
-        self.assertEqual(worker.request_map, {request_id: request_id})
-        self.assertIs(worker.kv_recv_layer_thread.ledger_by_req[lease.request.request_instance], ledger)
-        self.assertIn("same-external", worker.kv_recv_layer_thread.receipt_mode_reqs)
+        self.assertFalse(worker.request_map)
+        self.assertIs(worker.kv_recv_layer_thread.receipts.requests.get(lease.request.request_instance).ledger, ledger)
+        self.assertTrue(worker.kv_recv_layer_thread.receipts.requests.in_receipt_mode("same-external"))
         worker._retire_admitted_target(*instances[1])
         self.assertFalse(worker.request_map)
-        self.assertFalse(worker.kv_recv_layer_thread.receipt_mode_reqs)
+        self.assertFalse(worker.kv_recv_layer_thread.receipts.requests.in_receipt_mode("same-external"))
 
 
 class TestReceiptFailureIdentity(unittest.TestCase):
@@ -376,25 +184,26 @@ class TestReceiptFailureIdentity(unittest.TestCase):
         )
         failed = "failed-request-12345678"
         other = "ordinary-request-abcdefgh"
-        worker.request_map = {failed: failed, "ordinary-request": other}
-        worker._admitted_target_blocks = {failed: ((1, 3), (1, 3))}
+        worker.request_map = {"ordinary-request": other}
         worker._invalid_block_ids = set()
         worker._failed_receives = set()
         worker._recving_metadata = {other: SimpleNamespace(local_block_ids=[[1, 3], [1, 3]])}
         worker.virtual_request = set()
-        worker.kv_recv_layer_thread = SimpleNamespace(
-            get_and_clear_done_requests=lambda: set(),
-            get_and_clear_failed_requests=lambda: {failed},
-            forget_request=Mock(),
-        )
+        worker.kv_recv_layer_thread = make_receiver_adapter()
+        worker.kv_recv_layer_thread.get_and_clear_done_requests = lambda: set()
+        worker.kv_recv_layer_thread.get_and_clear_failed_requests = lambda: {failed}
+        worker.kv_recv_layer_thread.forget_request = Mock()
+        _, ledger, _ = ReceiverProtocolFixture().fixture()
+        ledger.lease = SimpleNamespace(allocation=SimpleNamespace(group_block_ids=((1, 3), (1, 3))))
+        worker.kv_recv_layer_thread.receipts.requests.install(failed, "failed-request", ledger, 0)
         connector = object.__new__(lc.MooncakeLayerwiseConnector)
         connector.connector_worker = worker
         result = connector.get_transfer_results(set())
         self.assertEqual(result.failed_recving, {failed})
         self.assertEqual(result.finished_recving, {failed})
         self.assertFalse(worker.get_block_ids_with_load_errors())
-        self.assertEqual(worker.request_map, {failed: failed, "ordinary-request": other})
-        self.assertIn(failed, worker._admitted_target_blocks)
+        self.assertEqual(worker.request_map, {"ordinary-request": other})
+        self.assertTrue(worker._has_admitted_target(failed))
         worker.kv_recv_layer_thread.forget_request.assert_called_once_with(failed, failed=True)
         self.assertFalse(worker.take_failed_receives())
 
@@ -726,22 +535,19 @@ class TestReceiptHandler:
 
     def _thread(self):
         thread = object.__new__(lc.KVCacheRecvingLayerThread)
-        import threading
-
-        thread.lock = threading.Lock()
         thread.done_requests = set()
         thread.failed_requests = set()
         thread.task_tracker = {}
-        thread.ledger_by_req = {}
-        thread.instance_to_req = {}
         thread.receipt_provider = None
+        thread.receipts = lc.ReceiptReceiver(lc.RECEIPT_WATCHDOG_SECONDS, lc.logger, status=thread)
+        thread.lock = thread.receipts.lock
         return thread
 
     def test_version_mismatch_is_dropped(self):
         thread = self._thread()
         msg = (lc.LAYER_RESULT_MSG, 999, "inst", 0, 0, 0, 0, "main", 0, 8, "b0", 1, "success", True)
         thread.handle_layer_result(msg)  # must not raise
-        assert not thread.ledger_by_req
+        assert thread.receipts.requests.get("inst") is None
 
     def test_malformed_frame_is_dropped(self):
         thread = self._thread()

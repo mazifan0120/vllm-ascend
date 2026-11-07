@@ -13,17 +13,20 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TargetClosedError,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import RegionAddress
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_protocol import (
+    GET_TARGET_REGIONS_MSG,
+    LAYER_RESULTS_MSG,
+    MAX_PROOF_SEND_ATTEMPTS,
+    PROOF_ACK,
+    PROOF_ACK_TARGET_CLOSED,
+    TARGET_PEER_ERROR,
+    TARGET_PEER_TIMEOUT_SECONDS,
+    TARGET_REGIONS_REPLY,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_protocol import (
+    MAX_PROOF_BATCH_FRAMES as MAX_PROOF_BATCH_FRAMES,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_wire import target_lease_to_wire
-
-GET_TARGET_REGIONS_MSG = b"get_target_regions_v1"
-TARGET_REGIONS_REPLY = b"target_regions_v1"
-TARGET_PEER_ERROR = b"target_peer_error_v1"
-LAYER_RESULTS_MSG = b"layer_results_v1"
-PROOF_ACK = b"ACK"
-PROOF_ACK_TARGET_CLOSED = b"ACK_TARGET_CLOSED"
-MAX_PROOF_BATCH_FRAMES = 64
-MAX_PROOF_SEND_ATTEMPTS = 3
-TARGET_PEER_TIMEOUT_SECONDS = 30.0
 
 
 def encode_target_addresses(lease, handles) -> tuple:
