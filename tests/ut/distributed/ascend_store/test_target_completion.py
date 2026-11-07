@@ -206,6 +206,23 @@ class TestNativeRecorderRecovery(unittest.TestCase):
         final = recorder.record_use()
         self.assertEqual([f.stream.npu_stream for f in final], [consume.npu_stream])
 
+    def test_unreadable_stream_identity_cannot_be_forgotten_on_retry(self):
+        _, manager, recorder, _, _ = self.fixture()
+
+        class UnreadableStream:
+            device = SimpleNamespace(index=0)
+
+            @property
+            def npu_stream(self):
+                raise RuntimeError("stream identity unavailable")
+
+        manager.streams = (UnreadableStream(),)
+        with self.assertRaisesRegex(RuntimeError, "identity unavailable"):
+            recorder.record_use()
+        manager.streams = ()
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            recorder.record_use()
+
     def test_foreign_device_or_unenumerable_streams_quarantine_the_owner(self):
         _, manager, recorder, _, _ = self.fixture()
         manager.streams = (SimpleNamespace(device=SimpleNamespace(index=1), npu_stream=5),)

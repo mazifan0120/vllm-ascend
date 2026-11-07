@@ -112,12 +112,15 @@ class NpuTargetStreams:
                 self._invalid_stream = True  # Unknown users cannot be recovered by guessing a new stream set.
                 raise
             selected = {}
-            for stream in streams:
-                if stream is not None:
-                    if getattr(getattr(stream, "device", None), "index", None) != self._device_id:
-                        self._invalid_stream = True
-                        raise RuntimeError("Target manager exposed a stream from another NPU")
-                    selected[getattr(stream, "npu_stream", id(stream))] = stream
+            try:
+                for stream in streams:
+                    if stream is not None:
+                        if getattr(getattr(stream, "device", None), "index", None) != self._device_id:
+                            raise RuntimeError("Target manager exposed a stream from another NPU")
+                        selected[getattr(stream, "npu_stream", id(stream))] = stream
+            except Exception:
+                self._invalid_stream = True  # An unidentifiable stream may already own queued work.
+                raise
             required = {key: value[0] for key, value in self._recovery_streams.items()}
             required.update(selected)
             try:
