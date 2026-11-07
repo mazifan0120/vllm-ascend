@@ -1,3 +1,23 @@
+> 2026-11-07 latest: runtime code dfb52bd0a requires eager or compiled
+> (VLLM_COMPILE/mode3) FULL_DECODE_ONLY receipt targets, PP/CP/DCP1.
+> Uncompiled mode0 is rejected: native semantic samples were17/20 and18/20,
+> beyond only the first cold request. Old mode0 timings are not an accepted
+> deployment baseline. Root cause is not fully established.
+>
+> The final new dfb52bd0a image, mode3/MTP3/async/no timer, passed40/40 semantic
+> cases (fresh and original failing prompts), actual Store prefix hit~49.4%,
+> and41/41 all8-rank receipt/release including a real decode disconnect.
+> Target graph is active; this GLM draft remains eager. Earlier bb679f01d
+> mode3/MTP5 passed20 semantic+8 long+2 disconnect cases; not a dual-graph claim.
+> CPU regression203passed/1skipped/112subtests. Native delayed-DMA/reset fault
+> injection and final-mode3 C10/C20 performance are not covered.
+>
+> Deployment keeps only the new D ...-review-safe containers running; P remains
+> e9bd1ce19 (...-dgraph), Master/proxy unchanged. Default inventory remains
+> fe559c440/eager. Use deployment artifacts/review-fixes-20261107/safe.yml for
+> the actual candidate identity; runbook11.78 and the refactor audit contain
+> evidence and boundaries. No broad structural rewrite has been applied.
+
 # Prefill KV buffer reuse 与 Mooncake PD transfer 项目交接
 
 ## 2026-11-06 性能验证更新
