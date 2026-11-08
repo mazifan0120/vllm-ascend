@@ -145,6 +145,26 @@ class TestMainSnapshotVersions(unittest.TestCase):
         worker._layerwise_session_tracker.commit_put_keys([old.save_last_block_key])
         self.assertEqual(worker._layerwise_session_tracker.prepare_load_entries("r1", []), [])
 
+    def test_missing_prefix_reports_native_and_fallback_codes_with_bounded_samples(self):
+        worker, _ = self.make_worker()
+        request = self.request(160, 2, previous=144)
+        worker.m_store.batch_get_start.side_effect = lambda keys: [-704] * len(keys)
+        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+        with (
+            patch(module + ".logger.error") as error,
+            self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"),
+        ):
+            self.open(worker, request)
+        _, count, samples = error.call_args.args
+        self.assertEqual(count, 9)
+        self.assertEqual(len(samples), 8)
+        for index, sample in enumerate(samples):
+            self.assertEqual(sample["request"], request.req_id)
+            self.assertEqual(sample["block_index"], index)
+            self.assertEqual(sample["code"], -704)
+            self.assertEqual(sample["fallback_code"], -704)
+        self.assertTrue(worker._layer_load_aborted.is_set())
+
     def test_non_saving_rank_uses_scheduler_snapshot_identity(self):
         worker, published = self.make_worker()
         worker.tp_rank = 1

@@ -139,6 +139,7 @@ PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
 SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
 PRIVATE_SNAPSHOT_CLEANUP_RETRY_INTERVAL_S = 1.0
+MAIN_REUSE_FAILURE_SAMPLE_LIMIT = 8
 
 
 class KVPoolWorker:
@@ -2993,6 +2994,30 @@ class KVPoolWorker:
                 if resolved not in request.load_keys:
                     request.load_keys.append(resolved)
             if invalid:
+                failures = []
+                for request, key, block_id, index in slots:
+                    resolved = key if codes[key] == 0 else replacements.get((request.req_id, key))
+                    if resolved == key or (resolved is not None and fallback_codes[resolved] == 0):
+                        continue
+                    failures.append(
+                        {
+                            "request": request.req_id,
+                            "instance": request.request_instance,
+                            "generation": request.snapshot_generation,
+                            "target_tokens": request.target_token_len,
+                            "block_id": block_id,
+                            "block_index": index,
+                            "key": key,
+                            "code": codes[key],
+                            "fallback_key": resolved,
+                            "fallback_code": fallback_codes.get(resolved),
+                        }
+                    )
+                    if len(failures) == MAIN_REUSE_FAILURE_SAMPLE_LIMIT:
+                        break
+                logger.error(
+                    "Main reuse Store prefix open failed: invalid_blocks=%d samples=%s", len(invalid), failures
+                )
                 self._record_layerwise_invalid_blocks(invalid)
                 raise RuntimeError("Main reuse could not open the complete committed Store prefix")
         except Exception:

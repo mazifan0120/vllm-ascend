@@ -480,9 +480,7 @@ class LayerBatchBuilder:
             layer_object_offset = int(self._block_len_np[:base_offset].sum())
             offsets = (layer_object_offset + layer_inner_offsets).tolist()
             sizes = layer_block_len.tolist()
-            all_buffers = [
-                (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
-            ]
+            all_buffers = (shared.block_ids_arr[:, None] * layer_block_stride + layer_base_addrs).tolist()
             return LayerRangeReqMeta(
                 req_ids=shared.req_ids,
                 layer_id=layer_id,
@@ -751,21 +749,35 @@ class KVTransferThread(threading.Thread):
         if not (len(all_buffers) == len(all_sizes) == len(all_offsets) == row_count):
             raise ValueError("Layerwise range metadata must contain one buffer/size/offset row per key")
 
-        # Default configuration (both limits unset) means one batch holding every
-        # key and no per-segment splitting, so every row passes through as-is
-        # unless it carries an empty or negative segment. Detect that case and
-        # hand back the caller's own lists: this runs once per key, per layer,
-        # per group, and rebuilding them element-wise was the receive thread's
-        # largest single block of exposed time.
-        if max_transfer_blocks <= 0 and max_transfer_bytes <= 0:
-            for buffers, sizes, offsets in zip(all_buffers, all_sizes, all_offsets, strict=True):
-                if not (len(buffers) == len(sizes) == len(offsets)):
-                    raise ValueError("Layerwise range rows must align buffers, sizes, and offsets")
-                if sizes and min(sizes) >= 0 and 0 not in sizes:
-                    continue
+        # Native range calls consume rows without modifying them. A key-count
+        # limit only slices the outer lists; it does not require rebuilding
+        # every descriptor. Reuse the rows when no byte splitting or removal
+        # of empty segments is needed, including with bounded transfers.
+        for buffers, sizes, offsets in zip(all_buffers, all_sizes, all_offsets, strict=True):
+            if not (len(buffers) == len(sizes) == len(offsets)):
+                raise ValueError("Layerwise range rows must align buffers, sizes, and offsets")
+            if sizes and max_transfer_blocks <= 0 and max_transfer_bytes <= 0 and min(sizes) > 0:
+                continue
+            if not sizes or any(
+                type(size) is not int or size <= 0 or (max_transfer_bytes > 0 and size > max_transfer_bytes)
+                for size in sizes
+            ):
                 break
-            else:
+        else:
+            if max_transfer_blocks <= 0:
+                if not row_count and max_transfer_bytes > 0:
+                    return []
                 return [(keys, all_buffers, all_sizes, all_offsets)]
+            return [
+                (
+                    keys[start:end],
+                    all_buffers[start:end],
+                    all_sizes[start:end],
+                    all_offsets[start:end],
+                )
+                for start in range(0, row_count, max_transfer_blocks)
+                for end in [min(start + max_transfer_blocks, row_count)]
+            ]
 
         normalized_buffers: list[list[int]] = []
         normalized_sizes: list[list[int]] = []

@@ -109,6 +109,27 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
         self.assertEqual(batches[0], (["k0"], [[100, 110, 120]], [[10, 10, 5]], [[1000, 1010, 1020]]))
         self.assertEqual(batches[1], (["k1"], [[200]], [[5]], [[2000]]))
 
+    def test_bounded_ranges_preserve_rows_offsets_and_key_order(self):
+        keys = ["k2", "k0", "k2"]
+        buffers = [[300, 400], [100, 200], [300, 400]]
+        sizes = [[128, 64], [128, 64], [128, 64]]
+        offsets = [[1024, 4096], [1024, 4096], [1024, 4096]]
+
+        batches = KVTransferThread._range_transfer_batches(keys, buffers, sizes, offsets, 2, 256)
+
+        self.assertEqual(batches[0], (keys[:2], buffers[:2], sizes[:2], offsets[:2]))
+        self.assertEqual(batches[1], (keys[2:], buffers[2:], sizes[2:], offsets[2:]))
+
+    def test_bounded_ranges_still_remove_empty_segments(self):
+        batches = KVTransferThread._range_transfer_batches(
+            ["key"], [[100, 200, 300]], [[0, 5, 0]], [[10, 20, 30]], 64, 16
+        )
+        self.assertEqual(batches, [(["key"], [[200]], [[5]], [[20]])])
+
+    def test_bounded_ranges_reject_later_misaligned_rows(self):
+        with self.assertRaisesRegex(ValueError, "align"):
+            KVTransferThread._range_transfer_batches(["k0", "k1"], [[100], [200]], [[5], [5, 6]], [[0], [0]], 64, 16)
+
 
 class TestMooncakeLayerSaveSession(unittest.TestCase):
     def test_range_put_and_commit_failures_honor_strict_policy(self):
