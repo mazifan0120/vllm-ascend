@@ -231,7 +231,11 @@ class TestSourceReadyPreparation(unittest.TestCase):
 
     def worker(self):
         worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
-        worker.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_producer=True))
+        worker.vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(is_kv_producer=True),
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")),
+        )
+        worker.use_mla = True
         worker.total_layers = 1
         worker.pcp_size = worker.dcp_size = worker.pd_head_ratio = 1
         worker.tp_size = 2
@@ -240,7 +244,9 @@ class TestSourceReadyPreparation(unittest.TestCase):
         worker._manifest_source_writer = SimpleNamespace(register_request=Mock(), prepare_job=Mock(return_value="job"))
         worker.attn_resharding_group_idx = set()
         worker._align_remote_block_ids = Mock(side_effect=AssertionError("manifest must retain manager block IDs"))
-        target = SimpleNamespace(lease=SimpleNamespace(allocation=SimpleNamespace(prompt_tokens=23)))
+        target = SimpleNamespace(
+            targets=(object(), object()), lease=SimpleNamespace(allocation=SimpleNamespace(prompt_tokens=23))
+        )
         meta = SimpleNamespace(
             remote_target_manifest=target,
             remote_pcp_size=1,
@@ -267,6 +273,42 @@ class TestSourceReadyPreparation(unittest.TestCase):
         worker.prepare_layerwise_step(metadata)
         self.assertEqual(worker._compute_done_events, [None] * 79)
         self.assertFalse(worker._no_compute_layers)
+
+    def test_real_prepare_accepts_replicated_glm_p8_d4(self):
+        worker, metadata = self.worker()
+        worker.tp_size = 8
+        meta = metadata.requests["internal-source"]
+        meta.remote_tp_size = 4
+        meta.remote_target_manifest.targets = tuple(range(4))
+        worker.prepare_layerwise_step(metadata)
+        worker._manifest_source_writer.register_request.assert_called_once_with("internal-source", meta)
+
+    def test_real_prepare_rejects_unsupported_unequal_tp_before_registering_sources(self):
+        for change in ("reverse", "nondivisible", "model", "mla", "pcp", "dcp", "quant", "manifest"):
+            worker, metadata = self.worker()
+            worker.tp_size = 8
+            meta = metadata.requests["internal-source"]
+            meta.remote_tp_size = 4
+            meta.remote_target_manifest.targets = tuple(range(4))
+            if change == "reverse":
+                worker.tp_size = 2
+            elif change == "nondivisible":
+                worker.tp_size = 6
+            elif change == "model":
+                worker.vllm_config.model_config.hf_text_config.model_type = "deepseek_v3"
+            elif change == "mla":
+                worker.use_mla = False
+            elif change == "pcp":
+                worker.pcp_size = 2
+            elif change == "dcp":
+                meta.remote_dcp_size = 2
+            elif change == "quant":
+                worker.enable_c8_quant = True
+            else:
+                meta.remote_tp_size = 2
+            with self.subTest(change=change), self.assertRaises(lc.ContractError):
+                worker.prepare_layerwise_step(metadata)
+            worker._manifest_source_writer.register_request.assert_not_called()
 
     def test_real_prepare_rejects_unwired_source_contract_before_any_transfer_job(self):
         worker, metadata = self.worker()

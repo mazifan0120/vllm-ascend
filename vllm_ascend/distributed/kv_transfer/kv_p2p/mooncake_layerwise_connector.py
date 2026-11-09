@@ -2523,6 +2523,7 @@ class MooncakeLayerwiseConnectorWorker:
                 self.kv_send_layer_thread.send_queue,
                 resolve_manifest_addresses,
                 ManifestPeerProofs(self.tp_rank),
+                producer_tp_size=self.tp_size,
             )
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
@@ -2791,7 +2792,8 @@ class MooncakeLayerwiseConnectorWorker:
 
     def _map_received_requests(self, request_ids):
         return {
-            mapped for req_id in request_ids
+            mapped
+            for req_id in request_ids
             if (mapped := req_id if self._has_admitted_target(req_id) else self.request_map.get(req_id)) is not None
         }
 
@@ -2903,12 +2905,27 @@ class MooncakeLayerwiseConnectorWorker:
                         or self.dcp_size != 1
                         or req_meta.remote_pcp_size != 1
                         or req_meta.remote_dcp_size != 1
-                        or req_meta.remote_tp_size != self.tp_size
                         or self.pd_head_ratio != 1
                         or self.enable_c8_quant
                         or self.enable_kv_quant
                     ):
-                        raise ContractError("Manifest SourceReady writes require equal TP, CP1 and BF16 Main")
+                        raise ContractError("Manifest SourceReady writes require CP1 and BF16 Main")
+                    if req_meta.remote_tp_size != len(req_meta.remote_target_manifest.targets):
+                        raise ContractError("Receiver TP does not match the admitted manifest")
+                    if req_meta.remote_tp_size != self.tp_size:
+                        # GLM DSA Main and Indexer K/scale are complete replicas,
+                        # including after P's DSA-CP cache-write all-gather. Use
+                        # only P ranks [0, D TP); the existing wire writer ranks
+                        # and D receipt expectations remain unchanged.
+                        if not (
+                            self.use_mla
+                            and self.vllm_config.model_config.hf_text_config.model_type == "glm_moe_dsa"
+                            and self.tp_size > req_meta.remote_tp_size
+                            and self.tp_size % req_meta.remote_tp_size == 0
+                        ):
+                            raise ContractError(
+                                "Unequal manifest TP requires replicated GLM DSA KV and P TP divisible by D TP"
+                            )
                     self._manifest_source_writer.register_request(req_id, req_meta)
                     update_metadata[req_id] = req_meta
                     continue

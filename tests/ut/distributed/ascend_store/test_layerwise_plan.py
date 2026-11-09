@@ -25,8 +25,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner_codec im
 
 
 class MemoryFixture:
-    def __init__(self, *, layers=2):
-        self.provider, _, request, allocation = coordinated(layers=layers)
+    def __init__(self, *, layers=2, tp=2):
+        self.provider, _, request, allocation = coordinated(tp=tp, layers=layers)
         self.manifest = self.provider.manifest(self.provider.acquire_target(request, allocation))
         self.destinations = {}
         self.handles = []

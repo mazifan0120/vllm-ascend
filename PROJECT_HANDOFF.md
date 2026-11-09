@@ -1,3 +1,27 @@
+> 2026-11-09 unequal TP performance: P8/DP4 → D2/DP16 or D4/DP8,
+> same Python/native snapshot as prior acceptance. Compared to stock DCP4
+> at128K/2K,C30/C40,0/90%,12cells/960 requests passed. TP2 output throughput
+> +21.7–33.2% and TPOT −33.1–38.6% over DCP; both feature variants also win
+> TTFT at0%, but DCP TTFT remains lower at90%. TP2 C40/90 D running39,
+> KV33.18%, no sampled capacity wait; remaining mean TTFT gap is in P prefill.
+> Original service restored, test containers stopped. No runtime code changed
+> in this benchmark. Evidence ../../docs/layerwise-tp-performance-20261109.md.
+
+> 2026-11-09 unequal-TP implementation: GLM DSA replicated KV only,
+> P TP an integer multiple of D TP, CP1/BF16 Main. P ranks [0,D TP) retain
+> the existing Main-P0 / per-rank Indexer writer and receipt identities; higher
+> P ranks have no remote jobs or terminals and retire their empty read plans.
+> 234 SDK CPU tests pass. Native P8 DP4 → D4 DP8,1M max length,MTP3/main decode
+> graph passed25/25 requests (short,33K chunks,Store prefix reuse,128K), every
+> request has4 exact-rank receipts and target release.8D instances covered;
+> actual MTP draft/acceptance and Store hits verified, all queues/KV drained.
+> Original services restored with unchanged IDs/images/source and control PIDs;
+> original request/8-rank receipt/release/idle checks passed. Candidate stopped.
+> Native functional evidence: ../../artifacts/tp-mismatch-20261109 and
+> ../../docs/layerwise-unequal-tp-20261109.md. The checked-in TP2 deployment
+> profile is ../../ansible/inventories/a3-layerwise-guide/decode-tp2.yml.
+
+
 > 2026-11-08 refactor phase2: receipt parsing/visibility/watchdog now belongs
 > to ReceiptReceiver, using a ReceiveRequestIndex record shared by receive
 > messages and worker admission/retirement. Parallel ledger/request/deadline

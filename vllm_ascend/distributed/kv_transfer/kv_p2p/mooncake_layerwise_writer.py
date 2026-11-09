@@ -76,14 +76,17 @@ class SourceWriteJob:
 
 
 class ManifestSourceWriter:
-    def __init__(self, producer_rank, send_queue, resolve_addresses, send_proofs) -> None:
+    def __init__(self, producer_rank, send_queue, resolve_addresses, send_proofs, *, producer_tp_size=None) -> None:
         if (
             type(producer_rank) is not int
             or producer_rank < 0
             or not all(map(callable, (resolve_addresses, send_proofs)))
         ):
             raise ContractError("Manifest writer requires an explicit producer and peer transports")
+        if producer_tp_size is not None and (type(producer_tp_size) is not int or producer_tp_size <= producer_rank):
+            raise ContractError("Manifest writer rank must belong to its producer TP group")
         self.rank = producer_rank
+        self._producer_tp_size = producer_tp_size
         self.send_queue = send_queue
         self._resolve = resolve_addresses
         self._send_proofs = send_proofs
@@ -107,7 +110,14 @@ class ManifestSourceWriter:
         manifest = metadata.remote_target_manifest
         if manifest is None or metadata.remote_host is None or metadata.remote_port is None:
             raise ContractError("Direct writes require an admitted manifest and receiver side channel")
-        if manifest.lease.request.request_instance != metadata.request_instance or self.rank >= len(manifest.targets):
+        receiver_count = len(manifest.targets)
+        producer_count = self._producer_tp_size if self._producer_tp_size is not None else receiver_count
+        if (
+            manifest.lease.request.request_instance != metadata.request_instance
+            or self.rank >= producer_count
+            or producer_count < receiver_count
+            or producer_count % receiver_count
+        ):
             raise ContractError("Producer request/rank does not match the admitted manifest")
         with self._lock:
             if self._closing:
@@ -126,9 +136,15 @@ class ManifestSourceWriter:
                 return
             plan = ManifestWritePlan(manifest)
             required = {r.key.operation_id: r.key for r in plan.requirements if r.key.rank == self.rank}
-            if not required:
+            if not required and self.rank < receiver_count:
                 raise ContractError("Producer has no admitted component entries")
-            self._requests[request_id] = _RequestWrites(request_id, metadata, plan, required)
+            # The connector admits unequal TP only for replicated GLM DSA KV.
+            # P ranks [0, D TP) own the existing Indexer writes; higher P ranks
+            # have no remote reader or terminal. Store still registers and
+            # drains its local PUT readers independently.
+            self._requests[request_id] = _RequestWrites(
+                request_id, metadata, plan, required, closed=not required, terminal_sent=not required
+            )
             self._target_owners[target] = request_id
 
     def prepare_job(self, source, request, ready_event) -> SourceWriteJob | None:

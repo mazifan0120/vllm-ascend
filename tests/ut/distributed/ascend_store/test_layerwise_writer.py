@@ -16,6 +16,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     Status,
     TargetClosedError,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_exact_receipt import ExactReceiptLedger
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_plan import ManifestWritePlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_source_consumer import LayerwiseSourceConsumer
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_writer import ManifestSourceWriter
 
@@ -45,6 +47,101 @@ def metadata(fixture):
 
 
 class TestSourceWriter(unittest.TestCase):
+    def test_p8_d4_copies_chunks_with_exact_receipts_and_retires_unused_source_epochs(self):
+        fixture = MemoryFixture(layers=1, tp=4)
+        plan = ManifestWritePlan(fixture.manifest)
+        ledgers = tuple(
+            ExactReceiptLedger(
+                fixture.manifest.lease.request,
+                plan.receive_keys(rank),
+                expected_ranks=tuple(range(4)),
+                target_generation=fixture.manifest.lease.allocation.allocation_generation,
+                visibility_rank=rank,
+            )
+            for rank in range(4)
+        )
+        terminals = []
+        lookups = []
+        work = queue.Queue()
+
+        def resolve(meta, plan, rank):
+            lookups.append(rank)
+            return tuple(fixture.handles)
+
+        def proof_sender(rank):
+            def send(meta, results, terminal):
+                for result, receivers in results:
+                    for receiver in receivers:
+                        ledgers[receiver].record(result)
+                if terminal is not None:
+                    terminals.append(rank)
+                    for ledger in ledgers:
+                        ledger.finish_rank(ledger.request, rank, *terminal)
+
+            return send
+
+        writers = tuple(
+            ManifestSourceWriter(rank, work, resolve, proof_sender(rank), producer_tp_size=8) for rank in range(8)
+        )
+        engine = CpuEngine()
+        fence = SimpleNamespace(synchronize=lambda: None)
+        try:
+            for rank, writer in enumerate(writers):
+                writer.register_request("internal-source", metadata(fixture))
+                source, request = fixture.source(rank if rank < 4 else 0, padding=16)
+                if rank >= 4:
+                    worker = SimpleNamespace(prepare_source_batch=lambda *args: ((), False))
+                    consumer = LayerwiseSourceConsumer(worker, timeout=0.1)
+
+                    def prepare(source, requests, ready, producer=writer):
+                        self.assertIsNone(producer.prepare_job(source, requests[0], ready))
+                        return (), False
+
+                    worker.prepare_source_batch = prepare
+                    consumer.open_source(source)
+                    consumer.source_ready(source, (request,), fence)
+                    consumer.seal_source(source)
+                    consumer.wait_source(source)
+                    self.assertFalse(consumer._generations)
+                else:
+                    for start, end in ((0, 11), (11, 23)):
+                        job = writer.prepare_job(source, replace(request, start_token=start, end_token=end), fence)
+                        job.publish(lambda error, quiesced: self.assertEqual((error, quiesced), (None, True)))
+                        work.get_nowait().execute(engine)
+                    writer._proof_queue.join()
+                    if rank < 3:
+                        self.assertTrue(all(ledger.build_receipt() is None for ledger in ledgers))
+                writer.finish_requests(("internal-source",))
+                self.assertFalse(writer._requests)
+                with self.assertRaisesRegex(ContractError, "already assigned or closed"):
+                    writer.register_request("replayed-source", metadata(fixture))
+            self.assertEqual(terminals, list(range(4)))
+            self.assertEqual(lookups, list(range(4)))
+            self.assertEqual(len(engine.calls), 10)
+            self.assertTrue(work.empty())
+            for rank, ledger in enumerate(ledgers):
+                self.assertIsNotNone(ledger.build_receipt())
+                self.assertTrue(ledger.remote_quiesced())
+                ledger.mark_visible(rank)
+                self.assertTrue(ledger.should_publish())
+            fixture.verify(0, 23)
+        finally:
+            for writer in writers:
+                self.stop(writer)
+
+    def test_writer_rejects_reverse_tp_and_out_of_group_rank(self):
+        fixture = MemoryFixture(layers=1, tp=4)
+        for rank, tp in ((0, 2), (0, 6), (4, None)):
+            writer = ManifestSourceWriter(rank, queue.Queue(), lambda *_: (), lambda *_: None, producer_tp_size=tp)
+            try:
+                with self.subTest(rank=rank, tp=tp), self.assertRaises(ContractError):
+                    writer.register_request("internal-source", metadata(fixture))
+            finally:
+                self.stop(writer)
+        for tp in (0, -1, True, 4):
+            with self.subTest(tp=tp), self.assertRaises(ContractError):
+                ManifestSourceWriter(4, queue.Queue(), lambda *_: (), lambda *_: None, producer_tp_size=tp)
+
     def test_close_drains_the_final_callback_before_stopping_proof_delivery(self):
         fixture, writer, work, proofs = self.make()
         source, request = fixture.source(0)
