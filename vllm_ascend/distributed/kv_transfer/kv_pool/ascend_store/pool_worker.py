@@ -921,6 +921,16 @@ class KVPoolWorker:
             return
 
         if self.use_layerwise:
+            max_get_blocks = self.layerwise_max_transfer_blocks
+            if (
+                self.use_block_key_layerwise
+                and self.kv_role == "kv_producer"
+                and self._main_buffer_layer_slots
+                and "layerwise_get_max_transfer_blocks" in self._extra_config
+            ):
+                max_get_blocks = self._extra_config["layerwise_get_max_transfer_blocks"]
+                if type(max_get_blocks) is not int or max_get_blocks < 0:
+                    raise ValueError("layerwise_get_max_transfer_blocks must be a non-negative integer")
             self.get_event = threading.Event()
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
@@ -987,7 +997,7 @@ class KVPoolWorker:
                     self.sync_save_events,
                     self.num_layers,
                     self.h2d_stagger_us,
-                    self.layerwise_max_transfer_blocks,
+                    max_get_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
                     external_slot_release_waiter=self.external_slot_release_waiter,
