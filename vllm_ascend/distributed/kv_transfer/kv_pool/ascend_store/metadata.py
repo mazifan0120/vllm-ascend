@@ -1396,6 +1396,19 @@ class LayerTransferTask:
     use_key_major_ranges: bool = False
     # Group-local completion differs from the physical model layer boundary.
     final_group_layer: bool = False
+    range_load_plan: LayerRangeLoadPlan | None = None
+
+
+@dataclass(frozen=True)
+class LayerRangeLoadPlan:
+    """Read-only GET metadata owned by one prefill step."""
+
+    block_ids: list[int]
+    relative_buffers: np.ndarray
+    base_addresses: np.ndarray
+    sizes: list[int]
+    offsets: list[int]
+    batches: tuple[slice, ...]
 
 
 @dataclass

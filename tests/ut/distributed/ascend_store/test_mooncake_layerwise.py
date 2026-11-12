@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tr
     LayerwiseSessionTracker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVTransferThread,
     LayerBatchBuilder,
@@ -36,6 +37,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
     KeyMetadata,
     LayerBlockRange,
+    LayerLoadTask,
     LayerRangeReqMeta,
     LayerTransferTask,
     LoadSpec,
@@ -94,6 +96,99 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
         self.assertEqual(result.all_buffers, [[3600]])
         self.assertEqual(result.all_sizes, [[30]])
         self.assertEqual(result.all_offsets, [[30]])
+
+    def test_prefill_reuse_prepares_only_eligible_gets_and_preserves_range_calls(self):
+        for reuse, max_bytes, prepared in ((True, 0, True), (True, 15, False), (False, 0, False)):
+            with self.subTest(reuse=reuse, max_bytes=max_bytes):
+                database = make_token_database()
+                database.set_group_buffers(
+                    {0: [1000, 2000, 1000, 4000]},
+                    {0: [10, 20, 10, 20]},
+                    {0: [100, 200, 100, 200]},
+                    group_num_layers={0: 2},
+                    group_layer_cache_entry_offsets={0: [0, 2, 4]},
+                )
+                builder = LayerBatchBuilder(database, page_size_bytes=60, num_layers=2)
+                load_events = [threading.Event(), threading.Event()]
+                store = MagicMock()
+                slot_released = [False, False]
+
+                def copy_get(keys, *_, events=load_events, released=slot_released):
+                    layer = 1 if events[0].is_set() else 0
+                    self.assertTrue(released[layer])
+                    self.assertFalse(events[layer].is_set())
+                    return [30] * len(keys)
+
+                def release_slot(layer, released=slot_released):
+                    released[layer] = True
+
+                store.batch_copy_get.side_effect = copy_get
+                receiver = KVCacheStoreLayerRecvingThread(
+                    m_store=store,
+                    token_database=database,
+                    block_size=16,
+                    tp_rank=0,
+                    tp_size=1,
+                    dcp_size=1,
+                    page_size_bytes=60,
+                    ready_event=threading.Event(),
+                    get_event=threading.Event(),
+                    layer_load_finished_events=load_events,
+                    layer_save_finished_events=[],
+                    sync_save_events=[],
+                    num_layers=2,
+                    max_transfer_blocks=2,
+                    max_transfer_bytes=max_bytes,
+                    group_builders=[builder],
+                    external_slot_release_waiter=release_slot,
+                )
+                request = ReqMeta("r1", block_ids=[2, 5, 3], block_hashes=[])
+                request.load_block_keys = ["shared", None]
+                request.load_last_block_key = "private-tail"
+                other = ReqMeta("r2", block_ids=[7], block_hashes=[])
+                other.load_block_keys = ["shared"]
+                tasks = [
+                    LayerTransferTask(
+                        layer_id=layer,
+                        layer_idx_in_group=layer,
+                        block_ranges=[LayerBlockRange(request, 0, 2, 2), LayerBlockRange(other, 0, 1)],
+                        use_key_major_ranges=True,
+                    )
+                    for layer in range(2)
+                ]
+                worker = object.__new__(KVPoolWorker)
+                worker.kv_recv_thread = receiver
+                worker.layerwise_offload = reuse
+                worker.use_block_key_layerwise = True
+                worker.kv_role = "kv_producer"
+                worker._main_buffer_layer_slots = {0: 0, 1: 0} if reuse else {}
+                worker.num_layers = 2
+                worker.num_kv_cache_groups = 1
+                worker.layer_load_tasks = [[task] for task in tasks]
+                worker._build_shared_load_data()
+
+                self.assertTrue(all((task.range_load_plan is not None) == prepared for task in tasks))
+                if prepared:
+                    self.assertIs(tasks[0].range_load_plan.relative_buffers, tasks[1].range_load_plan.relative_buffers)
+                expected = []
+                for task in tasks:
+                    metadata = builder.build_addrs(task.shared_block_data, task.layer_idx_in_group)
+                    self.assertEqual(metadata.keys, ["shared", "private-tail", "shared"])
+                    expected.extend(
+                        KVTransferThread._range_transfer_batches(
+                            metadata.keys, metadata.all_buffers, metadata.all_sizes, metadata.all_offsets, 2, max_bytes
+                        )
+                    )
+                builder.build_addrs = MagicMock(wraps=builder.build_addrs)
+                receiver._range_transfer_batches = MagicMock(wraps=receiver._range_transfer_batches)
+                store.batch_copy_get.assert_not_called()
+                for task in tasks:
+                    load = LayerLoadTask(wait_for_save_layer=None, transfer_tasks=[task], layer_id=task.layer_id)
+                    receiver.request_queue.put(load)
+                    receiver._handle_request(load)
+                self.assertEqual([call.args for call in store.batch_copy_get.call_args_list], expected)
+                self.assertEqual(builder.build_addrs.call_count, 0 if prepared else 2)
+                self.assertEqual(receiver._range_transfer_batches.call_count, 0 if prepared else 2)
 
     def test_range_limits_split_rows_and_large_segments(self):
         batches = KVTransferThread._range_transfer_batches(

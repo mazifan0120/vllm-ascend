@@ -3383,10 +3383,14 @@ class KVPoolWorker:
                             if task.group_id == group_id:
                                 task.shared_block_data = shared
             return
+        prepare_range_loads = (
+            self.use_block_key_layerwise and self.kv_role == "kv_producer" and bool(self._main_buffer_layer_slots)
+        )
         for group_id in range(self.num_kv_cache_groups):
             shared_by_ranges: dict[
                 tuple[bool, tuple[tuple[int, int, int, int | None], ...]], SharedBlockData | None
             ] = {}
+            range_tasks: list[LayerTransferTask] = []
             for layer_id in range(self.num_layers):
                 for task in self.layer_load_tasks[layer_id]:
                     if task.group_id != group_id:
@@ -3409,6 +3413,10 @@ class KVPoolWorker:
                                 shared.block_gvas_arr = shared.block_gvas_arr.copy()
                         shared_by_ranges[key] = shared
                     task.shared_block_data = shared_by_ranges[key]
+                    if prepare_range_loads and task.use_key_major_ranges:
+                        range_tasks.append(task)
+            if range_tasks:
+                self.kv_recv_thread.prepare_range_loads(group_id, range_tasks)
 
     def _compute_reachable_store_masks(
         self,
