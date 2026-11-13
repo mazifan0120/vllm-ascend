@@ -17,7 +17,10 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 from vllm_ascend import envs
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
+    AttentionComputeCompletion,
+    AttentionComputeStartGate,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
     Backend,
     require_aligned_batch_results,
@@ -35,6 +38,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerBatchReqMeta,
     LayerBlockRange,
     LayerLoadTask,
+    LayerRangeLoadPlan,
     LayerRangeReqMeta,
     LayerTransferTask,
     ReqMeta,
@@ -140,6 +144,7 @@ class LayerBatchBuilder:
         self._layer_cache_entry_offsets_np = np.asarray(layer_cache_entry_offsets, dtype=np.int64)
         self._block_ids_buf: np.ndarray | None = None
         self._block_gvas_buf: np.ndarray | None = None
+        self._range_load_layouts: dict[int, tuple[np.ndarray, np.ndarray, list[int], list[int]]] = {}
 
     def _ensure_buf(self, capacity: int) -> tuple[np.ndarray, np.ndarray]:
         if self._block_ids_buf is None or len(self._block_ids_buf) < capacity:
@@ -459,6 +464,53 @@ class LayerBatchBuilder:
             load_keys=all_load_keys,
         )
 
+    def _key_major_layout(self, layer_id: int) -> tuple[np.ndarray, np.ndarray, list[int], list[int]]:
+        start = int(self._layer_cache_entry_offsets_np[layer_id])
+        stop = int(self._layer_cache_entry_offsets_np[layer_id + 1])
+        lengths = self._block_len_np[start:stop]
+        inner_offsets = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(lengths[:-1], dtype=np.int64)))
+        object_offset = int(self._block_len_np[:start].sum())
+        return (
+            self._kv_caches_base_addr_np[start:stop],
+            self._block_stride_np[start:stop],
+            lengths.tolist(),
+            (object_offset + inner_offsets).tolist(),
+        )
+
+    def prepare_range_loads(
+        self,
+        tasks: list[LayerTransferTask],
+        max_transfer_blocks: int,
+        max_transfer_bytes: int,
+    ) -> None:
+        """Prepare the full-row GET path for one step in a registered KV group."""
+        rows: dict[int, tuple[list[int], tuple[slice, ...]]] = {}
+        displacements: dict[tuple[int, tuple[int, ...]], np.ndarray] = {}
+        for task in tasks:
+            shared = task.shared_block_data
+            if shared is None or not shared.block_keys:
+                continue
+
+            layer = task.layer_idx_in_group
+            if layer not in self._range_load_layouts:
+                self._range_load_layouts[layer] = self._key_major_layout(layer)
+            bases, strides, sizes, offsets = self._range_load_layouts[layer]
+            if not sizes or any(size <= 0 or 0 < max_transfer_bytes < size for size in sizes):
+                # Segment splitting and empty segments retain the existing path.
+                continue
+
+            selection = id(shared)
+            if selection not in rows:
+                row_count = len(shared.block_keys)
+                rows_per_batch = max_transfer_blocks if max_transfer_blocks > 0 else row_count
+                batches = tuple(slice(start, start + rows_per_batch) for start in range(0, row_count, rows_per_batch))
+                rows[selection] = shared.block_ids_arr.tolist(), batches
+            block_ids, batches = rows[selection]
+            key = (selection, tuple(strides))
+            if key not in displacements:
+                displacements[key] = shared.block_ids_arr[:, None] * strides
+            task.range_load_plan = LayerRangeLoadPlan(block_ids, displacements[key], bases, sizes, offsets, batches)
+
     def build_addrs(
         self,
         shared: SharedBlockData,
@@ -466,20 +518,8 @@ class LayerBatchBuilder:
     ) -> LayerBatchReqMeta | LayerRangeReqMeta:
         """Compute per-layer addresses from pre-computed shared block data."""
         if shared.block_keys is not None:
-            base_offset = int(self._layer_cache_entry_offsets_np[layer_id])
-            end_offset = int(self._layer_cache_entry_offsets_np[layer_id + 1])
-            layer_base_addrs = self._kv_caches_base_addr_np[base_offset:end_offset]
-            layer_block_len = self._block_len_np[base_offset:end_offset]
-            layer_block_stride = self._block_stride_np[base_offset:end_offset]
-            layer_inner_offsets = np.concatenate(
-                (np.zeros(1, dtype=np.int64), np.cumsum(layer_block_len[:-1], dtype=np.int64))
-            )
-            layer_object_offset = int(self._block_len_np[:base_offset].sum())
-            offsets = (layer_object_offset + layer_inner_offsets).tolist()
-            sizes = layer_block_len.tolist()
-            all_buffers = [
-                (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
-            ]
+            layer_base_addrs, layer_block_stride, sizes, offsets = self._key_major_layout(layer_id)
+            all_buffers = (shared.block_ids_arr[:, None] * layer_block_stride + layer_base_addrs).tolist()
             return LayerRangeReqMeta(
                 req_ids=shared.req_ids,
                 layer_id=layer_id,
@@ -589,7 +629,7 @@ class KVTransferThread(threading.Thread):
 
     def _wait_for_event(
         self,
-        event: threading.Event | AttentionComputeStartGate,
+        event: threading.Event | AttentionComputeStartGate | AttentionComputeCompletion,
         failure_checker: Callable[[], None] | None = None,
     ) -> bool:
         while not self._stopping.is_set():
@@ -748,21 +788,35 @@ class KVTransferThread(threading.Thread):
         if not (len(all_buffers) == len(all_sizes) == len(all_offsets) == row_count):
             raise ValueError("Layerwise range metadata must contain one buffer/size/offset row per key")
 
-        # Default configuration (both limits unset) means one batch holding every
-        # key and no per-segment splitting, so every row passes through as-is
-        # unless it carries an empty or negative segment. Detect that case and
-        # hand back the caller's own lists: this runs once per key, per layer,
-        # per group, and rebuilding them element-wise was the receive thread's
-        # largest single block of exposed time.
-        if max_transfer_blocks <= 0 and max_transfer_bytes <= 0:
-            for buffers, sizes, offsets in zip(all_buffers, all_sizes, all_offsets, strict=True):
-                if not (len(buffers) == len(sizes) == len(offsets)):
-                    raise ValueError("Layerwise range rows must align buffers, sizes, and offsets")
-                if sizes and min(sizes) >= 0 and 0 not in sizes:
-                    continue
+        # Native range calls consume rows without modifying them. A key-count
+        # limit only slices the outer lists; it does not require rebuilding
+        # every descriptor. Reuse the rows when no byte splitting or removal
+        # of empty segments is needed, including with bounded transfers.
+        for buffers, sizes, offsets in zip(all_buffers, all_sizes, all_offsets, strict=True):
+            if not (len(buffers) == len(sizes) == len(offsets)):
+                raise ValueError("Layerwise range rows must align buffers, sizes, and offsets")
+            if sizes and max_transfer_blocks <= 0 and max_transfer_bytes <= 0 and min(sizes) > 0:
+                continue
+            if not sizes or any(
+                type(size) is not int or size <= 0 or (max_transfer_bytes > 0 and size > max_transfer_bytes)
+                for size in sizes
+            ):
                 break
-            else:
+        else:
+            if max_transfer_blocks <= 0:
+                if not row_count and max_transfer_bytes > 0:
+                    return []
                 return [(keys, all_buffers, all_sizes, all_offsets)]
+            return [
+                (
+                    keys[start:end],
+                    all_buffers[start:end],
+                    all_sizes[start:end],
+                    all_offsets[start:end],
+                )
+                for start in range(0, row_count, max_transfer_blocks)
+                for end in [min(start + max_transfer_blocks, row_count)]
+            ]
 
         normalized_buffers: list[list[int]] = []
         normalized_sizes: list[list[int]] = []
@@ -1816,6 +1870,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
                 self._active_put_keys.difference_update(failed_keys)
+                if self.raise_on_transfer_failure:
+                    raise RuntimeError("Mooncake range PUT failed; refusing unsafe KV buffer reuse")
 
         if not (layer_id == self.final_layer_id if final_group_layer is None else final_group_layer):
             return
@@ -1836,6 +1892,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if self._session_tracker is not None:
                 self._session_tracker.commit_put_keys(committed_keys)
             self._remove_started_keys(active_keys)
+            if failed_keys and self.raise_on_transfer_failure:
+                raise RuntimeError("Mooncake range commit failed; refusing an uncommitted KV snapshot")
         self._active_put_keys = None
 
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
@@ -2053,6 +2111,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             builder = self.layer_batch_builder
         return builder.build_shared(task, is_save=False)
 
+    def prepare_range_loads(self, group_id: int, tasks: list[LayerTransferTask]) -> None:
+        builder = self.group_builders[group_id] if self.group_builders is not None else self.layer_batch_builder
+        builder.prepare_range_loads(tasks, self.max_transfer_blocks, self.max_transfer_bytes)
+
     def _mark_invalid_transfer_task_blocks(self, transfer_tasks: list[LayerTransferTask]) -> None:
         block_ids: set[int] = set()
         for task in transfer_tasks:
@@ -2075,7 +2137,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(req_meta.block_ids[index] for index in indices)
 
-    def _handle_range_request(self, req_meta: LayerRangeReqMeta, shared: SharedBlockData) -> None:
+    def _handle_range_request(
+        self, req_meta: LayerRangeReqMeta, shared: SharedBlockData, planned_batches: tuple[slice, ...] = ()
+    ) -> None:
         layer_id = req_meta.layer_id
         if self._active_load_indices is None or layer_id == 0:
             self._active_load_indices = set(range(len(req_meta.keys)))
@@ -2083,24 +2147,52 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         # Read the abort flag once: this comprehension covers every key of the
         # layer, so an is_set() per key is pure overhead in the receive thread.
         aborted = self._load_abort_event.is_set()
-        active_indices = [
-            index for index in range(len(req_meta.keys)) if not aborted and index in self._active_load_indices
-        ]
-        active_keys = [req_meta.keys[index] for index in active_indices]
+        row_count = len(req_meta.keys)
+        # Layers can select different row counts. A filtered set from a
+        # larger selection can have the same length as the current selection.
+        full_plan = (
+            planned_batches
+            and not aborted
+            and len(self._active_load_indices) == row_count
+            and max(self._active_load_indices, default=-1) == row_count - 1
+        )
+        active_indices: range | list[int]
+        if full_plan:
+            active_indices = range(row_count)
+            active_keys = req_meta.keys
+        else:
+            active_indices = [index for index in range(row_count) if not aborted and index in self._active_load_indices]
+            active_keys = [req_meta.keys[index] for index in active_indices]
         if active_keys:
             self._stagger_h2d_submit(layer_id)
-            active_buffers = [req_meta.all_buffers[index] for index in active_indices]
-            active_sizes = [req_meta.all_sizes[index] for index in active_indices]
-            active_offsets = [req_meta.all_offsets[index] for index in active_indices]
+            if full_plan:
+                active_buffers, active_sizes, active_offsets = (
+                    req_meta.all_buffers,
+                    req_meta.all_sizes,
+                    req_meta.all_offsets,
+                )
+                batches = (
+                    [(active_keys, active_buffers, active_sizes, active_offsets)]
+                    if len(planned_batches) == 1
+                    else [
+                        (active_keys[batch], active_buffers[batch], active_sizes[batch], active_offsets[batch])
+                        for batch in planned_batches
+                    ]
+                )
+            else:
+                active_buffers = [req_meta.all_buffers[index] for index in active_indices]
+                active_sizes = [req_meta.all_sizes[index] for index in active_indices]
+                active_offsets = [req_meta.all_offsets[index] for index in active_indices]
+                batches = self._range_transfer_batches(
+                    active_keys,
+                    active_buffers,
+                    active_sizes,
+                    active_offsets,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                )
             results: list[int] = []
-            for keys, buffers, sizes, offsets in self._range_transfer_batches(
-                active_keys,
-                active_buffers,
-                active_sizes,
-                active_offsets,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            ):
+            for keys, buffers, sizes, offsets in batches:
                 results.extend(
                     require_aligned_batch_results(
                         "batch_copy_get",
@@ -2113,6 +2205,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if failed_indices:
                 self._mark_invalid_range_indices(req_meta, failed_indices)
                 self._active_load_indices.difference_update(failed_indices)
+                if self.raise_on_transfer_failure:
+                    raise RuntimeError("Mooncake range GET failed; refusing incomplete KV")
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids, shared.is_last_chunks, strict=True):
@@ -2132,25 +2226,49 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.sync_save_events[wait_for_save].synchronize()
                 self.layer_save_finished_events[wait_for_save].clear()
 
+            if data.previous_compute_done is not None:
+                if not self._wait_for_event(data.previous_compute_done, self.save_failure_checker):
+                    raise RuntimeError("Receiver stopped before previous attention completed")
             if data.attention_start_gate is not None:
                 if not self._wait_for_event(data.attention_start_gate):
                     return
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             for task in data.transfer_tasks:
                 shared = task.shared_block_data
                 if shared is None:
                     raise RuntimeError("Layerwise range load requires shared block metadata")
-                builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
-                req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
-                if not isinstance(req_meta, LayerRangeReqMeta):
-                    raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
-                req_meta.layer_id = layer_id
+                plan = task.range_load_plan
+                if plan is None:
+                    builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
+                    req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
+                    if not isinstance(req_meta, LayerRangeReqMeta):
+                        raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
+                    req_meta.layer_id = layer_id
+                else:
+                    assert shared.block_keys is not None
+                    req_meta = LayerRangeReqMeta(
+                        req_ids=shared.req_ids,
+                        layer_id=layer_id,
+                        block_ids=plan.block_ids,
+                        keys=shared.block_keys,
+                        all_buffers=(plan.relative_buffers + plan.base_addresses).tolist(),
+                        all_sizes=[plan.sizes] * len(plan.block_ids),
+                        all_offsets=[plan.offsets] * len(plan.block_ids),
+                        load_keys=shared.load_keys,
+                    )
                 self._active_load_indices = self._group_load_indices.get(task.group_id)
-                self._handle_range_request(req_meta, shared)
+                self._handle_range_request(req_meta, shared, plan.batches if plan is not None else ())
                 self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
         except Exception as exc:
             self._fatal_error = exc
+            if data.slot_write_failed is not None:
+                try:
+                    data.slot_write_failed(exc)
+                except Exception:
+                    logger.exception("Source consumer failed to acknowledge a load failure")
             if self._active_load_indices is not None:
                 self._active_load_indices.clear()
             self._mark_invalid_transfer_task_blocks(data.transfer_tasks)
@@ -2188,6 +2306,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self._mark_failed_requests([br.request for task in data.transfer_tasks for br in task.block_ranges])
         except Exception as exc:
             self._fatal_error = exc
+            if data.slot_write_failed is not None:
+                data.slot_write_failed(exc)
             raise
         finally:
             self.layer_load_finished_events[data.layer_id].set()
@@ -2214,7 +2334,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             logger.debug("Layer save event cleared: layer %d", wait_for_save)
             self.layer_save_finished_events[wait_for_save].clear()
 
+        if data.previous_compute_done is not None:
+            if not self._wait_for_event(data.previous_compute_done, self.save_failure_checker):
+                raise RuntimeError("Receiver stopped before previous attention completed")
         if self.load_disabled.is_set():
+            if data.before_slot_write is not None:
+                raise RuntimeError("Refusing to open a source epoch after a failed load")
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
             return False
@@ -2222,6 +2347,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if len(transfer_tasks) == 0:
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             return True
@@ -2247,6 +2374,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if not task_metas:
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             return True
@@ -2275,6 +2404,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
         if self.external_slot_release_waiter is not None:
             self.external_slot_release_waiter(layer_id)
+        if data.before_slot_write is not None:
+            data.before_slot_write()
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,

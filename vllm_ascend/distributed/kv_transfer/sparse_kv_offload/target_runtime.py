@@ -1,0 +1,470 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Owner-side target lifetime and real stream dependencies for D offload.
+
+The connector supplies receive dependencies directly, or confirms exact native
+sync-WRITE receipts before this runtime records the D consumption dependency.
+Request end alone never proves completion. The connector still owns remote-DMA
+quiescence and scheduler block-free permission.
+"""
+
+import math
+import threading
+import time
+from collections.abc import Iterable
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
+    BlockAllocation,
+    ContractError,
+    ReceiveReceipt,
+    RequestKey,
+    TargetLease,
+    copy_target_lease,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_completion import CompletionFrontier, StreamCompletion
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import RetentionAuthority
+
+
+@dataclass(frozen=True)
+class ReceivedTargetWrites:
+    """Local dependencies for one exact lease, supplied by the transfer owner.
+
+    host_visible.wait(timeout) must return True only after remote Host writes
+    are visible (not just source-read completion). indexer_event is the real
+    device-write event. Both objects remain local and retain their resources.
+    """
+
+    lease: TargetLease
+    host_visible: object
+    indexer_event: object
+
+    def __post_init__(self) -> None:
+        if not callable(getattr(self.host_visible, "wait", None)):
+            raise TypeError("A real Host-visible completion fence is required")
+        if not callable(getattr(self.indexer_event, "query", None)):
+            raise TypeError("A real Indexer device completion event is required")
+        object.__setattr__(self, "lease", copy_target_lease(self.lease))
+
+    def __getstate__(self):
+        raise TypeError("Receive dependencies must stay in the target owner process")
+
+
+class NpuTargetStreams:
+    """Bind visibility and completion to the actual worker consumption stream."""
+
+    def __init__(self, manager, device_id: int, consumption_stream) -> None:
+        if type(device_id) is not int or device_id < 0 or consumption_stream is None:
+            raise ValueError("Target runtime needs an explicit NPU and consumption stream")
+        if not callable(getattr(manager, "target_runtime_streams", None)):
+            raise TypeError("Sparse manager must expose its compute/writeback streams")
+        import torch
+
+        stream_device = getattr(getattr(consumption_stream, "device", None), "index", None)
+        if stream_device != device_id:
+            raise ValueError("Target consumption stream belongs to another NPU")
+        self._manager = manager
+        self._device_id = device_id
+        self._stream = consumption_stream
+        self._npu = torch.npu
+        self._record_lock = threading.Lock()
+        self._fence_owner = object()
+        self._fence_sequence = 0
+        self._recovery_streams = {}
+        self._invalid_stream = False
+
+    @contextmanager
+    def consumption(self):
+        with self._npu.device(self._device_id), self._npu.stream(self._stream):
+            yield
+
+    def install_visibility(self, dependency: ReceivedTargetWrites) -> None:
+        if not isinstance(dependency.indexer_event, self._npu.Event):
+            raise TypeError("Indexer visibility requires a native NPU event")
+        if not dependency.indexer_event.npu_event:
+            raise ContractError("Indexer visibility event has not been recorded")
+        with self._npu.device(self._device_id):
+            self._stream.wait_event(dependency.indexer_event)
+
+    def confirmed_receive_dependency(self, lease: TargetLease) -> ReceivedTargetWrites:
+        """Called only after exact entry receipts prove remote sync WRITE completion.
+
+        The Host fence reflects that observed native completion, not a guessed
+        request state. Record a native event on the actual D consumption stream
+        for future work; no synthetic already-completed device event is used.
+        """
+        with self._npu.device(self._device_id), self._npu.stream(self._stream):
+            indexer_event = self._npu.Event()
+            indexer_event.record()
+        host_visible = threading.Event()
+        host_visible.set()
+        return ReceivedTargetWrites(lease, host_visible, indexer_event)
+
+    def record_use(self) -> tuple:
+        # Sparse fused writeback can run on a distinct stream. Fence every
+        # stream that could have used this request before dropping owner refs.
+        with self._record_lock, self._npu.device(self._device_id):
+            if self._invalid_stream:
+                raise RuntimeError("Target stream ownership is unresolved; keep allocations retained")
+            try:
+                streams = [self._stream, *self._manager.target_runtime_streams()]
+            except Exception:
+                self._invalid_stream = True  # Unknown users cannot be recovered by guessing a new stream set.
+                raise
+            selected = {}
+            try:
+                for stream in streams:
+                    if stream is not None:
+                        if getattr(getattr(stream, "device", None), "index", None) != self._device_id:
+                            raise RuntimeError("Target manager exposed a stream from another NPU")
+                        selected[getattr(stream, "npu_stream", id(stream))] = stream
+            except Exception:
+                self._invalid_stream = True  # An unidentifiable stream may already own queued work.
+                raise
+            required = {key: value[0] for key, value in self._recovery_streams.items()}
+            required.update(selected)
+            try:
+                # Only failed submissions need adapter-level recovery storage.
+                # Never forget a removed stream until its recorded tail completes.
+                for key, (_, event) in tuple(self._recovery_streams.items()):
+                    if event is not None and event.query():
+                        event.synchronize()
+                        self._recovery_streams.pop(key)
+                        if key not in selected:
+                            required.pop(key)
+                events = []
+                for key, stream in required.items():
+                    with self._npu.stream(stream):
+                        event = self._npu.Event()
+                        event.record()
+                    self._fence_sequence += 1
+                    events.append(StreamCompletion(self._fence_owner, stream, self._fence_sequence, event))
+                by_key = {getattr(f.stream, "npu_stream", id(f.stream)): f.event for f in events}
+                for key in self._recovery_streams:
+                    self._recovery_streams[key] = required[key], by_key[key]
+                return tuple(events)
+            except Exception:
+                self._recovery_streams.update((key, (stream, None)) for key, stream in required.items())
+                raise
+
+    def wait_quiescent(self, events: Iterable, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        with self._npu.device(self._device_id):
+            for event in events:
+                while not event.query():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Target compute/writeback is not quiescent; retain allocations")
+                    time.sleep(min(0.001, max(0.0, deadline - time.monotonic())))
+                event.synchronize()
+
+
+@dataclass
+class _TargetUse:
+    lease: TargetLease
+    resources: object
+    retention: object
+    dependency: ReceivedTargetWrites | None = None
+    visible: bool = False
+    preparing: bool = False
+    closing: bool = False
+    releasing: bool = False
+    users: int = 0
+    events: CompletionFrontier = field(default_factory=CompletionFrontier)
+    needs_recovery_fence: bool = False
+
+
+@dataclass(frozen=True, eq=False)
+class _BoundTargetUse:
+    """Owner-local admission result; never accepted across an RPC boundary."""
+
+    runtime: object
+    state: _TargetUse
+
+    def __getstate__(self):
+        raise TypeError("Bound target uses must stay in their owner process")
+
+
+class OwnerTargetRuntime:
+    """Concrete retain/visibility/release implementation over registered memory.
+
+    resources is the live RegisteredTargetResources, not a second allocator.
+    RetentionAuthority executes in the scheduler or a real transport to it.
+    All callbacks and waits execute outside the state lock.
+    """
+
+    def __init__(self, resources, retention: RetentionAuthority, streams, *, timeout: float) -> None:
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("Target runtime needs a positive bounded wait timeout")
+        for owner, methods in (
+            (resources, ("retain", "validate", "validate_allocation")),
+            (retention, ("retain",)),
+            (streams, ("consumption", "install_visibility", "record_use", "wait_quiescent")),
+        ):
+            if any(not callable(getattr(owner, name, None)) for name in methods):
+                raise TypeError("Target runtime requires real resource, retention and stream owners")
+        self._resources = resources
+        self._retention = retention
+        self._streams = streams
+        self._timeout = float(timeout)
+        self._lock = threading.RLock()
+        self._states: dict[RequestKey, _TargetUse] = {}
+        self._acquiring: set[RequestKey] = set()
+        self._quarantine: list = []
+        self._retrying_rollbacks = False
+
+    def _state(self, lease: TargetLease) -> _TargetUse:
+        state = self._states.get(lease.request)
+        if state is None or state.lease != lease:
+            raise ContractError("Unknown or changed owner target lease")
+        return state
+
+    def retain(self, lease: TargetLease) -> None:
+        with self._lock:
+            if self._quarantine or self._retrying_rollbacks:
+                raise RuntimeError("Target retain rollback is incomplete; owner is quarantined")
+            if lease.request in self._states or lease.request in self._acquiring:
+                raise ContractError("Target already has an owner operation")
+            self._acquiring.add(lease.request)
+        guard = None
+        resource_pin = None
+        try:
+            self._resources.validate(lease)
+            guard = self._retention.retain(lease.allocation)
+            if any(not callable(getattr(guard, name, None)) for name in ("validate", "release")):
+                raise TypeError("Retention authority did not return a live guard")
+            guard.validate()
+            resource_pin = self._resources.retain(lease)
+            if not callable(getattr(resource_pin, "release", None)):
+                raise TypeError("Target resource owner did not return a real pin")
+            with self._lock:
+                self._states[lease.request] = _TargetUse(copy_target_lease(lease), resource_pin, guard)
+        except Exception:
+            try:
+                if resource_pin is not None:
+                    resource_pin.release()
+                if guard is not None:
+                    guard.release()
+            except Exception:
+                with self._lock:
+                    self._quarantine.append((resource_pin, guard))
+                raise RuntimeError("Target retain failed and rollback remains quarantined") from None
+            raise
+        finally:
+            with self._lock:
+                self._acquiring.discard(lease.request)
+
+    def retry_failed_retains(self) -> None:
+        """Retry only unpublished acquisitions; never forge transfer quiescence."""
+        with self._lock:
+            if self._retrying_rollbacks:
+                raise ContractError("Target retain rollback retry is already running")
+            self._retrying_rollbacks = True
+            pending, self._quarantine = self._quarantine, []
+        try:
+            for index, (pin, guard) in enumerate(pending):
+                try:
+                    if pin is not None:
+                        pin.release()
+                    if guard is not None:
+                        guard.release()
+                except Exception:
+                    with self._lock:
+                        self._quarantine.extend(pending[index:])
+                    raise
+        finally:
+            with self._lock:
+                self._retrying_rollbacks = False
+
+    def publish_received(self, lease: TargetLease, dependency: ReceivedTargetWrites) -> None:
+        if dependency.lease != lease:
+            raise ContractError("Receive dependencies belong to another target allocation")
+        with self._lock:
+            state = self._state(lease)
+            if state.closing or state.preparing or state.visible or state.dependency is not None:
+                raise ContractError("Receive dependencies cannot replace an active target generation")
+            state.dependency = dependency
+
+    def confirm_native_received(self, lease: TargetLease, receipt: ReceiveReceipt) -> None:
+        """Worker-local bridge from judged native results to real receive fences.
+
+        Not an owner RPC operation. Only the actual receive ledger may supply
+        this receipt; a scheduler cannot manufacture a native receive fence.
+        """
+        if (
+            receipt.request != lease.request
+            or receipt.target_generation != lease.allocation.allocation_generation
+            or receipt.visible
+            or not (receipt.main_union_ok and receipt.indexer_ranks_ok and receipt.terminals_ok)
+        ):
+            raise ContractError("Native receive confirmation requires the exact complete entry receipt")
+        with self._lock:
+            state = self._state(lease)
+            if state.closing or state.preparing:
+                raise ContractError("Target receive confirmation races with lifecycle closure")
+            if state.dependency is not None:
+                return
+            state.preparing = True
+        try:
+            state.retention.validate()
+            self._resources.validate(lease)
+            dependency = self._streams.confirmed_receive_dependency(lease)
+            if type(dependency) is not ReceivedTargetWrites or dependency.lease != lease:
+                raise ContractError("Native receive dependency belongs to another target")
+            with self._lock:
+                state.dependency = dependency
+        finally:
+            with self._lock:
+                state.preparing = False
+
+    def make_visible(self, lease: TargetLease, receipt: ReceiveReceipt) -> None:
+        if (
+            receipt.request != lease.request
+            or receipt.target_generation != lease.allocation.allocation_generation
+            or receipt.visible
+            or not (receipt.main_union_ok and receipt.indexer_ranks_ok and receipt.terminals_ok)
+        ):
+            raise ContractError("Target visibility needs the matching complete, not-yet-visible receipt")
+        with self._lock:
+            state = self._state(lease)
+            if state.visible:
+                return
+            if state.closing or state.preparing or state.dependency is None:
+                raise ContractError("Actual receive dependencies must precede target visibility")
+            state.preparing = True
+            dependency = state.dependency
+        try:
+            state.retention.validate()
+            self._resources.validate(lease)
+            if dependency.host_visible.wait(self._timeout) is not True:
+                raise TimeoutError("Remote Host writes are not visible; target remains retained")
+            state.retention.validate()
+            self._streams.install_visibility(dependency)
+            with self._lock:
+                state.visible = True
+        finally:
+            with self._lock:
+                state.preparing = False
+
+    @contextmanager
+    def use(self, lease: TargetLease, *, scheduled_allocation: BlockAllocation | None = None):
+        """Validate an external lease before entering the local batch path."""
+        with self.use_batch(((self.bind_use(lease), scheduled_allocation),)):
+            yield
+
+    def bind_use(self, lease: TargetLease) -> _BoundTargetUse:
+        """Compare the full descriptor once when a local delivery is admitted."""
+        with self._lock:
+            state = self._state(lease)
+            if state.closing:
+                raise ContractError("Target admission races with lifecycle closure")
+            return _BoundTargetUse(self, state)
+
+    @contextmanager
+    def use_batch(self, entries):
+        """Validate shared resources and fence actual model work once per batch.
+
+        Bound state identity avoids repeating full lease/view comparisons. The
+        scheduler's allocation map is still checked once for each request, and
+        stale handles fail after release or a new allocation generation.
+        """
+        entries = tuple(entries)
+        if not entries:
+            yield
+            return
+        states = []
+        with self._lock:
+            seen = set()
+            for handle, allocation in entries:
+                if type(handle) is not _BoundTargetUse or handle.runtime is not self:
+                    raise ContractError("Target use binding belongs to another owner")
+                state = handle.state
+                if self._states.get(state.lease.request) is not state or id(state) in seen:
+                    raise ContractError("Target use binding is stale or duplicated")
+                if not state.visible or state.closing or state.preparing:
+                    raise ContractError("Target is not available for decode")
+                if allocation is not None and (
+                    type(allocation) is not BlockAllocation or allocation != state.lease.allocation
+                ):
+                    raise ContractError("Scheduler step allocation does not match the retained target")
+                seen.add(id(state))
+                states.append(state)
+            for state in states:
+                state.users += 1
+        try:
+            for state, (_, allocation) in zip(states, entries):
+                if allocation is None:
+                    state.retention.validate()
+            self._resources.validate_allocation()
+            with self._streams.consumption():
+                for state in states:
+                    self._streams.install_visibility(state.dependency)
+                yield
+        finally:
+            try:
+                events = self._streams.record_use()
+                if not events:
+                    raise RuntimeError("Target consumption produced no real completion fences")
+                superseded = []
+                with self._lock:
+                    for state in states:
+                        superseded.extend(state.events.extend(events))
+                superseded.clear()
+            except Exception:
+                with self._lock:
+                    for state in states:
+                        state.needs_recovery_fence = True
+                raise
+            finally:
+                with self._lock:
+                    for state in states:
+                        state.users -= 1
+
+    def release(self, lease: TargetLease) -> None:
+        with self._lock:
+            state = self._state(lease)
+            if state.preparing or state.users or state.releasing:
+                raise ContractError("Target still has active compute/writeback users or release")
+            state.closing = True
+            state.releasing = True
+            recover = state.needs_recovery_fence
+        try:
+            if recover:
+                events = self._streams.record_use()
+                if not events:
+                    raise RuntimeError("Cannot prove failed target use is quiescent")
+                with self._lock:
+                    superseded = state.events.extend(events)
+                    state.needs_recovery_fence = False
+                superseded.clear()
+            # Also fence already queued manager work at the release boundary.
+            # The connector must stop future submissions before requesting it.
+            final_events = self._streams.record_use()
+            if not final_events:
+                raise RuntimeError("Target owner cannot prove its final stream quiescence")
+            events = tuple(state.events) + tuple(final_events)
+            if state.dependency is not None:
+                events += (state.dependency.indexer_event,)
+            self._streams.wait_quiescent(events, self._timeout)
+            state.retention.validate()
+            state.resources.release()
+            state.retention.release()
+            with self._lock:
+                del self._states[lease.request]
+        finally:
+            with self._lock:
+                state.releasing = False
+        # The connector must still prove remote DMA quiescence before allowing
+        # SchedulerRetentionRegistry.retire and the scheduler's block free.
+
+    def assert_can_close(self) -> None:
+        with self._lock:
+            if self._states or self._acquiring or self._quarantine or self._retrying_rollbacks:
+                raise ContractError("Target runtime still holds live or quarantined allocations")
+
+    def __getstate__(self):
+        raise TypeError("Target runtime belongs to its worker owner process")

@@ -121,6 +121,7 @@ _vllm_mock_modules = [
     "vllm.v1.request",
     "vllm.v1.serial_utils",
     "vllm.v1.worker",
+    "vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils",
 ]
 if _MOCK_VLLM_DEPS:
     for _mod_name in _vllm_mock_modules:
@@ -130,11 +131,9 @@ if _MOCK_VLLM_DEPS:
 if _MOCK_VLLM_DEPS:
     sys.modules["vllm.utils.math_utils"].cdiv = lambda a, b: -(-a // b)  # type: ignore[attr-defined]
     sys.modules["vllm.logger"].logger = logging.getLogger("vllm")  # type: ignore[attr-defined]
-    sys.modules["vllm.utils.torch_utils"].get_dtype_size = lambda dtype: {  # type: ignore[attr-defined]
-        "int8": 1,
-        "float16": 2,
-        "float32": 4,
-    }[dtype]
+    sys.modules["vllm.utils.torch_utils"].get_dtype_size = (  # type: ignore[attr-defined]
+        lambda dtype: dtype.itemsize if hasattr(dtype, "itemsize") else {"int8": 1, "float16": 2, "float32": 4}[dtype]
+    )
 
 _base_mod: Any = (
     sys.modules["vllm.distributed.kv_transfer.kv_connector.v1.base"] if _MOCK_VLLM_DEPS else types.SimpleNamespace()
@@ -252,6 +251,40 @@ class _FakeFullAttentionSpec(_FakeAttentionSpec):
     pass
 
 
+@dataclass(frozen=True, kw_only=True)
+class _FakeMLAAttentionSpec(_FakeAttentionSpec):
+    # Keep inherited dataclass fields available to Ascend's real MLA specs.
+    block_size: int = 16
+    num_kv_heads: int = 1
+    head_size: int = 1
+    dtype: Any = "int8"
+    head_size_v: int = 0
+    tokens_per_state: int = 1
+    model_version: str | None = None
+    page_size_padded: int | None = None
+
+    @property
+    def num_heads(self):
+        return self.num_kv_heads
+
+    @property
+    def num_states(self):
+        return self.block_size // self.tokens_per_state
+
+    @property
+    def state_content_size_bytes(self):
+        dtype_size = getattr(self.dtype, "itemsize", 1)
+        return (self.head_size + self.head_size_v) * dtype_size
+
+    @property
+    def real_page_size_bytes(self):
+        return self.num_heads * self.num_states * self.state_content_size_bytes
+
+    @property
+    def page_size_bytes(self):
+        return self.page_size_padded or self.real_page_size_bytes
+
+
 class _FakeSlidingWindowSpec(_FakeKVCacheSpec):
     def __init__(self, block_size=16, sliding_window=32, **kwargs):
         super().__init__(block_size=block_size, sliding_window=sliding_window, **kwargs)
@@ -291,6 +324,16 @@ class _FakeKVCacheConfig:
         self.num_blocks = num_blocks
         self.kv_cache_tensors = kv_cache_tensors or []
         self.kv_cache_groups = kv_cache_groups or []
+
+
+@dataclass
+class _FakeKVCacheTensor:
+    size: int
+    layers: list[str]
+    layer_stride: int
+    block_stride: int
+    offset: int = 0
+    host_resident: bool = False
 
 
 _kv_cache_utils_mod.KVCacheBlock = _FakeKVCacheBlock  # type: ignore[attr-defined]
@@ -399,7 +442,7 @@ _kv_interface_mod: Any = sys.modules["vllm.v1.kv_cache_interface"] if _MOCK_VLLM
 _kv_interface_mod.KVCacheSpec = _FakeKVCacheSpec  # type: ignore[attr-defined]
 _kv_interface_mod.AttentionSpec = _FakeAttentionSpec  # type: ignore[attr-defined]
 _kv_interface_mod.FullAttentionSpec = _FakeFullAttentionSpec  # type: ignore[attr-defined]
-_kv_interface_mod.MLAAttentionSpec = _FakeFullAttentionSpec  # type: ignore[attr-defined]
+_kv_interface_mod.MLAAttentionSpec = _FakeMLAAttentionSpec  # type: ignore[attr-defined]
 _kv_interface_mod.SlidingWindowMLASpec = _FakeSlidingWindowSpec  # type: ignore[attr-defined]
 _kv_interface_mod.CircularBufferSpec = type(  # type: ignore[attr-defined]
     "CircularBufferSpec", (_FakeKVCacheSpec,), {"prefix_cacheable": False}
@@ -409,6 +452,7 @@ _kv_interface_mod.MambaSpec = _FakeMambaSpec  # type: ignore[attr-defined]
 _kv_interface_mod.UniformTypeKVCacheSpecs = _FakeUniformTypeKVCacheSpecs  # type: ignore[attr-defined]
 _kv_interface_mod.KVCacheGroupSpec = _FakeKVCacheGroupSpec  # type: ignore[attr-defined]
 _kv_interface_mod.KVCacheConfig = _FakeKVCacheConfig  # type: ignore[attr-defined]
+_kv_interface_mod.KVCacheTensor = _FakeKVCacheTensor  # type: ignore[attr-defined]
 
 
 class _FakeKVCacheSpecRegistry:
@@ -466,6 +510,13 @@ _vllm_ascend_package_paths = {
 for _pkg, _path in _vllm_ascend_package_paths.items():
     if _pkg not in sys.modules:
         sys.modules[_pkg] = _make_pkg(_pkg, _path)
+
+if _MOCK_VLLM_DEPS and "vllm_ascend.spec_decode" not in sys.modules:
+    # Load the real lightweight dspark_utils without importing every proposer
+    # through spec_decode/__init__.py in Store-only CPU tests.
+    sys.modules["vllm_ascend.spec_decode"] = _make_pkg(
+        "vllm_ascend.spec_decode", os.path.join(_vllm_ascend_real_path, "spec_decode")
+    )
 
 _distributed_utils = types.ModuleType("vllm_ascend.distributed.utils")
 _distributed_utils.all_gather_async = MagicMock()  # type: ignore[attr-defined]

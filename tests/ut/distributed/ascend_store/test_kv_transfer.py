@@ -32,6 +32,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerLoadTask,
     LayerBatchReqMeta,
     LayerPoolKey,
+    LayerRangeReqMeta,
     LayerTransferTask,
     LoadSpec,
     ReqMeta,
@@ -490,6 +491,134 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
 
         self.assertEqual(load_finished_observed, [False])
         self.assertTrue(load_finished[1].is_set())
+
+    def test_block_key_get_waits_for_save_and_external_release(self):
+        call_order = []
+        thread, load_finished, save_finished, sync_events = self._make_thread(
+            external_slot_release_waiter=lambda layer: call_order.append(("reuse", layer))
+        )
+        save_finished[0].set()
+        sync_events[0].synchronize.side_effect = lambda: call_order.append(("save", 0))
+        thread.group_builders[0].build_addrs.return_value = LayerRangeReqMeta(
+            req_ids=["r1"],
+            layer_id=1,
+            block_ids=[0],
+            keys=["key"],
+            all_buffers=[[10]],
+            all_sizes=[[16]],
+            all_offsets=[[0]],
+        )
+
+        def copy_get(*_args):
+            self.assertFalse(load_finished[1].is_set())
+            call_order.append(("get", 1))
+            return [16]
+
+        thread.m_store.batch_copy_get.side_effect = copy_get
+        task = LayerTransferTask(
+            layer_id=1,
+            block_ranges=[],
+            use_key_major_ranges=True,
+            shared_block_data=SharedBlockData(
+                block_ids_arr=np.asarray([0]),
+                block_gvas_arr=None,
+                req_ids=["r1"],
+                is_last_chunks=[False],
+            ),
+        )
+        load_task = LayerLoadTask(wait_for_save_layer=0, transfer_tasks=[task], layer_id=1)
+        thread.request_queue.put(load_task)
+        thread._handle_request(load_task)
+
+        self.assertEqual(call_order, [("save", 0), ("reuse", 1), ("get", 1)])
+        self.assertTrue(load_finished[1].is_set())
+
+    def test_empty_load_cannot_finish_while_external_reader_is_pending(self):
+        entered = threading.Event()
+        released = threading.Event()
+        errors = []
+
+        def wait_for_reuse(_layer):
+            entered.set()
+            if not released.wait(timeout=5):
+                raise RuntimeError("test reader was not released")
+
+        thread, load_finished, _, _ = self._make_thread(external_slot_release_waiter=wait_for_reuse)
+        load_task = LayerLoadTask(wait_for_save_layer=None, transfer_tasks=[], layer_id=1)
+        thread.request_queue.put(load_task)
+
+        def receive():
+            try:
+                thread._handle_request(load_task)
+            except Exception as exc:
+                errors.append(exc)
+
+        receiver = threading.Thread(target=receive)
+        receiver.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5), "receiver did not enter reuse wait")
+            self.assertFalse(load_finished[1].is_set())
+            thread.m_store.batch_copy_get.assert_not_called()
+        finally:
+            released.set()
+            receiver.join(timeout=5)
+        self.assertFalse(receiver.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(load_finished[1].is_set())
+
+    def test_block_key_waiter_failure_prevents_get(self):
+        waiter = MagicMock(side_effect=RuntimeError("external reader failed"))
+        thread, _, _, _ = self._make_thread(external_slot_release_waiter=waiter)
+        task = LayerTransferTask(layer_id=1, block_ranges=[], use_key_major_ranges=True)
+        load_task = LayerLoadTask(wait_for_save_layer=None, transfer_tasks=[task], layer_id=1)
+        thread.request_queue.put(load_task)
+
+        with self.assertRaisesRegex(RuntimeError, "external reader failed"):
+            thread._handle_request(load_task)
+
+        waiter.assert_called_once_with(1)
+        thread.m_store.batch_copy_get.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "failed during asynchronous transfer") as raised:
+            thread.raise_if_failed()
+        self.assertIs(raised.exception.__cause__, waiter.side_effect)
+
+    def test_range_get_failure_honors_strict_policy(self):
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                thread, finished, _, _ = self._make_thread(raise_on_transfer_failure=strict)
+                thread.group_builders[0].build_addrs.return_value = LayerRangeReqMeta(
+                    req_ids=["r1"],
+                    layer_id=1,
+                    block_ids=[2],
+                    keys=["key"],
+                    all_buffers=[[100]],
+                    all_sizes=[[16]],
+                    all_offsets=[[0]],
+                )
+                thread.m_store.batch_copy_get.return_value = [-1]
+                task = LayerTransferTask(
+                    layer_id=1,
+                    block_ranges=[],
+                    use_key_major_ranges=True,
+                    shared_block_data=SharedBlockData(
+                        block_ids_arr=np.asarray([2]),
+                        block_gvas_arr=None,
+                        req_ids=["r1"],
+                        is_last_chunks=[False],
+                    ),
+                )
+                load = LayerLoadTask(layer_id=1, wait_for_save_layer=None, transfer_tasks=[task])
+                thread.request_queue.put(load)
+                if strict:
+                    with self.assertRaisesRegex(RuntimeError, "refusing incomplete KV"):
+                        thread._handle_request(load)
+                    with self.assertRaisesRegex(RuntimeError, "asynchronous transfer"):
+                        thread.raise_if_failed()
+                else:
+                    thread._handle_request(load)
+                    thread.raise_if_failed()
+                self.assertIn(2, thread._invalid_block_ids)
+                self.assertTrue(finished[1].is_set())
 
 
 class TestKVCacheStoreSendingThread(unittest.TestCase):

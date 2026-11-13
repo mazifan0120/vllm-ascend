@@ -71,7 +71,7 @@ def test_glm_split_regions_register_and_unregister_in_order():
 
 def test_split_registration_failure_rolls_back_prior_regions():
     engine = MagicMock()
-    engine.register_memory.side_effect = [0, -1]
+    engine.register_memory.side_effect = [0, -1, -1]
     engine.unregister_memory.return_value = 0
     manager = _manager_with_engine(engine)
     first_ptr = 0x400000
@@ -89,6 +89,7 @@ def test_split_registration_failure_rolls_back_prior_regions():
     assert engine.register_memory.call_args_list == [
         call(first_ptr, first_size, "npu:0"),
         call(second_ptr, second_size, "npu:0"),
+        call(second_ptr, second_size, "*"),
     ]
     engine.unregister_memory.assert_called_once_with(first_ptr)
     assert manager._registered_regions == []

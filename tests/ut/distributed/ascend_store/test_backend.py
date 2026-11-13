@@ -562,6 +562,17 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         with self.assertRaises(backend_base.BatchResultShapeError):
             b.batch_is_readable(["k1", "k2"])
 
+    def test_remove_private_snapshots_acknowledges_missing_but_retains_leased_objects(self):
+        backend = self._make_backend()
+        keys = ["@private_snapshot_v1:removed", "@private_full_v1:missing", "@private_full_v1:leased"]
+        backend.store.remove.side_effect = [0, -704, -706]
+
+        self.assertEqual(backend.remove_private_snapshots(keys), [0, 0, -706])
+        self.assertEqual([call.args for call in backend.store.remove.call_args_list], [(key, False) for key in keys])
+        with self.assertRaisesRegex(ValueError, "must not remove public"):
+            backend.remove_private_snapshots(["public"])
+        self.assertEqual(backend.store.remove.call_count, len(keys))
+
     def test_transfers(self):
         module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.logger"
         for operation, store_method in [
