@@ -1008,6 +1008,13 @@ class KVPoolWorker:
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
                     load_abort_event=self._layer_load_aborted,
                     raise_on_transfer_failure=self.layerwise_offload or self.num_kv_cache_groups > 1,
+                    # The Mooncake backend already validates and normalizes its range GET results.
+                    validate_range_get_results=not (
+                        self.backend_name == "mooncake"
+                        and self.use_block_key_layerwise
+                        and self.kv_role == "kv_producer"
+                        and self._main_buffer_layer_slots
+                    ),
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(

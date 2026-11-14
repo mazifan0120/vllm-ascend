@@ -323,7 +323,11 @@ class TestGVALayerTransferFailures(unittest.TestCase):
 
 class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
     def _make_thread(
-        self, external_slot_release_waiter=None, save_failure_checker=None, raise_on_transfer_failure=True
+        self,
+        external_slot_release_waiter=None,
+        save_failure_checker=None,
+        raise_on_transfer_failure=True,
+        validate_range_get_results=True,
     ):
         # Plain mock store: the layerwise threads are backend-agnostic.
         # `.store` is attached explicitly to pin batch_copy's return value.
@@ -359,6 +363,7 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
             external_slot_release_waiter=external_slot_release_waiter,
             save_failure_checker=save_failure_checker,
             raise_on_transfer_failure=raise_on_transfer_failure,
+            validate_range_get_results=validate_range_get_results,
         )
         return thread, load_finished, save_finished, sync_events
 
@@ -583,9 +588,11 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
         self.assertIs(raised.exception.__cause__, waiter.side_effect)
 
     def test_range_get_failure_honors_strict_policy(self):
-        for strict in (False, True):
-            with self.subTest(strict=strict):
-                thread, finished, _, _ = self._make_thread(raise_on_transfer_failure=strict)
+        for strict, validate in ((False, True), (True, True), (True, False)):
+            with self.subTest(strict=strict, validate=validate):
+                thread, finished, _, _ = self._make_thread(
+                    raise_on_transfer_failure=strict, validate_range_get_results=validate
+                )
                 thread.group_builders[0].build_addrs.return_value = LayerRangeReqMeta(
                     req_ids=["r1"],
                     layer_id=1,

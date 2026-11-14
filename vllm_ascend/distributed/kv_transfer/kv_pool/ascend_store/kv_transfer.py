@@ -2065,6 +2065,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         invalid_block_ids_lock: threading.Lock | None = None,
         load_abort_event: threading.Event | None = None,
         raise_on_transfer_failure: bool = True,
+        validate_range_get_results: bool = True,
     ):
         super().__init__(
             m_store,
@@ -2087,6 +2088,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.external_slot_release_waiter = external_slot_release_waiter
         self.save_failure_checker = save_failure_checker
         self.raise_on_transfer_failure = raise_on_transfer_failure
+        self.validate_range_get_results = validate_range_get_results
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self._load_abort_event = load_abort_event or threading.Event()
@@ -2193,13 +2195,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 )
             results: list[int] = []
             for keys, buffers, sizes, offsets in batches:
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_get",
-                        keys,
-                        self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
-                    )
-                )
+                batch_results = self.m_store.batch_copy_get(keys, buffers, sizes, offsets)
+                if self.validate_range_get_results:
+                    batch_results = require_aligned_batch_results("batch_copy_get", keys, batch_results)
+                results.extend(batch_results)
             _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:

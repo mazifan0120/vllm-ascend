@@ -632,6 +632,14 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         b.store.batch_put_from_multi_buffer_ranges.assert_called_once_with(["k"], [[100]], [[16]], [[32]])
         b.store.batch_get_into_multi_buffer_ranges.assert_called_once_with(["k"], [[200]], [[16]], [[32]])
 
+    def test_layerwise_range_get_rejects_malformed_per_key_results(self):
+        backend = self._make_backend()
+        for invalid in ([], [0, 0], [True], [None]):
+            with self.subTest(invalid=invalid):
+                backend.store.batch_get_into_multi_buffer_ranges.return_value = invalid
+                with self.assertRaises(backend_base.BatchResultShapeError):
+                    backend.batch_copy_get(["k"], [[200]], [[16]], [[32]])
+
     def test_layerwise_batch_result_shape_is_rejected(self):
         b = self._make_backend()
         b.store.batch_get_session_start.return_value = []
