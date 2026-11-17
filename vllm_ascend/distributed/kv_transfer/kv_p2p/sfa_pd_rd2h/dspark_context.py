@@ -14,7 +14,6 @@ import torch
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
-from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -69,6 +68,8 @@ def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
         raise ValueError(
             "P-side DSpark requires local prefix caching disabled; paired AscendStore prefix reuse is separate."
         )
+    from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
+
     layer_ids = get_dspark_aux_layer_ids(vllm_config)
     if not layer_ids:
         raise ValueError("P-side DSpark draft KV generation requires auxiliary boundaries from the draft checkpoint.")

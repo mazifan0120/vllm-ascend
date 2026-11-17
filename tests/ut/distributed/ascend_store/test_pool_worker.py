@@ -1211,6 +1211,27 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.m_store.ensure_initialized.assert_called_once_with()
         worker.m_store.register_buffer.assert_called_once()
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.threading.Event")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreLayerRecvingThread")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreLayerSendingThread")
+    def test_prefill_get_limit_only_applies_to_rewrite_receiver(self, send_thread, recv_thread, event):
+        for reuse, get_limit, expected in ((True, 0, 0), (True, None, 32), (False, 64, 32)):
+            with self.subTest(reuse=reuse, get_limit=get_limit):
+                config = {"backend": "mooncake", "layerwise_max_transfer_blocks": 32}
+                if get_limit is not None:
+                    config["layerwise_get_max_transfer_blocks"] = get_limit
+                worker = self._make_worker(extra_config=config, use_layerwise=True)
+                worker.use_block_key_layerwise = True
+                worker.page_size_bytes = 64
+                if reuse:
+                    worker.prefill_slot_provider = MagicMock()
+                worker._build_group_layer_builders = MagicMock()
+
+                worker._start_kv_transfer_threads()
+
+                self.assertEqual(recv_thread.call_args.args[14], expected)
+                self.assertEqual(send_thread.call_args.args[11], 32)
+
     def test_start_load_kv_sync(self):
         worker = self._make_worker(extra_config={"load_async": False})
         worker.m_store.get = MagicMock(return_value=[0])

@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -2169,7 +2169,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def _handle_range_request(self, req_meta: LayerRangeReqMeta, shared: SharedBlockData) -> None:
         layer_id = req_meta.layer_id
-        if self._active_load_indices is None or layer_id == 0:
+        # Slot reuse restores the exact selection for each layer. A failed
+        # range aborts the whole step, so there is no filter to carry forward.
+        if self.prefill_slot_provider is not None or self._active_load_indices is None or layer_id == 0:
             self._active_load_indices = set(range(len(req_meta.keys)))
         assert self._active_load_indices is not None
         # Read the abort flag once: this comprehension covers every key of the
@@ -2217,6 +2219,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
         try:
+            requests: Iterable[tuple[LayerTransferTask, SharedBlockData, LayerRangeReqMeta]]
+            requests = self._range_requests(data)
+            if self.prefill_slot_provider is not None:
+                # Materialize address lists while this layer is still waiting
+                # to own the slot. Only the receiver's current layer is held.
+                requests = tuple(requests)
             wait_for_save = data.wait_for_save_layer
             if wait_for_save is not None:
                 if not self._wait_for_event(self.layer_save_finished_events[wait_for_save], self.save_failure_checker):
@@ -2232,13 +2240,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if self.prefill_slot_provider is not None:
                 slots = self.prefill_slot_provider()
                 if data.transfer_tasks:
-                    restore_into_slot(slots, layer_id, lambda: self._load_ranges(data))
+                    restore_into_slot(slots, layer_id, lambda: self._load_ranges(requests))
                 else:
                     slots.begin_write(layer_id)
             else:
                 if self.external_slot_release_waiter is not None:
                     self.external_slot_release_waiter(layer_id)
-                self._load_ranges(data)
+                self._load_ranges(requests)
         except Exception as exc:
             self._fatal_error = exc
             if self._active_load_indices is not None:
@@ -2252,7 +2260,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.request_queue.task_done()
             self.get_event.set()
 
-    def _load_ranges(self, data: LayerLoadTask) -> None:
+    def _range_requests(
+        self, data: LayerLoadTask
+    ) -> Iterator[tuple[LayerTransferTask, SharedBlockData, LayerRangeReqMeta]]:
         for task in data.transfer_tasks:
             shared = task.shared_block_data
             if shared is None:
@@ -2262,6 +2272,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if not isinstance(req_meta, LayerRangeReqMeta):
                 raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
             req_meta.layer_id = data.layer_id
+            yield task, shared, req_meta
+
+    def _load_ranges(self, requests: Iterable[tuple[LayerTransferTask, SharedBlockData, LayerRangeReqMeta]]) -> None:
+        for task, shared, req_meta in requests:
             self._active_load_indices = self._group_load_indices.get(task.group_id)
             self._handle_range_request(req_meta, shared)
             self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices

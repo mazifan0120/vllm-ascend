@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tr
     LayerwiseSessionTracker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVTransferThread,
     LayerBatchBuilder,
@@ -36,12 +37,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
     KeyMetadata,
     LayerBlockRange,
+    LayerLoadTask,
     LayerRangeReqMeta,
     LayerTransferTask,
     LoadSpec,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import SlotBarrier
 
 # isort: on
 
@@ -186,6 +189,52 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
         self.assertEqual(store.batch_copy_put.call_count, 2)
         store.batch_commit.assert_called_once_with(["key"])
         self.assertEqual(tracker.prepare_load_entries("r1", []), [("key", 0)])
+
+
+class TestMooncakeLayerLoad(unittest.TestCase):
+    def test_prepare_addresses_before_gate_and_load_each_layers_selection(self):
+        db = make_token_database()
+        builder = LayerBatchBuilder(db, page_size_bytes=60, num_layers=2)
+        build_addrs = MagicMock(wraps=builder.build_addrs)
+        builder.build_addrs = build_addrs
+        store = MagicMock()
+        slots = SlotBarrier(((0,), (1,)))
+        recv = KVCacheStoreLayerRecvingThread(
+            store,
+            db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event(), threading.Event()],
+            layer_save_finished_events=[],
+            sync_save_events=[],
+            num_layers=2,
+            group_builders=[builder],
+        )
+        recv.prefill_slot_provider = lambda: slots
+        request = ReqMeta("r1", block_ids=[2, 3], load_block_keys=["k0", "k1"], is_last_chunk=True)
+        store.batch_copy_get.side_effect = lambda keys, *_: [0] * len(keys)
+
+        for layer, count in enumerate((1, 2)):
+            def wait_for_attention(layer_id=layer, **_):
+                self.assertEqual(build_addrs.call_count, layer_id + 1)
+                self.assertEqual(store.batch_copy_get.call_count, layer_id)
+                return True
+
+            gate = MagicMock()
+            gate.wait.side_effect = wait_for_attention
+            task = LayerTransferTask(
+                layer, [LayerBlockRange(request, 0, count)], layer_idx_in_group=layer, use_key_major_ranges=True
+            )
+            task.shared_block_data = builder.build_shared(task, is_save=False)
+            load = LayerLoadTask(None, [task], layer, gate)
+            recv.request_queue.put(load)
+            recv._handle_request(load)
+            self.assertEqual(store.batch_copy_get.call_args.args[0], request.load_block_keys[:count])
 
 
 class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
