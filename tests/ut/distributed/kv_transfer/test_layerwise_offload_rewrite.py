@@ -628,6 +628,47 @@ class TestLayerwiseRewrite(unittest.TestCase):
         self.assertEqual(sender.finish(case.target), NativeResult(None, True))
         self.assertEqual(sender.finish(case.target, cancel=True), NativeResult(None, True))
 
+    def test_writer_retries_proof_when_decode_ack_is_lost(self):
+        case = _Fixture()
+        allocation, refs = case.publish()
+        reports, writes = [], []
+
+        def report(rank, target, results):
+            case.report(rank, target, results)
+            reports.append((rank, target, results))
+            if len(reports) == 1:
+                raise TimeoutError("Decode applied the proof but its reply was lost")
+
+        def write(transfer):
+            writes.append(transfer)
+            return case.write(transfer)
+
+        barrier = case.barriers[0]
+        sender = LayerwiseSender(0, case.layout, barrier, case.addresses, write, report)
+        for rank, writer in enumerate((sender, case.p[1])):
+            writer.attach(allocation, refs)
+            for layer in range(2):
+                slot = case.barriers[rank]
+                epoch = restore_into_slot(slot, layer, None)
+                job = writer.reserve_layer(case.target, epoch, Span(0, 7), case.sources(rank, layer), None)
+                slot.seal(epoch)
+                writer.execute(job)
+        case.p[1].flush_proofs(case.target)
+        case.collect_terminal(1, case.p[1].finish(case.target))
+        native_count = len(writes)
+
+        sender.flush_proofs(case.target)
+        self.assertIsNone(sender.finish(case.target))
+        self.assertFalse(any(worker.try_ready(case.target) for worker in case.d))
+
+        sender.flush_proofs(case.target)
+        self.assertEqual(reports[0], reports[1])
+        self.assertEqual(len(writes), native_count)
+        outcome = sender.finish(case.target)
+        self.assertEqual(outcome, NativeResult(None, True))
+        case.collect_terminal(0, outcome)
+        self.assertTrue(all(worker.try_ready(case.target) for worker in case.d))
+
     def test_cancel_between_publish_and_native_completion_retains_blocks(self):
         case = _Fixture(multi_writer=False)
         allocation, refs = case.publish()

@@ -220,7 +220,14 @@ class LayerwiseSender:
                     if transfer.closing or transfer.error is not None or not transfer.proofs:
                         return
                     receiver, frames = transfer.proofs.popleft()
-                self._report(receiver, target, frames)
+                try:
+                    self._report(receiver, target, frames)
+                except TimeoutError:
+                    # The receiver may already have applied these ranges.
+                    with self._lock:
+                        if not transfer.closing and transfer.error is None:
+                            transfer.proofs.appendleft((receiver, frames))
+                    return
         except Exception as exc:
             with self._lock:
                 transfer.error = transfer.error or str(exc) or type(exc).__name__
