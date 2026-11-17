@@ -26,6 +26,60 @@ _lock = threading.RLock()
 _attention_compute_start_gate: AttentionComputeStartGate | None = None
 
 
+class AttentionComputeCompletion:
+    """One layer execution's completion, never reset or reused by a new step.
+
+    Unlike a KV-ready event, this event must be recorded after the last
+    attention read is enqueued. Waiting for an unrecorded device event is not
+    sufficient: first wait for the host to publish that record, then wait for
+    the device work. A failure wakes waiters without reporting safe reuse.
+    """
+
+    def __init__(self, event: torch.npu.Event | None = None) -> None:
+        self._event = event if event is not None else torch.npu.Event()
+        self._condition = threading.Condition()
+        self._record_started = False
+        self._recorded = False
+        self._error: Exception | None = None
+
+    def record(self) -> None:
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("Attention completion failed") from self._error
+            if self._record_started:
+                return
+            self._record_started = True
+        try:
+            self._event.record()
+        except Exception as exc:
+            self.fail(exc)
+            raise
+        with self._condition:
+            self._recorded = True
+            self._condition.notify_all()
+
+    def fail(self, error: Exception) -> None:
+        with self._condition:
+            if self._error is None:
+                self._error = error
+            self._condition.notify_all()
+
+    def wait(self, timeout: float = 10.0) -> bool:
+        with self._condition:
+            if not self._condition.wait_for(lambda: self._recorded or self._error is not None, timeout):
+                return False
+            if self._error is not None:
+                raise RuntimeError("Attention completion failed") from self._error
+        # Do not hold a lock needed by record/fail while synchronizing NPU work.
+        # As with the existing attention start gate, timeout bounds the host
+        # publication wait; device synchronization uses the runtime's guarantee.
+        self._event.synchronize()
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("Attention completion failed") from self._error
+        return True
+
+
 class AttentionComputeStartGate:
     """Gate that opens when the compute stream reaches attention.
 

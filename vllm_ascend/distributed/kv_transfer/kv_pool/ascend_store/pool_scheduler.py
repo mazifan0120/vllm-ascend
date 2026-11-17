@@ -54,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_group_block_sizes,
     infer_group_cache_families,
     infer_tp_mismatch_info,
+    mtp_prefix_block_hash,
     normalize_block_ids_by_group,
     uses_hybrid_kv_cache,
 )
@@ -122,6 +123,11 @@ class KVPoolScheduler:
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
+        self.main_reuse_mtp_prefix = (
+            self.use_eagle
+            and getattr(speculative_config, "method", None) == "mtp"
+            and getattr(speculative_config, "num_speculative_tokens", None) == 1
+        )
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
         self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
         cacheable_block_sizes = [self.original_block_size[i] for i in self.cacheable_group_ids]
@@ -254,6 +260,13 @@ class KVPoolScheduler:
                     self.num_layers,
                     vllm_config.kv_transfer_config.kv_connector_extra_config,
                 ).has_layer_reuse
+        elif self.use_block_key_layerwise and kv_cache_config is not None:
+            reuse_config = self.layerwise_protocol.extract_layout_config(extra_config)
+            if reuse_config is not None:
+                # Scheduler specs merge per-rank Indexer names and describe no
+                # physical allocation. Worker-local planners validate storage;
+                # the scheduler needs only the shared logical slot assignment.
+                self.layerwise_offload = build_layerwise_cache_layout(self.num_layers, reuse_config).has_layer_reuse
         self.model_name = model_config.model.split("/")[-1]
 
         self.client: LookupKeyClient | None = None
@@ -543,9 +556,17 @@ class KVPoolScheduler:
         )
         if not block_hashes:
             return 0
-        keys_by_block = [
-            self._make_layerwise_hit_check_keys(0, block_hash_to_str(block_hash)) for block_hash in block_hashes
-        ]
+        if self.layerwise_offload and self.use_eagle:
+            # Only blocks with a full, matching successor are portable. The
+            # request-private tail is never a cross-request cache hit.
+            keys_by_block = [
+                self._make_layerwise_hit_check_keys(0, mtp_prefix_block_hash(block_hashes, index))
+                for index in range(len(block_hashes) - 1)
+            ]
+        else:
+            keys_by_block = [
+                self._make_layerwise_hit_check_keys(0, block_hash_to_str(block_hash)) for block_hash in block_hashes
+            ]
         block_hits = self._query_layerwise_block_hits(keys_by_block)
         num_hit_blocks = 0
         for hit in block_hits:
@@ -615,6 +636,11 @@ class KVPoolScheduler:
         self.load_specs.pop(request.request_id, None)
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
+        if self.use_block_key_layerwise and self.layerwise_offload and self.use_eagle:
+            if num_computed_tokens:
+                raise RuntimeError("Main-only MTP reuse cannot restore a cross-request local prefix")
+            if not getattr(self, "main_reuse_mtp_prefix", False):
+                return 0, False
 
         prompt_token_len = len(request.prompt_token_ids)
         if self.use_block_key_layerwise:
@@ -650,6 +676,8 @@ class KVPoolScheduler:
                     hbm_hit_tokens=num_computed_tokens,
                 )
 
+        if self.layerwise_offload and self.use_block_key_layerwise and num_computed_tokens > num_external_hit_tokens:
+            raise RuntimeError("Shared Main local prefix is not fully recoverable from Store")
         if num_external_hit_tokens == 0:
             return 0, False
 
@@ -783,6 +811,8 @@ class KVPoolScheduler:
         )
 
     def _get_last_chunk_tokens_num(self, prompt_token_ids: list[int]) -> int:
+        if self.layerwise_offload:
+            return len(prompt_token_ids)
         if self._discard_partial_chunks:
             return self._floor_to_cache_transfer_granularity(len(prompt_token_ids))
         return len(prompt_token_ids)
@@ -794,7 +824,10 @@ class KVPoolScheduler:
         load_spec: LoadSpec | None,
         prompt_token_ids: list[int],
         skip_save: bool | None,
+        restore_end_token: int = 0,
     ):
+        if self.layerwise_offload and restore_end_token > 0 and load_spec is None:
+            raise RuntimeError("Shared Main prefix requires a Store restore plan")
         last_chunk_tokens_num = self._get_last_chunk_tokens_num(prompt_token_ids)
         return ReqMeta.from_request_tracker(
             request_tracker,
@@ -808,6 +841,7 @@ class KVPoolScheduler:
             kv_cache_group_families=self.kv_cache_group_families,
             save_partial_block=self.layerwise_offload,
             hash_block_size=self.hash_block_size,
+            restore_end_token=restore_end_token if self.layerwise_offload else 0,
         )
 
     def _process_new_request(
@@ -844,14 +878,27 @@ class KVPoolScheduler:
             gva_block_offset=(previous_tracker.gva_block_offset if previous_tracker else 0),
             num_speculative_blocks_by_group=self.num_speculative_blocks_by_group,
             block_sizes=self.grouped_block_size,
+            request_instance=previous_tracker.request_instance if previous_tracker else None,
+            snapshot_generation=previous_tracker.snapshot_generation if previous_tracker else 0,
         )
         self._request_trackers[request.req_id] = request_tracker
+        # Receipt-mode restore-only: the D scheduler marked this request's
+        # entire prompt as covered by the target lease, so the Store restore
+        # driver must restore the full range (restore_end_token == token_len)
+        # rather than the partially-computed prefix. Without this the driver's
+        # no-new-tokens contract rejects the request.
+        params = getattr(request, "kv_transfer_params", None) or {}
+        if params.get("restore_only"):
+            restore_end_token = num_tokens_to_compute
+        else:
+            restore_end_token = request.num_computed_tokens
         return self._build_req_meta(
             request_tracker,
             request_real.block_hashes,
             load_spec,
             request.prompt_token_ids,
             force_skip_save,
+            restore_end_token=restore_end_token,
         )
 
     def _process_preempted_cached_request(
@@ -885,6 +932,8 @@ class KVPoolScheduler:
             gva_block_offset=(previous_tracker.gva_block_offset if previous_tracker else 0),
             num_speculative_blocks_by_group=self.num_speculative_blocks_by_group,
             block_sizes=self.grouped_block_size,
+            request_instance=previous_tracker.request_instance if previous_tracker else None,
+            snapshot_generation=previous_tracker.snapshot_generation if previous_tracker else 0,
         )
         self._request_trackers[req_id] = request_tracker
         return self._build_req_meta(
@@ -893,6 +942,7 @@ class KVPoolScheduler:
             load_spec,
             request_real.prompt_token_ids,
             force_skip_save,
+            restore_end_token=request_real.num_computed_tokens,
         )
 
     def _process_running_cached_request(
@@ -917,6 +967,7 @@ class KVPoolScheduler:
         previous_snapshot_end_token = request_tracker.last_layerwise_snapshot_end_token
         previous_snapshot_block_index = request_tracker.last_layerwise_snapshot_block_index
         previous_snapshot_start_block = request_tracker.last_layerwise_snapshot_start_block
+        previous_snapshot_generation = request_tracker.snapshot_generation
         num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
         if req_tuple:
             request = req_tuple[0]
@@ -940,6 +991,7 @@ class KVPoolScheduler:
                 layerwise_snapshot_block_index=previous_snapshot_block_index,
                 layerwise_snapshot_start_block=previous_snapshot_start_block,
                 layerwise_previous_step=True,
+                layerwise_snapshot_generation=previous_snapshot_generation,
             )
         return self._build_req_meta(
             request_tracker,
@@ -947,6 +999,7 @@ class KVPoolScheduler:
             load_spec,
             request.prompt_token_ids,
             force_skip_save,
+            restore_end_token=num_current_tokens,
         )
 
     def _process_async_load_request(
@@ -974,6 +1027,8 @@ class KVPoolScheduler:
             gva_block_offset=(previous_tracker.gva_block_offset if previous_tracker else 0),
             num_speculative_blocks_by_group=self.num_speculative_blocks_by_group,
             block_sizes=self.grouped_block_size,
+            request_instance=previous_tracker.request_instance if previous_tracker else None,
+            snapshot_generation=previous_tracker.snapshot_generation if previous_tracker else 0,
         )
         self._request_trackers[request_id] = request_tracker
         return ReqMeta.from_request_tracker(

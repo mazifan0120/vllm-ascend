@@ -302,6 +302,35 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return False
         return self.connector_worker.set_external_slot_release_waiter(waiter)
 
+    def set_reuse_source_consumer(self, consumer) -> None:
+        """Install the worker-local source contract before KV registration."""
+        if self.connector_worker is None:
+            raise RuntimeError("Source consumers must be installed on the worker")
+        self.connector_worker.set_reuse_source_consumer(consumer)
+
+    def wants_reuse_source_contract(self) -> bool:
+        """Negotiate the source contract only for an actual Main cache plan."""
+        worker = self.connector_worker
+        return bool(
+            self.use_block_key_layerwise
+            and worker is not None
+            and getattr(worker, "_main_buffer_layer_slots", None)
+            and getattr(worker, "_layerwise_reuse_layout", None) is not None
+        )
+
+    def restore_kv_for_transfer(self, connector_metadata) -> None:
+        if self.connector_worker is None:
+            raise RuntimeError("Restore-only transfer requires a worker")
+        self.connector_worker.restore_kv_for_transfer(connector_metadata)
+
+    def abort_reuse_sources(self, error: Exception) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.abort_reuse_sources(error)
+
+    def drain_reuse_sources(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.drain_reuse_sources()
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)

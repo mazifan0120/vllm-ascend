@@ -562,6 +562,17 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         with self.assertRaises(backend_base.BatchResultShapeError):
             b.batch_is_readable(["k1", "k2"])
 
+    def test_remove_private_snapshots_acknowledges_missing_but_retains_leased_objects(self):
+        backend = self._make_backend()
+        keys = ["@private_snapshot_v1:removed", "@private_full_v1:missing", "@private_full_v1:leased"]
+        backend.store.remove.side_effect = [0, -704, -706]
+
+        self.assertEqual(backend.remove_private_snapshots(keys), [0, 0, -706])
+        self.assertEqual([call.args for call in backend.store.remove.call_args_list], [(key, False) for key in keys])
+        with self.assertRaisesRegex(ValueError, "must not remove public"):
+            backend.remove_private_snapshots(["public"])
+        self.assertEqual(backend.store.remove.call_count, len(keys))
+
     def test_transfers(self):
         module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.logger"
         for operation, store_method in [
@@ -620,6 +631,14 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         self.assertEqual(b.batch_copy_get(["k"], [[200]], [[16]], [[32]]), [0])
         b.store.batch_put_from_multi_buffer_ranges.assert_called_once_with(["k"], [[100]], [[16]], [[32]])
         b.store.batch_get_into_multi_buffer_ranges.assert_called_once_with(["k"], [[200]], [[16]], [[32]])
+
+    def test_layerwise_range_get_rejects_malformed_per_key_results(self):
+        backend = self._make_backend()
+        for invalid in ([], [0, 0], [True], [None]):
+            with self.subTest(invalid=invalid):
+                backend.store.batch_get_into_multi_buffer_ranges.return_value = invalid
+                with self.assertRaises(backend_base.BatchResultShapeError):
+                    backend.batch_copy_get(["k"], [[200]], [[16]], [[32]])
 
     def test_layerwise_batch_result_shape_is_rejected(self):
         b = self._make_backend()

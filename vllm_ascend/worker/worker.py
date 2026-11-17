@@ -85,6 +85,7 @@ from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import get_layerwise_protocol
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
@@ -1085,6 +1086,13 @@ class NPUWorker(WorkerBase):
     ) -> tuple[int, int, float]:
         if not kv_cache_spec:
             return 0, 0, 1.0
+        # Protocols that keep Indexers private must not take the legacy path,
+        # which counts only one Indexer backing per shared Main slot.
+        protocol = get_layerwise_protocol(str(extra_config.get("backend", "mooncake")))
+        get_reuse_memory_info = getattr(protocol, "get_reuse_memory_info", None)
+        if callable(get_reuse_memory_info):
+            base_layers = self.model_config.get_num_layers(self.parallel_config)
+            return get_reuse_memory_info(kv_cache_spec, base_layers, extra_config, vllm_config=self.vllm_config)
         # Match the allocation planner: persistent draft pages are not target
         # scratch slots and must be counted once each in the physical budget.
         excluded_layer_names = (excluded_layer_names or set()) & kv_cache_spec.keys()

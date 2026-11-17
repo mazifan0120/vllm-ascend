@@ -87,23 +87,23 @@ class TestMooncakeHostPool(unittest.TestCase):
         self.assertFalse(create_segment.call_args.kwargs["mmap"])
         self.assertFalse(create_segment.call_args.kwargs["host_register"])
         self.assertEqual(create_segment.call_args.kwargs["device_id"], 7)
-        self.assertIn("comm_group", create_segment.call_args.kwargs)
-        self.assertNotIn("tp_group", create_segment.call_args.kwargs)
+        self.assertIn("tp_group", create_segment.call_args.kwargs)
+        self.assertNotIn("comm_group", create_segment.call_args.kwargs)
         block = create_segment.call_args.kwargs["blocks"]["pool"]
-        self.assertEqual(block["shape"], (1 << 30,))
+        self.assertEqual(block["shape"], (requested_size + alignment - 1,))
         raw.narrow.assert_called_once_with(0, alignment - 1, requested_size)
         self.assertIs(region.tensor, aligned)
         self.assertEqual(region.tensor.numel(), requested_size)
         self.assertEqual(region.segment_offset, alignment - 1)
 
-    def test_vmm_reservation_size_covers_padding_and_heap_alignment(self):
-        # Include the reported failure and both sides of the 1 GiB boundary
-        # after adding the 15 bytes needed for a 16-byte-aligned tensor view.
+    def test_legacy_reservation_covers_alignment_without_vmm_rounding(self):
+        # Legacy mmap/host-register reserves only the required alignment slack,
+        # including at the 1 GiB boundary that would need VMM rounding.
         cases = (
-            (0x4FFA00000, 0x500000000),
+            (0x4FFA00000, 0x4FFA00000 + 15),
             ((1 << 30) - 15, 1 << 30),
-            ((1 << 30) - 14, 2 << 30),
-            (1 << 30, 2 << 30),
+            ((1 << 30) - 14, (1 << 30) + 1),
+            (1 << 30, (1 << 30) + 15),
         )
         for requested_size, expected_allocation in cases:
             with self.subTest(size=requested_size):
@@ -132,15 +132,15 @@ class TestMooncakeHostPool(unittest.TestCase):
                 self.assertIs(region.tensor, aligned)
                 self.assertEqual(region.segment_offset, 15)
 
-    def test_selects_vmm_without_host_registration(self):
+    def test_selects_mmap_with_host_registration(self):
         with patch.object(
             _shared_segment_stub,
             "shared_segment_supported",
             return_value=True,
         ) as supported:
-            self.assertEqual(host_pool_module._select_shared_segment_mode(), (False, False))
+            self.assertEqual(host_pool_module._select_shared_segment_mode(), (True, True))
 
-        supported.assert_called_once_with(mmap=False, host_register=False)
+        supported.assert_called_once_with(mmap=True, host_register=True)
 
     def test_no_supported_mode_raises(self):
         with (
@@ -151,7 +151,7 @@ class TestMooncakeHostPool(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "requires Ascend VMM support",
+                "cannot expose an NPU-addressable address",
             ),
         ):
             host_pool_module._select_shared_segment_mode()

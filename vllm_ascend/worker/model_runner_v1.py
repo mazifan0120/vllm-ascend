@@ -290,6 +290,7 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
+from vllm_ascend.core.receipt_execution import use_receipt_targets
 
 v41_metadata_builder_type: type[AscendDSAV41MetadataBuilder] = AscendDSAV41MetadataBuilder
 v41_cache_layer_type: type[DeepseekV41CacheLayer] = DeepseekV41CacheLayer
@@ -2223,7 +2224,19 @@ class NPUModelRunner(GPUModelRunner):
         )
         return cut_tokens
 
+    def receipt_target_use_context(self, scheduler_output):
+        if not has_kv_transfer_group():
+            return nullcontext()
+        connector = get_kv_transfer_group()
+        if not getattr(connector,"requires_target_owner",False):
+            return nullcontext()
+        use = getattr(connector,"target_use_context",None)
+        if not callable(use):
+            raise RuntimeError("Receipt target connector must cover actual model execution")
+        return use(tuple(scheduler_output.num_scheduled_tokens), scheduler_output.kv_connector_metadata)
+
     @torch.inference_mode()
+    @use_receipt_targets
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2832,19 +2845,22 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 return
             assert spec_decode_common_attn_metadata is not None
-            self._draft_token_ids = self.propose_draft_token_ids(
-                sampled_token_ids,
-                self.input_batch.sampling_metadata,
-                scheduler_output,
-                spec_decode_metadata,
-                spec_decode_common_attn_metadata,
-                positions,
-                scheduler_output.total_num_scheduled_tokens,
-                hidden_states,
-                aux_hidden_states,
-                sample_hidden_states,
-                batch_desc,
-            )
+            # Drafting runs after execute_model has recorded its receipt use.
+            # Record separate stream tails for the draft model's KV access.
+            with self.receipt_target_use_context(scheduler_output):
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    sampled_token_ids,
+                    self.input_batch.sampling_metadata,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    positions,
+                    scheduler_output.total_num_scheduled_tokens,
+                    hidden_states,
+                    aux_hidden_states,
+                    sample_hidden_states,
+                    batch_desc,
+                )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         output_spec_token_ids = None
@@ -4685,7 +4701,34 @@ class NPUModelRunner(GPUModelRunner):
                     layer = self.compilation_config.static_forward_context[layer_name]
                     layer.impl.bind_copy_sfa_kv_cache(self.sparse_kv_offload_manager, layer_name)
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            connector = get_kv_transfer_group()
+            # Receipt-mode decode worker: bind the sparse manager, consumption
+            # stream and shared TE to the target owner facade before KV
+            # registration. A MultiConnector explicitly forwards this setup to
+            # its target child; the owner's reverse authority uses configured
+            # loopback RPC and does not wait for scheduler initialization.
+            if getattr(connector, "requires_target_owner", False):
+                # Receipt-mode decode requires the sparse offload manager: the
+                # Host Main pool it owns is the target backing. A receipt worker
+                # without sparse offload is a misconfiguration, not a silent skip.
+                assert self.sparse_kv_offload_manager is not None, (
+                    "Receipt-mode decode requires sparse KV offload to be enabled"
+                )
+                from vllm_ascend.distributed.kv_transfer.utils.utils import (
+                    get_transfer_timeout_value,
+                )
+
+                # The target and MTP graphs share this parameter-update stream.
+                # Fence it explicitly along with compute and sparse writeback.
+                self.sparse_kv_offload_manager.target_graph_update_stream = getattr(self, "update_stream", None)
+                connector.configure_target_owner(
+                    self.sparse_kv_offload_manager,
+                    retention=None,
+                    consumption_stream=torch.npu.current_stream(),
+                    timeout=float(get_transfer_timeout_value()),
+                    te=None,
+                )
+            connector.register_kv_caches(kv_caches)
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,

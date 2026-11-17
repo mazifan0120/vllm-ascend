@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -13,6 +15,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.distributed.kv_events import KVConnectorKVEvents
+    from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -39,6 +42,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             "HMA should not be enabled unless all sub-connectors support it"
         )
         self._configure_layerwise_reuse_completion()
+        self._configure_target_provider()
         self._mamba_copy_bufs = None
         # Handle to the (V2) mamba hybrid model state while its per-layer
         # align pre-copy is deferred behind a layerwise child connector.
@@ -93,15 +97,164 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             set_waiter = getattr(connector, "set_external_slot_release_waiter", None)
             if callable(set_waiter) and set_waiter(self._wait_for_external_slot_release) is not False:
                 self._external_slot_release_sink_configured = True
+        self._configure_reuse_source_contract()
+
+    def _configure_reuse_source_contract(self) -> None:
+        providers = [
+            p for p in self._layerwise_slot_release_providers if getattr(p, "reuse_source_contract_version", None) == 1
+        ]
+        if not providers:
+            return
+        if len(providers) != 1:
+            raise RuntimeError("Reuse source contract v1 requires exactly one transport consumer")
+        sinks = []
+        for connector in self._connectors:
+            if not callable(getattr(connector, "set_reuse_source_consumer", None)):
+                continue
+            wants_contract = getattr(connector, "wants_reuse_source_contract", None)
+            if callable(wants_contract) and not wants_contract():
+                continue
+            sinks.append(connector)
+        # A transport capability does not opt a plain, Store-less engine in
+        # to buffer reuse. Preserve its legacy send path.
+        if not sinks:
+            return
+        if len(sinks) != 1 or not self._external_slot_release_sink_configured:
+            raise RuntimeError("Reuse source contract requires one wired Store sink")
+        sinks[0].set_reuse_source_consumer(providers[0])
+        bound = getattr(providers[0], "bind_reuse_source_contract", None)
+        if callable(bound):
+            bound()
 
     def _wait_for_external_slot_release(self, layer_idx: int) -> None:
         for provider in self._layerwise_slot_release_providers:
             provider.wait_for_layer_reuse(layer_idx)
 
+    @staticmethod
+    def _receipt_mode_requested(connector) -> bool:
+        """Layerwise receipt mode is opted in per engine via the kv-transfer
+        extra config key ``layerwise_receipt_mode``."""
+        config = getattr(connector, "vllm_config", None)
+        kv_transfer = getattr(config, "kv_transfer_config", None) if config is not None else None
+        extra = getattr(kv_transfer, "kv_connector_extra_config", None) or {}
+        return bool(extra.get("layerwise_receipt_mode", False))
+
+    def _configure_target_provider(self) -> None:
+        """TargetProvider injection. Three-way decision:
+        - mode off + no provider -> skip (legal, plain mode);
+        - mode on + no provider -> startup failure (no silent
+          degradation when the feature was requested);
+        - more than one provider -> startup failure (exactly one D-target store).
+        The discovered provider must pass the facade's capability probe, which
+        also aborts startup on any gap."""
+        providers = []
+        for connector in self._connectors:
+            worker = getattr(connector, "connector_worker", None)
+            candidates = [connector, worker]
+            for candidate in (connector, worker):
+                if candidate is not None:
+                    # A stable facade can be exposed before its owner catalog
+                    # is registered. Do not serialize/duplicate the owner.
+                    exposed = getattr(candidate, "__dict__", {}).get("target_provider")
+                    if exposed is not None:
+                        candidates.append(exposed)
+            for candidate in candidates:
+                if candidate is not None and callable(getattr(candidate, "acquire_target", None)):
+                    if all(candidate is not existing for existing in providers):
+                        providers.append(candidate)
+        if len(providers) > 1:
+            raise ValueError(f"Expected at most one TargetProvider, found {len(providers)}")
+        if not providers:
+            if any(self._receipt_mode_requested(connector) for connector in self._connectors):
+                raise ValueError(
+                    "layerwise_receipt_mode is enabled but no connector exposes a TargetProvider "
+                    "(acquire_target); refusing to start"
+                )
+            return
+        for connector in self._connectors:
+            setter = getattr(connector, "set_target_provider", None)
+            if callable(setter):
+                setter(providers[0])
+                return
+        if any(self._receipt_mode_requested(connector) for connector in self._connectors):
+            raise ValueError("Found a TargetProvider but no connector accepts set_target_provider")
+
     def shutdown(self) -> None:
         # Release provider waits before joining the store's receive threads.
         self._connectors[:] = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
         super().shutdown()
+
+    @property
+    def requires_target_owner(self) -> bool:
+        return any(getattr(c, "requires_target_owner", False) for c in self._connectors)
+
+    def configure_target_owner(self, manager, **kwargs) -> None:
+        owners = [c for c in self._connectors if getattr(c, "requires_target_owner", False)]
+        if len(owners) != 1:
+            raise RuntimeError("Receipt worker requires exactly one target owner connector")
+        owners[0].configure_target_owner(manager, **kwargs)
+
+    def configure_receipt_scheduler_runtime(self, manager, allocation_lock):
+        owners = [c for c in self._connectors if getattr(c, "target_provider", None) is not None]
+        if len(owners) != 1:
+            raise RuntimeError("Receipt scheduler requires exactly one target owner connector")
+        return owners[0].configure_receipt_scheduler_runtime(manager, allocation_lock)
+
+    def prepare_target_free(self, request) -> bool:
+        return all(
+            c.prepare_target_free(request)
+            for c in self._connectors
+            if callable(getattr(c, "prepare_target_free", None))
+        )
+
+    def is_target_ready(self, request) -> bool:
+        return all(
+            connector.is_target_ready(request)
+            for connector in self._connectors
+            if callable(getattr(connector, "is_target_ready", None))
+        )
+
+    @contextmanager
+    def target_use_context(self, request_ids, metadata=None):
+        child_metadata = getattr(metadata, "metadata", ())
+        with ExitStack() as stack:
+            for index, connector in enumerate(self._connectors):
+                if getattr(connector, "requires_target_owner", False):
+                    child = child_metadata[index] if index < len(child_metadata) else None
+                    stack.enter_context(connector.target_use_context(request_ids, child))
+            yield
+
+    def _receipt_restore_only_requests(self):
+        """Collect explicit restore-only marks from request-keyed child metadata."""
+        marked = set()
+        for connector in self._connectors:
+            metadata = getattr(connector, "_connector_metadata", None)
+            requests = getattr(metadata, "requests", None)
+            if not isinstance(requests, Mapping):
+                continue
+            for req_id, meta in requests.items():
+                if getattr(meta, "restore_only", False):
+                    marked.add(req_id)
+        return marked
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        # Receipt-mode restore-only requests are routed to the Store restore
+        # driver instead of the normal per-child forward load. The Store child
+        # already built its own AscendConnectorMetadata with the full-range
+        # restore bounds; hand it to the restore driver and skip the upstream
+        # per-child start_load_kv for this step's restore-only requests.
+        restore_ids = self._receipt_restore_only_requests()
+        if restore_ids:
+            store = self._store_restore_connector()
+            if store is None:
+                raise RuntimeError(
+                    "Receipt restore-only requests present but no AscendStore connector exposes a restore driver"
+                )
+            getter = getattr(store, "_get_connector_metadata", None)
+            store_metadata = getter() if callable(getter) else getattr(store, "_connector_metadata", None)
+            store.restore_kv_for_transfer(store_metadata)
+            return
+        super().start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if getattr(self, "_external_slot_release_sink_configured", False):
@@ -124,6 +277,29 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         # state no-ops for non-mamba layers and for already-copied layers.
         if (mamba_state := getattr(self, "_mamba_state", None)) is not None:
             mamba_state.do_mamba_copy_for_layer(layer_name)
+
+    def restore_kv_for_transfer(self, connector_metadata) -> None:
+        """Route a receipt-mode restore-only step to the Store restore driver.
+
+        The D scheduler marks a request whose entire prompt is covered by the
+        target lease. The MooncakeLayerwise connector carries that mark in its
+        metadata, but the restore driver lives on the AscendStore connector
+        (its pool_worker owns the layerwise load/save loop without a model
+        forward). Forward the Store's own metadata to that driver here, so the
+        request restores from the Store instead of entering normal attention.
+        """
+        store = self._store_restore_connector()
+        if store is None:
+            raise RuntimeError("Restore-only transfer requires an AscendStore connector")
+        store.restore_kv_for_transfer(connector_metadata)
+
+    def _store_restore_connector(self):
+        """The child connector that owns the Store restore driver."""
+        for connector in self._connectors:
+            worker = getattr(connector, "connector_worker", None)
+            if worker is not None and callable(getattr(worker, "restore_kv_for_transfer", None)):
+                return connector
+        return None
 
     def prepare_mamba_state_copy(self, mamba_state_or_copy_bufs) -> bool:
         """Take over the mamba align pre-copy for this step.

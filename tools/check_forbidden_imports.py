@@ -46,6 +46,15 @@ CHECK_IMPORTS = {
             # Backport the upstream MessageQueue pickle protocol and test its wire format.
             "vllm_ascend/patch/platform/patch_shm_broadcast.py",
             "tests/ut/patch/platform/test_patch_shm_broadcast.py",
+            # Target contract tests round-trip trusted local values and prove
+            # that live allocation owners, pins and events cannot be pickled.
+            "tests/ut/distributed/ascend_store/test_target_provider.py",
+            "tests/ut/distributed/ascend_store/test_target_lifetime.py",
+            "tests/ut/distributed/ascend_store/test_target_owner_runtime.py",
+            # Trusted local connector metadata must remain serializable when
+            # crossing the scheduler/worker process boundary.
+            "tests/ut/distributed/ascend_store/test_layerwise_metadata.py",
+            "tests/e2e/kv_transfer/target_owner_runtime_npu.py",
         },
     ),
     "re": ForbiddenImport(

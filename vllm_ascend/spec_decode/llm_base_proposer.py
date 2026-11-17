@@ -257,6 +257,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             self.use_cuda_graph = False
 
+        transfer = getattr(self.vllm_config, "kv_transfer_config", None)
+        extra = getattr(transfer, "kv_connector_extra_config", None) or {}
+        if extra.get("layerwise_receipt_mode", False):
+            logger.info(
+                "Receipt MTP execution: target_graph_mode=%s draft_graph=%s speculative_tokens=%d compilation_mode=%s",
+                self.vllm_config.compilation_config.cudagraph_mode,
+                self.use_cuda_graph,
+                self.num_speculative_tokens,
+                self.vllm_config.compilation_config.mode,
+            )
+
         # NOTE: _enable_probabilistic_draft_probs is set by the upstream
         # SpecDecodeBaseProposer.__init__.
         if self._enable_probabilistic_draft_probs:

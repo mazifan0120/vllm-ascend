@@ -94,6 +94,40 @@ def test_interleaved_full_block(mode, scale, padding, dtype):
     roundtrip(mode, scale, padding, dtype)
 
 
+@pytest.mark.parametrize("scale", [1, 3, 45])
+@pytest.mark.parametrize("block_ids", [[], [2, 0, 2]])
+def test_block_key_batch_preserves_sparse_block_order(scale, block_ids):
+    backing, views = components(scale, 3, torch.bfloat16)
+    worker = make_worker({"model.layers.0.self_attn.attn": views}, layerwise=True)
+    database = make_database(worker, scale)
+    builder = LayerBatchBuilder(database, sum(database.group_block_len[0]), database.group_num_layers["kv"][0])
+    shared = SharedBlockData(
+        block_ids_arr=np.asarray(block_ids, dtype=np.int64),
+        block_gvas_arr=None,
+        req_ids=["batch"],
+        is_last_chunks=[True],
+        block_keys=[f"key-{i}" for i in range(len(block_ids))],
+    )
+
+    result = builder.build_addrs(shared, 0)
+
+    assert result.block_ids == block_ids
+    assert len(result.all_buffers) == len(block_ids)
+    tokens_per_block = views[0].shape[1]
+    for block_id, buffers, sizes in zip(block_ids, result.all_buffers, result.all_sizes, strict=True):
+        start = block_id * scale * tokens_per_block
+        expected_buffers, expected_sizes, _ = database.prepare_value_layer(
+            start, start + scale * tokens_per_block, [0, 1, 2], 0
+        )
+        assert buffers == expected_buffers
+        assert sizes == expected_sizes
+        # All ranges must remain inside this storage, including padded views.
+        assert all(
+            backing.data_ptr() <= address < backing.data_ptr() + backing.numel() * backing.element_size()
+            for address in buffers
+        )
+
+
 @pytest.mark.parametrize("mode", ["bulk", "gva", "block_key", "legacy"])
 def test_5760_token_block_128_token_kernel_bf16(mode):
     roundtrip(mode, 45, 0, torch.bfloat16, tokens=128, nope=512, rope=64)

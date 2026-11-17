@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import receipt_mtp_layer_count
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.layerwise_keys import LayerwiseKeyBuilder
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
@@ -21,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 )
 
 if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import MainOnlyCachePlan
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
 
@@ -75,9 +77,72 @@ def bind_layerwise_keys(
 
 
 def extract_layout_config(extra_config: dict[str, Any]) -> dict[str, Any] | None:
-    """Block-key transfer does not opt into GVA-backed physical reuse."""
-    del extra_config
+    """Opt into Main-only reuse only when a shared-buffer count is explicit."""
+    if extra_config.get("use_layerwise", False) and "layerwise_num_shared_buffers" in extra_config:
+        return extra_config
     return None
+
+
+def build_cache_plan(kv_cache_config: Any, vllm_config: Any, extra_config: dict[str, Any]) -> MainOnlyCachePlan:
+    """Use one Main-only planner for both runner allocation and Store reuse.
+
+    The producer runtime validates the external waiter separately at startup.
+    """
+    # The layout module resolves protocols through this module's registry.
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+        MainOnlyCachePlan,
+        build_layerwise_cache_layout,
+        build_layerwise_reuse_layout,
+        build_main_only_kv_cache_plan,
+        get_layerwise_kv_cache_specs,
+    )
+
+    base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    if not build_layerwise_cache_layout(base_layers, extra_config).has_layer_reuse:
+        specs = get_layerwise_kv_cache_specs(kv_cache_config)
+        layout = build_layerwise_reuse_layout(
+            specs, base_layers, {**extra_config, "layerwise_independent_layers": "all"}
+        )
+        return MainOnlyCachePlan(
+            layout, tuple(kv_cache_config.kv_cache_tensors), sum(s.page_size_bytes for s in specs.values())
+        )
+    role = vllm_config.kv_transfer_config.kv_role
+    if getattr(role, "value", role) != "kv_producer":
+        raise ValueError("Mooncake Main-only buffer reuse supports Prefill producers only")
+    if getattr(vllm_config, "use_v2_model_runner", False):
+        raise NotImplementedError("Mooncake Main-only buffer reuse requires the V1 runner")
+    if not vllm_config.model_config.enforce_eager:
+        raise NotImplementedError("Mooncake Main-only buffer reuse currently requires eager execution")
+    if vllm_config.parallel_config.pipeline_parallel_size != 1:
+        raise NotImplementedError("Mooncake Main-only buffer reuse requires PP=1")
+    validate_topology(vllm_config.parallel_config)
+    if len(kv_cache_config.kv_cache_groups) != 1:
+        raise NotImplementedError("Mooncake Main-only reuse currently requires a single KV manager group")
+    resident_mtp_layers = receipt_mtp_layer_count(vllm_config)
+    if resident_mtp_layers and vllm_config.cache_config.enable_prefix_caching:
+        raise NotImplementedError("Mooncake Main-only reuse with MTP requires prefix caching disabled")
+    return build_main_only_kv_cache_plan(
+        kv_cache_config, base_layers, extra_config, resident_mtp_layers=resident_mtp_layers
+    )
+
+
+def get_reuse_memory_info(
+    layer_specs: dict[str, Any], base_layers: int, extra_config: dict[str, Any], *, vllm_config: Any = None
+):
+    """Share the allocation plan with the worker's profiling budget."""
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+        build_layerwise_cache_layout,
+        get_main_only_reuse_memory_info,
+    )
+
+    resident_mtp_layers = (
+        receipt_mtp_layer_count(vllm_config)
+        if build_layerwise_cache_layout(base_layers, extra_config).has_layer_reuse
+        else 0
+    )
+    return get_main_only_reuse_memory_info(
+        layer_specs, base_layers, extra_config, resident_mtp_layers=resident_mtp_layers
+    )
 
 
 def make_block_key(
@@ -118,7 +183,21 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
     """
     parallel = vllm_config.parallel_config
     if parallel.pipeline_parallel_size == 1:
-        return ""
+        if getattr(vllm_config, "speculative_config", None) is None:
+            return ""
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+            build_layerwise_cache_layout,
+            get_layerwise_reuse_config,
+        )
+
+        reuse = get_layerwise_reuse_config(getattr(vllm_config, "kv_transfer_config", None))
+        if reuse is None:
+            return ""
+        base_layers = vllm_config.model_config.get_num_layers(parallel)
+        if not build_layerwise_cache_layout(base_layers, reuse).has_layer_reuse:
+            return ""
+        # An object containing only target layers cannot satisfy a draft load.
+        receipt_mtp_layer_count(vllm_config)
     model = vllm_config.model_config
     partitions = []
     previous_end = 0

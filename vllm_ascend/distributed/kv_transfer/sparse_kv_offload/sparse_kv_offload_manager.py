@@ -1,5 +1,6 @@
 import contextlib
 import os
+import threading
 import typing
 from dataclasses import dataclass
 from zlib import adler32
@@ -35,13 +36,13 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
-from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import (
     HostMemoryRegion,
     HostPoolTopology,
     MooncakeHostPool,
     allocate_mooncake_host_region,
 )
+from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Main BF16 cache:
 # [k_cache, v_cache, k_cache_cpu, v_cache_cpu, topk_buffer_k, topk_buffer_v].
@@ -581,6 +582,9 @@ class SparseKVOffloadManager:
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self._target_owner_lock = threading.RLock()
+        self._target_owner_facade = None
+        self.target_graph_update_stream = None
         self.sparse_kv_offload_config = sparse_kv_offload_config
 
         model_config = vllm_config.model_config
@@ -768,6 +772,108 @@ class SparseKVOffloadManager:
             raise RuntimeError("Sparse KV offload is not using the Mooncake Host backend")
         return allocator
 
+    def target_runtime_streams(self) -> tuple:
+        """Real attention, graph-parameter and asynchronous Host writeback streams."""
+        streams = list(get_subscribed_compute_streams())
+        streams.extend(
+            getattr(self, name, None)
+            for name in ("current_kv_save_stream", "fused_plan_stream", "target_graph_update_stream")
+        )
+        return tuple(stream for stream in streams if stream is not None)
+
+    def bind_registered_target_owner(
+        self, kv_caches, te, *, retention, consumption_stream, timeout: float, facade=None
+    ):
+        """Bind A1/A2 only after existing allocations and TE registration exist.
+
+        The caller supplies the real scheduler retention client and model
+        consumption stream. No second pool, tensor or request block is allocated.
+        Every TP rank calls this during the same initialization phase.
+        """
+
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import ContractError
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
+            DeferredTargetProvider,
+            create_registered_target_owner,
+            validate_registered_target_execution,
+        )
+
+        validate_registered_target_execution(self.vllm_config)
+        if not self.vllm_config.model_config.enforce_eager and self.target_graph_update_stream is None:
+            raise ContractError("Registered D graph targets require the actual graph update stream")
+        components, identities, block_tokens = self.get_target_cache_identities()
+        with self._target_owner_lock:
+            if self._target_owner_facade is not None:
+                raise ContractError("D target owner is already bound to a registration generation")
+            facade = facade if facade is not None else DeferredTargetProvider()
+            owner = create_registered_target_owner(
+                self,
+                kv_caches,
+                te,
+                components=components,
+                layer_groups=identities,
+                block_tokens=block_tokens,
+                num_blocks=self.kv_cache_config.num_blocks,
+                retention=retention,
+                device_id=self.get_mooncake_host_pool().topology.device_id,
+                consumption_stream=consumption_stream,
+                timeout=timeout,
+            )
+            try:
+                facade.bind(owner)
+            except Exception:
+                owner.close()
+                raise
+            self._target_owner_facade = facade
+            return facade
+
+    def get_target_cache_identities(self):
+        """Explicit registered-target roles, shared by registration and owner."""
+        from vllm.v1.worker.utils import extract_layer_index
+
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
+            Component,
+            ContractError,
+            receipt_mtp_layer_count,
+        )
+
+        model_layers = self.num_target_layers + receipt_mtp_layer_count(self.vllm_config)
+        components, identities, block_tokens = {}, {}, {}
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            for name in group.layer_names:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[name]
+                if isinstance(spec, AscendSFAIndexerCacheSpec):
+                    component = Component.INDEXER
+                elif isinstance(spec, AscendMLAAttentionSpec):
+                    component = Component.MAIN
+                else:
+                    raise ContractError("D target catalog encountered an unsupported cache component")
+                layer = extract_layer_index(name)
+                if not 0 <= layer < model_layers or name in components:
+                    raise ContractError("D target layer identity is extra, duplicate or out of range")
+                components[name] = component
+                identities[name] = (layer, group_id)
+                block_tokens[name] = spec.block_size
+        main_layers = {identities[name][0] for name, component in components.items() if component is Component.MAIN}
+        if main_layers != set(range(model_layers)):
+            raise ContractError("D target catalog does not cover every model and resident MTP Main layer")
+        return components, identities, block_tokens
+
+    def get_target_transfer_caches(self, kv_caches):
+        """Views of existing Host Main and HBM Indexer; allocate nothing."""
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import Component, ContractError
+
+        components, _, _ = self.get_target_cache_identities()
+        if set(kv_caches) != set(components):
+            raise ContractError("Target registration must cover every actual component cache")
+        return {
+            name: self.get_local_host_kv_views(name) if component is Component.MAIN else kv_caches[name]
+            for name, component in components.items()
+        }
+
     def _get_mooncake_writeback_view(
         self,
         logical_tensor: torch.Tensor,
@@ -809,6 +915,12 @@ class SparseKVOffloadManager:
 
     def close(self) -> None:
         """Release backend-owned Host KV resources."""
+        with getattr(self, "_target_owner_lock", contextlib.nullcontext()):
+            facade = getattr(self, "_target_owner_facade", None)
+            if facade is not None:
+                # Check BEFORE releasing any membership/Host allocation. Active
+                # target leases must preserve the complete owner's resources.
+                facade.close()
         # Legacy (pre-VMM) mode: the membership map is one shared region
         # owned by the allocator; release it together with the allocator.
         region = self.fused_overlap_membership_region
@@ -1663,6 +1775,7 @@ class SparseKVOffloadManager:
         result = offload.sparse_copy(sources, destinations, lengths, count, sources.device)
         if result not in (None, 0):
             raise RuntimeError(f"memfabric fused_copy_sfa tail H2D failed with result={result}")
+
     def _initialize_paired_current_scatter(self) -> None:
         self.fused_current_scatter = None
         if not self.use_fused_overlap or self.max_num_tokens == 0 or not envs.VLLM_ASCEND_FSA_PAIRED_CURRENT_SCATTER:
