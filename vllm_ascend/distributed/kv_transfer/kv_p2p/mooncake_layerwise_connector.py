@@ -1418,6 +1418,12 @@ class MooncakeLayerwiseConnectorScheduler:
                 continue
             params = info.request.kv_transfer_params
             allocation, refs = decode_allocation(params["layerwise_allocation"])
+            model = self.vllm_config.model_config
+            RegisteredLayout.validate_tp(
+                self.vllm_config.parallel_config.tensor_parallel_size,
+                len(refs),
+                replicated=model.use_mla and model.hf_text_config.model_type == "glm_moe_dsa",
+            )
             start = info.local_computed_tokens
             end = min(
                 allocation.prompt_tokens,

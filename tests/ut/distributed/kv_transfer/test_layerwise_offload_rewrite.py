@@ -100,9 +100,9 @@ def _serve_rank(worker, endpoint, stop):
 
 
 class _Fixture:
-    def __init__(self, *, multi_writer=True):
-        catalogs = tuple(decode_catalog(_roundtrip(encode_catalog(_catalog(rank)))) for rank in range(2))
-        self.layout = RegisteredLayout(catalogs, producer_tp=4, parallel_main=multi_writer)
+    def __init__(self, *, multi_writer=True, producer_tp=4, decode_tp=2):
+        catalogs = tuple(decode_catalog(_roundtrip(encode_catalog(_catalog(rank)))) for rank in range(decode_tp))
+        self.layout = RegisteredLayout(catalogs, producer_tp, parallel_main=multi_writer)
         self.allocation = TargetAllocation(TargetId("request", 1, 7), 7, ((1, 0), (2, 1)))
         self.target = self.allocation.target
         self.bytes = {}
@@ -115,16 +115,16 @@ class _Fixture:
                 lambda: None,
                 lambda allocation, rank=rank: self.visibility.append((rank, allocation.target)),
             )
-            for rank in range(2)
+            for rank in range(decode_tp)
         )
         self.retained = []
         self.released = []
         self.block_owners = {}
         self.scheduler = DecodeAdmission(self.layout, self.hold_blocks, self.release_blocks)
-        self.barriers = tuple(SlotBarrier(((0, 1),)) for _ in range(2))
+        self.barriers = tuple(SlotBarrier(((0, 1),)) for _ in range(producer_tp))
         self.p = tuple(
             LayerwiseSender(rank, self.layout, self.barriers[rank], self.addresses, self.write, self.report)
-            for rank in range(2)
+            for rank in range(decode_tp)
         )
 
     def hold_blocks(self, allocation):
@@ -159,7 +159,7 @@ class _Fixture:
         return mooncake_sync_write(self, write)
 
     def batch_transfer_sync_write(self, endpoint, sources, targets, lengths):
-        assert endpoint in ("test-0", "test-1")
+        assert endpoint in {catalog.endpoint for catalog in self.layout.catalogs}
         for src, dst, count in zip(sources, targets, lengths, strict=True):
             for offset in range(count):
                 self.bytes[dst + offset] = self.bytes[src + offset]
@@ -189,6 +189,17 @@ class _Fixture:
 
 
 class TestLayerwiseRewrite(unittest.TestCase):
+    def test_unequal_tp_requires_replicated_model_and_divisible_ratio(self):
+        RegisteredLayout.validate_tp(8, 8, replicated=False)
+        for producer_tp, decode_tp in ((8, 0), (2, 8), (8, 3)):
+            with (
+                self.subTest(producer_tp=producer_tp, decode_tp=decode_tp),
+                self.assertRaisesRegex(ValueError, "divisible"),
+            ):
+                RegisteredLayout.validate_tp(producer_tp, decode_tp, replicated=True)
+        with self.assertRaisesRegex(ValueError, "replicated GLM DSA"):
+            RegisteredLayout.validate_tp(8, 2, replicated=False)
+
     def test_only_exact_main_aliases_are_registered_once(self):
         source = DsaCacheLayout("layer.0", 0, 100, 8, 8, 1, 4, "int8", 2)
         atom = DsaRegisterAtom(100, 116, "*", 92)
@@ -396,7 +407,8 @@ class TestLayerwiseRewrite(unittest.TestCase):
             self.assertEqual(
                 decode_catalog(client.request(catalog.ref.rank, encode_catalog_query(catalog.ref))), catalog
             )
-        for rank, barrier in enumerate(case.barriers):
+        for rank in case.layout.writers:
+            barrier = case.barriers[rank]
             sender = LayerwiseSender(rank, case.layout, barrier, writer.read_addresses, case.write, writer.report)
             sender.attach(*published)
             for layer in range(2):
@@ -415,7 +427,13 @@ class TestLayerwiseRewrite(unittest.TestCase):
         self.assertTrue(case.scheduler.may_decode(case.target))
 
     def test_prefill_control_reuses_catalog_and_completes_multiple_chunks(self):
-        case = _Fixture()
+        for decode_tp, multi_writer in ((2, False), (4, True)):
+            with self.subTest(decode_tp=decode_tp, multi_writer=multi_writer):
+                self._check_prefill_control(decode_tp, multi_writer)
+
+    def _check_prefill_control(self, decode_tp, multi_writer):
+        producer_tp = 8
+        case = _Fixture(producer_tp=producer_tp, decode_tp=decode_tp, multi_writer=multi_writer)
         endpoints = self._side_channels(case)
         client = SideChannelClient(endpoints, 1000)
         self.addCleanup(client.close)
@@ -430,7 +448,9 @@ class TestLayerwiseRewrite(unittest.TestCase):
         case.scheduler.publish(case.target)
         events.clear()
 
-        p_controls = tuple(PrefillControl(rank, 4, barrier, case.write) for rank, barrier in enumerate(case.barriers))
+        p_controls = tuple(
+            PrefillControl(rank, producer_tp, barrier, case.write) for rank, barrier in enumerate(case.barriers)
+        )
         stop = Event()
         threads = tuple(Thread(target=p.run, args=(stop,)) for p in p_controls)
         for thread in threads:
@@ -438,9 +458,14 @@ class TestLayerwiseRewrite(unittest.TestCase):
         senders = {}
         try:
             for span in (Span(0, 5), Span(5, 7)):
-                chunk = PrefillChunk(case.allocation, refs, endpoints, True, ((0, 1), (0, 1)), span)
+                chunk = PrefillChunk(case.allocation, refs, endpoints, multi_writer, ((0, 1), (0, 1)), span)
                 for rank, p in enumerate(p_controls):
-                    ((sender, attached),) = p.prepare((chunk,))
+                    assignments = p.prepare((chunk,))
+                    if rank >= decode_tp:
+                        self.assertEqual(assignments, ())
+                        self.assertEqual(p._sessions, {})
+                        continue
+                    ((sender, attached),) = assignments
                     self.assertIs(attached, chunk)
                     self.assertIs(senders.setdefault(rank, sender), sender)
                     barrier = case.barriers[rank]
@@ -455,10 +480,31 @@ class TestLayerwiseRewrite(unittest.TestCase):
                 if not chunk.finished:
                     self.assertEqual(events, [])
             deadline = monotonic() + 5
-            while len(events) != 2 and monotonic() < deadline:
+            while len(events) < decode_tp and monotonic() < deadline:
                 control.step()
                 stop.wait(0.01)
-            self.assertEqual([(event.kind, event.worker.rank) for event in events], [("ready", 0), ("ready", 1)])
+            expected_ranks = set(range(decode_tp))
+            self.assertEqual(
+                {(event.kind, event.worker.rank) for event in events}, {("ready", rank) for rank in expected_ranks}
+            )
+            for event in events:
+                self.assertFalse(case.scheduler.may_decode(case.target))
+                case.scheduler.ready(event.target, event.worker)
+            self.assertTrue(case.scheduler.may_decode(case.target))
+            self.assertEqual(case.bytes[1000 + 32 + 5], 33)
+            for rank in expected_ranks:
+                self.assertEqual(case.bytes[2000 + 100 * rank + 32 + 8 + 5], 33 + rank)
+
+            events.clear()
+            control.close_target(case.target, case.scheduler.begin_close(case.target))
+            control.step()
+            self.assertEqual(
+                {(event.kind, event.worker.rank) for event in events}, {("closed", rank) for rank in expected_ranks}
+            )
+            for event in events:
+                self.assertEqual(case.released, [])
+                case.scheduler.closed(event.target, event.worker)
+            self.assertEqual(case.released, [case.allocation])
         finally:
             stop.set()
             for thread in threads:

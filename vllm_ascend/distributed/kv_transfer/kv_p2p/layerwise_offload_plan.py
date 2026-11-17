@@ -166,10 +166,17 @@ class Route:
 class RegisteredLayout:
     """Static routes shared by P and D. Holds descriptors but no request-local views or addresses."""
 
+    @staticmethod
+    def validate_tp(producer_tp: int, decode_tp: int, *, replicated: bool) -> None:
+        if decode_tp <= 0 or producer_tp < decode_tp or producer_tp % decode_tp:
+            raise ValueError("Layerwise offload requires Prefill TP divisible by Decode TP")
+        if producer_tp != decode_tp and not replicated:
+            raise ValueError("Unequal layerwise TP requires replicated GLM DSA Main and Indexer KV")
+
     def __init__(self, catalogs: tuple[RankCatalog, ...], producer_tp: int, *, parallel_main: bool = False):
         decode_tp = len(catalogs)
-        if not decode_tp or producer_tp < decode_tp or producer_tp % decode_tp:
-            raise ValueError("Layerwise offload requires a supported replicated P/D rank geometry")
+        # The producer validates model replication before accepting the target.
+        self.validate_tp(producer_tp, decode_tp, replicated=True)
         if tuple(catalog.ref.rank for catalog in catalogs) != tuple(range(decode_tp)):
             raise ValueError("Registration must cover every D rank in order")
         per_rank = tuple(validate_catalog(catalog) for catalog in catalogs)
@@ -219,6 +226,8 @@ class RegisteredLayout:
             indexer_backings.update(backing_ids)
         self.catalogs = catalogs
         self.routes = tuple(routes)
+        # Indexer writer r feeds consumer r. Surplus producer ranks keep their
+        # local Store work and never acquire remote addresses.
         self.writers = tuple(range(decode_tp))
 
     @property
