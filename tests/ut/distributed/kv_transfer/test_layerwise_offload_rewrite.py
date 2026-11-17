@@ -3,6 +3,7 @@
 import json
 import multiprocessing
 import unittest
+from concurrent.futures import Future
 from dataclasses import replace
 from threading import Event, Thread
 from time import monotonic
@@ -21,12 +22,14 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_control import
 from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_plan import (
     CatalogRef,
     EntryId,
+    PeerAddress,
     RegisteredLayout,
     RegisteredRegion,
     Span,
     TargetAllocation,
     TargetId,
     WriteResult,
+    plan_writes,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_sender import (
     LayerwiseSender,
@@ -218,6 +221,7 @@ class TestLayerwiseRewrite(unittest.TestCase):
     def test_native_catalog_binds_manager_host_views_across_distinct_virtual_addresses(self):
         main, indexer = "model.layers.0.attn", "model.layers.0.attn.indexer.k_cache"
         catalogs = []
+        addresses = {}
 
         def tensor(base, rank):
             storage = SimpleNamespace(data_ptr=lambda: base, nbytes=lambda: 64)
@@ -267,8 +271,32 @@ class TestLayerwiseRewrite(unittest.TestCase):
             self.assertEqual(catalog.regions[0].backing_offset, 96)
             self.assertNotIn(str(device), catalog.regions[1].backing)
             catalogs.append(decode_catalog(encode_catalog(catalog)))
+            addresses.update(
+                {
+                    (rank, region.name): PeerAddress(catalog.ref, region.name, bases[region.name], region.length)
+                    for region in catalog.regions
+                }
+            )
         layout = RegisteredLayout(tuple(catalogs), 2, parallel_main=True)
         self.assertEqual(layout.refs[1].rank, 1)
+        local = {
+            entry.entry: (entry.as_layout(1_000_000 + index * 256), (0, 1))
+            for index, entry in enumerate(catalogs[0].entries)
+        }
+        allocation = TargetAllocation(TargetId("request", 1, 0), 7, ((1, 0), (2, 1)))
+        writes = plan_writes(layout, allocation, local, addresses, 0, 0, Span(0, 7))
+        self.assertEqual([write.component for write in writes], ["indexer", "main"])
+        for write in writes:
+            expected = {
+                WriteResult(0, key, span)
+                for (writer, key), spans in layout.receive_plan(0, 7).items()
+                if writer == 0 and key.component == write.component
+                for span in spans
+            }
+            self.assertEqual(set(write.results), expected)
+            self.assertEqual(sum(write.lengths), sum(result.span.end - result.span.start for result in expected) * 4)
+        self.assertEqual(writes[0].receivers, (0,))
+        self.assertEqual(writes[1].receivers, (0, 1))
 
     def test_ready_target_installs_visibility_on_the_actual_consumer(self):
         case = _Fixture()
@@ -430,6 +458,40 @@ class TestLayerwiseRewrite(unittest.TestCase):
         for decode_tp, multi_writer in ((2, False), (4, True)):
             with self.subTest(decode_tp=decode_tp, multi_writer=multi_writer):
                 self._check_prefill_control(decode_tp, multi_writer)
+
+    def test_prefill_command_runs_between_active_targets(self):
+        case = _Fixture()
+        control = PrefillControl(0, 4, case.barriers[0], case.write)
+        first_started, release_first, stop = Event(), Event(), Event()
+        visited = []
+
+        def progress(target):
+            if target == "first" and not first_started.is_set():
+                first_started.set()
+                self.assertTrue(release_first.wait(5))
+            visited.append(target)
+            return False
+
+        for target in ("first", "second", "third"):
+            control._active[TargetId(target, 1, 0)] = SimpleNamespace(
+                control=SimpleNamespace(progress=lambda *args, key=target, **kw: progress(key)),
+                sender=None,
+                finished=False,
+                cancel=False,
+            )
+        loop = Thread(target=control.run, args=(stop,))
+        loop.start()
+        try:
+            self.assertTrue(first_started.wait(5))
+            answer = Future()
+            control._commands.put((lambda: tuple(visited), answer))
+            release_first.set()
+            self.assertEqual(answer.result(5), ("first",))
+        finally:
+            stop.set()
+            release_first.set()
+            loop.join(5)
+        self.assertFalse(loop.is_alive())
 
     def _check_prefill_control(self, decode_tp, multi_writer):
         producer_tp = 8

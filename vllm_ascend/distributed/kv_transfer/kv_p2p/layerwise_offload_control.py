@@ -275,22 +275,28 @@ class PrefillControl:
         if targets:
             self._commands.put((mark, None))
 
+    def _run_command(self, timeout: float) -> None:
+        try:
+            action, answer = self._commands.get(timeout=timeout)
+        except Empty:
+            return
+        if answer is None:
+            action()
+        else:
+            try:
+                answer.set_result(action())
+            except Exception as error:
+                answer.set_exception(error)
+
     def run(self, stop: Event) -> None:
         try:
             while not stop.is_set():
-                try:
-                    action, answer = self._commands.get(timeout=0.02)
-                except Empty:
-                    pass
-                else:
-                    if answer is None:
-                        action()
-                    else:
-                        try:
-                            answer.set_result(action())
-                        except Exception as error:
-                            answer.set_exception(error)
-                for target, task in tuple(self._active.items()):
+                self._run_command(0.02)
+                for target in tuple(self._active):
+                    # Model steps and cancellation need progress while other targets report proofs.
+                    if not self._commands.empty():
+                        self._run_command(0)
+                    task = self._active[target]
                     if task.control.progress(task.sender, target, finished=task.finished, cancel=task.cancel):
                         task.sender.forget(target)
                         del self._active[target]

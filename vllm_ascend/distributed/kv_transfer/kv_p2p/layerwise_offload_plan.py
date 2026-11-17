@@ -2,7 +2,7 @@
 """Fixed layerwise offload descriptors and the common producer/receiver plan."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Literal, NamedTuple
 
@@ -287,7 +287,8 @@ def plan_writes(
 ) -> tuple[Write, ...]:
     if not 0 <= span.start <= span.end <= allocation.prompt_tokens:
         raise ValueError("Source chunk exceeds the admitted prompt")
-    writes = []
+    writes: dict[tuple[str, Component, tuple[int, ...]], Write] = {}
+    mapping_cache = {}
     by_entry: dict[EntryId, list[Route]] = {}
     for route in layout.writer_routes(writer, layer):
         by_entry.setdefault(route.entry.entry, []).append(route)
@@ -317,6 +318,7 @@ def plan_writes(
             writer_rank=route.writer_index,
             writer_size=route.writer_count,
             indexer=key.component == "indexer",
+            mapping_cache=mapping_cache,
         )
         results = tuple(
             WriteResult(writer, key, Span(max(expected.start, span.start), min(expected.end, span.end)))
@@ -332,15 +334,14 @@ def plan_writes(
         ):
             raise ValueError("Native write plan does not match the admitted target ranges")
         if results:
-            writes.append(
-                Write(
-                    catalog.endpoint,
-                    key.component,
-                    src,
-                    dst,
-                    lengths,
-                    results,
-                    tuple(route.receiver for route in routes),
-                )
-            )
-    return tuple(writes)
+            receivers = tuple(route.receiver for route in routes)
+            batch_key = catalog.endpoint, key.component, receivers
+            previous = writes.get(batch_key)
+            if previous is None:
+                writes[batch_key] = Write(catalog.endpoint, key.component, src, dst, lengths, results, receivers)
+            else:
+                previous.sources.extend(src)
+                previous.targets.extend(dst)
+                previous.lengths.extend(lengths)
+                writes[batch_key] = replace(previous, results=previous.results + results)
+    return tuple(writes.values())
