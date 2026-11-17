@@ -48,6 +48,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVTransferThread,
     LayerBatchBuilder,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import (
+    ReadOutcome,
+    SlotBarrier,
+)
 
 
 class FakeStore:
@@ -92,6 +96,99 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
             return True
         block_idx = start // self.get_block_size(kv_cache_group_id)
         return block_idx < len(masks[kv_cache_group_id]) and masks[kv_cache_group_id][block_idx]
+
+
+class TestPrefillSlotReuse(unittest.TestCase):
+    def setUp(self):
+        self.store = MagicMock()
+        self.slots = SlotBarrier(((0, 1),))
+        self.save_events = [threading.Event(), threading.Event()]
+        database = FakeTokenDatabase()
+        database.set_group_buffers({0: [1000, 2000]}, {0: [30, 30]}, {0: [300, 300]}, group_num_layers={0: 2})
+        options = dict(
+            m_store=self.store,
+            token_database=database,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=self.save_events,
+            sync_save_events=[MagicMock(), MagicMock()],
+        )
+        self.send = KVCacheStoreLayerSendingThread(**options)
+        self.recv = KVCacheStoreLayerRecvingThread(
+            **options,
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event(), threading.Event()],
+        )
+        self.recv.prefill_slot_provider = lambda: self.slots
+
+    def test_prefill_empty_load_can_rotate_after_reads_and_before_commit(self):
+        slots, store, send, recv = self.slots, self.store, self.send, self.recv
+        old = slots.begin_write(0)
+        pd_read = slots.register(old, "transfer", "r1")
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[], is_last_chunk=True)
+        request.save_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+            final_group_layer=True,
+        )
+        task.shared_block_data = send.build_shared_data(task)
+        send.add_stored_request("r1")
+        send.add_prefill_save([task], slots, 0)
+        attention_done = MagicMock()
+        slots.seal(old, attention_done)
+
+        def copy(*_):
+            with self.assertRaises(TimeoutError):
+                slots.begin_write(1, timeout=0)
+            return [30]
+
+        def commit(_):
+            attention_done.assert_called_once()
+            with self.assertRaises(TimeoutError):
+                slots.begin_write(1, timeout=0)
+            slots.complete(pd_read, ReadOutcome(True))
+            self.assertFalse(self.save_events[0].is_set())
+            recv.add_request(LayerLoadTask(None, [], 1))
+            begin_write = slots.begin_write
+            with patch.object(slots, "begin_write", side_effect=lambda layer: begin_write(layer, timeout=0)):
+                recv._handle_request(recv.request_queue.get_nowait())
+            self.assertEqual(slots.epoch(1).generation, 2)
+            self.assertTrue(recv.layer_load_finished_events[1].is_set())
+            store.batch_copy_get.assert_not_called()
+            return [0]
+
+        store.batch_copy_put.side_effect = copy
+        store.batch_commit.side_effect = commit
+        send._handle_request(send.request_queue.get_nowait())
+        store.batch_commit.assert_called_once_with(["key"])
+        self.assertTrue(self.save_events[0].is_set())
+
+    def test_failed_prefill_get_cannot_admit_attention_or_overwrite_slot(self):
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[])
+        request.load_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+        task.shared_block_data = self.recv.build_shared_data(task)
+        self.store.batch_copy_get.return_value = [-1]
+        self.recv.add_request(LayerLoadTask(None, [task], 0))
+
+        with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
+            self.recv._handle_request(self.recv.request_queue.get_nowait())
+        self.assertTrue(self.recv.layer_load_finished_events[0].is_set())
+        with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
+            self.slots.epoch(0)
+        with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
+            self.slots.begin_write(1, timeout=0)
 
 
 class TestLayerBatchBuilderOffsets(unittest.TestCase):

@@ -1828,6 +1828,55 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             self.assertIsNot(worker.layer_save_tasks[layer_id], old_save_tasks[layer_id])
             self.assertIsNot(worker.layer_load_tasks[layer_id], old_load_tasks[layer_id])
 
+    def test_prefill_slot_queue_preserves_empty_layer_before_prefetch(self):
+        worker = make_worker(self, use_layerwise=True)
+        worker.num_layers = 3
+        worker.num_prefetch_layers = 2
+        worker.current_layer = worker.next_layer_to_submit = 0
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[], [object()], []]
+        worker.prefill_slot_provider = MagicMock()
+        worker.kv_recv_thread = MagicMock()
+
+        worker._submit_ready_layer_loads()
+
+        submitted = [call.args[0] for call in worker.kv_recv_thread.add_request.call_args_list]
+        self.assertEqual([task.layer_id for task in submitted], [0, 1, 2])
+        self.assertEqual([bool(task.transfer_tasks) for task in submitted], [False, True, False])
+
+        worker.kv_recv_thread.reset_mock()
+        worker.next_layer_to_submit = 0
+        worker._submit_ready_layer_loads(restore_only=True)
+        submitted = [call.args[0] for call in worker.kv_recv_thread.add_request.call_args_list]
+        self.assertTrue(all(task.attention_start_gate is None for task in submitted))
+
+    def test_prefill_restore_seals_layers_without_compute_or_save(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import ReadOutcome, SlotBarrier
+
+        slots = SlotBarrier(((0, 1),))
+        worker = self._make_worker()
+        worker.num_layers = 2
+        worker.current_layer = 0
+        worker.layer_save_tasks = [[], []]
+        worker.prefill_slot_provider = lambda: slots
+
+        def load(*, restore_only):
+            self.assertTrue(restore_only)
+            slots.begin_write(worker.current_layer, timeout=0)
+
+        worker.wait_for_layer_load = MagicMock(side_effect=load)
+        sent = []
+
+        def send(layer):
+            epoch = slots.epoch(layer)
+            ticket = slots.register(epoch, "transfer", layer)
+            slots.complete(ticket, ReadOutcome(True))
+            sent.append(epoch.generation)
+
+        worker.restore_prefill_step(send)
+        self.assertEqual(sent, [1, 2])
+        self.assertTrue(slots.may_dispose())
+
     def test_deferred_last_save_drains_when_next_step_binds(self):
         worker = make_worker(self, use_layerwise=True)
         worker._pending_last_save_drain = True

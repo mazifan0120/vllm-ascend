@@ -63,6 +63,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
 
 
 class KVPoolScheduler:
+    prefill_snapshots = False
+    prefill_restore = False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -654,6 +657,9 @@ class KVPoolScheduler:
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
+        restore_only = self.prefill_restore and self._can_restore_prompt(
+            request, num_computed_tokens, num_external_hit_tokens
+        )
         if self.use_eagle:
             # Keep the draft model's recomputation zone intact: the
             # generation-point hidden states must be freshly computed, and the
@@ -675,7 +681,7 @@ class KVPoolScheduler:
                     num_computed_tokens,
                     num_external_hit_tokens - self.lcm_block_size,
                 )
-        if num_external_hit_tokens == request.num_tokens:
+        if not restore_only and num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
         if len(self.cacheable_group_ids) != len(self.original_block_size):
             # Private compressor state is rebuilt locally. Recompute the last
@@ -707,6 +713,7 @@ class KVPoolScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=force_layerwise_load,
             kvpool_store_skip_tokens=store_skip_tokens,
+            restore_only=restore_only,
         )
         logger.debug(
             "KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "
@@ -719,7 +726,26 @@ class KVPoolScheduler:
             self.use_layerwise,
         )
 
-        return need_to_allocate, self.load_async and not self.use_layerwise
+        return need_to_allocate, restore_only or (self.load_async and not self.use_layerwise)
+
+    def _can_restore_prompt(self, request: "Request", computed: int, store_tokens: int) -> bool:
+        params = request.kv_transfer_params or {}
+        sampling = request.sampling_params
+        return (
+            computed == 0
+            and store_tokens == request.num_tokens == request.num_prompt_tokens
+            and len(self.cacheable_group_ids) == len(self.original_block_size)
+            and self.vllm_config.speculative_config is None
+            and params.get("do_remote_decode") is True
+            and not params.get("do_remote_prefill")
+            and bool(params.get("layerwise_allocation"))
+            and request.max_tokens == 1
+            and sampling is not None
+            and sampling.prompt_logprobs is None
+            and not request.has_encoder_inputs
+            and not request.num_output_tokens
+            and not request.num_preemptions
+        )
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         """
@@ -794,9 +820,13 @@ class KVPoolScheduler:
         load_spec: LoadSpec | None,
         prompt_token_ids: list[int],
         skip_save: bool | None,
+        *,
+        computed_tokens: int = 0,
     ):
-        last_chunk_tokens_num = self._get_last_chunk_tokens_num(prompt_token_ids)
-        return ReqMeta.from_request_tracker(
+        last_chunk_tokens_num = (
+            len(prompt_token_ids) if self.prefill_snapshots else self._get_last_chunk_tokens_num(prompt_token_ids)
+        )
+        meta = ReqMeta.from_request_tracker(
             request_tracker,
             self.cache_transfer_granularity,
             load_spec=load_spec,
@@ -806,9 +836,13 @@ class KVPoolScheduler:
             discard_partial_chunks=self._discard_partial_chunks,
             original_block_size=self.original_block_size,
             kv_cache_group_families=self.kv_cache_group_families,
-            save_partial_block=self.layerwise_offload,
+            save_partial_block=self.layerwise_offload or self.prefill_snapshots,
             hash_block_size=self.hash_block_size,
         )
+        if self.prefill_snapshots and meta is not None:
+            pool_tokens = load_spec.kvpool_cached_tokens if load_spec and load_spec.can_load else 0
+            meta.prefill_history = max(computed_tokens, pool_tokens)
+        return meta
 
     def _process_new_request(
         self,
@@ -852,6 +886,7 @@ class KVPoolScheduler:
             load_spec,
             request.prompt_token_ids,
             force_skip_save,
+            computed_tokens=request.num_computed_tokens,
         )
 
     def _process_preempted_cached_request(
@@ -893,6 +928,7 @@ class KVPoolScheduler:
             load_spec,
             request_real.prompt_token_ids,
             force_skip_save,
+            computed_tokens=request_real.num_computed_tokens,
         )
 
     def _process_running_cached_request(
@@ -947,6 +983,7 @@ class KVPoolScheduler:
             load_spec,
             request.prompt_token_ids,
             force_skip_save,
+            computed_tokens=num_current_tokens,
         )
 
     def _process_async_load_request(
@@ -976,6 +1013,10 @@ class KVPoolScheduler:
             block_sizes=self.grouped_block_size,
         )
         self._request_trackers[request_id] = request_tracker
+        if load_spec.restore_only:
+            return self._build_req_meta(
+                request_tracker, request.block_hashes, load_spec, request.prompt_token_ids, skip_save=True
+            )
         return ReqMeta.from_request_tracker(
             request_tracker,
             self.cache_transfer_granularity,
@@ -1033,6 +1074,7 @@ class KVPoolScheduler:
                     not new_block_ids
                     and not self.tp_mismatch
                     and not self.layerwise_offload
+                    and not self.prefill_snapshots
                     and not self.save_decode_cache
                 ):
                     continue

@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, Any, cast
 
+from vllm.config import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
@@ -9,10 +10,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiCo
 from vllm.v1.worker import mamba_utils
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+    get_prefill_main_reuse_config,
+)
 
 if TYPE_CHECKING:
+    import torch
     from vllm.config import VllmConfig
     from vllm.distributed.kv_events import KVConnectorKVEvents
+    from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -38,7 +44,21 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager or self._all_support_hma, (
             "HMA should not be enabled unless all sub-connectors support it"
         )
-        self._configure_layerwise_reuse_completion()
+        prefill_main_config = get_prefill_main_reuse_config(transfer)
+        if (
+            prefill_main_config is not None
+            and not vllm_config.model_config.enforce_eager
+            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            raise ValueError("Prefill Main reuse requires per-layer hooks on every forward")
+        self._configure_layerwise_reuse_completion(prefill_main_config)
+        if any(
+            getattr(getattr(connector, "connector_scheduler", None), "layerwise_host_prefill", False) is True
+            for connector in self._connectors
+        ):
+            for connector in self._connectors:
+                if callable(configure := getattr(connector, "configure_prefill_snapshots", None)):
+                    configure()
         self._mamba_copy_bufs = None
         # Handle to the (V2) mamba hybrid model state while its per-layer
         # align pre-copy is deferred behind a layerwise child connector.
@@ -70,7 +90,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             self._requires_full_dspark_prompt = False
         return bool(providers)
 
-    def _configure_layerwise_reuse_completion(self) -> None:
+    def _configure_layerwise_reuse_completion(self, prefill_main_config: dict | None = None) -> None:
         # Producers that report when a shared physical KV slot is safe to reuse.
         self._layerwise_slot_release_providers = [
             connector
@@ -89,6 +109,29 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         self._external_slot_release_sink_configured = False
         if not self._layerwise_slot_release_providers:
             return
+        prefill_providers = [
+            provider
+            for provider in self._layerwise_slot_release_providers
+            if getattr(provider.connector_worker, "layerwise_host_prefill", False) is True
+        ]
+        if prefill_providers:
+            if len(self._layerwise_slot_release_providers) != 1:
+                raise ValueError("Prefill slot reads must use one P/D connector")
+            (provider,) = prefill_providers
+            sinks = [
+                connector
+                for connector in self._non_slot_release_connectors
+                if callable(bind := getattr(connector, "bind_prefill_slots", None))
+                and bind(provider.prefill_slots) is True
+            ]
+            if len(sinks) > 1:
+                raise ValueError("Prefill slots must have a single Store writer")
+            if sinks:
+                provider.connector_worker.prefill_store_bound = True
+                provider.connector_worker.prefill_main_config = prefill_main_config
+            elif prefill_main_config is not None:
+                raise RuntimeError("Shared Prefill Main slots require a bound Store")
+            return
         for connector in self._connectors:
             set_waiter = getattr(connector, "set_external_slot_release_waiter", None)
             if callable(set_waiter) and set_waiter(self._wait_for_external_slot_release) is not False:
@@ -97,6 +140,37 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     def _wait_for_external_slot_release(self, layer_idx: int) -> None:
         for provider in self._layerwise_slot_release_providers:
             provider.wait_for_layer_reuse(layer_idx)
+
+    def configure_prefill_restore(self) -> None:
+        schedulers = [getattr(connector, "connector_scheduler", None) for connector in self._connectors]
+        stores = [scheduler for scheduler in schedulers if getattr(scheduler, "prefill_snapshots", False) is True]
+        senders = [scheduler for scheduler in schedulers if getattr(scheduler, "layerwise_host_prefill", False) is True]
+        if len(schedulers) != 2 or len(stores) != 1 or len(senders) != 1:
+            raise ValueError("Prefill restore requires one rewritten P/D sender and one block-key Store")
+        stores[0].prefill_restore = True
+        senders[0].prefill_restore = True
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        for sender in self._layerwise_slot_release_providers:
+            metadata = getattr(sender, "_connector_metadata", None)
+            if getattr(metadata, "prefill_without_forward", False) is not True:
+                continue
+            (store,) = self._non_slot_release_connectors
+            store.restore_prefill_step(metadata.prefill_restores.keys(), sender.send_restored_layer)
+            # The upstream connector-only context does not call wait_for_save.
+            sender.wait_for_save()
+            return
+        super().start_load_kv(forward_context, **kwargs)
+
+    def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
+        providers = self._layerwise_slot_release_providers
+        if providers and getattr(providers[0].connector_worker, "prefill_store_bound", False) is True:
+            # When sharing one transfer engine, let the P/D sender register
+            # the validated physical regions before the Store borrows them.
+            for connector in (*providers, *self._non_slot_release_connectors):
+                connector.register_kv_caches(kv_caches)
+            return
+        super().register_kv_caches(kv_caches)
 
     def shutdown(self) -> None:
         # Release provider waits before joining the store's receive threads.

@@ -59,6 +59,32 @@ def make_token_database() -> ChunkedTokenDatabase:
 
 
 class TestMooncakeLayerBatchBuilder(unittest.TestCase):
+    def test_prefill_tail_respects_segment_boundaries_and_keeps_object_offsets(self):
+        database = ChunkedTokenDatabase([KeyMetadata("model", 0, 0, 0)], [4], None)
+        database.set_group_buffers(
+            {0: [1000, 1100, 2000]},
+            {0: [4, 4, 4]},
+            {0: [256, 256, 4]},
+            group_num_layers={0: 1},
+            group_cache_entry_segments={0: [(0, 2), (1, 2), (0, 1)]},
+        )
+        builder = LayerBatchBuilder(database, page_size_bytes=12, num_layers=1)
+        cut = ReqMeta("cut", block_ids=[1], load_block_keys=["public"])
+        cut.prefill_history = 1
+        cut.range_tokens = {"public": 1}
+        full = ReqMeta("full", block_ids=[2], load_block_keys=["public"])
+        full.prefill_history = 4
+        task = LayerTransferTask(
+            0,
+            [LayerBlockRange(cut, 0, 1), LayerBlockRange(full, 0, 1)],
+            use_key_major_ranges=True,
+        )
+        metadata = builder.build(task, is_save=False)
+        self.assertIsInstance(metadata, LayerRangeReqMeta)
+        self.assertEqual(metadata.all_buffers, [[1256, 2004], [1512, 1612, 2008]])
+        self.assertEqual(metadata.all_sizes, [[2, 1], [4, 4, 4]])
+        self.assertEqual(metadata.all_offsets, [[0, 8], [0, 4, 8]])
+
     def test_range_debug_payload_reports_per_key_bytes_and_offsets(self):
         payload = _build_range_debug_payload(
             "save",
@@ -202,6 +228,63 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         worker._layerwise_session_tracker = LayerwiseSessionTracker()
         worker.m_store = MagicMock()
         return worker
+
+    def test_prefill_tail_requires_commit_then_promotes_to_public_block(self):
+        worker = self._make_worker()
+        worker.prefill_slot_provider = MagicMock()
+        worker.block_key_hybrid = False
+        worker.num_kv_cache_groups = 1
+        worker.cacheable_group_ids = [0]
+        worker.grouped_block_size = [4]
+        worker.hash_block_size = 4
+        worker.group_block_len = {0: [8, 4]}
+        worker._layer_load_aborted = threading.Event()
+        worker._load_session_lock = threading.Lock()
+        worker._invalid_block_ids = set()
+        worker._invalid_block_ids_lock = threading.Lock()
+        worker.m_store.requires_exists_before_put = True
+        worker.m_store.exists.side_effect = lambda keys: [0] * len(keys)
+        worker.m_store.batch_put_start.side_effect = lambda keys, sizes: [0] * len(keys)
+        worker.m_store.batch_get_end.return_value = 0
+        readable = set()
+        worker.m_store.batch_get_start.side_effect = lambda keys: [0 if key in readable else -1 for key in keys]
+        tracker = worker._layerwise_session_tracker
+
+        def prepare(history, extent, *, final=False):
+            request = ReqMeta(
+                "r1",
+                block_ids=[7, 8],
+                block_hashes=[b"complete"],
+                target_token_len=extent,
+                can_save=True,
+                is_last_chunk=final,
+            )
+            request.prefill_history = history
+            return mooncake_layerwise.prepare_layerwise_sessions(worker, [request])[0][0]
+
+        first = prepare(0, 2)
+        private = first.save_block_keys[0]
+        self.assertIn("prefill_private_", private)
+        self.assertEqual(first.range_tokens, {private: 2})
+        self.assertEqual(tracker.committed_private_blocks("r1", 0), {})
+        with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
+            prepare(2, 5)
+        readable.add(private)
+        tracker.commit_put_keys([private])
+        second = prepare(2, 5)
+        self.assertEqual(second.load_block_keys, [private])
+        public, next_private = second.save_block_keys
+        self.assertEqual(public, worker._make_layerwise_full_key(0, b"complete".hex()))
+        self.assertNotEqual(private, next_private)
+        self.assertEqual(second.range_tokens, {private: 2, next_private: 1})
+        readable.update([public, next_private])
+        tracker.commit_put_keys([public, next_private])
+        worker._finish_current_layerwise_load_sessions()
+        final = prepare(5, 6, final=True)
+        self.assertEqual(final.load_block_keys, [public, next_private])
+        self.assertEqual(final.range_tokens, {next_private: 1})
+        self.assertEqual(final.save_block_keys, [None])
+        self.assertEqual(tracker.unused_private_keys(), [private])
 
     def test_put_start_uses_full_current_layout_size_and_skips_hits(self):
         worker = self._make_worker()

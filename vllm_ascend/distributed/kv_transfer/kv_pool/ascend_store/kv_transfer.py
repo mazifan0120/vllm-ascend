@@ -28,6 +28,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_b
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tracker import (
     LayerwiseSessionTracker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import (
+    ReadOutcome,
+    ReadTicket,
+    SlotBarrier,
+    restore_into_slot,
+)
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -111,6 +117,13 @@ class _LayerRevokeTask:
     keys: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _PrefillSaveTask:
+    tasks: list[LayerTransferTask]
+    slots: SlotBarrier
+    reader: ReadTicket
+
+
 class LayerBatchBuilder:
     def __init__(
         self,
@@ -123,6 +136,7 @@ class LayerBatchBuilder:
         self.page_size_bytes = page_size_bytes
         self.num_layers = num_layers
         self.group_id = group_id
+        self._token_database = token_database
         self.layer_byte_offset = layer_byte_offset
         self._block_len_np = np.asarray(token_database.group_block_len[group_id], dtype=np.int64)
         self._kv_caches_base_addr_np = np.asarray(
@@ -401,6 +415,9 @@ class LayerBatchBuilder:
         is_last_chunks: list[bool | None] = []
         all_load_keys: list[str] = []
         seen_save_keys: set[str] = set()
+        range_tokens: list[int | None] | None = (
+            [] if task.block_ranges and task.block_ranges[0].request.prefill_history is not None else None
+        )
 
         for block_range in task.block_ranges:
             request = block_range.request
@@ -437,6 +454,8 @@ class LayerBatchBuilder:
                     continue
                 block_ids.append(block_id)
                 block_keys.append(key)
+                if range_tokens is not None:
+                    range_tokens.append(request.range_tokens.get(key) if request.range_tokens else None)
                 if is_save:
                     seen_save_keys.add(key)
 
@@ -447,6 +466,8 @@ class LayerBatchBuilder:
                 if last_block_key is not None and (not is_save or last_block_key not in seen_save_keys):
                     block_ids.append(request_block_ids[partial_block_index])
                     block_keys.append(last_block_key)
+                    if range_tokens is not None:
+                        range_tokens.append(request.range_tokens.get(last_block_key) if request.range_tokens else None)
                     if is_save:
                         seen_save_keys.add(last_block_key)
 
@@ -457,6 +478,7 @@ class LayerBatchBuilder:
             req_ids=req_ids,
             is_last_chunks=is_last_chunks,
             load_keys=all_load_keys,
+            range_tokens=range_tokens,
         )
 
     def build_addrs(
@@ -477,17 +499,39 @@ class LayerBatchBuilder:
             layer_object_offset = int(self._block_len_np[:base_offset].sum())
             offsets = (layer_object_offset + layer_inner_offsets).tolist()
             sizes = layer_block_len.tolist()
+            row_offsets = [offsets.copy() for _ in shared.block_ids_arr]
+            row_sizes = [sizes.copy() for _ in shared.block_ids_arr]
             all_buffers = [
                 (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
             ]
+            if shared.range_tokens is not None:
+                block_tokens = self._token_database.get_block_size(self.group_id)
+                layout = self._token_database.group_cache_entry_segments.get(self.group_id)
+                segments = layout[base_offset:end_offset] if layout else [(0, 1)] * len(sizes)
+                for i, tokens in enumerate(shared.range_tokens):
+                    if tokens is None:
+                        continue
+                    if not 0 < tokens <= block_tokens:
+                        raise ValueError("Prefill private range exceeds the manager block")
+                    buffers, lengths, object_offsets = [], [], []
+                    for addr, size, offset, (part, count) in zip(all_buffers[i], sizes, offsets, segments, strict=True):
+                        width = block_tokens // count
+                        if block_tokens % count or size % width:
+                            raise ValueError("Prefill range requires whole, contiguous token rows")
+                        valid = min(width, tokens - part * width)
+                        if valid > 0:
+                            buffers.append(addr)
+                            lengths.append(size // width * valid)
+                            object_offsets.append(offset)
+                    all_buffers[i], row_sizes[i], row_offsets[i] = buffers, lengths, object_offsets
             return LayerRangeReqMeta(
                 req_ids=shared.req_ids,
                 layer_id=layer_id,
                 block_ids=shared.block_ids_arr.tolist(),
                 keys=shared.block_keys,
                 all_buffers=all_buffers,
-                all_sizes=[sizes.copy() for _ in shared.block_ids_arr],
-                all_offsets=[offsets.copy() for _ in shared.block_ids_arr],
+                all_sizes=row_sizes,
+                all_offsets=row_offsets,
                 load_keys=shared.load_keys,
             )
 
@@ -1784,6 +1828,10 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 self._session_tracker.revoke_put_keys(keys)
 
     def _handle_range_request(self, req_meta: LayerRangeReqMeta, final_group_layer: bool | None = None) -> None:
+        self._copy_range_request(req_meta)
+        self._commit_range_request(req_meta, final_group_layer)
+
+    def _copy_range_request(self, req_meta: LayerRangeReqMeta, *, strict: bool = False) -> None:
         layer_id = req_meta.layer_id
         if self._active_put_keys is None or layer_id == 0:
             self._active_put_keys = set(req_meta.keys)
@@ -1816,9 +1864,16 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
                 self._active_put_keys.difference_update(failed_keys)
+                if strict:
+                    raise RuntimeError(f"Prefill Store PUT failed for {len(failed_keys)} keys in layer {layer_id}")
 
+    def _commit_range_request(
+        self, req_meta: LayerRangeReqMeta, final_group_layer: bool | None, *, strict: bool = False
+    ) -> None:
+        layer_id = req_meta.layer_id
         if not (layer_id == self.final_layer_id if final_group_layer is None else final_group_layer):
             return
+        assert self._active_put_keys is not None
         active_keys = [key for key in req_meta.keys if key in self._active_put_keys]
         if active_keys:
             try:
@@ -1836,11 +1891,17 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if self._session_tracker is not None:
                 self._session_tracker.commit_put_keys(committed_keys)
             self._remove_started_keys(active_keys)
+            if strict and failed_keys:
+                raise RuntimeError(f"Prefill Store commit failed for {len(failed_keys)} keys in layer {layer_id}")
         self._active_put_keys = None
 
-    def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
+    def _handle_range_layer_tasks(
+        self, transfer_tasks: list[LayerTransferTask], prefill: _PrefillSaveTask | None = None
+    ) -> None:
         layer_id = transfer_tasks[0].layer_id
+        copied = False
         try:
+            commit_tasks = []
             for task in transfer_tasks:
                 shared = task.shared_block_data
                 if shared is None:
@@ -1851,16 +1912,32 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
                 req_meta.layer_id = layer_id
                 self._active_put_keys = self._group_put_keys.get(task.group_id)
+                final = task.final_group_layer or layer_id == self.final_layer_id
                 try:
-                    self._handle_range_request(req_meta, task.final_group_layer or layer_id == self.final_layer_id)
+                    if prefill is None:
+                        self._handle_range_request(req_meta, final)
+                    else:
+                        self._copy_range_request(req_meta, strict=True)
+                        commit_tasks.append((task.group_id, req_meta, final))
                 finally:
                     self._group_put_keys[task.group_id] = self._active_put_keys
-                for req_id in req_meta.req_ids:
-                    self.dec_stored_request(req_id)
-                    if self.try_finish_and_delete_stored_request(req_id):
-                        self.set_finished_request(req_id)
+                if prefill is None:
+                    self._finish_layer_put_requests(req_meta.req_ids)
+            if prefill is not None:
+                prefill.slots.complete(prefill.reader, ReadOutcome(True))
+                copied = True
+                for group_id, req_meta, final in commit_tasks:
+                    self._active_put_keys = self._group_put_keys[group_id]
+                    self._commit_range_request(req_meta, final, strict=True)
+                    self._group_put_keys[group_id] = self._active_put_keys
+                    self._finish_layer_put_requests(req_meta.req_ids)
         except Exception as exc:
             self._fatal_error = exc
+            if prefill is not None:
+                error = str(exc) or type(exc).__name__
+                if not copied:
+                    prefill.slots.complete(prefill.reader, ReadOutcome(False, error))
+                prefill.slots.abort(error)
             # All started objects belong to the failed forward step, including
             # groups whose first physical layer has not been visited yet.
             with self._put_started_keys_lock:
@@ -1873,9 +1950,18 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             transfer_tasks.clear()
             self.request_queue.task_done()
 
+    def _finish_layer_put_requests(self, req_ids: list[str]) -> None:
+        for req_id in req_ids:
+            self.dec_stored_request(req_id)
+            if self.try_finish_and_delete_stored_request(req_id):
+                self.set_finished_request(req_id)
+
     def _handle_request(  # type: ignore[override]
-        self, request: list[LayerTransferTask] | _LayerRevokeTask
+        self, request: list[LayerTransferTask] | _LayerRevokeTask | _PrefillSaveTask
     ):
+        if isinstance(request, _PrefillSaveTask):
+            self._handle_range_layer_tasks(request.tasks, request)
+            return
         if isinstance(request, _LayerRevokeTask):
             try:
                 self._revoke_range_keys(list(request.keys))
@@ -1915,6 +2001,10 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.layer_save_finished_events[layer_id].set()
             request.clear()
             self.request_queue.task_done()
+
+    def add_prefill_save(self, tasks: list[LayerTransferTask], slots: SlotBarrier, layer: int) -> None:
+        reader = slots.register(slots.epoch(layer), "store", layer)
+        self.add_request(_PrefillSaveTask(tasks, slots, reader))
 
     def _copy_gva_layers(self, transfer_tasks: list[LayerTransferTask]) -> bool:
         if self.save_disabled.is_set():
@@ -1982,6 +2072,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
+    prefill_slot_provider: Callable[[], SlotBarrier] | None = None
+
     def __init__(
         self,
         m_store: Backend,
@@ -2113,6 +2205,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if failed_indices:
                 self._mark_invalid_range_indices(req_meta, failed_indices)
                 self._active_load_indices.difference_update(failed_indices)
+                if self.prefill_slot_provider is not None:
+                    raise RuntimeError(f"Prefill Store GET failed for {len(failed_indices)} keys in layer {layer_id}")
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids, shared.is_last_chunks, strict=True):
@@ -2135,20 +2229,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if data.attention_start_gate is not None:
                 if not self._wait_for_event(data.attention_start_gate):
                     return
-            if self.external_slot_release_waiter is not None:
-                self.external_slot_release_waiter(layer_id)
-            for task in data.transfer_tasks:
-                shared = task.shared_block_data
-                if shared is None:
-                    raise RuntimeError("Layerwise range load requires shared block metadata")
-                builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
-                req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
-                if not isinstance(req_meta, LayerRangeReqMeta):
-                    raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
-                req_meta.layer_id = layer_id
-                self._active_load_indices = self._group_load_indices.get(task.group_id)
-                self._handle_range_request(req_meta, shared)
-                self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
+            if self.prefill_slot_provider is not None:
+                slots = self.prefill_slot_provider()
+                if data.transfer_tasks:
+                    restore_into_slot(slots, layer_id, lambda: self._load_ranges(data))
+                else:
+                    slots.begin_write(layer_id)
+            else:
+                if self.external_slot_release_waiter is not None:
+                    self.external_slot_release_waiter(layer_id)
+                self._load_ranges(data)
         except Exception as exc:
             self._fatal_error = exc
             if self._active_load_indices is not None:
@@ -2161,6 +2251,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.layer_load_finished_events[layer_id].set()
             self.request_queue.task_done()
             self.get_event.set()
+
+    def _load_ranges(self, data: LayerLoadTask) -> None:
+        for task in data.transfer_tasks:
+            shared = task.shared_block_data
+            if shared is None:
+                raise RuntimeError("Layerwise range load requires shared block metadata")
+            builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
+            req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
+            if not isinstance(req_meta, LayerRangeReqMeta):
+                raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
+            req_meta.layer_id = data.layer_id
+            self._active_load_indices = self._group_load_indices.get(task.group_id)
+            self._handle_range_request(req_meta, shared)
+            self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
 
     def _get_h2d_stagger_delay_us(self, layer_id: int) -> int:
         if self.h2d_stagger_us <= 0:
@@ -2179,7 +2283,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
     ):
-        if data.transfer_tasks and data.transfer_tasks[0].use_key_major_ranges:
+        use_ranges = data.transfer_tasks and data.transfer_tasks[0].use_key_major_ranges
+        if self.prefill_slot_provider is not None or use_ranges:
             self._handle_range_layer_task(data)
             return
         try:

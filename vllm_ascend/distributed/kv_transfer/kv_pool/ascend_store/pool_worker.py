@@ -102,6 +102,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import SlotBarrier
 from vllm_ascend.distributed.kv_transfer.load_failure_registry import (
     record_failed_load,
 )
@@ -133,6 +134,8 @@ SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
 
 
 class KVPoolWorker:
+    prefill_slot_provider: Callable[[], SlotBarrier] | None = None
+
     # The main class for the cache engine.
 
     def __init__(
@@ -853,6 +856,7 @@ class KVPoolWorker:
                     load_abort_event=self._layer_load_aborted,
                     raise_on_transfer_failure=self.layerwise_offload or self.num_kv_cache_groups > 1,
                 )
+                self.kv_recv_thread.prefill_slot_provider = self.prefill_slot_provider
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
                     self.m_store,
@@ -1369,8 +1373,13 @@ class KVPoolWorker:
         # The final-layer fence drains this rank only. Readers of replicated
         # KV must also wait for the writer before querying the previous step.
         # Use configuration, never local requests/tasks, to gate the collective.
-        if self.use_layerwise_transfer and self.layerwise_offload and self.tp_size > 1:
+        if self.tp_size > 1 and (
+            (self.use_layerwise_transfer and self.layerwise_offload) or self.prefill_slot_provider is not None
+        ):
             get_tp_group().barrier()
+        if self.prefill_slot_provider is not None:
+            self._release_layerwise_requests_terminal(metadata.released_req_ids)
+            self._retire_prefill_snapshots()
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         self.next_layer_to_submit = 0
@@ -1380,6 +1389,14 @@ class KVPoolWorker:
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
         self.process_layer_data(metadata.requests)
+
+    def _retire_prefill_snapshots(self) -> None:
+        tracker = self._layerwise_session_tracker
+        for keys in self._layerwise_key_batches(tracker.unused_private_keys()):
+            try:
+                tracker.forget_private_keys(self.m_store.retire_private_keys(keys))
+            except Exception:
+                logger.exception("Prefill Store could not retire %d private keys", len(keys))
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         if self.use_layerwise:
@@ -1607,11 +1624,19 @@ class KVPoolWorker:
         layer_idx_in_group: int = 0,
     ) -> None:
         # MLA replicas share a writer; recurrent state is saved by every TP rank.
-        if not self._is_layerwise_save_owner(group_id):
+        save_owner = self._is_layerwise_save_owner(group_id)
+        if not save_owner and not (requests and requests[0].prefill_history is not None):
             return
         block_size = get_group_block_size(self.grouped_block_size, group_id)
         request_block_ranges = []
         for request in requests:
+            if request.prefill_history is not None:
+                if any(key is not None for key in request.save_block_keys):
+                    start = request.save_key_block_offset
+                    request_block_ranges.append(LayerBlockRange(request, start, start + len(request.save_block_keys)))
+                continue
+            if not save_owner:
+                continue
             if request.can_save is None or not request.can_save:
                 continue
             save_start_block = request.save_start_token // block_size
@@ -2644,6 +2669,10 @@ class KVPoolWorker:
         else:
             req_ids = self._current_layerwise_last_chunk_req_ids.copy()
             self._release_layerwise_requests_terminal(req_ids)
+            if self.prefill_slot_provider is not None:
+                continuing = self._current_layerwise_request_ids - req_ids
+                self._release_layerwise_requests_for_retry(continuing)
+                req_ids.update(continuing)
         self._current_layerwise_request_ids.difference_update(req_ids)
         self._current_layerwise_last_chunk_req_ids.difference_update(req_ids)
 
@@ -3036,7 +3065,8 @@ class KVPoolWorker:
         else:
             num_local = self.num_layers
         for request in requests:
-            request.store_masks = self._compute_reachable_store_masks(request)
+            if request.prefill_history is None:
+                request.store_masks = self._compute_reachable_store_masks(request)
         group_requests = {}
         if self.use_block_key_layerwise:
             group_requests = self.layerwise_protocol.prepare_layerwise_sessions(self, requests)
@@ -3077,13 +3107,16 @@ class KVPoolWorker:
         """Start current-layer put only once KV is ready at attention entry."""
         if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
             return
+        self._attention_saved_layers.add(layer_id)
+        self._enqueue_layer_save(layer_id)
+
+    def _enqueue_layer_save(self, layer_id: int) -> None:
         assert self.sync_save_events is not None
         assert self.layer_save_finished_events is not None
         assert self.kv_send_thread is not None
         sync_save_events = self.sync_save_events
         save_finished_events = self.layer_save_finished_events
         send_thread = self.kv_send_thread
-        self._attention_saved_layers.add(layer_id)
         sync_save_events[layer_id].record()
         tasks = self.layer_save_tasks[layer_id]
         if not tasks:
@@ -3092,7 +3125,11 @@ class KVPoolWorker:
         for task in tasks:
             for block_range in task.block_ranges:
                 send_thread.add_stored_request(block_range.request.req_id)
-        send_thread.add_request(tasks)
+        if self.prefill_slot_provider is not None:
+            assert isinstance(send_thread, KVCacheStoreLayerSendingThread)
+            send_thread.add_prefill_save(tasks, self.prefill_slot_provider(), layer_id)
+        else:
+            send_thread.add_request(tasks)
 
     def _finish_attention_window(self) -> None:
         try:
@@ -3152,20 +3189,20 @@ class KVPoolWorker:
             # Errors are still surfaced per layer by wait_for_layer_load.
             self._check_hybrid_load_errors()
 
-    def _submit_ready_layer_loads(self) -> None:
+    def _submit_ready_layer_loads(self, *, restore_only: bool = False) -> None:
         assert self.kv_recv_thread is not None
         recv_thread = self.kv_recv_thread
 
         def submit_layer_load(layer_id: int) -> bool:
             reuse_source = self.prefetch_layer_map.get(layer_id)
-            if not self.layer_load_tasks[layer_id] and reuse_source is None:
+            if not self.layer_load_tasks[layer_id] and reuse_source is None and self.prefill_slot_provider is None:
                 return False
             attention_start_gate = None
-            if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
+            if not restore_only and self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
-                    wait_for_save_layer=reuse_source,
+                    wait_for_save_layer=reuse_source if self.prefill_slot_provider is None else None,
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
@@ -3179,7 +3216,21 @@ class KVPoolWorker:
             self.next_layer_to_submit += 1
             submit_layer_load(layer_id)
 
-    def wait_for_layer_load(self) -> None:
+    def restore_prefill_step(self, send_layer: Callable[[int], None]) -> None:
+        if self.prefill_slot_provider is None or self.current_layer != 0 or any(self.layer_save_tasks):
+            raise RuntimeError("Store restore requires a freshly bound layerwise Prefill step")
+        slots = self.prefill_slot_provider()
+        try:
+            for layer in range(self.num_layers):
+                self.wait_for_layer_load(restore_only=True)
+                send_layer(layer)
+                slots.seal(slots.epoch(layer))
+                self.current_layer += 1
+        except Exception as exc:
+            slots.abort(str(exc) or type(exc).__name__)
+            raise
+
+    def wait_for_layer_load(self, *, restore_only: bool = False) -> None:
         if self.current_layer >= self.num_layers:
             return
         assert self.layer_load_finished_events is not None
@@ -3187,21 +3238,27 @@ class KVPoolWorker:
         gate = reset_attention_compute_start_gate()
         try:
             self.kv_recv_thread.raise_if_failed()
-            if getattr(self, "block_key_hybrid", False):
+            if not restore_only and getattr(self, "block_key_hybrid", False):
                 layer_id = self.current_layer
                 # Conv/recurrent state is updated inside attention, after this
                 # entry event. Preserve its post-compute save hook.
                 if layer_id not in self._recurrent_layers:
                     gate.on_start = lambda: self._submit_attention_save(layer_id)
                 gate.on_finish = self._finish_attention_window
-            if getattr(self, "block_key_hybrid", False) and self.next_layer_to_submit <= self.current_layer:
+            if (
+                not restore_only
+                and getattr(self, "block_key_hybrid", False)
+                and self.next_layer_to_submit <= self.current_layer
+            ):
                 # An unprefetched demand load must not race earlier collectives.
                 boundary = torch.npu.Event()
                 boundary.record()
                 boundary.synchronize()
-            self._submit_ready_layer_loads()
+            self._submit_ready_layer_loads(restore_only=restore_only)
             should_wait = (
-                bool(self.layer_load_tasks[self.current_layer]) or self.current_layer in self.prefetch_layer_map
+                self.prefill_slot_provider is not None
+                or bool(self.layer_load_tasks[self.current_layer])
+                or self.current_layer in self.prefetch_layer_map
             )
             if should_wait:
                 while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
@@ -3212,9 +3269,11 @@ class KVPoolWorker:
                 self.external_slot_release_waiter(self.current_layer)
             if getattr(self, "block_key_hybrid", False):
                 self._check_hybrid_load_errors()
-        except Exception:
+        except Exception as exc:
             if hasattr(self, "_layer_load_aborted"):
                 self._layer_load_aborted.set()
+            if self.prefill_slot_provider is not None:
+                self.prefill_slot_provider().abort(str(exc) or type(exc).__name__)
             if getattr(self, "block_key_hybrid", False):
                 gate.cancel()
                 # Range calls must finish before releasing their get sessions.
@@ -3256,14 +3315,13 @@ class KVPoolWorker:
         send_thread = self.kv_send_thread
         send_thread.raise_if_failed()
         if self.current_layer not in self._attention_saved_layers:
-            self.sync_save_events[self.current_layer].record()
-            if self.layer_save_tasks[self.current_layer]:
-                for task in self.layer_save_tasks[self.current_layer]:
-                    for block_range in task.block_ranges:
-                        send_thread.add_stored_request(block_range.request.req_id)
-                send_thread.add_request(self.layer_save_tasks[self.current_layer])  # type: ignore[arg-type]
-            else:
-                self.layer_save_finished_events[self.current_layer].set()
+            self._enqueue_layer_save(self.current_layer)
+        if self.prefill_slot_provider is not None:
+            slots = self.prefill_slot_provider()
+            # The save hook follows attention. Only waiting to overwrite a
+            # slot needs to synchronize the compute stream with this event.
+            event = torch.npu.current_stream().record_event()
+            slots.seal(slots.epoch(self.current_layer), event.synchronize)
         if self.block_key_hybrid:
             # Recurrent and record-only paths do not exit an attention window.
             self._finish_attention_window()
@@ -3309,7 +3367,7 @@ class KVPoolWorker:
                 while not save_finished_events[layer_id].wait(timeout=10):
                     send_thread.raise_if_failed()
             send_thread.raise_if_failed()
-        reuse_source_layers = set(self.prefetch_layer_map.values())
+        reuse_source_layers = set(self.prefetch_layer_map.values()) if self.prefill_slot_provider is None else set()
         for layer_id in range(num_local):
             if layer_id in reuse_source_layers:
                 continue

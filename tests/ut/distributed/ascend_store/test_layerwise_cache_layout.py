@@ -117,6 +117,55 @@ def test_base_layers_are_merged_into_shared_slots():
     ]
 
 
+def test_main_reuse_folds_only_main_with_separate_indexers_and_draft():
+    config = _make_vllm_config(5, 2)
+    store = config.kv_transfer_config.kv_connector_extra_config
+    store.update(backend="mooncake", layerwise_independent_layers=[0])
+    pd = {"layerwise_host_offload": True}
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        is_kv_producer=True,
+        is_kv_consumer=False,
+        kv_connector_extra_config={
+            "connectors": [
+                {
+                    "kv_connector": "MooncakeLayerwiseConnector",
+                    "kv_role": "kv_producer",
+                    "kv_connector_extra_config": pd,
+                },
+                {"kv_connector": "AscendStoreConnector", "kv_role": "kv_producer", "kv_connector_extra_config": store},
+            ]
+        },
+    )
+    main_names = [f"model.layers.{layer}.self_attn" for layer in range(6)]
+    indexer_names = [f"{name}.indexer.k_cache" for name in main_names]
+    main = AscendMLAAttentionSpec(block_size=2, num_kv_heads=1, head_size=8, dtype=torch.int8)
+    indexer = AscendSFAIndexerCacheSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.int8)
+    specs = dict.fromkeys(main_names, main) | dict.fromkeys(indexer_names, indexer)
+    groups = [
+        SimpleNamespace(
+            layer_names=names,
+            kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs={name: specs[name] for name in names}),
+        )
+        for names in (main_names, indexer_names)
+    ]
+    original = [_make_kv_cache_tensor(spec.page_size_bytes, [name]) for name, spec in specs.items()]
+    cache = SimpleNamespace(num_blocks=1, kv_cache_groups=groups, kv_cache_tensors=original)
+    apply_layerwise_kv_cache_plan(cache, config)
+    names = [tuple(get_kv_cache_tensor_layers(tensor)) for tensor in cache.kv_cache_tensors]
+    assert (main_names[1], main_names[3]) in names
+    assert (main_names[2], main_names[4]) in names
+    assert (main_names[0],) in names and (main_names[5],) in names
+    assert all((name,) in names for name in indexer_names)
+    expected_bytes = 4 * main.page_size_bytes + 6 * indexer.page_size_bytes
+    assert sum(tensor.size for tensor in cache.kv_cache_tensors) == expected_bytes
+
+    pd["layerwise_host_offload"] = False
+    cache.kv_cache_tensors = original
+    apply_layerwise_kv_cache_plan(cache, config)
+    assert cache.kv_cache_tensors is original
+
+
 def test_default_layout_keeps_one_buffer_per_layer():
     layout = build_layerwise_cache_layout(27)
 

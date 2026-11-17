@@ -17,7 +17,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     get_layerwise_protocol,
 )
@@ -112,6 +112,36 @@ class LayerwiseReuseLayout:
     has_layer_reuse: bool
 
 
+def get_prefill_main_reuse_config(transfer: Any) -> dict[str, Any] | None:
+    """Resolve the Producer's Store layout only when the rewritten P/D path is selected."""
+    if (
+        getattr(transfer, "kv_connector", None) != "MultiConnector"
+        or getattr(transfer, "is_kv_producer", False) is not True
+        or getattr(transfer, "is_kv_consumer", False)
+    ):
+        return None
+    extra = getattr(transfer, "kv_connector_extra_config", None) or {}
+    connectors = extra.get("connectors", ())
+    if not any(
+        child.get("kv_connector") == "MooncakeLayerwiseConnector"
+        and child.get("kv_role") == "kv_producer"
+        and (child.get("kv_connector_extra_config") or {}).get("layerwise_host_offload") is True
+        for child in connectors
+    ):
+        return None
+    stores = [
+        cfg
+        for child in connectors
+        if child.get("kv_connector") in ("AscendStoreConnector", "MooncakeConnectorStoreV1")
+        and child.get("kv_role") in ("kv_producer", "kv_both")
+        and (cfg := child.get("kv_connector_extra_config") or {}).get("use_layerwise") is True
+        and str(cfg.get("backend", "mooncake")).lower() == "mooncake"
+    ]
+    if len(stores) > 1:
+        raise ValueError("Rewritten Prefill requires one layerwise Store")
+    return stores[0] if stores and _NUM_SHARED_BUFFERS in stores[0] else None
+
+
 def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None:
     """Return the extra config of the layerwise-reuse connector, if any.
 
@@ -122,6 +152,9 @@ def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None
     """
     if kv_transfer_config is None:
         return None
+    main_config = get_prefill_main_reuse_config(kv_transfer_config)
+    if main_config is not None:
+        return main_config
 
     connector_name = getattr(kv_transfer_config, "kv_connector", None)
     root_extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
@@ -333,6 +366,37 @@ def build_layerwise_reuse_layout(
     )
 
 
+def build_prefill_main_layout(
+    layer_specs: dict[str, KVCacheSpec], base_layers: int, extra_config: dict[str, Any]
+) -> LayerwiseReuseLayout:
+    """Use the standard slot planner with resident draft layers pinned individually."""
+    layers = {get_layerwise_physical_layer_index(name, base_layers) for name in layer_specs}
+    if not set(range(base_layers)) <= layers or layers != set(range(len(layers))):
+        raise ValueError("Prefill Main reuse requires contiguous model layers and resident drafts")
+    independent = build_layerwise_cache_layout(base_layers, extra_config).independent_layers
+    layout = build_layerwise_reuse_layout(
+        layer_specs,
+        base_layers,
+        {**extra_config, _INDEPENDENT_LAYERS: [*independent, *range(base_layers, len(layers))]},
+    )
+    for layer, spec in layout.layer_cache_specs.items():
+        main = spec.main.spec
+        if (
+            not isinstance(main, AscendMLAAttentionSpec)
+            or main.store_on_host
+            or main.model_version is not None
+            or main.tokens_per_state != 1
+            or spec.extra_main_specs
+            or (spec.indexer is not None and not isinstance(spec.indexer.spec, AscendSFAIndexerCacheSpec))
+        ):
+            raise ValueError(f"Unsupported Main/Indexer layout for Prefill layer {layer}")
+    expected_indexers = {name for name in layer_specs if name.endswith(_INDEXER_CACHE_SUFFIX)}
+    indexers = {spec.indexer.layer_name for spec in layout.layer_cache_specs.values() if spec.indexer is not None}
+    if expected_indexers != indexers:
+        raise ValueError("Each Prefill layer may have one private Indexer cache")
+    return layout
+
+
 def apply_layerwise_kv_cache_plan(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -351,7 +415,9 @@ def apply_layerwise_kv_cache_plan(
     base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
     layer_specs = get_layerwise_kv_cache_specs(kv_cache_config)
     excluded_layer_names = (excluded_layer_names or set()) & layer_specs.keys()
-    reuse_layout = build_layerwise_reuse_layout(
+    main_only = get_prefill_main_reuse_config(vllm_config.kv_transfer_config) is not None
+    build_layout = build_prefill_main_layout if main_only else build_layerwise_reuse_layout
+    reuse_layout = build_layout(
         {name: spec for name, spec in layer_specs.items() if name not in excluded_layer_names},
         base_layers,
         extra_config,
@@ -434,7 +500,11 @@ def apply_layerwise_kv_cache_plan(
             if indexer is not None:
                 indexer_specs.append(indexer)
         if indexer_specs:
-            _merge_specs(indexer_specs, indexer=True)
+            if main_only:
+                for spec in indexer_specs:
+                    _merge_specs([spec])
+            else:
+                _merge_specs(indexer_specs, indexer=True)
     # Draft KV survives between forwards, unlike a layerwise target scratch
     # slot. Give every resident draft layer its own persistent descriptor.
     for layer_name in layer_specs:

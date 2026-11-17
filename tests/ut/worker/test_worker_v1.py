@@ -108,6 +108,10 @@ class TestNPUWorker(TestBase):
         expected_physical_bytes = 3 * main_spec.page_size_bytes + 2 * indexer_spec.page_size_bytes
         self.assertEqual((num_layers, num_slots), (6, 3))
         self.assertEqual(factor, expected_logical_bytes / expected_physical_bytes)
+        self.assertEqual(
+            worker._get_layerwise_kv_cache_memory_info(specs, {"layerwise_num_shared_buffers": 2}, main_only=True),
+            (6, 3, expected_logical_bytes / (3 * main_spec.page_size_bytes + 3 * indexer_spec.page_size_bytes)),
+        )
 
     def test_engram_group_initialization_preserves_target_config(self):
         from vllm.config import get_current_vllm_config, set_current_vllm_config

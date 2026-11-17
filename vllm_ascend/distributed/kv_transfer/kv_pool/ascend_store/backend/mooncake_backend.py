@@ -406,6 +406,12 @@ class MooncakeBackend(Backend):
     def batch_revoke(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_put_session_revoke", keys, keys)
 
+    def retire_private_keys(self, keys: list[str]) -> list[str]:
+        # Mooncake's OBJECT_NOT_FOUND confirms that an evicted object needs no removal.
+        object_not_found = -704
+        results = self._call_layerwise_batch("batch_remove", keys, keys, False)
+        return [key for key, result in zip(keys, results, strict=True) if result in (0, object_not_found)]
+
     def batch_get_start(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_get_session_start", keys, keys)
 

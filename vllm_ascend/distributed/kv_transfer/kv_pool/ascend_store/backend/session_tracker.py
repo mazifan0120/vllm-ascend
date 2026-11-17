@@ -29,6 +29,7 @@ class LayerwiseSessionTracker:
         self._request_load_entries: dict[str, dict[str, tuple[int, int]]] = {}
         self._pending_put_owners: dict[str, dict[str, tuple[int, int]]] = {}
         self._load_key_owners: dict[str, set[str]] = {}
+        self._private_tokens: dict[str, int] = {}
 
     @staticmethod
     def _replace_block_entry(entries: dict[str, tuple[int, int]], key: str, block_index: tuple[int, int]) -> None:
@@ -51,6 +52,38 @@ class LayerwiseSessionTracker:
                 for req_id, block_index in request_entries.items():
                     entries = self._request_load_entries.setdefault(req_id, {})
                     self._replace_block_entry(entries, key, block_index)
+
+    def register_private_put(self, req_id: str, group_id: int, key: str, index: int, tokens: int) -> None:
+        with self._lock:
+            self._private_tokens[key] = tokens
+            self.register_put_keys(req_id, [(key, index)], group_id)
+
+    def committed_private_blocks(self, req_id: str, group_id: int) -> dict[int, tuple[str, int]]:
+        with self._lock:
+            return {
+                index: (key, self._private_tokens[key])
+                for key, (group, index) in self._request_load_entries.get(req_id, {}).items()
+                if group == group_id and key in self._private_tokens
+            }
+
+    def unused_private_keys(self) -> list[str]:
+        with self._lock:
+            unused = self._private_tokens.keys() - self._pending_put_owners.keys() - self._load_key_owners.keys()
+            for entries in self._request_load_entries.values():
+                if not unused:
+                    break
+                unused.difference_update(entries)
+            return list(unused)
+
+    def drop_private_reference(self, req_id: str, key: str) -> None:
+        with self._lock:
+            if key in self._private_tokens and (entries := self._request_load_entries.get(req_id)) is not None:
+                entries.pop(key, None)
+
+    def forget_private_keys(self, keys: Iterable[str]) -> None:
+        with self._lock:
+            for key in keys:
+                self._private_tokens.pop(key, None)
 
     def revoke_put_keys(self, keys: Iterable[str]) -> None:
         with self._lock:

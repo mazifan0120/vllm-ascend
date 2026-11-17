@@ -88,8 +88,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
+    build_prefill_main_layout,
     get_layerwise_physical_layer_index,
     get_layerwise_reuse_config,
+    get_prefill_main_reuse_config,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     plan_sparse_kv_offload_memory,
@@ -639,6 +641,10 @@ class NPUWorker(WorkerBase):
         extra_config = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config)
         if extra_config is not None:
             memory_info = getattr(self, "_gva_layerwise_memory_info", None)
+            if memory_info is None and get_prefill_main_reuse_config(self.vllm_config.kv_transfer_config) is not None:
+                memory_info = self._get_layerwise_kv_cache_memory_info(
+                    self.model_runner.get_kv_cache_spec(), extra_config, main_only=True
+                )
             if memory_info is None:
                 num_layers = self.model_config.get_num_layers(self.parallel_config)
                 layout = build_layerwise_cache_layout(num_layers, extra_config)
@@ -1082,6 +1088,7 @@ class NPUWorker(WorkerBase):
         extra_config: dict[str, Any],
         *,
         excluded_layer_names: set[str] | None = None,
+        main_only: bool = False,
     ) -> tuple[int, int, float]:
         if not kv_cache_spec:
             return 0, 0, 1.0
@@ -1092,9 +1099,10 @@ class NPUWorker(WorkerBase):
         base_layers = self.model_config.get_num_layers(self.parallel_config)
         physical_layers = {get_layerwise_physical_layer_index(layer_name, base_layers) for layer_name in target_specs}
         num_layers = len(physical_layers)
-        if num_layers < base_layers:
+        if num_layers < base_layers and not main_only:
             return num_layers, num_layers, 1.0
-        reuse_layout = build_layerwise_reuse_layout(
+        build_layout = build_prefill_main_layout if main_only else build_layerwise_reuse_layout
+        reuse_layout = build_layout(
             target_specs,
             base_layers,
             extra_config,
@@ -1111,7 +1119,8 @@ class NPUWorker(WorkerBase):
                 indexer = reuse_layout.layer_cache_specs[layer].indexer
                 if indexer is not None:
                     physical_page_bytes += indexer.spec.page_size_bytes
-                    break
+                    if not main_only:
+                        break
         return num_layers, num_buffer_assignments, logical_page_bytes / physical_page_bytes
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -1129,6 +1138,7 @@ class NPUWorker(WorkerBase):
                 kv_cache_spec,
                 extra_config,
                 excluded_layer_names=draft_names,
+                main_only=get_prefill_main_reuse_config(self.vllm_config.kv_transfer_config) is not None,
             )
         kvpp_config = KVPPConfig.from_vllm_config(self.vllm_config)
         if kvpp_config.size > 1:

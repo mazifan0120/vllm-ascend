@@ -48,6 +48,54 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler imp
 )
 
 
+def test_prefill_restore_requires_an_internal_full_store_hit():
+    scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+    scheduler.prefill_restore = scheduler.prefill_snapshots = True
+    scheduler.load_specs = {}
+    scheduler.kv_role = "kv_producer"
+    scheduler.use_block_key_layerwise = scheduler.use_layerwise = True
+    scheduler.use_eagle = scheduler.load_async = False
+    scheduler.layerwise_offload = False
+    scheduler.vllm_config = SimpleNamespace(speculative_config=None)
+    scheduler.cache_transfer_granularity = scheduler.lcm_block_size = 4
+    scheduler.cacheable_group_ids = [0]
+    scheduler.original_block_size = [4]
+    scheduler._get_block_key_layerwise_hit_tokens = MagicMock(return_value=8)
+    request = SimpleNamespace(
+        request_id="full",
+        block_hashes=[b"first", b"second"],
+        prompt_token_ids=list(range(8)),
+        num_tokens=8,
+        num_prompt_tokens=8,
+        kv_transfer_params={"do_remote_decode": True, "layerwise_allocation": ["target"]},
+        sampling_params=SimpleNamespace(prompt_logprobs=None),
+        max_tokens=1,
+        has_encoder_inputs=False,
+        num_output_tokens=0,
+        num_preemptions=0,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (8, True)
+    assert scheduler.load_specs["full"].restore_only
+    scheduler._request_trackers = {}
+    scheduler._block_size = scheduler.hash_block_size = 4
+    scheduler.grouped_block_size = [4]
+    scheduler.kv_cache_group_families = ["default"]
+    scheduler.num_speculative_blocks_by_group = {}
+    scheduler._discard_partial_chunks = True
+    metadata = scheduler._process_async_load_request("full", request, [[5, 6]])
+    assert metadata.prefill_history == metadata.target_token_len == 8
+    assert metadata.is_last_chunk and not metadata.can_save
+
+    request.sampling_params.prompt_logprobs = 1
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (7, False)
+    assert not scheduler.load_specs["full"].restore_only
+    request.sampling_params.prompt_logprobs = None
+    scheduler._get_block_key_layerwise_hit_tokens.return_value = 4
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4, False)
+    assert not scheduler.load_specs["full"].restore_only
+
+
 @pytest.fixture(autouse=True)
 def _patch_pool_scheduler_importlib():
     """KVPoolScheduler resolves its backend dynamically via

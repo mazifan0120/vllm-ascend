@@ -54,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler imp
     get_zmq_rpc_path_lookup,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import SlotBarrier
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
@@ -306,6 +307,26 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def bind_prefill_slots(self, provider: Callable[[], SlotBarrier]) -> bool:
+        worker = self.connector_worker
+        if worker is None or not worker.use_block_key_layerwise:
+            return False
+        if not is_kv_save_role(worker.kv_role, worker.consumer_is_to_put):
+            raise ValueError("The Prefill Store must be configured to save KV")
+        if (
+            worker.use_mamba
+            or len(worker.cacheable_group_ids) != worker.num_kv_cache_groups
+            or any(family not in ("default", "c1") for family in worker.kv_cache_group_families)
+        ):
+            raise ValueError("Prefill snapshot ranges require dense, uncompressed token pages in every group")
+        worker.prefill_slot_provider = provider
+        return True
+
+    def configure_prefill_snapshots(self) -> None:
+        scheduler = self.connector_scheduler
+        if scheduler is not None and scheduler.use_block_key_layerwise:
+            scheduler.prefill_snapshots = True
+
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
         """Fence only the saves of requests whose blocks this step may reuse.
 
@@ -350,6 +371,20 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             ],
         )
         self.connector_worker.start_load_kv(metadata)
+
+    def restore_prefill_step(self, request_ids: Iterable[str], send_layer: Callable[[int], None]) -> None:
+        assert self.connector_worker is not None
+        metadata = self._get_connector_metadata()
+        covered = {
+            request.req_id
+            for request in metadata.requests
+            if request.load_spec
+            and request.load_spec.restore_only
+            and request.prefill_history == request.target_token_len
+        }
+        if covered != set(request_ids) or len(covered) != len(metadata.requests):
+            raise RuntimeError("Restore-only Prefill requires complete Store coverage for every request")
+        self.connector_worker.restore_prefill_step(send_layer)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:

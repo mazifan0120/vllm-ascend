@@ -9,6 +9,7 @@ import hashlib
 import json
 from copy import copy
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -282,7 +283,7 @@ def selected(mask, index: int) -> bool:
 
 def prepare_layerwise_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dict[int, list[ReqMeta]]:
     """Preserve partial single-group sessions and complete hybrid snapshots."""
-    if worker.block_key_hybrid:
+    if worker.block_key_hybrid or any(request.prefill_history is not None for request in requests):
         return prepare_group_sessions(worker, requests)
     worker._prepare_block_key_layerwise_sessions(requests)
     return {}
@@ -293,6 +294,10 @@ def prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dic
     with worker._put_started_keys_lock:
         previously_started = worker._put_started_keys.copy()
     try:
+        if any(request.prefill_history is not None for request in requests):
+            if worker.prefill_slot_provider is None:
+                raise RuntimeError("Prefill snapshot plans require the Store slot barrier")
+            return _prepare_prefill_sessions(worker, requests)
         return _prepare_group_sessions(worker, requests)
     except Exception:
         # Preparation has not submitted payload transfers yet. Roll back other
@@ -303,6 +308,101 @@ def prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dic
         worker._queue_layerwise_revoke_keys(keys)
         worker._finish_current_layerwise_load_sessions()
         raise
+
+
+def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dict[int, list[ReqMeta]]:
+    """Restore the exact prefix and save new ranges using the existing group I/O."""
+    worker._current_layerwise_request_ids = {request.req_id for request in requests}
+    worker._current_layerwise_last_chunk_req_ids = {request.req_id for request in requests if request.is_last_chunk}
+    result: dict[int, list[ReqMeta]] = {}
+    get_slots: list[tuple[ReqMeta, str, int, int | None]] = []
+    superseded: list[tuple[str, str]] = []
+    puts_by_group: dict[int, list[tuple[ReqMeta, str, int, int | None]]] = {}
+    tracker = worker._layerwise_session_tracker
+    for group in worker.cacheable_group_ids:
+        views = result[group] = []
+        puts = puts_by_group[group] = []
+        block_size = worker.grouped_block_size[group]
+        public_writer = worker._is_layerwise_save_owner(group)
+        for request in requests:
+            history = request.prefill_history
+            if history is None or not 0 <= history <= request.target_token_len:
+                raise ValueError("Invalid Prefill snapshot history")
+            ids = request.block_ids_by_group[group]
+            num_blocks = (request.target_token_len + block_size - 1) // block_size
+            if len(ids) < num_blocks or any(block <= 0 for block in ids[:num_blocks]):
+                raise ValueError("Prefill snapshot requires dense, allocated token pages")
+            hashes = get_block_hashes(request.block_hashes, block_size, worker.hash_block_size)
+            previous = tracker.committed_private_blocks(request.req_id, group)
+            view = copy(request)
+            view.range_tokens = {}
+            view.load_keys = []
+            view.load_key_block_offset = 0
+            view.load_block_keys = []
+            view.load_last_block_key = view.save_last_block_key = None
+            view.partial_block_index = None
+            view.save_key_block_offset = history // block_size
+            view.save_block_keys = [None] * (num_blocks - view.save_key_block_offset)
+            views.append(view)
+            for index in range((history + block_size - 1) // block_size):
+                tokens = min(block_size, history - index * block_size)
+                private = previous.get(index)
+                if private is not None and private[1] >= tokens:
+                    key = private[0]
+                    view.range_tokens[key] = tokens
+                elif index < len(hashes):
+                    key = worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+                    if private is not None:
+                        superseded.append((request.req_id, private[0]))
+                    if tokens < block_size:
+                        view.range_tokens[key] = tokens
+                else:
+                    raise RuntimeError(f"Missing committed Prefill history for group {group}, block {index}")
+                view.load_block_keys.append(key)
+                get_slots.append((view, key, ids[index], index))
+            if not request.can_save:
+                continue
+            for index in range(view.save_key_block_offset, num_blocks):
+                tokens = min(block_size, request.target_token_len - index * block_size)
+                if tokens == block_size and index < len(hashes):
+                    if public_writer:
+                        key = worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+                        puts.append((view, key, index, None))
+                elif not request.is_last_chunk:
+                    key = worker._make_layerwise_full_key(group, f"prefill_private_{uuid4().hex}")
+                    view.range_tokens[key] = tokens
+                    puts.append((view, key, index, tokens))
+
+    worker._open_layerwise_get_sessions(get_slots)
+    if any(view.load_block_keys[index] is None for view, _, _, index in get_slots):
+        raise RuntimeError("Prefill could not open the complete committed Store prefix")
+    for req_id, key in superseded:
+        tracker.drop_private_reference(req_id, key)
+    for group, puts in puts_by_group.items():
+        public = list(dict.fromkeys(key for _, key, _, tokens in puts if tokens is None))
+        missing = set(worker._filter_pool_existing_keys(public))
+        names = list(dict.fromkeys(key for _, key, _, tokens in puts if tokens is not None or key in missing))
+        if not names:
+            continue
+        try:
+            codes = worker._start_layerwise_put_keys(names, sum(worker.group_block_len[group]))
+        except Exception:
+            # Each name was submitted by this local client. A missing local
+            # PUT session is a no-op for Mooncake revoke.
+            worker._queue_layerwise_revoke_keys(names)
+            raise
+        started = {key for key, code in zip(names, codes, strict=True) if code == 0}
+        with worker._put_started_keys_lock:
+            worker._put_started_keys.update(started)
+        for view, key, index, tokens in puts:
+            if key in started:
+                view.save_block_keys[index - view.save_key_block_offset] = key
+                if tokens is not None:
+                    tracker.register_private_put(view.req_id, group, key, index, tokens)
+        rejected = set(names) - started
+        if rejected and worker._filter_pool_existing_keys(sorted(rejected)):
+            raise RuntimeError(f"Mooncake could not allocate Prefill snapshot ranges for group {group}")
+    return result
 
 
 def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dict[int, list[ReqMeta]]:
