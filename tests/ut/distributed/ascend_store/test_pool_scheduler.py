@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import KVConnectorOutput
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreConnector
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -94,6 +95,36 @@ def test_prefill_restore_requires_an_internal_full_store_hit():
     scheduler._get_block_key_layerwise_hit_tokens.return_value = 4
     assert scheduler.get_num_new_matched_tokens(request, 0) == (4, False)
     assert not scheduler.load_specs["full"].restore_only
+
+
+def test_prefill_mtp_lookup_requires_readable_successor_identity_and_never_counts_tail():
+    scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+    scheduler.prefill_snapshots = scheduler.use_eagle = True
+    scheduler._block_size = scheduler.hash_block_size = 4
+    scheduler._make_layerwise_hit_check_keys = lambda group, identity: [f"{group}:{identity}"]
+    readable = {f"0:prefill_mtp1:0:{b'second'.hex()}", f"0:{b'first'.hex()}", f"0:{b'different'.hex()}"}
+    scheduler._query_layerwise_block_hits = lambda keys: [all(key in readable for key in group) for group in keys]
+    request = SimpleNamespace(request_id="mtp", block_hashes=[b"first", b"second", b"generated"])
+
+    assert scheduler._lookup_block_key_contiguous(request, 8, 0) == 4
+    request.block_hashes[1] = b"different"
+    assert scheduler._lookup_block_key_contiguous(request, 8, 0) == 0
+    scheduler.prefill_snapshots = False
+    assert scheduler._lookup_block_key_contiguous(request, 8, 0) == 8
+
+
+def test_prefill_snapshot_mtp_requires_synchronous_cpu_next_token_path():
+    spec = SimpleNamespace(method="mtp", num_speculative_tokens=1, disable_padded_drafter_batch=True)
+    config = SimpleNamespace(speculative_config=spec, scheduler_config=SimpleNamespace(async_scheduling=False))
+    AscendStoreConnector._validate_prefill_snapshot_spec(config)
+
+    spec.disable_padded_drafter_batch = False
+    with pytest.raises(ValueError, match="CPU next-token IDs"):
+        AscendStoreConnector._validate_prefill_snapshot_spec(config)
+    spec.disable_padded_drafter_batch = True
+    config.scheduler_config.async_scheduling = True
+    with pytest.raises(ValueError, match="synchronous"):
+        AscendStoreConnector._validate_prefill_snapshot_spec(config)
 
 
 @pytest.fixture(autouse=True)

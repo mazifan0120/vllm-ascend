@@ -29,6 +29,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     validate_layerwise_runtime,
     validate_layerwise_topology,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_layerwise import prefill_public_hash
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -443,6 +444,7 @@ class KVPoolScheduler:
         """
         coordinator = self.cache_coordinator
         assert coordinator is not None
+        mtp = self.prefill_snapshots and self.use_eagle
 
         def query_group_hits(
             group_id: int,
@@ -457,7 +459,14 @@ class KVPoolScheduler:
                     continue
                 if lookup_mask is not None and not (block_idx < len(lookup_mask) and lookup_mask[block_idx]):
                     continue
-                keys_by_block.append(self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(block_hash)))
+                identity = (
+                    prefill_public_hash(group_block_hashes, block_idx, mtp=True)
+                    if mtp
+                    else block_hash_to_str(block_hash)
+                )
+                if identity is None:
+                    break
+                keys_by_block.append(self._make_layerwise_hit_check_keys(group_id, identity))
                 allowed_hashes.append(block_hash)
             block_hits = self._query_layerwise_block_hits(keys_by_block)
             return [block_hash for block_hash, hit in zip(allowed_hashes, block_hits) if hit]
@@ -546,9 +555,13 @@ class KVPoolScheduler:
         )
         if not block_hashes:
             return 0
-        keys_by_block = [
-            self._make_layerwise_hit_check_keys(0, block_hash_to_str(block_hash)) for block_hash in block_hashes
-        ]
+        mtp = self.prefill_snapshots and self.use_eagle
+        keys_by_block = []
+        for index, block_hash in enumerate(block_hashes):
+            identity = prefill_public_hash(block_hashes, index, mtp=True) if mtp else block_hash_to_str(block_hash)
+            if identity is None:
+                break
+            keys_by_block.append(self._make_layerwise_hit_check_keys(0, identity))
         block_hits = self._query_layerwise_block_hits(keys_by_block)
         num_hit_blocks = 0
         for hit in block_hits:

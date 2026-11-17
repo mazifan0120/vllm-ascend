@@ -278,7 +278,7 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         worker.m_store = MagicMock()
         return worker
 
-    def test_prefill_tail_requires_commit_then_promotes_to_public_block(self):
+    def _make_prefill_snapshot_worker(self):
         worker = self._make_worker()
         worker.prefill_slot_provider = MagicMock()
         worker.block_key_hybrid = False
@@ -297,6 +297,10 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         worker.m_store.batch_get_end.return_value = 0
         readable = set()
         worker.m_store.batch_get_start.side_effect = lambda keys: [0 if key in readable else -1 for key in keys]
+        return worker, readable
+
+    def test_prefill_tail_requires_commit_then_promotes_to_public_block(self):
+        worker, readable = self._make_prefill_snapshot_worker()
         tracker = worker._layerwise_session_tracker
 
         def prepare(history, extent, *, final=False):
@@ -334,6 +338,43 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         self.assertEqual(final.range_tokens, {next_private: 1})
         self.assertEqual(final.save_block_keys, [None])
         self.assertEqual(tracker.unused_private_keys(), [private])
+
+    def test_mtp_snapshot_uses_successor_hash_and_keeps_request_tail_private(self):
+        worker, readable = self._make_prefill_snapshot_worker()
+        worker.use_eagle = True
+
+        def prepare(req_id, history, extent, hashes, *, final=False):
+            request = ReqMeta(
+                req_id,
+                block_ids=[7, 8, 9],
+                block_hashes=hashes,
+                target_token_len=extent,
+                num_prompt_tokens=8,
+                can_save=True,
+                is_last_chunk=final,
+            )
+            request.prefill_history = history
+            return mooncake_layerwise.prepare_layerwise_sessions(worker, [request])[0][0]
+
+        # Generated token hashes cannot make the final prompt page public.
+        hashes = [b"first", b"second", b"generated"]
+        first = prepare("r1", 0, 8, hashes)
+        public, private = first.save_block_keys
+        self.assertEqual(public, worker._make_layerwise_full_key(0, f"prefill_mtp1:0:{b'second'.hex()}"))
+        self.assertIn("prefill_private_", private)
+        self.assertEqual(first.range_tokens, {private: 4})
+        readable.update([public, private])
+        worker._layerwise_session_tracker.commit_put_keys([public, private])
+        later = prepare("r1", 8, 9, hashes, final=True)
+        self.assertEqual(later.load_block_keys, [public, private])
+        self.assertEqual(later.save_block_keys, [None])
+        worker._finish_current_layerwise_load_sessions()
+
+        replay = prepare("r2", 4, 8, hashes, final=True)
+        self.assertEqual(replay.load_block_keys, [public])
+        worker._finish_current_layerwise_load_sessions()
+        with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
+            prepare("r3", 4, 8, [b"first", b"different"], final=True)
 
     def test_put_start_uses_full_current_layout_size_and_skips_hits(self):
         worker = self._make_worker()

@@ -319,13 +319,28 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             or any(family not in ("default", "c1") for family in worker.kv_cache_group_families)
         ):
             raise ValueError("Prefill snapshot ranges require dense, uncompressed token pages in every group")
+        self._validate_prefill_snapshot_spec(worker.vllm_config)
         worker.prefill_slot_provider = provider
         return True
 
     def configure_prefill_snapshots(self) -> None:
         scheduler = self.connector_scheduler
         if scheduler is not None and scheduler.use_block_key_layerwise:
+            self._validate_prefill_snapshot_spec(scheduler.vllm_config)
             scheduler.prefill_snapshots = True
+
+    @staticmethod
+    def _validate_prefill_snapshot_spec(config: VllmConfig) -> None:
+        # The CPU drafter takes the token immediately after a partial chunk.
+        # The padded backup can instead select the end of the request.
+        spec = config.speculative_config
+        if spec is not None and (
+            spec.method != "mtp"
+            or spec.num_speculative_tokens != 1
+            or not spec.disable_padded_drafter_batch
+            or config.scheduler_config.async_scheduling
+        ):
+            raise ValueError("Prefill snapshots with MTP require one synchronous draft step and CPU next-token IDs")
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
         """Fence only the saves of requests whose blocks this step may reuse.

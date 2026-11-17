@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from copy import copy
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -22,6 +23,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_utils import BlockHash
+
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
 
@@ -281,6 +284,15 @@ def selected(mask, index: int) -> bool:
     return mask is None or (0 <= index < len(mask) and bool(mask[index]))
 
 
+def prefill_public_hash(block_hashes: Sequence[BlockHash | str], index: int, *, mtp: bool) -> str | None:
+    """MTP1 KV at a block's last position consumes the next prompt token."""
+    if not mtp:
+        return block_hash_to_str(block_hashes[index]) if index < len(block_hashes) else None
+    if index + 1 >= len(block_hashes):
+        return None
+    return f"prefill_mtp1:{index}:{block_hash_to_str(block_hashes[index + 1])}"
+
+
 def prepare_layerwise_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dict[int, list[ReqMeta]]:
     """Preserve partial single-group sessions and complete hybrid snapshots."""
     if worker.block_key_hybrid or any(request.prefill_history is not None for request in requests):
@@ -333,6 +345,10 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
             if len(ids) < num_blocks or any(block <= 0 for block in ids[:num_blocks]):
                 raise ValueError("Prefill snapshot requires dense, allocated token pages")
             hashes = get_block_hashes(request.block_hashes, block_size, worker.hash_block_size)
+            if worker.use_eagle:
+                if request.num_prompt_tokens is None:
+                    raise ValueError("MTP1 Prefill snapshots require the prompt boundary")
+                hashes = hashes[: request.num_prompt_tokens // block_size]
             previous = tracker.committed_private_blocks(request.req_id, group)
             view = copy(request)
             view.range_tokens = {}
@@ -350,8 +366,8 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
                 if private is not None and private[1] >= tokens:
                     key = private[0]
                     view.range_tokens[key] = tokens
-                elif index < len(hashes):
-                    key = worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+                elif (identity := prefill_public_hash(hashes, index, mtp=worker.use_eagle)) is not None:
+                    key = worker._make_layerwise_full_key(group, identity)
                     if private is not None:
                         superseded.append((request.req_id, private[0]))
                     if tokens < block_size:
@@ -364,9 +380,10 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
                 continue
             for index in range(view.save_key_block_offset, num_blocks):
                 tokens = min(block_size, request.target_token_len - index * block_size)
-                if tokens == block_size and index < len(hashes):
+                identity = prefill_public_hash(hashes, index, mtp=worker.use_eagle)
+                if tokens == block_size and identity is not None:
                     if public_writer:
-                        key = worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+                        key = worker._make_layerwise_full_key(group, identity)
                         puts.append((view, key, index, None))
                 elif not request.is_last_chunk:
                     key = worker._make_layerwise_full_key(group, f"prefill_private_{uuid4().hex}")
