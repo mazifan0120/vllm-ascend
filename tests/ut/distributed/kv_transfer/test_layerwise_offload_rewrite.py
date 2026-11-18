@@ -397,6 +397,9 @@ class TestLayerwiseRewrite(unittest.TestCase):
         job = sender.reserve_layer(case.target, epoch, Span(0, 4), case.sources(0, 0), lambda: None)
         barrier.seal(epoch)
         sender.execute(job)
+        clock_patch = patch(f"{DecodeControl.__module__}.monotonic", return_value=100.0)
+        clock = clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         control.close_target(case.target, case.scheduler.begin_close(case.target))
         control.step()
         self.assertEqual([(event.kind, event.worker.rank) for event in events], [("closed", 1)])
@@ -415,15 +418,23 @@ class TestLayerwiseRewrite(unittest.TestCase):
         with patch.object(p_client, "request", wraps=request) as rpc:
             self.assertFalse(writer.progress(sender, case.target))
             self.assertEqual([call.args[1][0] for call in rpc.call_args_list], ["poll-writer", "terminal", "terminal"])
-        control.step()
+        with patch.object(d_client, "request", wraps=d_client.request) as rpc:
+            control.step()
+            rpc.assert_not_called()
         self.assertEqual(events, [])
         self.assertEqual(case.released, [])
+        other = replace(case.allocation, target=TargetId("other-request", 1, 0), blocks=((2, 3), (0, 3)))
+        control.prepare(other, case.scheduler.retain(other))
+        control.step()
+        self.assertEqual([(event.target, event.kind) for event in events], [(other.target, "prepared")] * 2)
+        events.clear()
         with patch.object(p_client, "request", wraps=p_client.request) as rpc:
             for _ in range(3):
                 self.assertFalse(writer.progress(sender, case.target))
             rpc.assert_not_called()
         sender.confirm_native_quiescence(case.target)
         self.assertTrue(writer.progress(sender, case.target))
+        clock.return_value += 0.25
         control.step()
         self.assertEqual([(event.kind, event.worker.rank) for event in events], [("closed", 0)])
         self.assertTrue(case.scheduler.closed(events[0].target, events[0].worker))

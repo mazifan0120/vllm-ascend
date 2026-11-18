@@ -38,6 +38,7 @@ from .layerwise_offload_wire import (
 )
 
 logger = logging.getLogger(__name__)
+_CLOSE_RETRY_INTERVAL_S = 0.25
 
 
 class SideChannelClient:
@@ -95,7 +96,7 @@ class DecodeControl:
         self._post = post
         self._timeout = timeout_s
         self._commands: SimpleQueue[tuple[TargetId, CatalogRef, tuple, float]] = SimpleQueue()
-        self._pending: dict[tuple[TargetId, CatalogRef], tuple[tuple, float]] = {}
+        self._pending: dict[tuple[TargetId, CatalogRef], tuple[tuple, float, float]] = {}
 
     def link(self, publish: Callable) -> DecodeWorkerLink:
         return DecodeWorkerLink(self.prepare, self.close_target, publish)
@@ -117,34 +118,41 @@ class DecodeControl:
                 target, ref, frame, deadline = self._commands.get_nowait()
             except Empty:
                 break
-            self._pending[target, ref] = frame, deadline
+            self._pending[target, ref] = frame, deadline, 0.0
         unreachable = set()
-        for (target, ref), (frame, deadline) in list(self._pending.items()):
+        for (target, ref), (frame, deadline, retry_at) in list(self._pending.items()):
+            now = monotonic()
+            closing = frame[0] == "close-target"
+            if now < retry_at:
+                continue
             try:
-                if monotonic() >= deadline:
+                if now >= deadline:
                     raise ValueError("Layerwise target preparation or receipt timed out")
                 if ref.rank in unreachable:
                     continue
-                state, _ = decode_worker_status(self._client.request(ref.rank, frame), target, ref)
-                if frame[0] == "close-target":
-                    if state != "closed":
-                        continue
-                elif state == "prepared" and frame[0] == "target":
+                state, writers = decode_worker_status(self._client.request(ref.rank, frame), target, ref)
+                if closing and state == "closing" and not writers:
+                    continue  # Local decode work or writeback can finish on the next poll.
+                if state == "prepared" and frame[0] == "target":
                     self._post(DecodeWorkerEvent("prepared", target, ref))
-                    self._pending[target, ref] = encode_worker_query("poll-target", target, ref), deadline
+                    self._pending[target, ref] = encode_worker_query("poll-target", target, ref), deadline, 0.0
                     continue
                 elif state == "waiting" and frame[0] == "poll-target":
                     continue
-                elif state not in ("ready", "failed") or frame[0] != "poll-target":
+                elif not closing and (state not in ("ready", "failed") or frame[0] != "poll-target"):
                     raise ValueError("Unexpected worker state for layerwise command")
             except TimeoutError:
                 unreachable.add(ref.rank)
-                continue
-            except (ValueError, msgspec.DecodeError, zmq.ZMQError) as exc:
-                if frame[0] == "close-target":
+                if not closing:
                     continue
-                logger.warning("Layerwise target %s failed at rank %s: %s", target, ref.rank, exc)
+                state = None
+            except (ValueError, msgspec.DecodeError, zmq.ZMQError) as exc:
+                if not closing:
+                    logger.warning("Layerwise target %s failed at rank %s: %s", target, ref.rank, exc)
                 state = "failed"
+            if closing and state != "closed":
+                self._pending[target, ref] = frame, deadline, monotonic() + _CLOSE_RETRY_INTERVAL_S
+                continue
             self._post(DecodeWorkerEvent(state, target, ref))
             del self._pending[target, ref]
 
