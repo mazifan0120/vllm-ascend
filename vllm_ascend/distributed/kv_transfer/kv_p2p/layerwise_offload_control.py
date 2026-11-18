@@ -260,10 +260,15 @@ class PrefillControl:
                 continue
             target = chunk.allocation.target
             previous = self._active.get(target)
-            if previous is not None and previous.refusal is not None:
+            if previous is not None and (previous.refusal is not None or previous.cancel):
                 continue
             key = (chunk.refs, chunk.endpoints, chunk.parallel_main)
-            if key not in self._sessions:
+            session = self._sessions.get(key)
+            if previous is not None and (session is None or session[2] is not previous.sender):
+                logger.warning("P rank %d received a different layerwise session for %s", self._rank, target)
+                previous.cancel = True
+                continue
+            if session is None:
                 client = SideChannelClient(chunk.endpoints, 1000)
                 try:
                     catalogs = tuple(
@@ -275,14 +280,10 @@ class PrefillControl:
                 except (TimeoutError, ValueError, msgspec.DecodeError, zmq.ZMQError) as error:
                     reason = str(error) or type(error).__name__
                     logger.warning("P rank %d could not read layerwise catalog for %s: %s", self._rank, target, reason)
-                    if previous is None:
-                        # Only the receiver can confirm whether it issued an address grant.
-                        self._active[target] = _WriterTask(
-                            None, WriterControl(client, chunk.refs), refusal=NativeResult(reason, False)
-                        )
-                    else:
-                        client.close()
-                        previous.cancel = True
+                    # Only the receiver can confirm whether it issued an address grant.
+                    self._active[target] = _WriterTask(
+                        None, WriterControl(client, chunk.refs), refusal=NativeResult(reason, False)
+                    )
                     continue
                 except Exception:
                     client.close()
@@ -291,8 +292,8 @@ class PrefillControl:
                 sender = LayerwiseSender(
                     self._rank, layout, self._slots, control.read_addresses, self._write, control.report
                 )
-                self._sessions[key] = client, control, sender
-            _, control, sender = self._sessions[key]
+                session = self._sessions[key] = (client, control, sender)
+            _, control, sender = session
             try:
                 attached = sender.attach(chunk.allocation, chunk.refs)
             except (TimeoutError, ValueError, msgspec.DecodeError, zmq.ZMQError) as error:

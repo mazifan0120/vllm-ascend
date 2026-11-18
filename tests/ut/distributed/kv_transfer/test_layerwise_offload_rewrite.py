@@ -508,6 +508,26 @@ class TestLayerwiseRewrite(unittest.TestCase):
             with self.subTest(decode_tp=decode_tp, multi_writer=multi_writer):
                 self._check_prefill_control(decode_tp, multi_writer)
 
+    def test_later_chunk_cannot_rebind_an_active_writer(self):
+        case = _Fixture()
+        allocation, refs = case.publish()
+        endpoints = self._side_channels(case)
+        control = PrefillControl(0, 4, case.barriers[0], case.write)
+        first = PrefillChunk(allocation, refs, endpoints, True, allocation.blocks, Span(0, 4))
+        ((sender, _),) = control._attach((first,))
+        (session,) = control._sessions.values()
+        self.addCleanup(session[0].close)
+        last = replace(first, span=Span(4, 7))
+
+        self.assertEqual(control._attach((replace(last, parallel_main=False),)), ())
+        self.assertEqual(control._attach((last,)), ())
+        self.assertEqual(tuple(control._sessions.values()), (session,))
+        task = control._active[case.target]
+        self.assertIs(task.sender, sender)
+        self.assertTrue(task.cancel)
+        self.assertTrue(task.control.progress(sender, case.target, cancel=True))
+        sender.forget(case.target)
+
     def test_catalog_timeout_fails_only_the_unattached_target(self):
         case = _Fixture(multi_writer=False)
         failed, refs = case.publish()
