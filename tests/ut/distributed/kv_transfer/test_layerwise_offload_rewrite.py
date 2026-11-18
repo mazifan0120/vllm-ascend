@@ -8,7 +8,7 @@ from dataclasses import replace
 from threading import Event, Thread
 from time import monotonic
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import msgspec
 import zmq
@@ -36,7 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_sender import 
     LayerwiseSender,
     NativeResult,
     PrefillChunk,
-    mooncake_sync_write,
+    mooncake_write_once,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_wire import (
     decode_addresses,
@@ -160,13 +160,17 @@ class _Fixture:
         return decode_addresses(_roundtrip(self.d[rank].handle_peer(query)), target)
 
     def write(self, write):
-        return mooncake_sync_write(self, write)
+        return mooncake_write_once(self, write)
 
-    def batch_transfer_sync_write(self, endpoint, sources, targets, lengths):
+    def batch_transfer_async_write(self, endpoint, sources, targets, lengths):
         assert endpoint in {catalog.endpoint for catalog in self.layout.catalogs}
         for src, dst, count in zip(sources, targets, lengths, strict=True):
             for offset in range(count):
                 self.bytes[dst + offset] = self.bytes[src + offset]
+        return 1
+
+    def get_batch_transfer_status(self, batches):
+        assert batches == [1]
         return 0
 
     def report(self, rank, target, results):
@@ -193,6 +197,23 @@ class _Fixture:
 
 
 class TestLayerwiseRewrite(unittest.TestCase):
+    def test_native_write_does_not_retry_a_failed_batch(self):
+        write = SimpleNamespace(endpoint="decode", sources=(100,), targets=(200,), lengths=(64,))
+        for batch, status, quiesced in ((0, None, False), (17, -1, False), (17, 0, True)):
+            with self.subTest(batch=batch, status=status):
+                engine = Mock()
+                engine.batch_transfer_async_write.return_value = batch
+                engine.get_batch_transfer_status.return_value = status
+                result = mooncake_write_once(engine, write)
+                self.assertEqual(result.quiesced, quiesced)
+                self.assertEqual(result.error is None, quiesced)
+                engine.batch_transfer_async_write.assert_called_once_with("decode", (100,), (200,), (64,))
+                engine.batch_transfer_sync_write.assert_not_called()
+                if batch:
+                    engine.get_batch_transfer_status.assert_called_once_with([batch])
+                else:
+                    engine.get_batch_transfer_status.assert_not_called()
+
     def test_unequal_tp_requires_replicated_model_and_divisible_ratio(self):
         RegisteredLayout.validate_tp(8, 8, replicated=False)
         for producer_tp, decode_tp in ((8, 0), (2, 8), (8, 3)):

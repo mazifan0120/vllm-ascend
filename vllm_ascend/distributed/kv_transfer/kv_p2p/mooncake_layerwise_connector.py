@@ -75,7 +75,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_plan import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_sender import (
     LayerwiseSender,
     PrefillChunk,
-    mooncake_sync_write,
+    mooncake_write_once,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_wire import (
     decode_allocation,
@@ -1938,7 +1938,7 @@ class MooncakeLayerwiseConnectorWorker:
         self._prefill_batch: tuple[tuple[LayerwiseSender, PrefillChunk], ...] = ()
         self._prefill_emitted: set[int] = set()
         self._prefill_control = PrefillControl(
-            self.tp_rank, self.tp_size, self._prefill_slots, partial(mooncake_sync_write, self.engine)
+            self.tp_rank, self.tp_size, self._prefill_slots, partial(mooncake_write_once, self.engine)
         )
         self._prefill_control_stop = threading.Event()
         self._prefill_control_thread = threading.Thread(

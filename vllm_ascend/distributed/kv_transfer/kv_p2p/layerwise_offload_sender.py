@@ -32,12 +32,15 @@ class NativeResult:
             raise ValueError("Successful native write must stop reading the source")
 
 
-def mooncake_sync_write(engine, write: Write) -> NativeResult:
-    result = engine.batch_transfer_sync_write(write.endpoint, write.sources, write.targets, write.lengths)
+def mooncake_write_once(engine, write: Write) -> NativeResult:
+    # The sync wrapper can retry a failed batch without proving it has stopped.
+    batch = engine.batch_transfer_async_write(write.endpoint, write.sources, write.targets, write.lengths)
+    if batch == 0:
+        return NativeResult(f"Mooncake write submission failed for {write.endpoint}", False)
+    result = engine.get_batch_transfer_status([batch])
     if result == 0:
         return NativeResult(None, True)
-    # A sync API error can also represent a timeout; do not infer DMA quiescence.
-    return NativeResult(f"Mooncake sync write failed for {write.endpoint}: {result}", False)
+    return NativeResult(f"Mooncake write completion failed for {write.endpoint}: {result}", False)
 
 
 @dataclass(frozen=True)
