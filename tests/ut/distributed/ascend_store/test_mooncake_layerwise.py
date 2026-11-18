@@ -424,6 +424,59 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
             prepare("r3", 4, 8, [b"first", b"different"], final=True)
 
+    def test_prefill_store_writers_partition_whole_keys_and_restore_on_every_rank(self):
+        owner, readable = self._make_prefill_snapshot_worker()
+        second, _ = self._make_prefill_snapshot_worker()
+        follower, _ = self._make_prefill_snapshot_worker()
+        workers = (owner, second, follower)
+        for rank, worker in enumerate(workers):
+            worker.put_step = 3
+            worker.tp_rank = rank
+            worker.layerwise_prefill_put_writers = 2
+            worker.m_store.batch_get_start.side_effect = lambda keys: [
+                0 if key in readable else -704 for key in keys
+            ]
+
+        def prepare(worker, history, extent, *, final=False):
+            request = ReqMeta(
+                "r1",
+                block_ids=[7, 8, 9, 10, 11],
+                block_hashes=[b"first", b"second", b"third"],
+                target_token_len=extent,
+                can_save=True,
+                is_last_chunk=final,
+            )
+            request.prefill_history = history
+            request.prefill_snapshot_id = str(extent)
+            return mooncake_layerwise.prepare_layerwise_sessions(worker, [request])[0][0]
+
+        first_views = [prepare(worker, 0, 15) for worker in workers]
+        first, _, third, _ = first_views[0].save_block_keys
+        _, middle, _, tail = first_views[1].save_block_keys
+        self.assertEqual(first_views[0].save_block_keys, [first, None, third, None])
+        self.assertEqual(first_views[1].save_block_keys, [None, middle, None, tail])
+        self.assertEqual(first_views[2].save_block_keys, [None, None, None, None])
+        self.assertEqual(len({first, middle, third, tail, None}), 5)
+        follower.m_store.batch_put_start.assert_not_called()
+        for worker, view in zip(workers, first_views, strict=True):
+            worker.layer_save_tasks = [[]]
+            worker._process_save_for_layer_batch([view], 0)
+            self.assertEqual(bool(worker.layer_save_tasks[0]), worker is not follower)
+            keys = [key for key in view.save_block_keys if key is not None]
+            worker._layerwise_session_tracker.commit_put_keys(keys)
+            readable.update(keys)
+            if worker is owner:
+                with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
+                    prepare(follower, 15, 17, final=True)
+        for worker in workers:
+            view = prepare(worker, 15, 17, final=True)
+            self.assertEqual(view.load_block_keys, [first, middle, third, tail])
+            self.assertEqual(view.range_tokens, {tail: 3})
+            worker._finish_current_layerwise_load_sessions()
+        self.assertEqual(second._layerwise_session_tracker.collect_private_removals(), [tail])
+        for worker in (owner, follower):
+            self.assertEqual(worker._layerwise_session_tracker.collect_private_removals(), [])
+
     def test_prefill_concurrent_public_put_uses_committed_request_private_full_block(self):
         owner, readable = self._make_prefill_snapshot_worker()
         follower, _ = self._make_prefill_snapshot_worker()

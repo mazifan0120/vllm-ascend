@@ -135,6 +135,7 @@ SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
 
 class KVPoolWorker:
     prefill_slot_provider: Callable[[], SlotBarrier] | None = None
+    layerwise_prefill_put_writers = 1
 
     # The main class for the cache engine.
 
@@ -1636,8 +1637,8 @@ class KVPoolWorker:
         group_id: int = 0,
         layer_idx_in_group: int = 0,
     ) -> None:
-        # MLA replicas share a writer; recurrent state is saved by every TP rank.
-        if not self._is_layerwise_save_owner(group_id):
+        save_owner = self._is_layerwise_save_owner(group_id)
+        if not save_owner and not 0 < self.tp_rank < self.layerwise_prefill_put_writers:
             return
         block_size = get_group_block_size(self.grouped_block_size, group_id)
         request_block_ranges = []
@@ -1647,7 +1648,7 @@ class KVPoolWorker:
                     start = request.save_key_block_offset
                     request_block_ranges.append(LayerBlockRange(request, start, start + len(request.save_block_keys)))
                 continue
-            if request.can_save is None or not request.can_save:
+            if not save_owner or not request.can_save:
                 continue
             save_start_block = request.save_start_token // block_size
             group_block_hashes = get_block_hashes(

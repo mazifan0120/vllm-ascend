@@ -320,6 +320,17 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             raise ValueError("Prefill snapshot ranges require dense, uncompressed token pages in every group")
         self._validate_prefill_snapshot_spec(worker.vllm_config)
+        writers = worker._extra_config.get("layerwise_prefill_put_writers", 1)
+        if type(writers) is not int or not 1 <= writers <= worker.tp_size:
+            raise ValueError("layerwise_prefill_put_writers must be an integer between 1 and Prefill TP")
+        if writers > 1 and (
+            not worker.use_mla
+            or worker.hf_config.model_type != "glm_moe_dsa"
+            or worker.put_step != worker.tp_size
+            or (worker.pp_size, worker.pcp_size, worker.dcp_size) != (1, 1, 1)
+        ):
+            raise ValueError("Multiple Prefill Store PUT writers require replicated GLM DSA KV without PP or CP")
+        worker.layerwise_prefill_put_writers = writers
         worker.prefill_slot_provider = provider
         return True
 

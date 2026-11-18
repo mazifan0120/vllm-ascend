@@ -370,7 +370,8 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
         views = result[group] = []
         puts = puts_by_group[group] = []
         block_size = worker.grouped_block_size[group]
-        public_writer = worker._is_layerwise_save_owner(group)
+        default_writer = worker._is_layerwise_save_owner(group)
+        writers = worker.layerwise_prefill_put_writers
         for request in requests:
             history = request.prefill_history
             if history is None or not 0 <= history <= request.target_token_len:
@@ -416,8 +417,9 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
             for index in range(view.save_key_block_offset, num_blocks):
                 tokens = min(block_size, request.target_token_len - index * block_size)
                 identity = prefill_public_hash(hashes, index, mtp=worker.use_eagle)
+                owns_block = default_writer if writers == 1 else worker.tp_rank == index % writers
                 if tokens == block_size and identity is not None:
-                    if public_writer:
+                    if owns_block:
                         key = worker._make_layerwise_full_key(group, identity)
                         puts.append((view, key, index, None))
                 elif not request.is_last_chunk:
@@ -425,7 +427,7 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
                         raise RuntimeError("Prefill snapshot requires a scheduler version")
                     identity = f"prefill_private_{request.prefill_snapshot_id}:{index}"
                     key = worker._make_layerwise_full_key(group, identity)
-                    if public_writer:
+                    if owns_block:
                         view.range_tokens[key] = tokens
                         puts.append((view, key, index, tokens))
                     else:
