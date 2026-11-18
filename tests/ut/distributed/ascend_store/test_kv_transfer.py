@@ -180,9 +180,16 @@ class TestPrefillSlotReuse(unittest.TestCase):
         )
         task.shared_block_data = self.recv.build_shared_data(task)
         self.store.batch_copy_get.return_value = [-1]
+        self.recv.validate_range_get_results = False
         self.recv.add_request(LayerLoadTask(None, [task], 0))
 
-        with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.require_aligned_batch_results",
+                side_effect=AssertionError("Mooncake backend already validated this batch"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"),
+        ):
             self.recv._handle_request(self.recv.request_queue.get_nowait())
         self.assertTrue(self.recv.layer_load_finished_events[0].is_set())
         with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
@@ -190,8 +197,51 @@ class TestPrefillSlotReuse(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
             self.slots.begin_write(1, timeout=0)
 
+    def test_failed_range_receiver_escalates_only_with_prefill_slots(self):
+        for shared_slots in (False, True):
+            with self.subTest(shared_slots=shared_slots):
+                self.setUp()
+                if not shared_slots:
+                    self.recv.prefill_slot_provider = None
+                self.recv.add_request(LayerLoadTask(None, [], 0))
+                with (
+                    patch.object(self.recv, "_set_os_thread_name"),
+                    patch.object(self.recv, "_handle_request", side_effect=RuntimeError("in-doubt Store read")),
+                    patch("os._exit") as stop_process,
+                ):
+                    self.recv.run()
+                self.assertEqual(str(self.recv._fatal_error), "in-doubt Store read")
+                if shared_slots:
+                    stop_process.assert_called_once_with(1)
+                else:
+                    stop_process.assert_not_called()
+
 
 class TestLayerBatchBuilderOffsets(unittest.TestCase):
+    def test_prefill_get_broadcast_keeps_partial_strided_ranges(self):
+        database = FakeTokenDatabase()
+        database.set_group_buffers(
+            {0: [1000, 2000, 3000]},
+            {0: [16, 16, 32]},
+            {0: [64, 96, 128]},
+            group_num_layers={0: 2},
+            group_layer_cache_entry_offsets={0: [0, 2, 3]},
+            group_cache_entry_segments={0: [(0, 2), (1, 2), (0, 1)]},
+        )
+        builder = LayerBatchBuilder(database, page_size_bytes=64, num_layers=2)
+        shared = SharedBlockData(
+            block_ids_arr=np.asarray([7, 3, 1]),
+            block_gvas_arr=None,
+            req_ids=["r1"],
+            is_last_chunks=[False],
+            block_keys=["full", "short", "crosses-page"],
+            range_tokens=[None, 5, 11],
+        )
+        for layer in (0, 1):
+            with self.subTest(layer=layer):
+                result = builder.build_addrs(shared, layer, prefill_get=True)
+                self.assertEqual(result, builder.build_addrs(shared, layer))
+
     def test_uses_real_offsets_for_variable_cache_entries_per_layer(self):
         database = FakeTokenDatabase()
         database.set_group_buffers(

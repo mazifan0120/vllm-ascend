@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import queue
 import threading
 import time
@@ -485,6 +486,8 @@ class LayerBatchBuilder:
         self,
         shared: SharedBlockData,
         layer_id: int,
+        *,
+        prefill_get: bool = False,
     ) -> LayerBatchReqMeta | LayerRangeReqMeta:
         """Compute per-layer addresses from pre-computed shared block data."""
         if shared.block_keys is not None:
@@ -501,9 +504,12 @@ class LayerBatchBuilder:
             sizes = layer_block_len.tolist()
             row_offsets = [offsets.copy() for _ in shared.block_ids_arr]
             row_sizes = [sizes.copy() for _ in shared.block_ids_arr]
-            all_buffers = [
-                (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
-            ]
+            if prefill_get:
+                all_buffers = (layer_base_addrs + shared.block_ids_arr[:, None] * layer_block_stride).tolist()
+            else:
+                all_buffers = [
+                    (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
+                ]
             if shared.range_tokens is not None:
                 block_tokens = self._token_database.get_block_size(self.group_id)
                 layout = self._token_database.group_cache_entry_segments.get(self.group_id)
@@ -2099,6 +2105,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         invalid_block_ids_lock: threading.Lock | None = None,
         load_abort_event: threading.Event | None = None,
         raise_on_transfer_failure: bool = True,
+        validate_range_get_results: bool = True,
     ):
         super().__init__(
             m_store,
@@ -2121,6 +2128,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.external_slot_release_waiter = external_slot_release_waiter
         self.save_failure_checker = save_failure_checker
         self.raise_on_transfer_failure = raise_on_transfer_failure
+        self.validate_range_get_results = validate_range_get_results
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self._load_abort_event = load_abort_event or threading.Event()
@@ -2195,13 +2203,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
             ):
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_get",
-                        keys,
-                        self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
-                    )
-                )
+                batch_results = self.m_store.batch_copy_get(keys, buffers, sizes, offsets)
+                if self.validate_range_get_results:
+                    batch_results = require_aligned_batch_results("batch_copy_get", keys, batch_results)
+                results.extend(batch_results)
             _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:
@@ -2268,11 +2273,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if shared is None:
                 raise RuntimeError("Layerwise range load requires shared block metadata")
             builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
-            req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
+            req_meta = builder.build_addrs(
+                shared, task.layer_idx_in_group, prefill_get=self.prefill_slot_provider is not None
+            )
             if not isinstance(req_meta, LayerRangeReqMeta):
                 raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
             req_meta.layer_id = data.layer_id
             yield task, shared, req_meta
+
+    def run(self) -> None:
+        super().run()
+        if self.prefill_slot_provider is not None and self._fatal_error is not None:
+            # A poisoned slot blocks this forward. Exit to notify the executor even
+            # when its model RPC is still waiting on another TP rank.
+            os._exit(1)
 
     def _load_ranges(self, requests: Iterable[tuple[LayerTransferTask, SharedBlockData, LayerRangeReqMeta]]) -> None:
         for task, shared, req_meta in requests:

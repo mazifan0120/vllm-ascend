@@ -1230,6 +1230,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
                 worker._start_kv_transfer_threads()
 
                 self.assertEqual(recv_thread.call_args.args[14], expected)
+                self.assertEqual(recv_thread.call_args.kwargs["validate_range_get_results"], not reuse)
                 self.assertEqual(send_thread.call_args.args[11], 32)
 
     def test_start_load_kv_sync(self):

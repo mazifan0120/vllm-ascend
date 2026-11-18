@@ -860,6 +860,10 @@ class KVPoolWorker:
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
                     load_abort_event=self._layer_load_aborted,
                     raise_on_transfer_failure=self.layerwise_offload or self.num_kv_cache_groups > 1,
+                    # Mooncake already validates all per-key range GET results.
+                    validate_range_get_results=not (
+                        self.prefill_slot_provider is not None and self.backend_name == "mooncake"
+                    ),
                 )
                 self.kv_recv_thread.prefill_slot_provider = self.prefill_slot_provider
             else:
