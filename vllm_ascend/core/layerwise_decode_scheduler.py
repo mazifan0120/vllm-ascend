@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass, replace
 from queue import Empty, SimpleQueue
+from time import monotonic
 
 from vllm.logger import logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -23,6 +24,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_plan import (
 class _BoundRequest:
     request: Request
     allocation: TargetAllocation
+    retained_at: float
+    published_at: float | None = None
+    close_started_at: float | None = None
     drained: bool = False
 
     @property
@@ -47,6 +51,7 @@ class LayerwiseDecodeScheduler(Scheduler):
         self._layerwise_events: SimpleQueue[DecodeWorkerEvent] = SimpleQueue()
         self._layerwise_free_fence = 0
         self._layerwise_deferred_close: set[TargetId] = set()
+        self._layerwise_decode_stats: dict[str, int | float] = {}
         bind = getattr(getattr(self, "connector", None), "bind_layerwise_decode_scheduler", None)
         if callable(bind):
             bind(self)
@@ -73,7 +78,7 @@ class LayerwiseDecodeScheduler(Scheduler):
             return admission.retain(allocation)
         if target in self._layerwise_targets:
             raise RuntimeError("Target is already associated with another engine request")
-        binding = _BoundRequest(request, allocation)
+        binding = _BoundRequest(request, allocation, monotonic())
         self._layerwise_requests[request.request_id] = binding
         self._layerwise_targets[target] = binding
         try:
@@ -88,6 +93,16 @@ class LayerwiseDecodeScheduler(Scheduler):
     def post_layerwise_event(self, event: DecodeWorkerEvent) -> None:
         """Called by the control loop, which may be on another thread."""
         self._layerwise_events.put(event)
+
+    def take_layerwise_decode_stats(self) -> dict[str, int | float]:
+        stats, self._layerwise_decode_stats = self._layerwise_decode_stats, {}
+        return stats
+
+    def _record_layerwise_phase(self, phase: str, seconds: float) -> None:
+        stats = self._layerwise_decode_stats
+        stats[phase] = stats.get(phase, 0) + 1
+        key = f"{phase}_seconds"
+        stats[key] = stats.get(key, 0) + seconds
 
     def schedule(self, *args, **kwargs):
         self._drain_layerwise_events()
@@ -129,12 +144,18 @@ class LayerwiseDecodeScheduler(Scheduler):
             if event.kind == "prepared":
                 admission.prepared(target, worker)
                 if target not in self._layerwise_failures and (published := admission.publish(target)) is not None:
-                    self._layerwise_link.publish(self._layerwise_targets[target].request, *published)
+                    binding = self._layerwise_targets[target]
+                    binding.published_at = monotonic()
+                    self._record_layerwise_phase("prepare", binding.published_at - binding.retained_at)
+                    self._layerwise_link.publish(binding.request, *published)
             elif event.kind == "ready":
                 if admission.ready(target, worker):
+                    binding = self._layerwise_targets[target]
+                    if binding.published_at is not None:
+                        self._record_layerwise_phase("ready", monotonic() - binding.published_at)
                     logger.info(
                         "Layerwise Host target ready request=%s tp=%d",
-                        self._layerwise_targets[target].request.request_id,
+                        binding.request.request_id,
                         admission.worker_count,
                     )
             elif event.kind == "closed":
@@ -165,6 +186,8 @@ class LayerwiseDecodeScheduler(Scheduler):
 
     def _layerwise_closed(self, allocation: TargetAllocation) -> None:
         binding = self._layerwise_targets[allocation.target]
+        if binding.close_started_at is not None:
+            self._record_layerwise_phase("close", monotonic() - binding.close_started_at)
         binding.drained = True
         assert self._layerwise_admission is not None
         logger.info(
@@ -186,6 +209,10 @@ class LayerwiseDecodeScheduler(Scheduler):
         assert admission is not None
         ranks = admission.begin_close(binding.target)
         if ranks:
+            if binding.close_started_at is None:
+                binding.close_started_at = monotonic()
+                stats = self._layerwise_decode_stats
+                stats["close_started"] = stats.get("close_started", 0) + 1
             self._layerwise_link.close(binding.target, ranks)
 
     def _connector_finished(self, request):

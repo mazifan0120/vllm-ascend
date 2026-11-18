@@ -84,7 +84,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_wire import (
     encode_allocation,
     encode_catalog,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import LayerwiseWritePromMetrics, LayerwiseWriteStats
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import (
+    LayerwiseTransferPromMetrics,
+    LayerwiseTransferStats,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_transfer import (
     DsaRegisterAtom,
@@ -970,15 +973,19 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             if self.has_connector_metadata():
                 worker.virtual_request.update(self._connector_metadata.prefill_restores)
 
-    def get_kv_connector_stats(self) -> LayerwiseWriteStats | None:
+    def get_kv_connector_stats(self) -> LayerwiseTransferStats | None:
         worker = self.connector_worker
         if worker is not None and worker.layerwise_host_prefill:
             return worker.take_prefill_write_stats()
+        scheduler = self.connector_scheduler
+        if scheduler is not None and scheduler.decode_scheduler is not None:
+            if stats := scheduler.decode_scheduler.take_layerwise_decode_stats():
+                return LayerwiseTransferStats(data=stats)
         return None
 
     @classmethod
-    def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> LayerwiseWriteStats:
-        return LayerwiseWriteStats(data=data or {})
+    def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> LayerwiseTransferStats:
+        return LayerwiseTransferStats(data=data or {})
 
     @classmethod
     def build_prom_metrics(
@@ -989,13 +996,9 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         per_engine_labelvalues: dict[int, list[object]],
     ) -> KVConnectorPromMetrics | None:
         transfer = vllm_config.kv_transfer_config
-        if (
-            transfer is None
-            or not transfer.is_kv_producer
-            or not transfer.get_from_extra_config("layerwise_host_offload", False)
-        ):
+        if transfer is None or not transfer.get_from_extra_config("layerwise_host_offload", False):
             return None
-        return LayerwiseWritePromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        return LayerwiseTransferPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
     def send_restored_layer(self, layer: int) -> None:
         worker = self.connector_worker
@@ -1541,7 +1544,7 @@ class MooncakeLayerwiseConnectorWorker:
         self.layerwise_host_prefill = transfer.is_kv_producer and host_offload
         if self.layerwise_host_prefill:
             self._prefill_write_stats_lock = threading.Lock()
-            self._prefill_write_stats = LayerwiseWriteStats(data={})
+            self._prefill_write_stats = LayerwiseTransferStats(data={})
         self.prefill_store_bound = False
         self.prefill_main_config: dict | None = None
         self.decode_handshake: LayerwiseDecodeHandshake | None = None
@@ -1989,12 +1992,12 @@ class MooncakeLayerwiseConnectorWorker:
         with self._prefill_write_stats_lock:
             self._prefill_write_stats.record(submit, wait, success)
 
-    def take_prefill_write_stats(self) -> LayerwiseWriteStats | None:
+    def take_prefill_write_stats(self) -> LayerwiseTransferStats | None:
         with self._prefill_write_stats_lock:
             stats = self._prefill_write_stats
             if stats.is_empty():
                 return None
-            self._prefill_write_stats = LayerwiseWriteStats(data={})
+            self._prefill_write_stats = LayerwiseTransferStats(data={})
             return stats
 
     def stop_prefill_control(self) -> None:

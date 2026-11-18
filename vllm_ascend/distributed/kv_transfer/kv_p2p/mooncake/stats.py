@@ -160,10 +160,19 @@ _LAYERWISE_WRITE_METRICS = {
     "submit_seconds": "Total worker time in P-to-D layerwise native write submission.",
     "wait_seconds": "Total worker time waiting on P-to-D layerwise native writes.",
 }
+_LAYERWISE_DECODE_METRICS = {
+    "prepare": "Number of layerwise D targets confirmed prepared by all ranks.",
+    "prepare_seconds": "Total time from retaining D blocks to the last Prepare confirmation.",
+    "ready": "Number of layerwise D targets confirmed ready by all ranks.",
+    "ready_seconds": "Total time from D target publication to the last Ready confirmation.",
+    "close_started": "Number of layerwise D targets for which the scheduler sent Close.",
+    "close": "Number of layerwise D targets confirmed closed by all ranks.",
+    "close_seconds": "Total time from sending Close to the last Closed confirmation.",
+}
 
 
 @dataclass
-class LayerwiseWriteStats(KVConnectorStats):
+class LayerwiseTransferStats(KVConnectorStats):
     def record(self, submit: float, wait: float | None, success: bool) -> None:
         self.data["batches"] = self.data.get("batches", 0) + 1
         self.data["submit_seconds"] = self.data.get("submit_seconds", 0) + submit
@@ -188,21 +197,27 @@ class LayerwiseWriteStats(KVConnectorStats):
         return dict(self.data)
 
 
-class LayerwiseWritePromMetrics(KVConnectorPromMetrics):
+class LayerwiseTransferPromMetrics(KVConnectorPromMetrics):
     def __init__(self, vllm_config, metric_types, labelnames, per_engine_labelvalues):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
-        self._writes = {
+        roles = (
+            (self._kv_transfer_config.is_kv_producer, "write", _LAYERWISE_WRITE_METRICS),
+            (self._kv_transfer_config.is_kv_consumer, "decode", _LAYERWISE_DECODE_METRICS),
+        )
+        self._counters = {
             key: create_metric_per_engine(
                 self._counter_cls(
-                    name=f"vllm:mooncake_layerwise_write_{key}_total",
+                    name=f"vllm:mooncake_layerwise_{role}_{key}_total",
                     documentation=description,
                     labelnames=labelnames,
                 ),
                 per_engine_labelvalues,
             )
-            for key, description in _LAYERWISE_WRITE_METRICS.items()
+            for enabled, role, fields in roles
+            if enabled
+            for key, description in fields.items()
         }
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
         for key, value in transfer_stats_data.items():
-            self._writes[key][engine_idx].inc(value)
+            self._counters[key][engine_idx].inc(value)

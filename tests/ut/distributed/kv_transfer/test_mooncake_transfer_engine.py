@@ -4,7 +4,7 @@ import pytest
 
 pytest.importorskip("vllm")
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import LayerwiseWriteStats  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import LayerwiseTransferStats  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (  # noqa: E402
     GlobalTE,
 )
@@ -16,9 +16,9 @@ _TE_REGISTRATION_LIMIT_BYTES = 64 * 1024 * 1024 * 1024
 
 
 def test_layerwise_write_stats_aggregate_worker_totals():
-    first = LayerwiseWriteStats()
+    first = LayerwiseTransferStats()
     first.record(0.25, None, False)
-    second = LayerwiseWriteStats()
+    second = LayerwiseTransferStats()
     second.record(0.5, 1.5, True)
     second.record(0.25, 0.5, False)
 

@@ -294,7 +294,8 @@ class TestLayerwiseDecodeScheduler(unittest.TestCase):
         self.assertFalse(scheduler._try_promote_blocked_waiting_request(self.request))
         self.assertEqual(self.cache.released, [])
 
-    def test_prepare_ready_and_close_events_progress_without_model_forward(self):
+    @patch("vllm_ascend.core.layerwise_decode_scheduler.monotonic", side_effect=(1.0, 2.0, 4.0, 8.0, 9.5))
+    def test_prepare_ready_and_close_events_progress_without_model_forward(self, _clock):
         scheduler, admission = self._bound()
         self.link.prepare.assert_called_once_with(self.allocation, self.refs)
         target = self.allocation.target
@@ -315,6 +316,19 @@ class TestLayerwiseDecodeScheduler(unittest.TestCase):
                 scheduler.post_layerwise_event(DecodeWorkerEvent("closed", target, ref))
             scheduler.schedule()
         self.assertEqual(self.cache.released, [9, 7, 5, 3])
+        self.assertEqual(
+            scheduler.take_layerwise_decode_stats(),
+            {
+                "prepare": 1,
+                "prepare_seconds": 1.0,
+                "ready": 1,
+                "ready_seconds": 2.0,
+                "close_started": 1,
+                "close": 1,
+                "close_seconds": 1.5,
+            },
+        )
+        self.assertEqual(scheduler.take_layerwise_decode_stats(), {})
 
     def test_ordinary_request_uses_upstream_finish_and_free(self):
         self.request.status = RequestStatus.RUNNING
@@ -324,6 +338,7 @@ class TestLayerwiseDecodeScheduler(unittest.TestCase):
         scheduler.finish_requests(self.request.request_id, RequestStatus.FINISHED_ABORTED)
         self.assertEqual(self.cache.released, [9, 7, 5, 3])
         self.assertEqual(self.close_messages, [])
+        self.assertEqual(scheduler.take_layerwise_decode_stats(), {})
 
 
 if __name__ == "__main__":
