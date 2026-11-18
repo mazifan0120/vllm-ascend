@@ -128,6 +128,8 @@ class TestPrefillSlotReuse(unittest.TestCase):
 
     def test_prefill_empty_load_can_rotate_after_reads_and_before_commit(self):
         slots, store, send, recv = self.slots, self.store, self.send, self.recv
+        record = MagicMock()
+        send.record_prefill_operation = recv.record_prefill_operation = record
         old = slots.begin_write(0)
         pd_read = slots.register(old, "transfer", "r1")
         request = ReqMeta("r1", block_ids=[2], block_hashes=[], is_last_chunk=True)
@@ -157,7 +159,7 @@ class TestPrefillSlotReuse(unittest.TestCase):
             self.assertFalse(self.save_events[0].is_set())
             recv.add_request(LayerLoadTask(None, [], 1))
             begin_write = slots.begin_write
-            with patch.object(slots, "begin_write", side_effect=lambda layer: begin_write(layer, timeout=0)):
+            with patch.object(slots, "begin_write", side_effect=lambda layer, _: begin_write(layer, timeout=0)):
                 recv._handle_request(recv.request_queue.get_nowait())
             self.assertEqual(slots.epoch(1).generation, 2)
             self.assertTrue(recv.layer_load_finished_events[1].is_set())
@@ -169,6 +171,13 @@ class TestPrefillSlotReuse(unittest.TestCase):
         send._handle_request(send.request_queue.get_nowait())
         store.batch_commit.assert_called_once_with(["key"])
         self.assertTrue(self.save_events[0].is_set())
+        self.assertEqual(
+            [(call.args[0], call.args[2]) for call in record.call_args_list],
+            [
+                ("range_put", 1),
+                ("slot_acquire", 0),
+            ],
+        )
 
     def test_failed_prefill_get_cannot_admit_attention_or_overwrite_slot(self):
         request = ReqMeta("r1", block_ids=[2], block_hashes=[])
@@ -181,6 +190,7 @@ class TestPrefillSlotReuse(unittest.TestCase):
         task.shared_block_data = self.recv.build_shared_data(task)
         self.store.batch_copy_get.return_value = [-1]
         self.recv.validate_range_get_results = False
+        self.recv.record_prefill_operation = record = MagicMock()
         self.recv.add_request(LayerLoadTask(None, [task], 0))
 
         with (
@@ -192,6 +202,13 @@ class TestPrefillSlotReuse(unittest.TestCase):
         ):
             self.recv._handle_request(self.recv.request_queue.get_nowait())
         self.assertTrue(self.recv.layer_load_finished_events[0].is_set())
+        self.assertEqual(
+            [(call.args[0], call.args[2]) for call in record.call_args_list],
+            [
+                ("slot_acquire", 0),
+                ("range_get", 1),
+            ],
+        )
         with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
             self.slots.epoch(0)
         with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):

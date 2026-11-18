@@ -574,6 +574,7 @@ class LayerBatchBuilder:
 class KVTransferThread(threading.Thread):
     _invalid_block_ids: set[int]
     _invalid_block_ids_lock: threading.Lock
+    record_prefill_operation: Callable[[str, float, int], None] | None = None
 
     def __init__(
         self,
@@ -1861,13 +1862,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
             ):
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_put",
-                        keys,
-                        self.m_store.batch_copy_put(keys, buffers, sizes, offsets),
-                    )
-                )
+                record = self.record_prefill_operation
+                start = time.perf_counter() if record is not None else 0.0
+                batch_results = self.m_store.batch_copy_put(keys, buffers, sizes, offsets)
+                if record is not None:
+                    record("range_put", time.perf_counter() - start, len(keys))
+                results.extend(require_aligned_batch_results("batch_copy_put", keys, batch_results))
             _emit_range_debug_event("save", layer_id, active_sizes, active_offsets, results)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
@@ -2206,7 +2206,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
             ):
+                record = self.record_prefill_operation
+                start = time.perf_counter() if record is not None else 0.0
                 batch_results = self.m_store.batch_copy_get(keys, buffers, sizes, offsets)
+                if record is not None:
+                    record("range_get", time.perf_counter() - start, len(keys))
                 if self.validate_range_get_results:
                     batch_results = require_aligned_batch_results("batch_copy_get", keys, batch_results)
                 results.extend(batch_results)
@@ -2247,10 +2251,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     return
             if self.prefill_slot_provider is not None:
                 slots = self.prefill_slot_provider()
-                if data.transfer_tasks:
-                    restore_into_slot(slots, layer_id, lambda: self._load_ranges(requests))
-                else:
-                    slots.begin_write(layer_id)
+                restore_into_slot(
+                    slots,
+                    layer_id,
+                    (lambda: self._load_ranges(requests)) if data.transfer_tasks else None,
+                    record_operation=self.record_prefill_operation,
+                )
             else:
                 if self.external_slot_release_waiter is not None:
                     self.external_slot_release_waiter(layer_id)

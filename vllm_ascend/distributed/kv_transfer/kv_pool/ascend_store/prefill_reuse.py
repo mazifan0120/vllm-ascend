@@ -4,6 +4,7 @@
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from threading import Condition
+from time import perf_counter
 from typing import Literal
 
 Reader = Literal["attention", "store", "transfer", "restore"]
@@ -165,10 +166,18 @@ class SlotBarrier:
 
 
 def restore_into_slot(
-    barrier: SlotBarrier, layer: int, restore: Callable[[], ReadOutcome | None] | None, timeout: float | None = None
+    barrier: SlotBarrier,
+    layer: int,
+    restore: Callable[[], ReadOutcome | None] | None,
+    timeout: float | None = None,
+    *,
+    record_operation: Callable[[str, float, int], None] | None = None,
 ) -> SlotEpoch:
     """The Store receiver opens the Main epoch even when it has no GET rows."""
+    start = perf_counter() if record_operation is not None else 0.0
     epoch = barrier.begin_write(layer, timeout)
+    if record_operation is not None:
+        record_operation("slot_acquire", perf_counter() - start, 0)
     if restore is None:
         return epoch
     ticket = barrier.register(epoch, "restore", layer)

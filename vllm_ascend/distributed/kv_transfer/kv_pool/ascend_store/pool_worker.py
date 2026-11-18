@@ -812,6 +812,8 @@ class KVPoolWorker:
                     invalid_block_ids=self._invalid_block_ids,
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
                 )
+                if self.prefill_slot_provider is not None:
+                    self.kv_send_thread.record_prefill_operation = self._record_kv_connector_operation
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
             elif can_save:
@@ -866,6 +868,8 @@ class KVPoolWorker:
                     ),
                 )
                 self.kv_recv_thread.prefill_slot_provider = self.prefill_slot_provider
+                if self.prefill_slot_provider is not None:
+                    self.kv_recv_thread.record_prefill_operation = self._record_kv_connector_operation
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
                     self.m_store,
