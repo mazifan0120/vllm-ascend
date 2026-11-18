@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
+_REPLICA_IS_NOT_READY = -703
+_OBJECT_NOT_FOUND = -704
+_OBJECT_ALREADY_EXISTS = -705
+
 
 LAYERWISE_DATA_PLANE = "block_key"
 
@@ -321,6 +325,37 @@ def prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dic
         raise
 
 
+def _prefill_private_full_key(request: ReqMeta, public_key: str) -> str:
+    if request.prefill_request_instance is None:
+        raise RuntimeError("Prefill full-block fallback requires a request instance")
+    return f"{public_key}@prefill_private_full:{request.prefill_request_instance}"
+
+
+def _prefill_get_fallback(request: ReqMeta, key: str, code: int) -> str | None:
+    # The public block may still belong to another writer or have been evicted.
+    if (
+        code in (_REPLICA_IS_NOT_READY, _OBJECT_NOT_FOUND)
+        and request.prefill_request_instance is not None
+        and "@prefill_private_" not in key
+    ):
+        return _prefill_private_full_key(request, key)
+    return None
+
+
+def _start_prefill_puts(worker: KVPoolWorker, keys: list[str], group: int) -> dict[str, int]:
+    if not keys:
+        return {}
+    try:
+        codes = worker._start_layerwise_put_keys(keys, sum(worker.group_block_len[group]))
+    except Exception:
+        # A missing local PUT session is a no-op for Mooncake revoke.
+        worker._queue_layerwise_revoke_keys(keys)
+        raise
+    with worker._put_started_keys_lock:
+        worker._put_started_keys.update(key for key, code in zip(keys, codes, strict=True) if code == 0)
+    return dict(zip(keys, codes, strict=True))
+
+
 def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> dict[int, list[ReqMeta]]:
     """Restore the exact prefix and save new ranges using the existing group I/O."""
     worker._current_layerwise_request_ids = {request.req_id for request in requests}
@@ -396,35 +431,48 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
                     else:
                         reader_snapshots.append((request.req_id, group, key, index, tokens))
 
-    worker._open_layerwise_get_sessions(get_slots)
+    worker._open_layerwise_get_sessions(get_slots, fallback_key=_prefill_get_fallback)
     if any(view.load_block_keys[index] is None for view, _, _, index in get_slots):
         raise RuntimeError("Prefill could not open the complete committed Store prefix")
     for req_id, key in superseded:
         tracker.drop_private_reference(req_id, key)
     for group, puts in puts_by_group.items():
+        if not puts:
+            continue
         public = list(dict.fromkeys(key for _, key, _, tokens in puts if tokens is None))
         missing = set(worker._filter_pool_existing_keys(public))
         names = list(dict.fromkeys(key for _, key, _, tokens in puts if tokens is not None or key in missing))
-        if not names:
-            continue
-        try:
-            codes = worker._start_layerwise_put_keys(names, sum(worker.group_block_len[group]))
-        except Exception:
-            # Each name was submitted by this local client. A missing local
-            # PUT session is a no-op for Mooncake revoke.
-            worker._queue_layerwise_revoke_keys(names)
-            raise
-        started = {key for key, code in zip(names, codes, strict=True) if code == 0}
-        with worker._put_started_keys_lock:
-            worker._put_started_keys.update(started)
+        codes = _start_prefill_puts(worker, names, group)
+        rejected_public = [key for key in public if codes.get(key, 0) != 0]
+        unreadable = set(worker._filter_pool_existing_keys(rejected_public))
+        fallbacks = []
         for view, key, index, tokens in puts:
-            if key in started:
+            if codes.get(key) == 0:
                 view.save_block_keys[index - view.save_key_block_offset] = key
                 if tokens is not None:
                     tracker.register_private_snapshot(view.req_id, group, key, index, tokens, writer=True)
-        rejected = set(names) - started
-        if rejected and worker._filter_pool_existing_keys(sorted(rejected)):
-            raise RuntimeError(f"Mooncake could not allocate Prefill snapshot ranges for group {group}")
+            elif tokens is not None or key in unreadable:
+                if tokens is not None or codes[key] != _OBJECT_ALREADY_EXISTS:
+                    raise RuntimeError(f"Mooncake could not allocate Prefill snapshot ranges for group {group}")
+                # A final step needs no later restore. For continuing requests,
+                # finish our own copy without waiting on the other PUT session.
+                if not view.is_last_chunk:
+                    fallbacks.append((view, _prefill_private_full_key(view, key), index))
+        if not fallbacks:
+            continue
+        keys = list(dict.fromkeys(key for _, key, _ in fallbacks))
+        missing = worker._filter_pool_existing_keys(keys)
+        fallback_codes = _start_prefill_puts(worker, missing, group)
+        if any(fallback_codes.values()):
+            raise RuntimeError(f"Mooncake could not allocate private full blocks for group {group}")
+        for view, key, index in fallbacks:
+            tracker.register_private_snapshot(
+                view.req_id, group, key, index, worker.grouped_block_size[group], writer=True
+            )
+            if key in fallback_codes:
+                view.save_block_keys[index - view.save_key_block_offset] = key
+            else:
+                tracker.commit_put_keys([key])
     # The existing TP barrier orders the next read after the owner's Store
     # save. Followers still have to open a readable Store session for the key.
     for snapshot in reader_snapshots:

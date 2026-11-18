@@ -2792,7 +2792,12 @@ class KVPoolWorker:
             key_slots.append((key, request.block_ids[block_index], block_index))
         return key_slots
 
-    def _open_layerwise_get_sessions(self, request_key_slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
+    def _open_layerwise_get_sessions(
+        self,
+        request_key_slots: list[tuple[ReqMeta, str, int, int | None]],
+        *,
+        fallback_key: Callable[[ReqMeta, str, int], str | None] | None = None,
+    ) -> None:
         if not request_key_slots:
             return
         keys = list(dict.fromkeys(key for _, key, _, _ in request_key_slots))
@@ -2815,14 +2820,38 @@ class KVPoolWorker:
         results_by_key = dict(zip(keys, results, strict=True))
         for key, result in results_by_key.items():
             self._layerwise_session_tracker.record_get_result(key, request_ids_by_key[key], succeeded=result == 0)
+        replacements: dict[tuple[int, int | None], str] = {}
+        if fallback_key is not None and any(results):
+            owners: dict[str, set[str]] = {}
+            for request, key, _, slot in request_key_slots:
+                if results_by_key[key] != 0 and (alternate := fallback_key(request, key, results_by_key[key])):
+                    replacements[id(request), slot] = alternate
+                    owners.setdefault(alternate, set()).add(request.req_id)
+            if owners:
+                alternates = list(owners)
+                try:
+                    alternate_results = self._start_layerwise_get_keys(alternates)
+                except Exception:
+                    self._release_failed_layerwise_get_attempts(owners)
+                    raise
+                for key, result in zip(alternates, alternate_results, strict=True):
+                    results_by_key[key] = result
+                    self._layerwise_session_tracker.record_get_result(key, owners[key], succeeded=result == 0)
         request_load_keys: dict[int, list[str]] = {}
         request_seen_keys: dict[int, set[str]] = {}
         requests_by_id: dict[int, ReqMeta] = {}
         for request, key, block_id, slot in request_key_slots:
             request_identity = id(request)
+            alternate = replacements.get((request_identity, slot)) if replacements else None
             requests_by_id[request_identity] = request
             request_load_keys.setdefault(request_identity, [])
             request_seen_keys.setdefault(request_identity, set())
+            if alternate is not None and results_by_key[alternate] == 0:
+                assert slot is not None
+                request.load_block_keys[slot] = alternate
+                if request.range_tokens and key in request.range_tokens:
+                    request.range_tokens[alternate] = request.range_tokens[key]
+                key = alternate
             if results_by_key[key] == 0:
                 if key not in request_seen_keys[request_identity]:
                     request_load_keys[request_identity].append(key)

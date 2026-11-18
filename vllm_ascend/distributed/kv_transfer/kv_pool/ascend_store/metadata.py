@@ -896,6 +896,7 @@ class RequestTracker:
     last_layerwise_snapshot_end_token: int | None = None
     last_layerwise_snapshot_block_index: int | None = None
     last_layerwise_snapshot_start_block: int | None = None
+    prefill_request_instance: str | None = None
 
     # Number of speculative scratch blocks for each Mamba cache group.
     num_speculative_blocks_by_group: dict[int, int] | None = None
@@ -1011,6 +1012,7 @@ class ReqMeta:
     save_start_token: int = 0
     # Set by the rewrite scheduler to the complete prefix required this step.
     prefill_history: int | None = None
+    prefill_request_instance: str | None = None
     # Identifies one private snapshot version across the TP ranks of this step.
     prefill_snapshot_id: str | None = None
     # Group-local token lengths for privately saved ranges.

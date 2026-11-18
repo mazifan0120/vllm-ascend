@@ -106,14 +106,18 @@ def test_prefill_private_versions_are_minted_only_for_steps_that_save_a_snapshot
     scheduler.kv_cache_group_families = ["default"]
     scheduler.layerwise_offload = scheduler._discard_partial_chunks = False
 
-    def prepare(extent):
-        tracker = RequestTracker("same-id", extent, allocated_block_ids=[1, 2])
+    def prepare(extent, tracker=None):
+        tracker = tracker or RequestTracker("same-id", extent, allocated_block_ids=[1, 2])
+        tracker.token_len = extent
         return scheduler._build_req_meta(tracker, [b"block", b"tail"], None, list(range(8)), False)
 
     first, duplicate_extent, final = prepare(2), prepare(2), prepare(8)
     assert first.prefill_snapshot_id
     assert duplicate_extent.prefill_snapshot_id and first.prefill_snapshot_id != duplicate_extent.prefill_snapshot_id
     assert final.prefill_snapshot_id is None
+    assert first.prefill_request_instance != duplicate_extent.prefill_request_instance
+    tracker = RequestTracker("same-id", 2, allocated_block_ids=[1, 2])
+    assert prepare(2, tracker).prefill_request_instance == prepare(8, tracker).prefill_request_instance
 
 
 def test_prefill_mtp_lookup_requires_readable_successor_identity_and_never_counts_tail():

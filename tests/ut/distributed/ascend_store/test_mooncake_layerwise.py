@@ -424,6 +424,72 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
             prepare("r3", 4, 8, [b"first", b"different"], final=True)
 
+    def test_prefill_concurrent_public_put_uses_committed_request_private_full_block(self):
+        owner, readable = self._make_prefill_snapshot_worker()
+        follower, _ = self._make_prefill_snapshot_worker()
+        owner.put_step = follower.put_step = 2
+        follower.tp_rank = 1
+        public = owner._make_layerwise_full_key(0, b"shared".hex())
+        stable = owner._make_layerwise_full_key(0, b"stable".hex())
+        owner.m_store.batch_put_start.side_effect = lambda keys, sizes: [-705 if key == public else 0 for key in keys]
+        for worker in (owner, follower):
+            worker.m_store.exists.side_effect = lambda keys: [int(key in readable) for key in keys]
+            worker.m_store.batch_get_start.side_effect = lambda keys: [
+                0 if key in readable else -703 if key == public else -704 for key in keys
+            ]
+
+        def prepare(worker, history, extent, *, instance="first", final=False):
+            request = ReqMeta(
+                "r1",
+                block_ids=[7, 8, 9],
+                block_hashes=[b"shared", b"stable"],
+                target_token_len=extent,
+                can_save=True,
+                is_last_chunk=final,
+            )
+            request.prefill_history = history
+            request.prefill_request_instance = instance
+            return mooncake_layerwise.prepare_layerwise_sessions(worker, [request])[0][0]
+
+        first = prepare(owner, 0, 8)
+        private, saved_public = first.save_block_keys
+        self.assertNotEqual(private, public)
+        self.assertEqual(saved_public, stable)
+        self.assertEqual(prepare(follower, 0, 8).save_block_keys, [None, None])
+        follower.m_store.batch_put_start.assert_not_called()
+        self.assertEqual(owner._layerwise_session_tracker.private_blocks("r1", 0), {})
+        readable.add(stable)
+        with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
+            prepare(follower, 8, 9, final=True)
+
+        readable.add(private)
+        owner._layerwise_session_tracker.commit_put_keys([private])
+        for worker in (owner, follower):
+            restored = prepare(worker, 8, 9, final=True)
+            self.assertEqual(restored.load_block_keys, [private, stable])
+            self.assertEqual(restored.load_keys, [private, stable])
+            worker._finish_current_layerwise_load_sessions()
+        self.assertEqual(owner._layerwise_session_tracker.collect_private_removals(), [private])
+        self.assertEqual(follower._layerwise_session_tracker.collect_private_removals(), [])
+
+        with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
+            prepare(follower, 8, 9, instance="second", final=True)
+        readable.add(public)
+        self.assertEqual(prepare(follower, 8, 9, instance="second", final=True).load_block_keys, [public, stable])
+
+    def test_prefill_public_put_conflict_in_last_chunk_does_not_need_fallback(self):
+        owner, _ = self._make_prefill_snapshot_worker()
+        owner.m_store.batch_put_start.side_effect = lambda keys, sizes: [-705] * len(keys)
+        request = ReqMeta(
+            "r1", block_ids=[7], block_hashes=[b"shared"], target_token_len=4, can_save=True, is_last_chunk=True
+        )
+        request.prefill_history = 0
+        self.assertEqual(mooncake_layerwise.prepare_layerwise_sessions(owner, [request])[0][0].save_block_keys, [None])
+        owner.m_store.batch_put_start.assert_called_once()
+        owner.m_store.batch_put_start.side_effect = lambda keys, sizes: [-800] * len(keys)
+        with self.assertRaisesRegex(RuntimeError, "could not allocate Prefill snapshot"):
+            mooncake_layerwise.prepare_layerwise_sessions(owner, [request])
+
     def test_put_start_uses_full_current_layout_size_and_skips_hits(self):
         worker = self._make_worker()
         worker.m_store.batch_put_start.return_value = [0]
