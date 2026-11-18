@@ -5,6 +5,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from threading import Lock
+from time import perf_counter
 
 from ..kv_pool.ascend_store.prefill_reuse import ReadOutcome, ReadTicket, SlotBarrier, SlotEpoch
 from .layerwise_offload_plan import (
@@ -32,15 +33,31 @@ class NativeResult:
             raise ValueError("Successful native write must stop reading the source")
 
 
-def mooncake_write_once(engine, write: Write) -> NativeResult:
-    # The sync wrapper can retry a failed batch without proving it has stopped.
-    batch = engine.batch_transfer_async_write(write.endpoint, write.sources, write.targets, write.lengths)
-    if batch == 0:
-        return NativeResult(f"Mooncake write submission failed for {write.endpoint}", False)
-    result = engine.get_batch_transfer_status([batch])
-    if result == 0:
-        return NativeResult(None, True)
-    return NativeResult(f"Mooncake write completion failed for {write.endpoint}: {result}", False)
+def mooncake_write_once(
+    engine, write: Write, record: Callable[[float, float | None, bool], None] | None = None
+) -> NativeResult:
+    start = perf_counter()
+    submitted = None
+    success = False
+    try:
+        # The sync wrapper can retry a failed batch without proving it has stopped.
+        batch = engine.batch_transfer_async_write(write.endpoint, write.sources, write.targets, write.lengths)
+        if batch == 0:
+            return NativeResult(f"Mooncake write submission failed for {write.endpoint}", False)
+        submitted = perf_counter()
+        result = engine.get_batch_transfer_status([batch])
+        success = result == 0
+        if success:
+            return NativeResult(None, True)
+        return NativeResult(f"Mooncake write completion failed for {write.endpoint}: {result}", False)
+    finally:
+        if record is not None:
+            end = perf_counter()
+            record(
+                end - start if submitted is None else submitted - start,
+                None if submitted is None else end - submitted,
+                success,
+            )
 
 
 @dataclass(frozen=True)

@@ -204,15 +204,19 @@ class TestLayerwiseRewrite(unittest.TestCase):
                 engine = Mock()
                 engine.batch_transfer_async_write.return_value = batch
                 engine.get_batch_transfer_status.return_value = status
-                result = mooncake_write_once(engine, write)
+                record = Mock()
+                with patch(f"{mooncake_write_once.__module__}.perf_counter", side_effect=(1.0, 1.25, 2.0)):
+                    result = mooncake_write_once(engine, write, record)
                 self.assertEqual(result.quiesced, quiesced)
                 self.assertEqual(result.error is None, quiesced)
                 engine.batch_transfer_async_write.assert_called_once_with("decode", (100,), (200,), (64,))
                 engine.batch_transfer_sync_write.assert_not_called()
                 if batch:
                     engine.get_batch_transfer_status.assert_called_once_with([batch])
+                    record.assert_called_once_with(0.25, 0.75, quiesced)
                 else:
                     engine.get_batch_transfer_status.assert_not_called()
+                    record.assert_called_once_with(0.25, None, False)
 
     def test_unequal_tp_requires_replicated_model_and_divisible_ratio(self):
         RegisteredLayout.validate_tp(8, 8, replicated=False)

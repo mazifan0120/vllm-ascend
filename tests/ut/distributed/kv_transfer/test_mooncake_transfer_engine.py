@@ -4,6 +4,7 @@ import pytest
 
 pytest.importorskip("vllm")
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import LayerwiseWriteStats  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (  # noqa: E402
     GlobalTE,
 )
@@ -12,6 +13,25 @@ _GLM_LAYER_BYTES = 1_300_234_240
 _GLM_FIRST_REGION_LAYER_COUNT = 52
 _GLM_SECOND_REGION_LAYER_COUNT = 27
 _TE_REGISTRATION_LIMIT_BYTES = 64 * 1024 * 1024 * 1024
+
+
+def test_layerwise_write_stats_aggregate_worker_totals():
+    first = LayerwiseWriteStats()
+    first.record(0.25, None, False)
+    second = LayerwiseWriteStats()
+    second.record(0.5, 1.5, True)
+    second.record(0.25, 0.5, False)
+
+    assert first.aggregate(second).reduce() == {
+        "batches": 3,
+        "waits": 2,
+        "failures": 2,
+        "submit_seconds": 1.0,
+        "wait_seconds": 2.0,
+    }
+    first.reset()
+    assert first.is_empty()
+    assert second.data["waits"] == 2
 
 
 def _manager_with_engine(engine: object) -> GlobalTE:

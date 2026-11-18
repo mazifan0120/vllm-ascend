@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorPromMetrics, PromMetric, PromMetricT
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
@@ -83,6 +84,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_wire import (
     encode_allocation,
     encode_catalog,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import LayerwiseWritePromMetrics, LayerwiseWriteStats
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_transfer import (
     DsaRegisterAtom,
@@ -968,6 +970,33 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             if self.has_connector_metadata():
                 worker.virtual_request.update(self._connector_metadata.prefill_restores)
 
+    def get_kv_connector_stats(self) -> LayerwiseWriteStats | None:
+        worker = self.connector_worker
+        if worker is not None and worker.layerwise_host_prefill:
+            return worker.take_prefill_write_stats()
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> LayerwiseWriteStats:
+        return LayerwiseWriteStats(data=data or {})
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics | None:
+        transfer = vllm_config.kv_transfer_config
+        if (
+            transfer is None
+            or not transfer.is_kv_producer
+            or not transfer.get_from_extra_config("layerwise_host_offload", False)
+        ):
+            return None
+        return LayerwiseWritePromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+
     def send_restored_layer(self, layer: int) -> None:
         worker = self.connector_worker
         assert worker is not None and worker.prefill_store_bound
@@ -1510,6 +1539,9 @@ class MooncakeLayerwiseConnectorWorker:
         host_offload = transfer.get_from_extra_config("layerwise_host_offload", False)
         self.layerwise_host_offload = transfer.is_kv_consumer and host_offload
         self.layerwise_host_prefill = transfer.is_kv_producer and host_offload
+        if self.layerwise_host_prefill:
+            self._prefill_write_stats_lock = threading.Lock()
+            self._prefill_write_stats = LayerwiseWriteStats(data={})
         self.prefill_store_bound = False
         self.prefill_main_config: dict | None = None
         self.decode_handshake: LayerwiseDecodeHandshake | None = None
@@ -1938,7 +1970,10 @@ class MooncakeLayerwiseConnectorWorker:
         self._prefill_batch: tuple[tuple[LayerwiseSender, PrefillChunk], ...] = ()
         self._prefill_emitted: set[int] = set()
         self._prefill_control = PrefillControl(
-            self.tp_rank, self.tp_size, self._prefill_slots, partial(mooncake_write_once, self.engine)
+            self.tp_rank,
+            self.tp_size,
+            self._prefill_slots,
+            partial(mooncake_write_once, self.engine, record=self._record_prefill_write),
         )
         self._prefill_control_stop = threading.Event()
         self._prefill_control_thread = threading.Thread(
@@ -1949,6 +1984,18 @@ class MooncakeLayerwiseConnectorWorker:
         )
         self._start_sending_thread()
         self._prefill_control_thread.start()
+
+    def _record_prefill_write(self, submit: float, wait: float | None, success: bool) -> None:
+        with self._prefill_write_stats_lock:
+            self._prefill_write_stats.record(submit, wait, success)
+
+    def take_prefill_write_stats(self) -> LayerwiseWriteStats | None:
+        with self._prefill_write_stats_lock:
+            stats = self._prefill_write_stats
+            if stats.is_empty():
+                return None
+            self._prefill_write_stats = LayerwiseWriteStats(data={})
+            return stats
 
     def stop_prefill_control(self) -> None:
         if hasattr(self, "_prefill_control_thread"):
