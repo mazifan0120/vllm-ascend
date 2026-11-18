@@ -433,9 +433,7 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
             worker.put_step = 3
             worker.tp_rank = rank
             worker.layerwise_prefill_put_writers = 2
-            worker.m_store.batch_get_start.side_effect = lambda keys: [
-                0 if key in readable else -704 for key in keys
-            ]
+            worker.m_store.batch_get_start.side_effect = lambda keys: [0 if key in readable else -704 for key in keys]
 
         def prepare(worker, history, extent, *, final=False):
             request = ReqMeta(
