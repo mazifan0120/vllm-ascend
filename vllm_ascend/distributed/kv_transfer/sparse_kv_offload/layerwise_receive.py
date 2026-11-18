@@ -270,6 +270,8 @@ class DecodeTargets:
     def _target_status(self, target: TargetId) -> tuple[str, tuple[int, ...]]:
         if self.try_closed(target):
             return "closed", ()
+        if self.try_ready(target):
+            return "ready", ()
         with self._lock:
             record = self._targets.get(target)
             if record is None:
@@ -278,7 +280,7 @@ class DecodeTargets:
                 return "closing", self.close(target)
             if record.failed:
                 return "failed", ()
-        return ("ready" if self.try_ready(target) else "waiting"), ()
+        return "waiting", ()
 
     def prepare(self, allocation: TargetAllocation, refs: tuple[CatalogRef, ...]) -> CatalogRef:
         if refs != self._layout.refs:
@@ -373,6 +375,8 @@ class DecodeTargets:
                 received = record.coverage.get(key, ())
                 expected_tokens = sum(span.end - span.start for span in expected)
                 if sum(span.end - span.start for span in received) != expected_tokens:
+                    # A successful terminal follows acknowledgement of every proof.
+                    record.failed = True
                     return False
             record.visibility_pending = True
         wait_visible = None

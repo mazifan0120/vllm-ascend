@@ -502,11 +502,14 @@ class LayerBatchBuilder:
             layer_object_offset = int(self._block_len_np[:base_offset].sum())
             offsets = (layer_object_offset + layer_inner_offsets).tolist()
             sizes = layer_block_len.tolist()
-            row_offsets = [offsets.copy() for _ in shared.block_ids_arr]
-            row_sizes = [sizes.copy() for _ in shared.block_ids_arr]
             if prefill_get:
+                # Full-block rows are read-only. Partial ranges replace the whole row below.
+                row_offsets = [offsets] * len(shared.block_ids_arr)
+                row_sizes = [sizes] * len(shared.block_ids_arr)
                 all_buffers = (layer_base_addrs + shared.block_ids_arr[:, None] * layer_block_stride).tolist()
             else:
+                row_offsets = [offsets.copy() for _ in shared.block_ids_arr]
+                row_sizes = [sizes.copy() for _ in shared.block_ids_arr]
                 all_buffers = [
                     (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
                 ]

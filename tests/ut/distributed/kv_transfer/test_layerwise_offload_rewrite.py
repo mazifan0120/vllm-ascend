@@ -789,15 +789,30 @@ class TestLayerwiseRewrite(unittest.TestCase):
         self.assertTrue(case.scheduler.closed(case.target, refs[0]))
         self.assertEqual(case.released, [case.allocation])
 
-    def test_spoofed_writer_and_terminal_only_fail_admission(self):
+    def test_success_terminals_with_missing_ranges_fail_before_receipt_timeout(self):
+        case = _Fixture()
+        allocation, refs = case.publish()
+        for writer in case.layout.writers:
+            self.assertTrue(case.p[writer].attach(allocation, refs))
+        self.assertEqual(case.worker_status(0), ("waiting", ()))
+        for writer in case.layout.writers:
+            case.collect_terminal(writer, NativeResult(None, True))
+        self.assertEqual(case.worker_status(0), ("failed", ()))
+        self.assertFalse(case.scheduler.may_decode(case.target))
+        self.assertEqual(case.visibility, [])
+        self.assertEqual(case.released, [])
+
+        for ref in case.scheduler.begin_close(case.target):
+            self.assertEqual(case.worker_status(ref.rank, "close-target"), ("closed", ()))
+            case.scheduler.closed(case.target, ref)
+        self.assertEqual(case.released, [case.allocation])
+
+    def test_foreign_writer_range_fails_admission(self):
         case = _Fixture()
         case.publish()
-        case.collect_terminal(0, NativeResult(None, True))
-        case.collect_terminal(1, NativeResult(None, True))
-        self.assertFalse(case.d[0].try_ready(case.target))
         with self.assertRaises(ValueError):
             case.d[0].apply(case.target, (WriteResult(1, EntryId(0, "main", 0), Span(0, 1)),))
-        self.assertFalse(case.d[0].try_ready(case.target))
+        self.assertEqual(case.worker_status(0), ("failed", ()))
         self.assertEqual(case.visibility, [])
 
     def test_wire_rejects_wrong_protocol_and_boolean_block(self):

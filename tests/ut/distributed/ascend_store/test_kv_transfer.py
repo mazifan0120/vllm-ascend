@@ -230,17 +230,26 @@ class TestLayerBatchBuilderOffsets(unittest.TestCase):
         )
         builder = LayerBatchBuilder(database, page_size_bytes=64, num_layers=2)
         shared = SharedBlockData(
-            block_ids_arr=np.asarray([7, 3, 1]),
+            block_ids_arr=np.asarray([7, 3, 1, 11]),
             block_gvas_arr=None,
             req_ids=["r1"],
             is_last_chunks=[False],
-            block_keys=["full", "short", "crosses-page"],
-            range_tokens=[None, 5, 11],
+            block_keys=["full", "short", "crosses-page", "another-full"],
+            range_tokens=[None, 5, 11, None],
         )
         for layer in (0, 1):
             with self.subTest(layer=layer):
                 result = builder.build_addrs(shared, layer, prefill_get=True)
-                self.assertEqual(result, builder.build_addrs(shared, layer))
+                ordinary = builder.build_addrs(shared, layer)
+                self.assertEqual(result, ordinary)
+                for get_rows, ordinary_rows in (
+                    (result.all_sizes, ordinary.all_sizes),
+                    (result.all_offsets, ordinary.all_offsets),
+                ):
+                    self.assertIs(get_rows[0], get_rows[3])
+                    self.assertIsNot(get_rows[0], get_rows[1])
+                    self.assertIsNot(get_rows[0], get_rows[2])
+                    self.assertIsNot(ordinary_rows[0], ordinary_rows[3])
 
     def test_uses_real_offsets_for_variable_cache_entries_per_layer(self):
         database = FakeTokenDatabase()
