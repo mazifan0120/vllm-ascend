@@ -153,13 +153,18 @@ class Route:
     writer_count: int
     entry: Destination
 
-    def required(self, prompt: int) -> tuple[Span, ...]:
+    def required(self, span: Span) -> tuple[Span, ...]:
+        start, end = span
+        if start == end:
+            return ()
         if self.writer_count == 1:
-            return (Span(0, prompt),)
+            return (span,)
         width = self.entry.block_tokens
+        first = start // width
+        first += (self.writer_index - first) % self.writer_count
         return tuple(
-            Span(start, min(prompt, start + width))
-            for start in range(self.writer_index * width, prompt, self.writer_count * width)
+            Span(max(start, block), min(end, block + width))
+            for block in range(first * width, end, self.writer_count * width)
         )
 
 
@@ -244,9 +249,17 @@ class RegisteredLayout:
                 raise ValueError("Allocation cannot hold the complete prompt")
 
     def receive_plan(self, rank: int, prompt: int) -> dict[tuple[int, EntryId], tuple[Span, ...]]:
-        return {
-            (route.writer, route.entry.entry): route.required(prompt) for route in self.routes if route.receiver == rank
-        }
+        partitions = {}
+        expected = {}
+        span = Span(0, prompt)
+        for route in self.routes:
+            if route.receiver != rank:
+                continue
+            key = (route.writer_index, route.writer_count, route.entry.block_tokens)
+            if key not in partitions:
+                partitions[key] = route.required(span)
+            expected[(route.writer, route.entry.entry)] = partitions[key]
+        return expected
 
     def writer_routes(self, rank: int, layer: int) -> tuple[Route, ...]:
         return tuple(route for route in self.routes if route.writer == rank and route.entry.entry.layer == layer)
@@ -320,11 +333,7 @@ def plan_writes(
             indexer=key.component == "indexer",
             mapping_cache=mapping_cache,
         )
-        results = tuple(
-            WriteResult(writer, key, Span(max(expected.start, span.start), min(expected.end, span.end)))
-            for expected in route.required(allocation.prompt_tokens)
-            if max(expected.start, span.start) < min(expected.end, span.end)
-        )
+        results = tuple(WriteResult(writer, key, required) for required in route.required(span))
         expected_bytes = sum(result.span.end - result.span.start for result in results) * (
             entry.page_bytes // entry.page_tokens
         )

@@ -959,6 +959,12 @@ class TestLayerwiseRewrite(unittest.TestCase):
         self.assertEqual(case.worker_status(0), ("failed", ()))
         self.assertEqual(case.visibility, [])
 
+    def test_partitioned_writer_ranges_clip_to_the_current_chunk(self):
+        case = _Fixture(multi_writer=True)
+        route = next(route for route in case.layout.writer_routes(1, 0) if route.entry.entry.component == "main")
+        self.assertEqual(route.required(Span(6, 15)), (Span(6, 8), Span(12, 15)))
+        self.assertEqual(route.required(Span(8, 12)), ())
+
     def test_wire_rejects_wrong_protocol_and_boolean_block(self):
         case = _Fixture()
         frame = _roundtrip(encode_allocation(case.allocation, case.layout.refs))

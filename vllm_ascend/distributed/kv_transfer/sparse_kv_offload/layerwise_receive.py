@@ -333,7 +333,8 @@ class DecodeTargets:
         key = (result.writer, result.entry)
         start, end = result.span
         expected = record.expected[key]
-        if not any(owned.start <= start < end <= owned.end for owned in expected):
+        match = bisect_right(expected, Span(start, record.allocation.prompt_tokens)) - 1
+        if match < 0 or not start < end <= expected[match].end:
             raise ValueError("Writer reported an unassigned destination range")
         existing = record.coverage.setdefault(key, [])
         pos = bisect_left(existing, result.span)
