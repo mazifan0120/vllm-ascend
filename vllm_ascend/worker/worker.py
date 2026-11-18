@@ -979,6 +979,11 @@ class NPUWorker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        if get_prefill_main_reuse_config(self.vllm_config.kv_transfer_config) is not None:
+            from vllm.utils.gc_utils import freeze_gc_heap
+
+            # Keep warmed-up model objects out of collections during layerwise GET.
+            freeze_gc_heap()
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
             # `encoder_compilation_time` was added after v0.19.1 (vLLM #39240); fall

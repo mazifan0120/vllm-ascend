@@ -1770,6 +1770,57 @@ class TestNPUWorker(TestBase):
             mock_warm_up_atb.assert_called_once()
             mock_kernel_warmup.assert_called_once_with(worker)
 
+    def test_freeze_gc_heap_after_warmup_for_prefill_main_reuse(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        transfer = SimpleNamespace(
+            kv_connector="MultiConnector",
+            is_kv_producer=True,
+            is_kv_consumer=False,
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "MooncakeLayerwiseConnector",
+                        "kv_role": "kv_producer",
+                        "kv_connector_extra_config": {"layerwise_host_offload": True},
+                    },
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_role": "kv_both",
+                        "kv_connector_extra_config": {"use_layerwise": True, "layerwise_num_shared_buffers": 3},
+                    },
+                ],
+            },
+        )
+        with (
+            patch.object(NPUWorker, "__init__", lambda self: None),
+            patch.object(kw_module, "kernel_warmup") as warmup,
+            patch("vllm_ascend.worker.worker.get_current_hardware_profile") as hardware,
+            patch("vllm_ascend.worker.worker.get_ascend_config") as ascend_config,
+            patch("vllm_ascend.worker.worker.set_random_seed"),
+            patch("vllm.utils.gc_utils.freeze_gc_heap") as freeze,
+        ):
+            hardware.return_value.supports.return_value = False
+            ascend_config.return_value.enable_cpu_binding = False
+            worker = NPUWorker()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.compilation_config.compile_sizes = []
+            worker.model_config = SimpleNamespace(enforce_eager=True, seed=0)
+            worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=1024)
+            worker.vllm_config.kv_transfer_config = None
+            worker.compile_or_warm_up_model()
+            worker.vllm_config.kv_transfer_config = SimpleNamespace(
+                **(vars(transfer) | {"is_kv_producer": False, "is_kv_consumer": True})
+            )
+            worker.compile_or_warm_up_model()
+            freeze.assert_not_called()
+
+            warmup.reset_mock()
+            freeze.side_effect = lambda: warmup.assert_called_once_with(worker)
+            worker.vllm_config.kv_transfer_config = transfer
+            worker.compile_or_warm_up_model()
+            freeze.assert_called_once_with()
+
     @patch("vllm_ascend.worker.worker.set_random_seed")
     @patch("vllm_ascend.worker.worker.get_current_hardware_profile")
     @patch("vllm_ascend.worker.worker.CUDAGraphMode")
