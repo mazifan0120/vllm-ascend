@@ -194,17 +194,25 @@ class WriterControl:
         terminal = sender.finish(target, cancel=state == "closing", end_of_input=finished)
         if terminal is None or (acknowledged and not terminal.quiesced):
             return False
-        frame = encode_terminal(target, sender.rank, terminal.error, terminal.quiesced)
-        try:
-            for worker in self._refs:
-                self._send(worker.rank, frame)
-        except (TimeoutError, ValueError, msgspec.DecodeError, zmq.ZMQError):
-            return False  # Retry the same terminal; no worker is inferred to be closed.
+        if not self.send_terminal(sender.rank, target, terminal):
+            return False
         if terminal.quiesced:
             self._acknowledged_uncertain.discard(key)
         else:
             self._acknowledged_uncertain.add(key)
         return terminal.quiesced
+
+    def send_terminal(self, rank: int, target: TargetId, terminal: NativeResult) -> bool:
+        frame = encode_terminal(target, rank, terminal.error, terminal.quiesced)
+        try:
+            for worker in self._refs:
+                self._send(worker.rank, frame)
+        except (TimeoutError, ValueError, msgspec.DecodeError, zmq.ZMQError):
+            return False  # Retry the same terminal; no worker is inferred to be closed.
+        return True
+
+    def close(self) -> None:
+        self._client.close()
 
     def _send(self, rank: int, frame: tuple) -> None:
         if self._client.request(rank, frame) != ("ack",):
@@ -213,10 +221,11 @@ class WriterControl:
 
 @dataclass
 class _WriterTask:
-    sender: LayerwiseSender
+    sender: LayerwiseSender | None
     control: WriterControl
     finished: bool = False
     cancel: bool = False
+    refusal: NativeResult | None = None
 
 
 class PrefillControl:
@@ -241,6 +250,10 @@ class PrefillControl:
         for chunk in chunks:
             if self._rank >= len(chunk.refs):
                 continue
+            target = chunk.allocation.target
+            previous = self._active.get(target)
+            if previous is not None and previous.refusal is not None:
+                continue
             key = (chunk.refs, chunk.endpoints, chunk.parallel_main)
             if key not in self._sessions:
                 client = SideChannelClient(chunk.endpoints, 1000)
@@ -251,6 +264,18 @@ class PrefillControl:
                     layout = RegisteredLayout(catalogs, self._tp_size, parallel_main=chunk.parallel_main)
                     if layout.refs != chunk.refs:
                         raise ValueError("D worker returned a different registered catalog")
+                except (TimeoutError, ValueError, msgspec.DecodeError, zmq.ZMQError) as error:
+                    reason = str(error) or type(error).__name__
+                    logger.warning("P rank %d could not read layerwise catalog for %s: %s", self._rank, target, reason)
+                    if previous is None:
+                        # Only the receiver can confirm whether it issued an address grant.
+                        self._active[target] = _WriterTask(
+                            None, WriterControl(client, chunk.refs), refusal=NativeResult(reason, False)
+                        )
+                    else:
+                        client.close()
+                        previous.cancel = True
+                    continue
                 except Exception:
                     client.close()
                     raise
@@ -260,7 +285,6 @@ class PrefillControl:
                 )
                 self._sessions[key] = client, control, sender
             _, control, sender = self._sessions[key]
-            target = chunk.allocation.target
             try:
                 attached = sender.attach(chunk.allocation, chunk.refs)
             except (TimeoutError, ValueError, msgspec.DecodeError, zmq.ZMQError) as error:
@@ -304,9 +328,18 @@ class PrefillControl:
                     if not self._commands.empty():
                         self._run_command(0)
                     task = self._active[target]
+                    if task.refusal is not None:
+                        if task.control.send_terminal(self._rank, target, task.refusal):
+                            task.control.close()
+                            del self._active[target]
+                        continue
+                    assert task.sender is not None
                     if task.control.progress(task.sender, target, finished=task.finished, cancel=task.cancel):
                         task.sender.forget(target)
                         del self._active[target]
         finally:
             for client, _, _ in self._sessions.values():
                 client.close()
+            for task in self._active.values():
+                if task.refusal is not None:
+                    task.control.close()

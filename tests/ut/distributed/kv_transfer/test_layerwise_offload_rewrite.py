@@ -476,6 +476,76 @@ class TestLayerwiseRewrite(unittest.TestCase):
             with self.subTest(decode_tp=decode_tp, multi_writer=multi_writer):
                 self._check_prefill_control(decode_tp, multi_writer)
 
+    def test_catalog_timeout_fails_only_the_unattached_target(self):
+        case = _Fixture(multi_writer=False)
+        failed, refs = case.publish()
+        good = replace(
+            failed,
+            target=TargetId("other-request", 1, 0),
+            blocks=((2, 3), (0, 3)),
+        )
+        case.scheduler.retain(good)
+        for worker in case.d:
+            case.scheduler.prepared(good.target, worker.prepare(good, refs))
+        case.scheduler.publish(good.target)
+        endpoints = self._side_channels(case)
+        chunks = tuple(
+            PrefillChunk(allocation, refs, endpoints, False, allocation.blocks, Span(0, 7))
+            for allocation in (failed, good)
+        )
+        requests = []
+        original = SideChannelClient.request
+        lost_ack, rejection_sent = Event(), Event()
+
+        def request(client, rank, frame):
+            requests.append((rank, frame))
+            if len(requests) == 1:
+                self.assertEqual(frame[0], "get-catalog")
+                raise TimeoutError("catalog reply was lost")
+            reply = original(client, rank, frame)
+            if frame[0] == "terminal" and frame[2][0] == failed.target.request and rank == 1:
+                if not lost_ack.is_set():
+                    lost_ack.set()
+                    raise TimeoutError("D applied the rejection but its reply was lost")
+                rejection_sent.set()
+            return reply
+
+        prefill = PrefillControl(0, 4, case.barriers[0], case.write)
+        stop = Event()
+        loop = Thread(target=prefill.run, args=(stop,))
+        with patch.object(SideChannelClient, "request", request):
+            loop.start()
+            try:
+                ((_, attached),) = prefill.prepare(chunks)
+                self.assertIs(attached, chunks[1])
+                self.assertTrue(rejection_sent.wait(5))
+            finally:
+                stop.set()
+                loop.join(5)
+
+        self.assertFalse(loop.is_alive())
+        self.assertTrue(lost_ack.is_set())
+        self.assertEqual(case.bytes, {})
+        self.assertEqual(
+            [frame[2][0] for _, frame in requests if frame[0] == "get-addresses"],
+            [good.target.request],
+        )
+        terminals = [frame for _, frame in requests if frame[0] == "terminal"]
+        self.assertEqual(len(terminals), 4)
+        self.assertTrue(all(frame[-1] is False for frame in terminals))
+        client = SideChannelClient(endpoints, 1000)
+        self.addCleanup(client.close)
+        for ref in refs:
+            query = encode_worker_query("poll-target", failed.target, ref)
+            self.assertEqual(decode_worker_status(client.request(ref.rank, query), failed.target, ref), ("failed", ()))
+        self.assertEqual(case.released, [])
+        for ref in case.scheduler.begin_close(failed.target):
+            query = encode_worker_query("close-target", failed.target, ref)
+            self.assertEqual(decode_worker_status(client.request(ref.rank, query), failed.target, ref), ("closed", ()))
+            case.scheduler.closed(failed.target, ref)
+        self.assertEqual(case.released, [failed])
+        self.assertIn(good.target, prefill._active)
+
     def test_prefill_command_runs_between_active_targets(self):
         case = _Fixture()
         control = PrefillControl(0, 4, case.barriers[0], case.write)
@@ -492,9 +562,10 @@ class TestLayerwiseRewrite(unittest.TestCase):
         for target in ("first", "second", "third"):
             control._active[TargetId(target, 1, 0)] = SimpleNamespace(
                 control=SimpleNamespace(progress=lambda *args, key=target, **kw: progress(key)),
-                sender=None,
+                sender=object(),
                 finished=False,
                 cancel=False,
+                refusal=None,
             )
         loop = Thread(target=control.run, args=(stop,))
         loop.start()
