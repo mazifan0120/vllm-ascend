@@ -2,13 +2,17 @@
 
 import unittest
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+from vllm import SamplingParams
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_ascend.core.layerwise_decode_scheduler import AsyncLayerwiseDecodeScheduler, LayerwiseDecodeScheduler
 from vllm_ascend.core.layerwise_offload_scheduler import DecodeWorkerEvent, DecodeWorkerLink
@@ -189,6 +193,43 @@ class TestLayerwiseDecodeScheduler(unittest.TestCase):
         self.assertNotIn(self.request.request_id, self.cache.groups)
         self.assertEqual(self.cache.released, [9, 7, 5, 3])
         self.assertTrue(scheduler.reset_prefix_cache(reset_running_requests=True))
+
+    def test_cancel_holds_upstream_pool_blocks_until_last_close(self):
+        spec = FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=16, dtype=torch.float16)
+        config = KVCacheConfig(8, [], [KVCacheGroupSpec(["layer.0"], spec)])
+        cache = KVCacheManager(config, 16, scheduler_block_size=4, hash_block_size=4, enable_caching=False)
+        free_before = cache.block_pool.get_num_free_blocks()
+        request = Request("real-request", [1] * 6, SamplingParams(max_tokens=1), None)
+        allocated = cache.allocate_slots(request, request.num_prompt_tokens)
+        self.assertIsNotNone(allocated)
+        (blocks,) = cache.get_blocks(request.request_id).blocks
+        target = TargetId("real-transfer", 1, 2)
+        allocation = TargetAllocation(target, request.num_prompt_tokens, (tuple(block.block_id for block in blocks),))
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler = self._make_scheduler()
+        scheduler.kv_cache_manager = cache
+        scheduler.requests = {request.request_id: request}
+        admission = scheduler.bind_layerwise_workers(SimpleNamespace(refs=self.refs), self.link)
+        scheduler.retain_layerwise_target(request, allocation)
+        for ref in self.refs:
+            admission.prepared(target, ref)
+        admission.publish(target)
+
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        self.assertEqual(self.close_messages, [(target, self.refs)])
+        admission.closed(target, self.refs[0])
+        self.assertEqual(cache.block_pool.get_num_free_blocks(), free_before - 2)
+        self.assertEqual([block.ref_cnt for block in blocks], [1, 1])
+        old_target = replace(target, allocation_generation=1)
+        scheduler.post_layerwise_event(DecodeWorkerEvent("closed", old_target, self.refs[1]))
+        with patch.object(Scheduler, "schedule", return_value=None):
+            scheduler.schedule()
+        self.assertEqual(cache.block_pool.get_num_free_blocks(), free_before - 2)
+
+        admission.closed(target, self.refs[1])
+        self.assertEqual(cache.block_pool.get_num_free_blocks(), free_before)
+        self.assertEqual([block.ref_cnt for block in blocks], [0, 0])
+        self.assertNotIn(request.request_id, scheduler.requests)
 
     def test_dispatch_carries_target_identity_and_validates_new_block_ids(self):
         scheduler, _ = self._bound()
