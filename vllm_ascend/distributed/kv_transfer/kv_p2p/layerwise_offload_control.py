@@ -163,6 +163,7 @@ class WriterControl:
     def __init__(self, client: SideChannelClient, refs: tuple[CatalogRef, ...]):
         self._client = client
         self._refs = refs
+        self._acknowledged_uncertain: set[tuple[TargetId, int]] = set()
 
     def read_addresses(self, owner: int, target: TargetId, writer: int, ref: CatalogRef) -> tuple[PeerAddress, ...]:
         frame = encode_writer_query("get-addresses", target, writer, ref)
@@ -174,9 +175,11 @@ class WriterControl:
     def progress(
         self, sender: LayerwiseSender, target: TargetId, *, finished: bool = False, cancel: bool = False
     ) -> bool:
-        ref = self._refs[sender.rank]
-        state = "closing"
-        if not cancel:
+        key = target, sender.rank
+        acknowledged = key in self._acknowledged_uncertain
+        state = "closing" if cancel else None
+        if not cancel and not acknowledged:
+            ref = self._refs[sender.rank]
             try:
                 frame = encode_writer_query("poll-writer", target, sender.rank, ref)
                 state, _ = decode_worker_status(self._client.request(ref.rank, frame), target, ref)
@@ -189,7 +192,7 @@ class WriterControl:
         if state == "waiting":
             sender.flush_proofs(target)
         terminal = sender.finish(target, cancel=state == "closing", end_of_input=finished)
-        if terminal is None:
+        if terminal is None or (acknowledged and not terminal.quiesced):
             return False
         frame = encode_terminal(target, sender.rank, terminal.error, terminal.quiesced)
         try:
@@ -197,6 +200,10 @@ class WriterControl:
                 self._send(worker.rank, frame)
         except (TimeoutError, ValueError, msgspec.DecodeError, zmq.ZMQError):
             return False  # Retry the same terminal; no worker is inferred to be closed.
+        if terminal.quiesced:
+            self._acknowledged_uncertain.discard(key)
+        else:
+            self._acknowledged_uncertain.add(key)
         return terminal.quiesced
 
     def _send(self, rank: int, frame: tuple) -> None:

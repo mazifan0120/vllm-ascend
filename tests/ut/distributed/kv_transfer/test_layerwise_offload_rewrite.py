@@ -8,6 +8,7 @@ from dataclasses import replace
 from threading import Event, Thread
 from time import monotonic
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import msgspec
 import zmq
@@ -401,10 +402,26 @@ class TestLayerwiseRewrite(unittest.TestCase):
         self.assertEqual([(event.kind, event.worker.rank) for event in events], [("closed", 1)])
         self.assertFalse(case.scheduler.closed(events[0].target, events[0].worker))
         events.clear()
-        self.assertFalse(writer.progress(sender, case.target))
+        request = p_client.request
+
+        def lose_terminal_ack(rank, frame):
+            reply = request(rank, frame)
+            if rank == 1 and frame[0] == "terminal":
+                raise TimeoutError("D applied the terminal but its reply was lost")
+            return reply
+
+        with patch.object(p_client, "request", side_effect=lose_terminal_ack):
+            self.assertFalse(writer.progress(sender, case.target))
+        with patch.object(p_client, "request", wraps=request) as rpc:
+            self.assertFalse(writer.progress(sender, case.target))
+            self.assertEqual([call.args[1][0] for call in rpc.call_args_list], ["poll-writer", "terminal", "terminal"])
         control.step()
         self.assertEqual(events, [])
         self.assertEqual(case.released, [])
+        with patch.object(p_client, "request", wraps=p_client.request) as rpc:
+            for _ in range(3):
+                self.assertFalse(writer.progress(sender, case.target))
+            rpc.assert_not_called()
         sender.confirm_native_quiescence(case.target)
         self.assertTrue(writer.progress(sender, case.target))
         control.step()
