@@ -1401,7 +1401,7 @@ class KVPoolWorker:
 
     def _retire_prefill_snapshots(self) -> None:
         tracker = self._layerwise_session_tracker
-        for keys in self._layerwise_key_batches(tracker.unused_private_keys()):
+        for keys in self._layerwise_key_batches(tracker.collect_private_removals()):
             try:
                 tracker.forget_private_keys(self.m_store.retire_private_keys(keys))
             except Exception:
@@ -1633,8 +1633,7 @@ class KVPoolWorker:
         layer_idx_in_group: int = 0,
     ) -> None:
         # MLA replicas share a writer; recurrent state is saved by every TP rank.
-        save_owner = self._is_layerwise_save_owner(group_id)
-        if not save_owner and not (requests and requests[0].prefill_history is not None):
+        if not self._is_layerwise_save_owner(group_id):
             return
         block_size = get_group_block_size(self.grouped_block_size, group_id)
         request_block_ranges = []
@@ -1643,8 +1642,6 @@ class KVPoolWorker:
                 if any(key is not None for key in request.save_block_keys):
                     start = request.save_key_block_offset
                     request_block_ranges.append(LayerBlockRange(request, start, start + len(request.save_block_keys)))
-                continue
-            if not save_owner:
                 continue
             if request.can_save is None or not request.can_save:
                 continue

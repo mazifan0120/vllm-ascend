@@ -87,6 +87,7 @@ def test_prefill_restore_requires_an_internal_full_store_hit():
     metadata = scheduler._process_async_load_request("full", request, [[5, 6]])
     assert metadata.prefill_history == metadata.target_token_len == 8
     assert metadata.is_last_chunk and not metadata.can_save
+    assert metadata.prefill_snapshot_id is None
 
     request.sampling_params.prompt_logprobs = 1
     assert scheduler.get_num_new_matched_tokens(request, 0) == (7, False)
@@ -95,6 +96,24 @@ def test_prefill_restore_requires_an_internal_full_store_hit():
     scheduler._get_block_key_layerwise_hit_tokens.return_value = 4
     assert scheduler.get_num_new_matched_tokens(request, 0) == (4, False)
     assert not scheduler.load_specs["full"].restore_only
+
+
+def test_prefill_private_versions_are_minted_only_for_steps_that_save_a_snapshot():
+    scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+    scheduler.prefill_snapshots = True
+    scheduler.cache_transfer_granularity = scheduler.hash_block_size = 4
+    scheduler.original_block_size = [4]
+    scheduler.kv_cache_group_families = ["default"]
+    scheduler.layerwise_offload = scheduler._discard_partial_chunks = False
+
+    def prepare(extent):
+        tracker = RequestTracker("same-id", extent, allocated_block_ids=[1, 2])
+        return scheduler._build_req_meta(tracker, [b"block", b"tail"], None, list(range(8)), False)
+
+    first, duplicate_extent, final = prepare(2), prepare(2), prepare(8)
+    assert first.prefill_snapshot_id
+    assert duplicate_extent.prefill_snapshot_id and first.prefill_snapshot_id != duplicate_extent.prefill_snapshot_id
+    assert final.prefill_snapshot_id is None
 
 
 def test_prefill_mtp_lookup_requires_readable_successor_identity_and_never_counts_tail():

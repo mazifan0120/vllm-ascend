@@ -2,6 +2,7 @@ import importlib
 import math
 from collections.abc import Sequence
 from typing import Any
+from uuid import uuid4
 
 import vllm.envs as envs
 import zmq
@@ -855,6 +856,8 @@ class KVPoolScheduler:
         if self.prefill_snapshots and meta is not None:
             pool_tokens = load_spec.kvpool_cached_tokens if load_spec and load_spec.can_load else 0
             meta.prefill_history = max(computed_tokens, pool_tokens)
+            if meta.can_save and not meta.is_last_chunk:
+                meta.prefill_snapshot_id = uuid4().hex
         return meta
 
     def _process_new_request(

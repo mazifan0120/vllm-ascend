@@ -1011,6 +1011,8 @@ class ReqMeta:
     save_start_token: int = 0
     # Set by the rewrite scheduler to the complete prefix required this step.
     prefill_history: int | None = None
+    # Identifies one private snapshot version across the TP ranks of this step.
+    prefill_snapshot_id: str | None = None
     # Group-local token lengths for privately saved ranges.
     range_tokens: dict[str, int] | None = None
 

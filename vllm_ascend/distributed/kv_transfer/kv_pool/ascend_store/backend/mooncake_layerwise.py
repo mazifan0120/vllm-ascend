@@ -10,7 +10,6 @@ import json
 from collections.abc import Sequence
 from copy import copy
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
 from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -330,6 +329,7 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
     get_slots: list[tuple[ReqMeta, str, int, int | None]] = []
     superseded: list[tuple[str, str]] = []
     puts_by_group: dict[int, list[tuple[ReqMeta, str, int, int | None]]] = {}
+    reader_snapshots: list[tuple[str, int, str, int, int]] = []
     tracker = worker._layerwise_session_tracker
     for group in worker.cacheable_group_ids:
         views = result[group] = []
@@ -349,7 +349,7 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
                 if request.num_prompt_tokens is None:
                     raise ValueError("MTP1 Prefill snapshots require the prompt boundary")
                 hashes = hashes[: request.num_prompt_tokens // block_size]
-            previous = tracker.committed_private_blocks(request.req_id, group)
+            previous = tracker.private_blocks(request.req_id, group)
             view = copy(request)
             view.range_tokens = {}
             view.load_keys = []
@@ -386,9 +386,15 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
                         key = worker._make_layerwise_full_key(group, identity)
                         puts.append((view, key, index, None))
                 elif not request.is_last_chunk:
-                    key = worker._make_layerwise_full_key(group, f"prefill_private_{uuid4().hex}")
-                    view.range_tokens[key] = tokens
-                    puts.append((view, key, index, tokens))
+                    if request.prefill_snapshot_id is None:
+                        raise RuntimeError("Prefill snapshot requires a scheduler version")
+                    identity = f"prefill_private_{request.prefill_snapshot_id}:{index}"
+                    key = worker._make_layerwise_full_key(group, identity)
+                    if public_writer:
+                        view.range_tokens[key] = tokens
+                        puts.append((view, key, index, tokens))
+                    else:
+                        reader_snapshots.append((request.req_id, group, key, index, tokens))
 
     worker._open_layerwise_get_sessions(get_slots)
     if any(view.load_block_keys[index] is None for view, _, _, index in get_slots):
@@ -415,10 +421,14 @@ def _prepare_prefill_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> 
             if key in started:
                 view.save_block_keys[index - view.save_key_block_offset] = key
                 if tokens is not None:
-                    tracker.register_private_put(view.req_id, group, key, index, tokens)
+                    tracker.register_private_snapshot(view.req_id, group, key, index, tokens, writer=True)
         rejected = set(names) - started
         if rejected and worker._filter_pool_existing_keys(sorted(rejected)):
             raise RuntimeError(f"Mooncake could not allocate Prefill snapshot ranges for group {group}")
+    # The existing TP barrier orders the next read after the owner's Store
+    # save. Followers still have to open a readable Store session for the key.
+    for snapshot in reader_snapshots:
+        tracker.register_private_snapshot(*snapshot, writer=False)
     return result
 
 

@@ -313,13 +313,14 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
                 is_last_chunk=final,
             )
             request.prefill_history = history
+            request.prefill_snapshot_id = str(extent)
             return mooncake_layerwise.prepare_layerwise_sessions(worker, [request])[0][0]
 
         first = prepare(0, 2)
         private = first.save_block_keys[0]
         self.assertIn("prefill_private_", private)
         self.assertEqual(first.range_tokens, {private: 2})
-        self.assertEqual(tracker.committed_private_blocks("r1", 0), {})
+        self.assertEqual(tracker.private_blocks("r1", 0), {})
         with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
             prepare(2, 5)
         readable.add(private)
@@ -337,7 +338,53 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         self.assertEqual(final.load_block_keys, [public, next_private])
         self.assertEqual(final.range_tokens, {next_private: 1})
         self.assertEqual(final.save_block_keys, [None])
-        self.assertEqual(tracker.unused_private_keys(), [private])
+        self.assertEqual(tracker.collect_private_removals(), [private])
+
+    def test_replicated_private_snapshot_has_one_writer_and_store_gates_followers(self):
+        owner, readable = self._make_prefill_snapshot_worker()
+        follower, _ = self._make_prefill_snapshot_worker()
+        owner.put_step = follower.put_step = 2
+        follower.tp_rank = 1
+        follower.m_store.batch_get_start.side_effect = owner.m_store.batch_get_start.side_effect
+
+        def prepare(worker, history, extent, version, *, final=False):
+            request = ReqMeta(
+                "r1", block_ids=[7], block_hashes=[], target_token_len=extent, can_save=True, is_last_chunk=final
+            )
+            request.prefill_history = history
+            request.prefill_snapshot_id = version
+            return mooncake_layerwise.prepare_layerwise_sessions(worker, [request])[0][0]
+
+        first = prepare(owner, 0, 2, "first")
+        key = first.save_block_keys[0]
+        self.assertIn("prefill_private_first:0", key)
+        follower_view = prepare(follower, 0, 2, "first")
+        self.assertEqual(follower_view.save_block_keys, [None])
+        follower.m_store.batch_put_start.assert_not_called()
+        for worker, view in ((owner, first), (follower, follower_view)):
+            worker.layer_save_tasks = [[]]
+            worker._process_save_for_layer_batch([view], 0)
+            self.assertEqual(bool(worker.layer_save_tasks[0]), worker is owner)
+        with self.assertRaisesRegex(RuntimeError, "complete committed Store prefix"):
+            prepare(follower, 2, 3, None, final=True)
+
+        owner._layerwise_session_tracker.commit_put_keys([key])
+        readable.add(key)
+        for worker in (owner, follower):
+            view = prepare(worker, 2, 3, None, final=True)
+            self.assertEqual(view.load_block_keys, [key])
+            self.assertEqual(view.range_tokens, {key: 2})
+            worker._finish_current_layerwise_load_sessions()
+
+        follower._retire_prefill_snapshots()
+        follower.m_store.retire_private_keys.assert_not_called()
+        self.assertEqual(follower._layerwise_session_tracker.private_blocks("r1", 0), {})
+        owner.m_store.retire_private_keys.side_effect = [[], [key]]
+        owner._retire_prefill_snapshots()
+        self.assertEqual(owner._layerwise_session_tracker.collect_private_removals(), [key])
+        owner._retire_prefill_snapshots()
+        self.assertEqual(owner.m_store.retire_private_keys.call_count, 2)
+        self.assertEqual(owner._layerwise_session_tracker.collect_private_removals(), [])
 
     def test_mtp_snapshot_uses_successor_hash_and_keeps_request_tail_private(self):
         worker, readable = self._make_prefill_snapshot_worker()
@@ -354,6 +401,7 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
                 is_last_chunk=final,
             )
             request.prefill_history = history
+            request.prefill_snapshot_id = f"{req_id}:{extent}"
             return mooncake_layerwise.prepare_layerwise_sessions(worker, [request])[0][0]
 
         # Generated token hashes cannot make the final prompt page public.
