@@ -7,5 +7,5 @@
     537,
     33659
   ],
-  "scope": "Independent semantic regression after performance measurement; excluded from performance counters"
+  "scope": "Independent semantic regression after performance and near-1M request; same P/D 1M TP2/MTP5 configuration"
 }

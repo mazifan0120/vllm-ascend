@@ -1,1 +1,92 @@
-{"172.168.4.237:8410": {"vllm:num_requests_running{engine=\"0\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"0\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"glm-52\"}": 0.0}, "172.168.4.31:8410": {"vllm:num_requests_running{engine=\"1\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"1\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"1\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8420": {"vllm:num_requests_running{engine=\"0\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"0\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8421": {"vllm:num_requests_running{engine=\"1\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"1\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"1\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8422": {"vllm:num_requests_running{engine=\"2\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"2\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"2\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8423": {"vllm:num_requests_running{engine=\"3\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"3\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"3\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8424": {"vllm:num_requests_running{engine=\"4\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"4\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"4\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8425": {"vllm:num_requests_running{engine=\"5\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"5\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"5\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8426": {"vllm:num_requests_running{engine=\"6\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"6\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"6\",model_name=\"glm-52\"}": 0.0}, "172.168.4.230:8427": {"vllm:num_requests_running{engine=\"7\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"7\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"7\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8428": {"vllm:num_requests_running{engine=\"8\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"8\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"8\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8429": {"vllm:num_requests_running{engine=\"9\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"9\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"9\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8430": {"vllm:num_requests_running{engine=\"10\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"10\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"10\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8431": {"vllm:num_requests_running{engine=\"11\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"11\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"11\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8432": {"vllm:num_requests_running{engine=\"12\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"12\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"12\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8433": {"vllm:num_requests_running{engine=\"13\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"13\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"13\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8434": {"vllm:num_requests_running{engine=\"14\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"14\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"14\",model_name=\"glm-52\"}": 0.0}, "172.168.4.226:8435": {"vllm:num_requests_running{engine=\"15\",model_name=\"glm-52\"}": 0.0, "vllm:num_requests_waiting{engine=\"15\",model_name=\"glm-52\"}": 0.0, "vllm:kv_cache_usage_perc{engine=\"15\",model_name=\"glm-52\"}": 0.0}}
+{
+  "172.168.4.237:8410": {
+    "vllm:num_requests_running{engine=\"0\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"0\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.31:8410": {
+    "vllm:num_requests_running{engine=\"1\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"1\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"1\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8420": {
+    "vllm:num_requests_running{engine=\"0\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"0\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8421": {
+    "vllm:num_requests_running{engine=\"1\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"1\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"1\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8422": {
+    "vllm:num_requests_running{engine=\"2\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"2\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"2\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8423": {
+    "vllm:num_requests_running{engine=\"3\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"3\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"3\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8424": {
+    "vllm:num_requests_running{engine=\"4\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"4\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"4\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8425": {
+    "vllm:num_requests_running{engine=\"5\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"5\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"5\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8426": {
+    "vllm:num_requests_running{engine=\"6\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"6\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"6\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.230:8427": {
+    "vllm:num_requests_running{engine=\"7\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"7\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"7\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8428": {
+    "vllm:num_requests_running{engine=\"8\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"8\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"8\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8429": {
+    "vllm:num_requests_running{engine=\"9\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"9\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"9\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8430": {
+    "vllm:num_requests_running{engine=\"10\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"10\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"10\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8431": {
+    "vllm:num_requests_running{engine=\"11\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"11\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"11\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8432": {
+    "vllm:num_requests_running{engine=\"12\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"12\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"12\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8433": {
+    "vllm:num_requests_running{engine=\"13\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"13\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"13\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8434": {
+    "vllm:num_requests_running{engine=\"14\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"14\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"14\",model_name=\"glm-52\"}": 0.0
+  },
+  "172.168.4.226:8435": {
+    "vllm:num_requests_running{engine=\"15\",model_name=\"glm-52\"}": 0.0,
+    "vllm:num_requests_waiting{engine=\"15\",model_name=\"glm-52\"}": 0.0,
+    "vllm:kv_cache_usage_perc{engine=\"15\",model_name=\"glm-52\"}": 0.0
+  }
+}

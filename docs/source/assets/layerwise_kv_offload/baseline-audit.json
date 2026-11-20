@@ -122,5 +122,14 @@
     "lease_ms": 60000,
     "prefer_same_node": true,
     "purpose": "external cache working-set protocol; customer model and parallel settings retained"
-  }
+  },
+  "current_feature_max_model_len": {
+    "p": 1048576,
+    "d": 1048576
+  },
+  "customer_max_model_len": {
+    "p": 593920,
+    "d": 524288
+  },
+  "feature_512k_result_status": "superseded by feature P/D 1M rerun; historical commit retains evidence"
 }
