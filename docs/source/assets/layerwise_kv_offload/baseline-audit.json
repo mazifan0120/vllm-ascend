@@ -1,0 +1,126 @@
+{
+  "observed_at_utc": "2026-11-20T08:38:20.640482+00:00",
+  "read_only": true,
+  "customer_decode": {
+    "tp": 2,
+    "dp": 16,
+    "dcp": 2,
+    "max_num_seqs": 8,
+    "max_model_len": 524288
+  },
+  "measured_reference_decode": {
+    "tp": 4,
+    "dp": 8,
+    "dcp": 4,
+    "max_num_seqs": 32,
+    "max_model_len": 1048576
+  },
+  "status": "wrong_reference_for_customer_baseline",
+  "customer_sources": [
+    {
+      "source": "customer/GLM5.2-1M-58/p0/run_dp_template.sh",
+      "sha256": "093c34e3d1f0aba15e8c2f9a3b0d0d5e4148f29f9f7e58a96af1f06cc750a76f",
+      "modified_utc": "2026-11-12T10:20:11.453428+00:00",
+      "parameters": [
+        "export HCCL_BUFFSIZE=400",
+        "--data-parallel-size 2 \\",
+        "--tensor-parallel-size 16 \\",
+        "--prefill-context-parallel-size 1 \\",
+        "--decode-context-parallel-size 16 \\",
+        "--speculative-config '{\"num_speculative_tokens\": 1, \"method\":\"deepseek_mtp\",\"enforce_eager\":true}' \\",
+        "--max-model-len 593920 \\",
+        "--max-num-batched-tokens 8192 \\",
+        "--max-num-seqs 64 \\",
+        "--gpu-memory-utilization 0.9 \\"
+      ]
+    },
+    {
+      "source": "customer/GLM5.2-1M-58/p0/model-run.sh",
+      "sha256": "df39d24fd5191c15f47da9b0f15b50e4ebd573335efc9b2eaae2be3cda53f278",
+      "modified_utc": "2026-11-12T02:57:47.905086+00:00",
+      "parameters": []
+    },
+    {
+      "source": "customer/GLM5.2-1M-58/p1/run_dp_template.sh",
+      "sha256": "fe7c2ba1fc77d6ec96bcc8c49afb11763c74d9cc3344d07bed7fc6a3be2582e8",
+      "modified_utc": "2026-11-12T10:20:11.464698+00:00",
+      "parameters": [
+        "export HCCL_BUFFSIZE=400",
+        "--data-parallel-size 2 \\",
+        "--tensor-parallel-size 16 \\",
+        "--prefill-context-parallel-size 1 \\",
+        "--decode-context-parallel-size 16 \\",
+        "--speculative-config '{\"num_speculative_tokens\": 1, \"method\":\"deepseek_mtp\",\"enforce_eager\":true}' \\",
+        "--max-model-len 593920 \\",
+        "--max-num-batched-tokens 8192 \\",
+        "--max-num-seqs 64 \\",
+        "--gpu-memory-utilization 0.9 \\"
+      ]
+    },
+    {
+      "source": "customer/GLM5.2-1M-58/p1/model-run.sh",
+      "sha256": "722f8135325c88bfb7633a58c1c281b47f3c4cb1625fb39be8d99a04cae5787d",
+      "modified_utc": "2026-11-12T02:57:47.953057+00:00",
+      "parameters": []
+    },
+    {
+      "source": "customer/GLM5.2-1M-58/d0/run_dp_template.sh",
+      "sha256": "9b13a66ea2f4c1ad58d5efde074eca0f3c613a4b37becd203d65719051ff7ba4",
+      "modified_utc": "2026-11-12T02:57:47.840888+00:00",
+      "parameters": [
+        "export HCCL_BUFFSIZE=400",
+        "--data-parallel-size $3 \\",
+        "--tensor-parallel-size $7 \\",
+        "--prefill-context-parallel-size 1 \\",
+        "--decode-context-parallel-size 2 \\",
+        "--speculative-config '{\"num_speculative_tokens\": 5,  \"method\":\"deepseek_mtp\",\"enforce_eager\":true}' \\",
+        "--max-model-len 524288 \\",
+        "--max-num-batched-tokens 192 \\",
+        "--max-num-seqs 8 \\",
+        "--gpu-memory-utilization 0.88 \\"
+      ]
+    },
+    {
+      "source": "customer/GLM5.2-1M-58/d0/model-run.sh",
+      "sha256": "a9d1541fe2bd172a517c9e7560b33140889b696564ddc81ffa5936804d80219a",
+      "modified_utc": "2026-11-12T02:57:47.826054+00:00",
+      "parameters": [
+        "nohup python launch_online_dp.py --dp-size 16 --tp-size 2 --dp-size-local 8 --dp-rank-start 0 --dp-address 172.168.4.230 --dp-rpc-port 16600 --vllm-start-port 9900 > vllm-d0.log 2>&1 &"
+      ]
+    },
+    {
+      "source": "customer/GLM5.2-1M-58/d1/run_dp_template.sh",
+      "sha256": "b83080ba32043a3c8afea9ba024a13f576928f9a784cda0ff67754231885aadb",
+      "modified_utc": "2026-11-12T02:57:47.881442+00:00",
+      "parameters": [
+        "export HCCL_BUFFSIZE=400",
+        "--data-parallel-size $3 \\",
+        "--tensor-parallel-size $7 \\",
+        "--prefill-context-parallel-size 1 \\",
+        "--decode-context-parallel-size 2 \\",
+        "--speculative-config '{\"num_speculative_tokens\": 5,  \"method\":\"deepseek_mtp\",\"enforce_eager\":true}' \\",
+        "--max-model-len 524288 \\",
+        "--max-num-batched-tokens 192 \\",
+        "--max-num-seqs 8 \\",
+        "--gpu-memory-utilization 0.88 \\"
+      ]
+    },
+    {
+      "source": "customer/GLM5.2-1M-58/d1/model-run.sh",
+      "sha256": "854ac6de1c43c4f62156d1c5ae26cee5d7536d98dd72e97a171f5bf62db7a294",
+      "modified_utc": "2026-11-12T02:57:47.866684+00:00",
+      "parameters": [
+        "nohup python launch_online_dp.py --dp-size 16 --tp-size 2 --dp-size-local 8 --dp-rank-start 8 --dp-address 172.168.4.230 --dp-rpc-port 16600 --vllm-start-port 9900 > vllm-d1.log 2>&1 &"
+      ]
+    }
+  ],
+  "correction_status": "Correct customer TP2/DP16/DCP2 rerun completed; obsolete DCP4 results excluded from current tables",
+  "corrected_baseline_actual_config": "evidence/dcp/actual-config-audit.json",
+  "corrected_feature_actual_config": "evidence/feature/actual-config-audit.json",
+  "store_override": {
+    "segment_bytes_per_rank": 42949672960,
+    "lease_ms": 60000,
+    "prefer_same_node": true,
+    "purpose": "external cache working-set protocol; customer model and parallel settings retained"
+  }
+}

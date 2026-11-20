@@ -25,7 +25,7 @@ def bars(ax, selected, field, title, unit):
             values,
             width=0.36,
             color=colors[key],
-            label="Layerwise KV offload" if key == "feature" else "DCP baseline",
+            label="Layerwise KV offload" if key == "feature" else "Customer DCP2",
         )
         ax.bar_label(rects, fmt="%.2f", fontsize=8, padding=3)
     ax.set_xticks(x, [f"C{r['concurrency']} / {r['cache_target_pct']}%" for r in selected])
@@ -47,7 +47,7 @@ fig.get_layout_engine().set(rect=(0, 0.055, 1, 0.945))
 fig.text(
     0.5,
     0.018,
-    "One trial per case; profiler off; local prefix hits = 0. Deployment configurations differ (see report).",
+    "Historical Customer DCP2, not the requested customer DCP2 baseline. No customer-baseline benefit is established.",
     ha="center",
     fontsize=9,
     color="#444444",

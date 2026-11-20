@@ -47,7 +47,7 @@ def main():
                     "profile": args.profile,
                     "image": config["image"],
                     "image_id": config["image_id"],
-                    "proxy_port": 8496 if args.profile == "performance" else 8497,
+                    "proxy_port": 8499 if args.profile == "performance" else 8497,
                 },
                 indent=2,
             )

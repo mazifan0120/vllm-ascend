@@ -1,0 +1,26 @@
+{
+  "p0-matrix-c32": {
+    "samples": 114,
+    "decode_capacity_wait_peak": 0,
+    "per_decode_running_peak": 2.0,
+    "http_errors": 0
+  },
+  "p0-matrix-c64": {
+    "samples": 109,
+    "decode_capacity_wait_peak": 0,
+    "per_decode_running_peak": 2.0,
+    "http_errors": 0
+  },
+  "p90-gc-c32": {
+    "samples": 47,
+    "decode_capacity_wait_peak": 0,
+    "per_decode_running_peak": 2.0,
+    "http_errors": 0
+  },
+  "p90-rewarm-c64": {
+    "samples": 41,
+    "decode_capacity_wait_peak": 0,
+    "per_decode_running_peak": 5.0,
+    "http_errors": 0
+  }
+}

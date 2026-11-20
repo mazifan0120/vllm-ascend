@@ -1,0 +1,228 @@
+{
+  "p0": {
+    "image": "quay.io/ascend/vllm-ascend:v0.23.0-a3",
+    "image_id": "sha256:7b485a6e417b682a49c43b3bd902f2a5c9b85d18101fcaebbc11822318031cb1",
+    "container_id": "595853bc000c267ddd5c00b9585a5676b395178f357e82c47326a96255cf0ca0",
+    "engines": [
+      {
+        "tensor-parallel-size": "16",
+        "data-parallel-size": "2",
+        "data-parallel-rank": "0",
+        "decode-context-parallel-size": "16",
+        "max-model-len": "593920",
+        "max-num-seqs": "64",
+        "max-num-batched-tokens": "8192",
+        "gpu-memory-utilization": "0.9",
+        "mtp": 1
+      }
+    ]
+  },
+  "p1": {
+    "image": "quay.io/ascend/vllm-ascend:v0.23.0-a3",
+    "image_id": "sha256:7b485a6e417b682a49c43b3bd902f2a5c9b85d18101fcaebbc11822318031cb1",
+    "container_id": "a6a243f7bd1976301482ecf5f99ea232692ff50a767bf626d2ba2cd0075c0759",
+    "engines": [
+      {
+        "tensor-parallel-size": "16",
+        "data-parallel-size": "2",
+        "data-parallel-rank": "1",
+        "decode-context-parallel-size": "16",
+        "max-model-len": "593920",
+        "max-num-seqs": "64",
+        "max-num-batched-tokens": "8192",
+        "gpu-memory-utilization": "0.9",
+        "mtp": 1
+      }
+    ]
+  },
+  "d0": {
+    "image": "quay.io/ascend/vllm-ascend:v0.23.0-a3",
+    "image_id": "sha256:7b485a6e417b682a49c43b3bd902f2a5c9b85d18101fcaebbc11822318031cb1",
+    "container_id": "0e5e1000cfbf95bdd818b82f303973e53ffc7d45103c6878e0c647f46f537b74",
+    "engines": [
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "1",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "2",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "0",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "3",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "4",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "5",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "6",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "7",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      }
+    ]
+  },
+  "d1": {
+    "image": "quay.io/ascend/vllm-ascend:v0.23.0-a3",
+    "image_id": "sha256:7b485a6e417b682a49c43b3bd902f2a5c9b85d18101fcaebbc11822318031cb1",
+    "container_id": "cb83984916fb3366797401178dc55b1a2a71bb99cf26f766365c6b6b53e089cb",
+    "engines": [
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "9",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "8",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "10",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "11",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "12",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "13",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "14",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      },
+      {
+        "tensor-parallel-size": "2",
+        "data-parallel-size": "16",
+        "data-parallel-rank": "15",
+        "decode-context-parallel-size": "2",
+        "max-model-len": "524288",
+        "max-num-seqs": "8",
+        "max-num-batched-tokens": "192",
+        "gpu-memory-utilization": "0.88",
+        "mtp": 5
+      }
+    ]
+  }
+}
