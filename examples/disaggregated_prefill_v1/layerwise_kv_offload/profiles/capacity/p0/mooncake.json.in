@@ -1,0 +1,10 @@
+{
+  "metadata_server": "P2PHANDSHAKE",
+  "protocol": "ascend",
+  "device_name": "",
+  "master_server_address": "@P0_IP@:50164",
+  "global_segment_size": 21474836480,
+  "default_kv_lease_ttl": 300000,
+  "prefer_alloc_in_same_node": true,
+  "preferred_segment": true
+}

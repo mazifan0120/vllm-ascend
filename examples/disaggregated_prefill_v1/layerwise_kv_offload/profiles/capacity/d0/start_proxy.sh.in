@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -eo pipefail
+source /root/pd/settings.sh
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+exec python3 /vllm-workspace/vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py \
+  --host @P0_IP@ --port 8497 \
+  --prefiller-hosts @P0_IP@ @P0_IP@ @P1_IP@ @P1_IP@  \
+  --prefiller-ports 8410 8411 8412 8413  \
+  --decoder-hosts @D0_IP@ @D0_IP@ @D0_IP@ @D0_IP@ @D0_IP@ @D0_IP@ @D0_IP@ @D0_IP@ @D1_IP@ @D1_IP@ @D1_IP@ @D1_IP@ @D1_IP@ @D1_IP@ @D1_IP@ @D1_IP@  \
+  --decoder-ports 8420 8421 8422 8423 8424 8425 8426 8427 8428 8429 8430 8431 8432 8433 8434 8435  \
+  --prefill-restore-only \
+  > "$LOG_PATH/proxy.log" 2>&1

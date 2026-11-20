@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Layerwise KV offloading runtime configuration.
+source /usr/local/Ascend/cann/set_env.sh
+export VLLM_VERSION=0.30.0
+export VLLM_HOST_IP=@D0_IP@
+export HCCL_IF_IP=@D0_IP@
+export GLOO_SOCKET_IFNAME=@NIC@
+export TP_SOCKET_IFNAME=@NIC@
+export HCCL_SOCKET_IFNAME=@NIC@
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export TASK_QUEUE_ENABLE=1
+export SHM_BARRIER=true
+export PYTHONHASHSEED=0
+export ACL_OP_INIT_MODE=1
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export HCCL_BUFFSIZE=200
+export HCCL_OP_EXPANSION_MODE=AIV
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config":{"protocol_desc":"roce:device"}}'
+export HCCL_INTRA_ROCE_ENABLE=1
+export HCCL_INTRA_PCIE_ENABLE=0
+export ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'
+export ASCEND_CONNECT_TIMEOUT=60000
+export ASCEND_TRANSFER_TIMEOUT=60000
+export HCCL_CONNECT_TIMEOUT=720
+export HCCL_EXEC_TIMEOUT=840
+export ACL_DEVICE_SYNC_TIMEOUT=1200
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=380
+export VLLM_ENGINE_READY_TIMEOUT_S=1800
+export MF_GROUP_JOIN_MAX_TIMEOUT=1200
+export MC_TRANSFER_TIMEOUT=180
+export MC_LOG_LEVEL=ERROR
+export GLOG_minloglevel=2
+export VLLM_ASCEND_ENABLE_TOPK_OPTIMIZE=1
+export VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN=1
+export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+export MOONCAKE_CONFIG_PATH=/root/pd/mooncake.json
+export LOG_PATH=/root/pd/logs
+export ASCEND_PROCESS_LOG_PATH="$LOG_PATH/ascend"
+export MC_LOG_DIR="$LOG_PATH/mooncake"
+mkdir -p "$LOG_PATH" "$ASCEND_PROCESS_LOG_PATH" "$MC_LOG_DIR"
+ulimit -n 1048576
+ulimit -l unlimited

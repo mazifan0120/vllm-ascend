@@ -1,0 +1,27 @@
+{
+  "scope": "CPU-only synthetic checks; not a cluster performance run",
+  "rendered_profiles": 2,
+  "engine_command_equivalence": true,
+  "sse_client": {
+    "complete": {
+      "completed": 8,
+      "passed": 8,
+      "duration_s": 0.011926974999369122,
+      "ttft_mean_s": 0.0041018353740582825,
+      "ttft_p50_s": 0.003638263002358144,
+      "ttft_p99_s": 0.007785698684310773,
+      "output_tokens_s": 469523.915351228,
+      "tpot_mean_ms": 0.00035781545225986865
+    },
+    "sse-error": {
+      "completed": 1,
+      "passed": 0,
+      "duration_s": 0.004020709995529614
+    },
+    "token-mismatch": {
+      "completed": 1,
+      "passed": 0,
+      "duration_s": 0.004085705004399642
+    }
+  }
+}

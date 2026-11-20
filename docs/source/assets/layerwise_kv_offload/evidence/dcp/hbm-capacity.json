@@ -1,0 +1,18 @@
+[
+  {
+    "p": "p0",
+    "hbm_tokens": 3854336,
+    "min_groups": 79,
+    "groups": 112,
+    "working_set_tokens": 5505024,
+    "ratio": 1.42826780021254
+  },
+  {
+    "p": "p1",
+    "hbm_tokens": 3854336,
+    "min_groups": 79,
+    "groups": 112,
+    "working_set_tokens": 5505024,
+    "ratio": 1.42826780021254
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "image": "glm52-layerwise-kv:20261119",
+  "image_id": "sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44",
+  "nic": "CHANGE_ME",
+  "nodes": {
+    "p0": "CHANGE_ME",
+    "p1": "CHANGE_ME",
+    "d0": "CHANGE_ME",
+    "d1": "CHANGE_ME"
+  }
+}

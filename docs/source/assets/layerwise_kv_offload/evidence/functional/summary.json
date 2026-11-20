@@ -1,0 +1,30 @@
+{
+  "runs": [
+    {
+      "cases": 24,
+      "run_nonce": "d34fdfc813a144e69ae6e16f5d5efd9c",
+      "semantic_passed": 24,
+      "decode_engines": 8,
+      "tp_receipts": 4,
+      "prompt_token_range": [
+        537,
+        33659
+      ]
+    },
+    {
+      "cases": 24,
+      "run_nonce": "e98365744f6f4ab49a041206f4cd8b5b",
+      "semantic_passed": 24,
+      "decode_engines": 8,
+      "tp_receipts": 4,
+      "prompt_token_range": [
+        539,
+        33661
+      ]
+    }
+  ],
+  "total_semantic_passed": 48,
+  "healthy_idle_engines": 10,
+  "post_test_all_gauges_zero": true,
+  "image_id": "sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44"
+}

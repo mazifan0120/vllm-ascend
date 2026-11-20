@@ -1,0 +1,4 @@
+{"phase": "tokenized", "prompt_tokens": 1047256}
+{"phase": "stream_open", "id": "chatcmpl-5e250730-2d94-43c8-8312-ae3b4f86794d"}
+{"phase": "first_token", "id": "chatcmpl-5e250730-2d94-43c8-8312-ae3b4f86794d", "seconds": 488.5746323312633}
+{"phase": "complete", "id": "chatcmpl-5e250730-2d94-43c8-8312-ae3b4f86794d", "prompt_tokens": 1047256, "answer": "MAPLE", "usage": {"prompt_tokens": 1047256, "total_tokens": 1047259, "completion_tokens": 3, "completion_tokens_details": {"reasoning_tokens": 0}}, "finish_reason": "stop", "ttft_seconds": 488.5746323312633, "seconds": 488.586954748258}

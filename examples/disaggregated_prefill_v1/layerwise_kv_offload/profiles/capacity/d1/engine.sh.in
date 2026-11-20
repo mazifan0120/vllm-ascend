@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -eo pipefail
+source /root/pd/settings.sh
+rank=$1
+port=$2
+export ASCEND_RT_VISIBLE_DEVICES=$3
+export VLLM_WORKDIR="/tmp/layerwise-guide-dp$rank"
+mkdir -p "$VLLM_WORKDIR"
+cd "$VLLM_WORKDIR"
+additional_config='{
+  "enable_fused_mc2": 1,
+  "enable_mlapo": false,
+  "scheduler_config": {"recompute_scheduler_enable": false},
+  "ascend_compilation_config": {"enable_npugraph_ex": true, "fuse_muls_add": true},
+  "sparse_kv_offload_config": {
+    "enabled": true, "use_fused_overlap": true,
+    "topk_buffer_size": 4096, "dram_size_per_dp_GB": 100,
+    "host_backend": "mooncake", "keep_device_kv_cache": false, "lru_max_threads": 16
+  },
+  "mega_moe_max_tokens": 131072
+}'
+kv_config='{
+  "kv_connector": "MooncakeLayerwiseConnector", "kv_role": "kv_consumer",
+  "kv_port": 57100, "kv_load_failure_policy": "fail",
+  "kv_connector_extra_config": {
+    "layerwise_host_offload": true,
+    "layerwise_receipt_timeout_s": 7200,
+    "parallel_main_writers": false
+  }
+}'
+exec vllm serve /models/GLM-5.2-w4a8c8 \
+  --host @D1_IP@ --port "$port" --api-server-count 1 \
+  --trust-remote-code --served-model-name glm-52 \
+  --distributed-executor-backend mp --enable-expert-parallel \
+  --data-parallel-size 16 --data-parallel-rank "$rank" \
+  --data-parallel-address @D0_IP@ \
+  --data-parallel-rpc-port 17692 --tensor-parallel-size 2 \
+  --prefill-context-parallel-size 1 --decode-context-parallel-size 1 \
+  --max-model-len 1048576 --block-size 128 \
+  --max-num-batched-tokens 32 --max-num-seqs 8 \
+  --gpu-memory-utilization 0.88 \
+  --kv-cache-dtype auto --attention_config.indexer_kv_dtype int8 \
+  --quantization ascend \
+  --enforce-eager \
+  --enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm45 --seed 1024 \
+  --safetensors-load-strategy prefetch \
+  --no-enable-prefix-caching --async-scheduling \
+  --scheduler-cls vllm_ascend.core.layerwise_decode_scheduler.AsyncLayerwiseDecodeScheduler \
+  --no-disable-hybrid-kv-cache-manager --hf-overrides '{"use_index_cache":true}' \
+  --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":3,"enforce_eager":true}' \
+  --additional-config "$additional_config" --kv-transfer-config "$kv_config"

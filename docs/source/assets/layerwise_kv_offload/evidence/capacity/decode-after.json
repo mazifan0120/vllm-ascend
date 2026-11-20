@@ -1,0 +1,146 @@
+{
+  "172.168.4.230:8420": {
+    "prepare": 2.0,
+    "prepare_seconds": 0.7733182832598686,
+    "ready": 2.0,
+    "ready_seconds": 478.4169676541351,
+    "close_started": 2.0,
+    "close": 2.0,
+    "close_seconds": 0.6358344219624996
+  },
+  "172.168.4.230:8421": {
+    "prepare": 1.0,
+    "prepare_seconds": 0.1397483772598207,
+    "ready": 1.0,
+    "ready_seconds": 6.775215091649443,
+    "close_started": 1.0,
+    "close": 1.0,
+    "close_seconds": 0.5402008187957108
+  },
+  "172.168.4.230:8422": {
+    "prepare": 1.0,
+    "prepare_seconds": 0.13095197500661016,
+    "ready": 1.0,
+    "ready_seconds": 6.768830715212971,
+    "close_started": 1.0,
+    "close": 1.0,
+    "close_seconds": 0.5543155260384083
+  },
+  "172.168.4.230:8423": {
+    "prepare": 1.0,
+    "prepare_seconds": 0.1490807649679482,
+    "ready": 1.0,
+    "ready_seconds": 6.760129384230822,
+    "close_started": 1.0,
+    "close": 1.0,
+    "close_seconds": 0.5498508899472654
+  },
+  "172.168.4.230:8424": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.230:8425": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.230:8426": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.230:8427": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8428": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8429": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8430": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8431": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8432": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8433": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8434": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  },
+  "172.168.4.226:8435": {
+    "prepare": 0.0,
+    "prepare_seconds": 0.0,
+    "ready": 0.0,
+    "ready_seconds": 0.0,
+    "close_started": 0.0,
+    "close": 0.0,
+    "close_seconds": 0.0
+  }
+}
