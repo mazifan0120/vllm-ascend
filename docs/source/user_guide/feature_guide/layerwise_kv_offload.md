@@ -165,6 +165,65 @@ sequenceDiagram
 
 关闭特性保留既有普通 HBM 路径；本报告的正式性能对照是 DCP+Store，而不是“完全原始、无 connector”的纯 HBM 服务。下面的最新功能补测也没有重新覆盖所有关闭特性的历史回归项。
 
+### 3.1 新增代码量与统计口径
+
+以开发基线 `4234a1f1815252e8b52c75d6956d0bdf9ae80cc0` 为起点，固定统计快照为 `148ec8dc4e1e913b6d17c2d4faab760c83e46741`。统计采用 Git 物理行增量，包含空行和注释；“净增 = 新增行 − 删除行”，不是去除注释后的有效代码行。后续增加本统计说明和统计 JSON 不回填到此快照，保证数字可复核。
+
+**在线功能实现净增 4,066 行**：推理包内 4,042 行，代理 24 行。另有 UT 净增 2,233 行。连同独立部署/测试工具、启动 Shell 模板和绘图工具，**代码与脚本合计净增 8,020 行**；不将报告、JSON 结果数据、SVG 或模型/镜像体积算成特性代码。
+
+| 类别 | 变更文件数 | 新增行 | 删除行 | 净增行 |
+|---|---:|---:|---:|---:|
+| 推理包生产代码 `vllm_ascend/` | 27 | 4,173 | 131 | **4,042** |
+| D-first 代理 | 1 | 61 | 37 | **24** |
+| 在线功能实现小计 | **28** | **4,234** | **168** | **4,066** |
+| 单元测试 | 12 | 2,235 | 2 | **2,233** |
+| 独立部署、测试客户端、打包工具 | 6 | 594 | 0 | 594 |
+| 按节点展开的启动 Shell 模板 | 40 | 1,068 | 0 | 1,068 |
+| 性能图绘制工具 | 1 | 59 | 0 | 59 |
+| 代码、测试与脚本总计 | **87** | **8,190** | **170** | **8,020** |
+
+小计行不与明细行重复累加。启动模板中的重复参数行也计入脚本行数；这部分是两档四节点的配置展开，不是 40 个独立功能模块。另有 9 个运行配置 JSON，共 91 行，按配置数据单独统计。
+
+推理包生产代码按职责拆分如下，分组不重叠：
+
+| 模块 | 变更文件数 | 新增行 | 删除行 | 净增行 |
+|---|---:|---:|---:|---:|
+| P Store、共享槽、快照和指标 | 11 | 977 | 88 | **889** |
+| P/D 布局规划、控制协议、传输和指标 | 8 | 2,077 | 36 | **2,041** |
+| D 注册与接收 | 1 | 479 | 0 | **479** |
+| P/D 调度器 | 3 | 521 | 0 | **521** |
+| MultiConnector、worker、KV coordinator 与 transfer engine 接线 | 4 | 119 | 7 | **112** |
+| 推理包合计 | **27** | **4,173** | **131** | **4,042** |
+
+27 个生产文件中，**9 个是新文件，共 2,475 行**；另有 **18 个基线已有文件净增 1,567 行**。未将已有大文件的全部当前行数计为本次实现，也未把基线已有的 Host pool、SFA 算子和运行时重复计为新增开发量。
+
+| 新生产文件 | 当前行数 |
+|---|---:|
+| `core/layerwise_decode_scheduler.py` | 314 |
+| `core/layerwise_offload_scheduler.py` | 135 |
+| `core/prefill_restore_scheduler.py` | 72 |
+| `distributed/kv_transfer/kv_p2p/layerwise_offload_control.py` | 354 |
+| `distributed/kv_transfer/kv_p2p/layerwise_offload_plan.py` | 356 |
+| `distributed/kv_transfer/kv_p2p/layerwise_offload_sender.py` | 311 |
+| `distributed/kv_transfer/kv_p2p/layerwise_offload_wire.py` | 262 |
+| `distributed/kv_transfer/kv_pool/ascend_store/prefill_reuse.py` | 192 |
+| `distributed/kv_transfer/sparse_kv_offload/layerwise_receive.py` | 479 |
+| 新文件合计 | **2,475** |
+
+上述文件路径相对 `vllm_ascend/`。UT 按模块为 P Store/共享槽 8 个文件、净增 813 行；P/D 传输与调度 3 个文件、净增 1,365 行；worker 接线 1 个文件、净增 55 行。这里统计测试代码行数，不能将其当作测试用例数量或全量测试通过率。
+
+同一快照下，Git 全仓库显示新增 19,732 行、删除 170 行，净增 **19,562 行**。其中 **11,542 行属于报告、运行配置、结果 JSON、SVG 等非代码内容**；PNG 不参与文本行数统计。因此不能将仓库约 1.96 万行的总增量表述成“新增了约两万行特性代码”。
+
+逐文件明细及分组汇总随附件提供为 `figures/code-size.json`。有源码仓的读者可复核：
+
+```bash
+git diff --numstat 4234a1f1815252e8b52c75d6956d0bdf9ae80cc0 \
+  148ec8dc4e1e913b6d17c2d4faab760c83e46741 -- vllm_ascend/
+
+git diff --numstat 4234a1f1815252e8b52c75d6956d0bdf9ae80cc0 \
+  148ec8dc4e1e913b6d17c2d4faab760c83e46741 -- tests/ examples/
+```
+
 ## 4. 部署指导：纯脚本
 
 ### 4.1 交付物与环境准备
