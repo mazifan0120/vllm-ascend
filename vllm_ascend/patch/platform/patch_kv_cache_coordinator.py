@@ -33,6 +33,9 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+    get_prefill_main_reuse_config,
+)
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -511,6 +514,10 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     # Keep pcp_world_size in this patched function for upstream call
     # compatibility; platform validation guarantees that it is one.
     del pcp_world_size
+    if get_prefill_main_reuse_config(getattr(kv_cache_config, "kv_transfer_config", None)) is not None:
+        # A hash in the allocator cannot prove that each Main layer is still resident.
+        # The Store connector independently offers only confirmed external hits.
+        enable_caching = False
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens)
     hybrid_kwargs = dict(
         kv_cache_config=kv_cache_config,

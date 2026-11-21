@@ -1,0 +1,1405 @@
+{
+  "base": "4234a1f1815252e8b52c75d6956d0bdf9ae80cc0",
+  "revision": "148ec8dc4e1e913b6d17c2d4faab760c83e46741",
+  "method": "git diff --numstat BASE REVISION; physical lines including blanks/comments; binary line counts excluded",
+  "categories": {
+    "figures": {
+      "files": 2,
+      "new_files": 2,
+      "added": 1025,
+      "removed": 0,
+      "net": 1025,
+      "binary_files": 1
+    },
+    "plot_tool": {
+      "files": 1,
+      "new_files": 1,
+      "added": 59,
+      "removed": 0,
+      "net": 59,
+      "binary_files": 0
+    },
+    "production": {
+      "files": 27,
+      "new_files": 9,
+      "added": 4173,
+      "removed": 131,
+      "net": 4042,
+      "binary_files": 0
+    },
+    "proxy": {
+      "files": 1,
+      "new_files": 0,
+      "added": 61,
+      "removed": 37,
+      "net": 24,
+      "binary_files": 0
+    },
+    "report": {
+      "files": 1,
+      "new_files": 1,
+      "added": 591,
+      "removed": 0,
+      "net": 591,
+      "binary_files": 0
+    },
+    "result_data": {
+      "files": 35,
+      "new_files": 35,
+      "added": 9747,
+      "removed": 0,
+      "net": 9747,
+      "binary_files": 0
+    },
+    "runtime_configuration": {
+      "files": 9,
+      "new_files": 9,
+      "added": 91,
+      "removed": 0,
+      "net": 91,
+      "binary_files": 0
+    },
+    "runtime_documentation": {
+      "files": 1,
+      "new_files": 1,
+      "added": 88,
+      "removed": 0,
+      "net": 88,
+      "binary_files": 0
+    },
+    "runtime_tools": {
+      "files": 6,
+      "new_files": 6,
+      "added": 594,
+      "removed": 0,
+      "net": 594,
+      "binary_files": 0
+    },
+    "shell_templates": {
+      "files": 40,
+      "new_files": 40,
+      "added": 1068,
+      "removed": 0,
+      "net": 1068,
+      "binary_files": 0
+    },
+    "unit_tests": {
+      "files": 12,
+      "new_files": 2,
+      "added": 2235,
+      "removed": 2,
+      "net": 2233,
+      "binary_files": 0
+    }
+  },
+  "production_modules": {
+    "D registration / receive": {
+      "files": 1,
+      "new_files": 1,
+      "added": 479,
+      "removed": 0,
+      "net": 479,
+      "binary_files": 0
+    },
+    "P Store / shared slots / snapshots / metrics": {
+      "files": 11,
+      "new_files": 1,
+      "added": 977,
+      "removed": 88,
+      "net": 889,
+      "binary_files": 0
+    },
+    "P-D planning / protocol / transfer / metrics": {
+      "files": 8,
+      "new_files": 4,
+      "added": 2077,
+      "removed": 36,
+      "net": 2041,
+      "binary_files": 0
+    },
+    "P-D schedulers": {
+      "files": 3,
+      "new_files": 3,
+      "added": 521,
+      "removed": 0,
+      "net": 521,
+      "binary_files": 0
+    },
+    "Runtime wiring": {
+      "files": 4,
+      "new_files": 0,
+      "added": 119,
+      "removed": 7,
+      "net": 112,
+      "binary_files": 0
+    }
+  },
+  "online_feature": {
+    "files": 28,
+    "new_files": 9,
+    "added": 4234,
+    "removed": 168,
+    "net": 4066,
+    "binary_files": 0
+  },
+  "code_and_scripts_including_tests": {
+    "files": 87,
+    "new_files": 58,
+    "added": 8190,
+    "removed": 170,
+    "net": 8020,
+    "binary_files": 0
+  },
+  "repository_total": {
+    "files": 135,
+    "new_files": 106,
+    "added": 19732,
+    "removed": 170,
+    "net": 19562,
+    "binary_files": 1
+  },
+  "entries": [
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/after-gauges.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1,
+      "removed": 0,
+      "net": 1
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/before-gauges.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1,
+      "removed": 0,
+      "net": 1
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/decode-after.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 146,
+      "removed": 0,
+      "net": 146
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/decode-before.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 146,
+      "removed": 0,
+      "net": 146
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/near-1m-audit.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1,
+      "removed": 0,
+      "net": 1
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/near-1m-cache.log",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1,
+      "removed": 0,
+      "net": 1
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/near-1m-receipts.log",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 2,
+      "removed": 0,
+      "net": 2
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/near-1m.jsonl",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 4,
+      "removed": 0,
+      "net": 4
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/postcheck.jsonl",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 3,
+      "removed": 0,
+      "net": 3
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/validation-exit.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1,
+      "removed": 0,
+      "net": 1
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/capacity/verified-summary.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 31,
+      "removed": 0,
+      "net": 31
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/cold-c32-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/cold-c32-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/cold-c64-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/cold-c64-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/hbm-capacity.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 18,
+      "removed": 0,
+      "net": 18
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/hot-c32-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/hot-c32-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/hot-c64-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/dcp/hot-c64-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/cold-c32-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/cold-c32-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/cold-c64-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/cold-c64-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/hot-c32-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/hot-c32-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/hot-c64-plan.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1010,
+      "removed": 0,
+      "net": 1010
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/hot-c64-verdict.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 123,
+      "removed": 0,
+      "net": 123
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/feature/queue-sampling.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 26,
+      "removed": 0,
+      "net": 26
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/functional/functional-after-gauges.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 1,
+      "removed": 0,
+      "net": 1
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/functional/round-1.jsonl",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 25,
+      "removed": 0,
+      "net": 25
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/functional/round-2.jsonl",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 25,
+      "removed": 0,
+      "net": 25
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/functional/summary.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 30,
+      "removed": 0,
+      "net": 30
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/evidence/tools-local-validation.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 27,
+      "removed": 0,
+      "net": 27
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/performance-data.json",
+      "status": "A",
+      "category": "result_data",
+      "binary": false,
+      "added": 194,
+      "removed": 0,
+      "net": 194
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/performance-overview.png",
+      "status": "A",
+      "category": "figures",
+      "binary": true,
+      "added": null,
+      "removed": null,
+      "net": null
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/performance-overview.svg",
+      "status": "A",
+      "category": "figures",
+      "binary": false,
+      "added": 1025,
+      "removed": 0,
+      "net": 1025
+    },
+    {
+      "path": "docs/source/assets/layerwise_kv_offload/plot_performance.py",
+      "status": "A",
+      "category": "plot_tool",
+      "binary": false,
+      "added": 59,
+      "removed": 0,
+      "net": 59
+    },
+    {
+      "path": "docs/source/user_guide/feature_guide/layerwise_kv_offload.md",
+      "status": "A",
+      "category": "report",
+      "binary": false,
+      "added": 591,
+      "removed": 0,
+      "net": 591
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/README.md",
+      "status": "A",
+      "category": "runtime_documentation",
+      "binary": false,
+      "added": 88,
+      "removed": 0,
+      "net": 88
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/cluster.example.json",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 11,
+      "removed": 0,
+      "net": 11
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/package_report.py",
+      "status": "A",
+      "category": "runtime_tools",
+      "binary": false,
+      "added": 58,
+      "removed": 0,
+      "net": 58
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d0/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 51,
+      "removed": 0,
+      "net": 51
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d0/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d0/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d0/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d0/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d0/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d1/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 51,
+      "removed": 0,
+      "net": 51
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d1/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d1/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d1/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d1/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/d1/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p0/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 55,
+      "removed": 0,
+      "net": 55
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p0/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p0/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p0/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p0/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p0/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p1/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 55,
+      "removed": 0,
+      "net": 55
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p1/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p1/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p1/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p1/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/capacity/p1/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d0/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 52,
+      "removed": 0,
+      "net": 52
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d0/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d0/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d0/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d0/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d0/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d1/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 52,
+      "removed": 0,
+      "net": 52
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d1/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d1/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d1/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d1/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/d1/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p0/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 56,
+      "removed": 0,
+      "net": 56
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p0/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p0/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p0/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p0/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p0/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p1/engine.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 56,
+      "removed": 0,
+      "net": 56
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p1/mooncake.json.in",
+      "status": "A",
+      "category": "runtime_configuration",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p1/settings.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 44,
+      "removed": 0,
+      "net": 44
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p1/start_engines.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 14,
+      "removed": 0,
+      "net": 14
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p1/start_master.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/profiles/performance/p1/start_proxy.sh.in",
+      "status": "A",
+      "category": "shell_templates",
+      "binary": false,
+      "added": 12,
+      "removed": 0,
+      "net": 12
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/render.py",
+      "status": "A",
+      "category": "runtime_tools",
+      "binary": false,
+      "added": 61,
+      "removed": 0,
+      "net": 61
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/run-node.sh",
+      "status": "A",
+      "category": "runtime_tools",
+      "binary": false,
+      "added": 59,
+      "removed": 0,
+      "net": 59
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/tools/http_bench.py",
+      "status": "A",
+      "category": "runtime_tools",
+      "binary": false,
+      "added": 128,
+      "removed": 0,
+      "net": 128
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/tools/long_probe.py",
+      "status": "A",
+      "category": "runtime_tools",
+      "binary": false,
+      "added": 102,
+      "removed": 0,
+      "net": 102
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/layerwise_kv_offload/tools/smoke.py",
+      "status": "A",
+      "category": "runtime_tools",
+      "binary": false,
+      "added": 186,
+      "removed": 0,
+      "net": 186
+    },
+    {
+      "path": "examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py",
+      "status": "M",
+      "category": "proxy",
+      "binary": false,
+      "added": 61,
+      "removed": 37,
+      "net": 24
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_ascend_store_connector.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 49,
+      "removed": 0,
+      "net": 49
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_backend.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 8,
+      "removed": 0,
+      "net": 8
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_kv_transfer.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 173,
+      "removed": 0,
+      "net": 173
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_layerwise_cache_layout.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 49,
+      "removed": 0,
+      "net": 49
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_metrics.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 24,
+      "removed": 1,
+      "net": 23
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_mooncake_layerwise.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 338,
+      "removed": 0,
+      "net": 338
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_pool_scheduler.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 102,
+      "removed": 0,
+      "net": 102
+    },
+    {
+      "path": "tests/ut/distributed/ascend_store/test_pool_worker.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 71,
+      "removed": 0,
+      "net": 71
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/test_layerwise_decode_scheduler.py",
+      "status": "A",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 345,
+      "removed": 0,
+      "net": 345
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/test_layerwise_offload_rewrite.py",
+      "status": "A",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 981,
+      "removed": 0,
+      "net": 981
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/test_mooncake_transfer_engine.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 40,
+      "removed": 1,
+      "net": 39
+    },
+    {
+      "path": "tests/ut/worker/test_worker_v1.py",
+      "status": "M",
+      "category": "unit_tests",
+      "binary": false,
+      "added": 55,
+      "removed": 0,
+      "net": 55
+    },
+    {
+      "path": "vllm_ascend/core/layerwise_decode_scheduler.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 314,
+      "removed": 0,
+      "net": 314,
+      "module": "P-D schedulers"
+    },
+    {
+      "path": "vllm_ascend/core/layerwise_offload_scheduler.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 135,
+      "removed": 0,
+      "net": 135,
+      "module": "P-D schedulers"
+    },
+    {
+      "path": "vllm_ascend/core/prefill_restore_scheduler.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 72,
+      "removed": 0,
+      "net": 72,
+      "module": "P-D schedulers"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 76,
+      "removed": 2,
+      "net": 74,
+      "module": "Runtime wiring"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/layerwise_offload_control.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 354,
+      "removed": 0,
+      "net": 354,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/layerwise_offload_plan.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 356,
+      "removed": 0,
+      "net": 356,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/layerwise_offload_sender.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 311,
+      "removed": 0,
+      "net": 311,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/layerwise_offload_wire.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 262,
+      "removed": 0,
+      "net": 262,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/stats.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 70,
+      "removed": 0,
+      "net": 70,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_dsa_transfer.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 50,
+      "removed": 2,
+      "net": 48,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 672,
+      "removed": 33,
+      "net": 639,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/sfa_pd_rd2h/dspark_context.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 2,
+      "removed": 1,
+      "net": 1,
+      "module": "P-D planning / protocol / transfer / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 61,
+      "removed": 0,
+      "net": 61,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 6,
+      "removed": 0,
+      "net": 6,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 178,
+      "removed": 1,
+      "net": 177,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/session_tracker.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 46,
+      "removed": 0,
+      "net": 46,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 185,
+      "removed": 43,
+      "net": 142,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise_cache_layout.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 73,
+      "removed": 3,
+      "net": 70,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 10,
+      "removed": 0,
+      "net": 10,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metrics.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 30,
+      "removed": 4,
+      "net": 26,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 70,
+      "removed": 9,
+      "net": 61,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 126,
+      "removed": 28,
+      "net": 98,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/prefill_reuse.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 192,
+      "removed": 0,
+      "net": 192,
+      "module": "P Store / shared slots / snapshots / metrics"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/sparse_kv_offload/layerwise_receive.py",
+      "status": "A",
+      "category": "production",
+      "binary": false,
+      "added": 479,
+      "removed": 0,
+      "net": 479,
+      "module": "D registration / receive"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 18,
+      "removed": 2,
+      "net": 16,
+      "module": "Runtime wiring"
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 7,
+      "removed": 0,
+      "net": 7,
+      "module": "Runtime wiring"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "status": "M",
+      "category": "production",
+      "binary": false,
+      "added": 18,
+      "removed": 3,
+      "net": 15,
+      "module": "Runtime wiring"
+    }
+  ]
+}

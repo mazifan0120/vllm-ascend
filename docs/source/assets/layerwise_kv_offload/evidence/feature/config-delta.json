@@ -1,0 +1,14 @@
+{
+  "only_functional_changes": {
+    "d0/engine.sh": {
+      "before_max_model_len": 524288,
+      "after_max_model_len": 1048576
+    },
+    "d1/engine.sh": {
+      "before_max_model_len": 524288,
+      "after_max_model_len": 1048576
+    }
+  },
+  "p_max_model_len": 1048576,
+  "other_model_parallel_cache_batch_parameters": "identical to previous 512K feature run"
+}

@@ -1,0 +1,22 @@
+{
+  "arm": "p90-gc-c32",
+  "warm_requests": 224,
+  "distinct_groups": 112,
+  "groups_loaded_per_p": 112,
+  "completed_waves": 2,
+  "local_resets": [
+    {
+      "endpoint": "172.168.4.237:9081",
+      "result": {
+        "success": true
+      }
+    },
+    {
+      "endpoint": "172.168.4.31:9081",
+      "result": {
+        "success": true
+      }
+    }
+  ],
+  "passed": true
+}

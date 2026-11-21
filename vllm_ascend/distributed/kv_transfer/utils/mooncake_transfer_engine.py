@@ -12,6 +12,7 @@ class GlobalTE:
         self.transfer_engine_lock = threading.Lock()
         self.register_buffer_lock = threading.Lock()
         self._registered_regions: list[tuple[int, int, str]] = []
+        self._registration_epoch = 0
 
     def get_transfer_engine(self, hostname: str, device_name: str | None):
         if self.transfer_engine is None:
@@ -61,14 +62,18 @@ class GlobalTE:
         ptrs: list[int],
         sizes: list[int],
         locations: list[str] | None = None,
-    ) -> None:
+        *,
+        require_exact: bool = False,
+    ) -> int | None:
         normalized_locations = locations if locations is not None else [_WILDCARD_LOCATION] * len(ptrs)
         regions = list(zip(ptrs, sizes, normalized_locations))
 
         with self.register_buffer_lock:
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
             if self.is_register_buffer:
-                return
+                if require_exact and regions != self._registered_regions:
+                    raise RuntimeError("Mooncake transfer engine already has a different registration")
+                return self._registration_epoch if require_exact else None
 
             registered_regions: list[tuple[int, int, str]] = []
             try:
@@ -109,6 +114,17 @@ class GlobalTE:
                 raise
             self._registered_regions = regions
             self.is_register_buffer = True
+            self._registration_epoch += 1
+            return self._registration_epoch if require_exact else None
+
+    def validate_registration(self, regions: tuple[tuple[int, int, str], ...], epoch: int) -> None:
+        with self.register_buffer_lock:
+            if (
+                not self.is_register_buffer
+                or self._registration_epoch != epoch
+                or tuple(self._registered_regions) != regions
+            ):
+                raise RuntimeError("Mooncake registered target regions changed after publication")
 
     def unregister_buffer(self) -> None:
         """Unregister all buffers owned by this wrapper, if any."""

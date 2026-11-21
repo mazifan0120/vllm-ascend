@@ -1,0 +1,24 @@
+{
+  "request": {
+    "phase": "complete",
+    "id": "chatcmpl-81d29cc7-0c03-42d7-a2aa-ccdf21c9feaf",
+    "prompt_tokens": 1047257,
+    "answer": "MAPLE",
+    "usage": {
+      "prompt_tokens": 1047257,
+      "total_tokens": 1047260,
+      "completion_tokens": 3,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "finish_reason": "stop",
+    "ttft_seconds": 360.9395787976682,
+    "seconds": 360.9557615988888
+  },
+  "p_external_hit_tokens": 0.0,
+  "p_local_hit_tokens": 0.0,
+  "healthy_idle_engines": 18,
+  "all_gauges_zero": true,
+  "same_configuration_as_performance_matrix": true
+}

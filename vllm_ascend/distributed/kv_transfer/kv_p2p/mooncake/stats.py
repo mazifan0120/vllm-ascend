@@ -151,3 +151,73 @@ class MooncakePromMetrics(KVConnectorPromMetrics):
             self.bytes_transferred[engine_idx].observe(num_bytes)
         for failure in transfer_stats_data["num_failed_transfers"]:
             self.failed_transfers[engine_idx].inc(failure)
+
+
+_LAYERWISE_WRITE_METRICS = {
+    "batches": "Number of P-to-D layerwise native write submission attempts.",
+    "waits": "Number of P-to-D layerwise native write completion waits.",
+    "failures": "Number of failed P-to-D layerwise write submissions or waits.",
+    "submit_seconds": "Total worker time in P-to-D layerwise native write submission.",
+    "wait_seconds": "Total worker time waiting on P-to-D layerwise native writes.",
+}
+_LAYERWISE_DECODE_METRICS = {
+    "prepare": "Number of layerwise D targets confirmed prepared by all ranks.",
+    "prepare_seconds": "Total time from retaining D blocks to the last Prepare confirmation.",
+    "ready": "Number of layerwise D targets confirmed ready by all ranks.",
+    "ready_seconds": "Total time from D target publication to the last Ready confirmation.",
+    "close_started": "Number of layerwise D targets for which the scheduler sent Close.",
+    "close": "Number of layerwise D targets confirmed closed by all ranks.",
+    "close_seconds": "Total time from sending Close to the last Closed confirmation.",
+}
+
+
+@dataclass
+class LayerwiseTransferStats(KVConnectorStats):
+    def record(self, submit: float, wait: float | None, success: bool) -> None:
+        self.data["batches"] = self.data.get("batches", 0) + 1
+        self.data["submit_seconds"] = self.data.get("submit_seconds", 0) + submit
+        if wait is not None:
+            self.data["waits"] = self.data.get("waits", 0) + 1
+            self.data["wait_seconds"] = self.data.get("wait_seconds", 0) + wait
+        if not success:
+            self.data["failures"] = self.data.get("failures", 0) + 1
+
+    def reset(self) -> None:
+        self.data.clear()
+
+    def is_empty(self) -> bool:
+        return not self.data
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        for key, value in other.data.items():
+            self.data[key] = self.data.get(key, 0) + value
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        return dict(self.data)
+
+
+class LayerwiseTransferPromMetrics(KVConnectorPromMetrics):
+    def __init__(self, vllm_config, metric_types, labelnames, per_engine_labelvalues):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        roles = (
+            (self._kv_transfer_config.is_kv_producer, "write", _LAYERWISE_WRITE_METRICS),
+            (self._kv_transfer_config.is_kv_consumer, "decode", _LAYERWISE_DECODE_METRICS),
+        )
+        self._counters = {
+            key: create_metric_per_engine(
+                self._counter_cls(
+                    name=f"vllm:mooncake_layerwise_{role}_{key}_total",
+                    documentation=description,
+                    labelnames=labelnames,
+                ),
+                per_engine_labelvalues,
+            )
+            for enabled, role, fields in roles
+            if enabled
+            for key, description in fields.items()
+        }
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
+        for key, value in transfer_stats_data.items():
+            self._counters[key][engine_idx].inc(value)

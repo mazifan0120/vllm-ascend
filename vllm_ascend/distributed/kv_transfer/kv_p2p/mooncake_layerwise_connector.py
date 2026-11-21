@@ -14,7 +14,9 @@ from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import httpx
 import msgspec
@@ -28,10 +30,12 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorPromMetrics, PromMetric, PromMetricT
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
@@ -55,7 +59,44 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.core.layerwise_offload_scheduler import DecodeWorkerEvent
+from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_control import (
+    DecodeControl,
+    PrefillControl,
+    SideChannelClient,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_plan import (
+    CatalogRef,
+    EntryId,
+    RegisteredLayout,
+    Span,
+    TargetAllocation,
+    TargetId,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_sender import (
+    LayerwiseSender,
+    PrefillChunk,
+    mooncake_write_once,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.layerwise_offload_wire import (
+    decode_allocation,
+    decode_catalog,
+    encode_allocation,
+    encode_catalog,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import (
+    LayerwiseTransferPromMetrics,
+    LayerwiseTransferStats,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_transfer import (
+    DsaRegisterAtom,
+    collect_bounded_register_regions,
+    layout_span_bytes,
+    prefill_source_atoms,
+    tensor_cache_layout,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import SlotBarrier
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
@@ -85,6 +126,9 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
+
+    from vllm_ascend.core.layerwise_decode_scheduler import LayerwiseDecodeScheduler
+    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.layerwise_receive import DecodeTargets
 # isort: on
 
 DONE_SENDING_MSG = b"done_sending_msg"
@@ -103,6 +147,13 @@ class LayerMetadata:
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     te_rpc_port: int
     layer_metadata: dict[str, LayerMetadata]
+
+
+@dataclass(frozen=True)
+class LayerwiseDecodeHandshake(KVConnectorHandshakeMetadata):
+    catalog: tuple
+    side_channel: str
+    parallel_main: bool
 
 
 @dataclass
@@ -168,6 +219,7 @@ class SendReqInfo:
     local_transferred_tokens: int
     local_computed_tokens: int
     request: "Request"
+    restore_only: bool = False
 
     def extend_local_block_ids(self, new_block_ids: list[list[int]]) -> None:
         """extend local block ids for this step"""
@@ -265,7 +317,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                 send_queue_size = len(self.kv_cache_specs)
             else:
                 send_queue_size = 1
-        self.send_queue = queue.Queue[SendTask](maxsize=send_queue_size)
+        self.send_queue = queue.Queue[SendTask | Callable[[], None]](maxsize=send_queue_size)
+        self.native_error: Exception | None = None
         self.failed_reqs: set[str] = set()
         self.k_buffer = k_buffer
         self.v_buffer = v_buffer
@@ -282,7 +335,15 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event.set()
         while True:
             send_task = self.send_queue.get()
-            self._handle_request(send_task)
+            if isinstance(send_task, SendTask):
+                self._handle_request(send_task)
+            else:
+                try:
+                    send_task()
+                except Exception as error:
+                    self.native_error = error
+                finally:
+                    self.send_queue.task_done()
 
     def _handle_request(self, send_task: SendTask):
         error: str | None = None
@@ -587,6 +648,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         local_engine_id: str,
         metadata: MooncakeAgentMetadata,
         ready_event: threading.Event,
+        layerwise_targets: "DecodeTargets | None" = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
@@ -601,6 +663,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.task_tracker = dict[str, int]()
         self.ready_event = ready_event
         self.metadata = metadata
+        self.layerwise_targets = layerwise_targets
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -691,6 +754,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
                         self.update_failed_task(request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
+                    elif self.layerwise_targets is not None and isinstance(msg[0], str):
+                        response = self.layerwise_targets.handle_side_channel(msg)
+                        sock.send_multipart((identity, b"", encoder.encode(response)))
                     else:
                         logger.error(
                             "Unexpected message type: %s. expected GET_META_MSG or DONE_RECVING_MSG. msg=%s",
@@ -707,6 +773,11 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
         self.send_task: SendTask = SendTask()
+        self.decode_targets: tuple[TargetId, ...] = ()
+        self.prefill_chunks: tuple[PrefillChunk, ...] = ()
+        self.prefill_cancelled: tuple[TargetId, ...] = ()
+        self.prefill_restores: dict[str, TargetId] = {}
+        self.prefill_without_forward = False
 
     def add_new_req(
         self,
@@ -769,6 +840,32 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler Side Methods
     ############################################################
 
+    def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
+        if self.connector_worker is not None:
+            return self.connector_worker.decode_handshake
+        return None
+
+    def set_xfer_handshake_metadata_pp_aware(self, metadata):
+        scheduler = self.connector_scheduler
+        if scheduler is not None and scheduler.layerwise_host_offload:
+            scheduler.set_decode_handshake(metadata)
+        else:
+            super().set_xfer_handshake_metadata_pp_aware(metadata)
+
+    def bind_layerwise_decode_scheduler(self, runtime: "LayerwiseDecodeScheduler") -> None:
+        scheduler = self.connector_scheduler
+        if scheduler is not None and scheduler.layerwise_host_offload:
+            scheduler.decode_scheduler = runtime
+
+    def shutdown(self):
+        scheduler = self.connector_scheduler
+        if scheduler is not None and scheduler.layerwise_host_offload:
+            scheduler.stop_decode_control()
+        worker = self.connector_worker
+        if worker is not None and worker.layerwise_host_prefill:
+            worker.stop_prefill_control()
+        super().shutdown()
+
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
@@ -821,9 +918,17 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         super().bind_connector_metadata(connector_metadata)
         assert isinstance(connector_metadata, MooncakeLayerwiseConnectorMetadata)
         assert self.connector_worker is not None
+        if connector_metadata.decode_targets:
+            self.connector_worker.bind_decode_uses(connector_metadata.decode_targets)
         # Newer V1 runners may defer start_load_kv until after target forward.
         # Layerwise writes need the step's counters and send mappings beforehand.
         self.connector_worker.prepare_layerwise_step(connector_metadata)
+
+    def clear_connector_metadata(self) -> None:
+        worker = self.connector_worker
+        if worker is not None and worker.layerwise_host_offload:
+            worker.finish_decode_uses()
+        super().clear_connector_metadata()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -840,11 +945,15 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.wait_for_layer_reuse(layer_idx)
 
+    def prefill_slots(self) -> SlotBarrier:
+        assert self.connector_worker is not None
+        return self.connector_worker._prefill_slots
+
     def on_kv_cache_written(self, layer_name: str = "") -> None:
         if not self._is_kv_producer or not self.has_connector_metadata():
             return
         assert isinstance(self._connector_metadata, MooncakeLayerwiseConnectorMetadata)
-        if not self._connector_metadata.requests:
+        if not (self._connector_metadata.requests or self._connector_metadata.prefill_chunks):
             return
         assert self.connector_worker is not None
         self.connector_worker.on_kv_cache_written(layer_name)
@@ -858,18 +967,72 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, self._connector_metadata)
 
     def wait_for_save(self):
-        """MooncakeLayerwiseConnector does not save explicitly."""
-        pass
+        worker = self.connector_worker
+        if worker is not None and worker.layerwise_host_prefill:
+            worker.finish_prefill_step()
+            if self.has_connector_metadata():
+                worker.virtual_request.update(self._connector_metadata.prefill_restores)
+
+    def get_kv_connector_stats(self) -> LayerwiseTransferStats | None:
+        worker = self.connector_worker
+        if worker is not None and worker.layerwise_host_prefill:
+            return worker.take_prefill_write_stats()
+        scheduler = self.connector_scheduler
+        if scheduler is not None and scheduler.decode_scheduler is not None:
+            if stats := scheduler.decode_scheduler.take_layerwise_decode_stats():
+                return LayerwiseTransferStats(data=stats)
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> LayerwiseTransferStats:
+        return LayerwiseTransferStats(data=data or {})
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics | None:
+        transfer = vllm_config.kv_transfer_config
+        if transfer is None or not transfer.get_from_extra_config("layerwise_host_offload", False):
+            return None
+        return LayerwiseTransferPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+
+    def send_restored_layer(self, layer: int) -> None:
+        worker = self.connector_worker
+        assert worker is not None and worker.prefill_store_bound
+        if worker._prefill_layer_order[worker.current_layer] != layer:
+            raise RuntimeError("Store restore order differs from Prefill sender layers")
+        worker._emit_prefill_layer("", restored=True)
+        worker.current_layer += 1
 
 
 class MooncakeLayerwiseConnectorScheduler:
     """Implementation of Scheduler side methods"""
+
+    prefill_restore = False
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
         self.engine_id = engine_id
+        transfer = vllm_config.kv_transfer_config
+        host_offload = transfer.get_from_extra_config("layerwise_host_offload", False)
+        self.layerwise_host_offload = transfer.is_kv_consumer and host_offload
+        self.layerwise_host_prefill = transfer.is_kv_producer and host_offload
+        self.decode_layout: RegisteredLayout | None = None
+        self.decode_endpoints: tuple[str, ...] = ()
+        self.decode_scheduler: LayerwiseDecodeScheduler | None = None
+        self._decode_control_thread: threading.Thread | None = None
+        if self.layerwise_host_offload:
+            self._decode_control_stop = threading.Event()
+            # A producer owns all bytes during delivery. Prefix aliasing at
+            # the receiver could expose a target before all ranks have closed.
+            if vllm_config.cache_config.enable_prefix_caching:
+                raise ValueError("Layerwise Host Decode requires private blocks (D prefix caching disabled)")
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
 
         self.side_channel_host = get_ip()
@@ -907,6 +1070,72 @@ class MooncakeLayerwiseConnectorScheduler:
             )
         else:
             self.metaserver_client = httpx.Client(limits=httpx.Limits(max_connections=100000), timeout=None)
+
+    def set_decode_handshake(self, metadata: dict) -> None:
+        tp = self.vllm_config.parallel_config.tensor_parallel_size
+        if metadata.keys() != {(0, rank) for rank in range(tp)}:
+            raise ValueError("Layerwise Host Decode requires a handshake from each local TP worker")
+        ordered = tuple(metadata[0, rank] for rank in range(tp))
+        if any(not isinstance(worker, LayerwiseDecodeHandshake) for worker in ordered):
+            raise ValueError("Layerwise Host Decode received incompatible worker metadata")
+        parallel_main = ordered[0].parallel_main
+        if any(worker.parallel_main != parallel_main for worker in ordered):
+            raise ValueError("D workers disagree on the Main writer mapping")
+        self.decode_layout = RegisteredLayout(
+            tuple(decode_catalog(worker.catalog) for worker in ordered), tp, parallel_main=parallel_main
+        )
+        self.decode_endpoints = tuple(worker.side_channel for worker in ordered)
+        if self.decode_scheduler is None:
+            raise ValueError("Layerwise Host Decode requires LayerwiseDecodeScheduler or its async variant")
+        if self._decode_control_thread is not None:
+            raise RuntimeError("Layerwise Host Decode handshake already installed")
+        self.decode_timeout_s = self.vllm_config.kv_transfer_config.get_from_extra_config(
+            "layerwise_receipt_timeout_s", 300.0
+        )
+        control = DecodeControl(
+            SideChannelClient(self.decode_endpoints, timeout_ms=1000),
+            self.decode_scheduler.post_layerwise_event,
+            timeout_s=self.decode_timeout_s,
+        )
+        self.decode_scheduler.bind_layerwise_workers(self.decode_layout, control.link(self._publish_decode_target))
+        self._decode_control_thread = threading.Thread(
+            target=control.run, args=(self._decode_control_stop,), name="LayerwiseDecodeControl", daemon=True
+        )
+        self._decode_control_thread.start()
+
+    def stop_decode_control(self) -> None:
+        if self._decode_control_thread is not None:
+            self._decode_control_stop.set()
+            self._decode_control_thread.join()
+            self._decode_control_thread = None
+
+    def _publish_decode_target(self, request: "Request", allocation: TargetAllocation, refs: tuple[CatalogRef, ...]):
+        params = request.kv_transfer_params
+        message = {
+            "request_id": get_external_request_id(request.request_id),
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_cached_tokens": 0,
+            "layerwise_allocation": encode_allocation(allocation, refs),
+            "layerwise_side_channels": self.decode_endpoints,
+            "parallel_main_writers": self.vllm_config.kv_transfer_config.get_from_extra_config(
+                "parallel_main_writers", False
+            ),
+        }
+
+        def send():
+            try:
+                if not params or not params.get("metaserver"):
+                    raise ValueError("Layerwise Host Decode requires a P/D metaserver callback")
+                response = self.metaserver_client.post(
+                    params["metaserver"], json=message, timeout=self.decode_timeout_s
+                )
+                response.raise_for_status()
+            except (httpx.HTTPError, ValueError) as error:
+                logger.warning("Layerwise target publication for %s failed: %s", request.request_id, error)
+                self.decode_scheduler.post_layerwise_event(DecodeWorkerEvent("failed", allocation.target, refs[0]))
+
+        self.executor.submit(send)
 
     @staticmethod
     def _iter_kv_cache_specs(kv_cache_config: KVCacheConfig):
@@ -989,12 +1218,16 @@ class MooncakeLayerwiseConnectorScheduler:
         )
 
         if params is not None and params.get("do_remote_prefill"):
+            if self.layerwise_host_offload:
+                if num_computed_tokens or params.get("do_virtual"):
+                    raise ValueError("Layerwise Host Decode requires a full, private prompt allocation")
+                return request.num_prompt_tokens, request.num_prompt_tokens > 0
             # Remote prefill: get all prompt blocks from remote.
             assert num_computed_tokens % min(self.block_size) == 0
             count = max(self._hybrid_prefill_token_count(len(request.prompt_token_ids)) - num_computed_tokens, 0)
             return count, count > 0
 
-        if params is not None and params.get("do_remote_decode"):
+        if params is not None and params.get("do_remote_decode") and not self.layerwise_host_prefill:
             self._truncate_request_for_hybrid_prefill(request)
 
         # No remote prefill for this request.
@@ -1009,6 +1242,20 @@ class MooncakeLayerwiseConnectorScheduler:
         )
 
         if params is not None and params.get("do_remote_prefill"):
+            if self.layerwise_host_offload:
+                if self.decode_scheduler is None or self.decode_layout is None:
+                    raise RuntimeError("Layerwise Decode worker handshake was not installed")
+                if num_external_tokens != request.num_prompt_tokens:
+                    raise ValueError("Layerwise Host Decode did not allocate the full remote prompt")
+                allocation = TargetAllocation(
+                    TargetId(uuid4().hex, 1, 0),
+                    request.num_prompt_tokens,
+                    tuple(tuple(group) for group in blocks.get_block_ids()),
+                )
+                self.decode_layout.validate_allocation(allocation)
+                self.decode_scheduler.retain_layerwise_target(request, allocation)
+                params["do_remote_prefill"] = False
+                return
             do_virtual = params.get("do_virtual", False)
             local_block_ids = (blocks.get_block_ids()) if num_external_tokens > 0 else []
             remote_block_ids = self._trim_hybrid_remote_block_ids(local_block_ids, len(request.prompt_token_ids))
@@ -1058,6 +1305,8 @@ class MooncakeLayerwiseConnectorScheduler:
 
         # Layerwise prefiller add request need send
         if params is not None and params.get("do_remote_decode"):
+            if self.layerwise_host_prefill and "layerwise_allocation" not in params:
+                raise ValueError("Layerwise Host Prefill requires a registered D target")
             local_block_ids = list(blocks.get_block_ids())
             logger.debug(
                 "MooncakeLayerwiseConnector update_state_after_alloc: add %s to need send queue", request.request_id
@@ -1070,6 +1319,7 @@ class MooncakeLayerwiseConnectorScheduler:
                 local_transferred_tokens=local_transferred_tokens,
                 local_computed_tokens=local_computed_tokens,
                 request=request,
+                restore_only=self.prefill_restore and num_external_tokens == request.num_prompt_tokens,
             )
 
     def build_connector_meta(
@@ -1077,6 +1327,15 @@ class MooncakeLayerwiseConnectorScheduler:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MooncakeLayerwiseConnectorMetadata()
+
+        if self.layerwise_host_offload:
+            if self.decode_scheduler is None:
+                raise RuntimeError("Layerwise Decode scheduler is not bound")
+            meta.decode_targets = self.decode_scheduler.layerwise_scheduled_targets(scheduler_output)
+            return meta
+        if self.layerwise_host_prefill:
+            self._build_host_prefill_meta(meta, scheduler_output)
+            return meta
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             # Loop through scheduled reqs and convert to ReqMeta.
@@ -1161,6 +1420,73 @@ class MooncakeLayerwiseConnectorScheduler:
                         self._reqs_need_send_layerwise.pop(req_id)
         return meta
 
+    def _build_host_prefill_meta(self, meta: MooncakeLayerwiseConnectorMetadata, output: SchedulerOutput) -> None:
+        requests = self._reqs_need_send_layerwise
+        cancelled = []
+        for request_id in output.finished_req_ids | (output.preempted_req_ids or set()):
+            if (info := requests.pop(request_id, None)) is not None:
+                params = info.request.kv_transfer_params
+                allocation, _ = decode_allocation(params["layerwise_allocation"])
+                params["do_remote_decode"] = False
+                cancelled.append(allocation.target)
+        meta.prefill_cancelled = tuple(cancelled)
+
+        cached = output.scheduled_cached_reqs
+        for request_id, new_blocks in zip(cached.req_ids, cached.new_block_ids, strict=True):
+            if new_blocks is not None and request_id in requests:
+                requests[request_id].extend_local_block_ids(new_blocks)
+        computed = dict(zip(cached.req_ids, cached.num_computed_tokens, strict=True))
+        computed.update((request.req_id, request.num_computed_tokens) for request in output.scheduled_new_reqs)
+        scheduled_tokens = output.num_scheduled_tokens
+        if self.prefill_restore:
+            scheduled_tokens = dict(scheduled_tokens)
+            for request_id, info in requests.items():
+                if info.restore_only:
+                    scheduled_tokens[request_id] = 0
+                    computed[request_id] = info.request.num_prompt_tokens
+        chunks = []
+        for request_id, scheduled in scheduled_tokens.items():
+            if (info := requests.get(request_id)) is None:
+                continue
+            params = info.request.kv_transfer_params
+            allocation, refs = decode_allocation(params["layerwise_allocation"])
+            model = self.vllm_config.model_config
+            RegisteredLayout.validate_tp(
+                self.vllm_config.parallel_config.tensor_parallel_size,
+                len(refs),
+                replicated=model.use_mla and model.hf_text_config.model_type == "glm_moe_dsa",
+            )
+            start = info.local_computed_tokens
+            end = min(
+                allocation.prompt_tokens,
+                computed[request_id] + scheduled - len(output.scheduled_spec_decode_tokens.get(request_id, ())),
+            )
+            if end < start:
+                raise ValueError("Layerwise Prefill chunk regressed after delivery")
+            if end == start:
+                continue
+            endpoints = tuple(params["layerwise_side_channels"])
+            if len(endpoints) != len(refs):
+                raise ValueError("Layerwise target is missing worker endpoints")
+            chunk = PrefillChunk(
+                allocation,
+                refs,
+                endpoints,
+                bool(params.get("parallel_main_writers")),
+                tuple(tuple(group) for group in info.local_block_ids),
+                Span(start, end),
+            )
+            chunks.append(chunk)
+            if info.restore_only:
+                if start != 0 or not chunk.finished or request_id in output.num_scheduled_tokens:
+                    raise RuntimeError("Restore-only transfer requires an entire prompt without model work")
+                meta.prefill_restores[request_id] = allocation.target
+            info.update_computed_tokens(end)
+            if chunk.finished:
+                requests.pop(request_id)
+        meta.prefill_chunks = tuple(chunks)
+        meta.prefill_without_forward = bool(meta.prefill_restores) and not output.total_num_scheduled_tokens
+
     def _access_metaserver(self, url, message):
         success = False
         retry = 0
@@ -1212,6 +1538,17 @@ class MooncakeLayerwiseConnectorWorker:
         # Metadata.
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        transfer = vllm_config.kv_transfer_config
+        host_offload = transfer.get_from_extra_config("layerwise_host_offload", False)
+        self.layerwise_host_offload = transfer.is_kv_consumer and host_offload
+        self.layerwise_host_prefill = transfer.is_kv_producer and host_offload
+        if self.layerwise_host_prefill:
+            self._prefill_write_stats_lock = threading.Lock()
+            self._prefill_write_stats = LayerwiseTransferStats(data={})
+        self.prefill_store_bound = False
+        self.prefill_main_config: dict | None = None
+        self.decode_handshake: LayerwiseDecodeHandshake | None = None
+        self._decode_uses: tuple[tuple[TargetId, int], ...] = ()
         self.num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
         self.kv_cache_specs: list[KVCacheSpec] = [spec.kv_cache_spec for spec in self.kv_cache_config.kv_cache_groups]
         self.local_engine_id: str = " "
@@ -1381,6 +1718,12 @@ class MooncakeLayerwiseConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
+        if self.layerwise_host_offload:
+            self._register_decode_targets(kv_caches)
+            return
+        if self.layerwise_host_prefill:
+            self._register_prefill_sources(kv_caches)
+            return
         layer2group_ids: dict[str, int] = {}
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
         for i, kv_cache_group_spec in enumerate(kv_cache_groups):
@@ -1529,32 +1872,7 @@ class MooncakeLayerwiseConnectorWorker:
             layer_metadata=self.layer_metadata,
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
-            ready_event = threading.Event()
-            self.kv_send_layer_thread = KVCacheSendingLayerThread(
-                engine=self.engine,
-                vllm_config=self.vllm_config,
-                kv_cache_config=self.kv_cache_config,
-                kv_cache_specs=self.kv_cache_specs,
-                attn_resharding_group_idx=self.attn_resharding_group_idx,
-                total_layers=self.total_layers,
-                ready_event=ready_event,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
-                pd_head_ratio=self.pd_head_ratio,
-                num_head_replica=self.num_head_replica,
-                layer_metadata=self.layer_metadata,
-                use_mla=self.use_mla,
-                use_attn_mamba_hybrid=self.use_attn_mamba_hybrid,
-                k_buffer=self.k_buffer,
-                v_buffer=self.v_buffer,
-                enable_kv_quant=self.enable_kv_quant,
-                enable_c8_quant=self.enable_c8_quant,
-                resharding_stream=self.resharding_stream,
-                callback_func=self.send_done_send_signal,
-                reuse_completion_callback=self._complete_layer_reuse,
-            )
-            self.kv_send_layer_thread.start()
-            ready_event.wait()
+            self._start_sending_thread()
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             ready_event = threading.Event()
@@ -1569,6 +1887,298 @@ class MooncakeLayerwiseConnectorWorker:
             )
             self.kv_recv_layer_thread.start()
             ready_event.wait()
+
+    def _start_sending_thread(self) -> None:
+        ready = threading.Event()
+        self.kv_send_layer_thread = KVCacheSendingLayerThread(
+            engine=self.engine,
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            kv_cache_specs=self.kv_cache_specs,
+            attn_resharding_group_idx=self.attn_resharding_group_idx,
+            total_layers=self.total_layers,
+            ready_event=ready,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            pd_head_ratio=self.pd_head_ratio,
+            num_head_replica=self.num_head_replica,
+            layer_metadata=self.layer_metadata,
+            use_mla=self.use_mla,
+            use_attn_mamba_hybrid=self.use_attn_mamba_hybrid,
+            k_buffer=self.k_buffer,
+            v_buffer=self.v_buffer,
+            enable_kv_quant=self.enable_kv_quant,
+            enable_c8_quant=self.enable_c8_quant,
+            resharding_stream=self.resharding_stream,
+            callback_func=self.send_done_send_signal,
+            reuse_completion_callback=self._complete_layer_reuse,
+        )
+        self.kv_send_layer_thread.start()
+        ready.wait()
+
+    def _register_prefill_sources(self, kv_caches) -> None:
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+            build_prefill_main_layout,
+            get_layerwise_kv_cache_specs,
+            get_layerwise_physical_layer_index,
+        )
+
+        if self.vllm_config.parallel_config.pipeline_parallel_size != 1 or self.pcp_size != 1 or self.dcp_size != 1:
+            raise ValueError("Host layerwise source geometry requires unsharded Prefill layers")
+        layer_groups = {
+            name: (group, spec.kv_cache_spec.block_size)
+            for group, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+            for name in spec.layer_names
+        }
+        positions = defaultdict(int)
+        sources = defaultdict(dict)
+        layers_by_name = {}
+        main = defaultdict(list)
+        indexers = []
+        for name, caches in sorted(kv_caches.items()):
+            layer = get_layerwise_physical_layer_index(name, self.total_layers)
+            layers_by_name[name] = layer
+            component = "indexer" if name.endswith(".indexer.k_cache") else "main"
+            group, block_tokens = layer_groups[name]
+            for tensor in caches if isinstance(caches, (tuple, list)) else (caches,):
+                position = positions[layer, component]
+                positions[layer, component] += 1
+                source = tensor_cache_layout(name, position, tensor, self.kv_cache_config.num_blocks, block_tokens)
+                end = source.base + layout_span_bytes(source)
+                storage = tensor.untyped_storage()
+                base = int(storage.data_ptr())
+                if tensor.device.type != "npu" or not base <= source.base < end <= base + storage.nbytes():
+                    raise ValueError(f"Layerwise Prefill cache {name} is outside its local NPU storage")
+                atom = DsaRegisterAtom(source.base, end, "*", base)
+                if component == "main":
+                    main[layer].append((source, atom))
+                else:
+                    indexers.append(atom)
+                sources[layer][EntryId(layer, component, position)] = (source, group)
+        slots = tuple((layer,) for layer in sorted(sources))
+        if self.prefill_main_config is not None:
+            if not self.prefill_store_bound:
+                raise RuntimeError("Shared Prefill Main slots require a bound Store")
+            layout = build_prefill_main_layout(
+                get_layerwise_kv_cache_specs(self.kv_cache_config), self.total_layers, self.prefill_main_config
+            )
+            slots = layout.buffer_slots
+        regions = collect_bounded_register_regions(prefill_source_atoms(main, indexers, slots))
+        validate_register_region_count(RegisterRegions(ptrs=regions.ptrs, lengths=regions.lengths))
+        global_te.register_buffer(regions.ptrs, regions.lengths, regions.locations, require_exact=True)
+        self._prefill_sources = sources
+        self._prefill_layers_by_name = layers_by_name
+        self._prefill_layer_order = tuple(sorted(sources))
+        self._prefill_slots = SlotBarrier(slots)
+        self._prefill_batch: tuple[tuple[LayerwiseSender, PrefillChunk], ...] = ()
+        self._prefill_emitted: set[int] = set()
+        self._prefill_control = PrefillControl(
+            self.tp_rank,
+            self.tp_size,
+            self._prefill_slots,
+            partial(mooncake_write_once, self.engine, record=self._record_prefill_write),
+        )
+        self._prefill_control_stop = threading.Event()
+        self._prefill_control_thread = threading.Thread(
+            target=self._prefill_control.run,
+            args=(self._prefill_control_stop,),
+            name="LayerwisePrefillControl",
+            daemon=True,
+        )
+        self._start_sending_thread()
+        self._prefill_control_thread.start()
+
+    def _record_prefill_write(self, submit: float, wait: float | None, success: bool) -> None:
+        with self._prefill_write_stats_lock:
+            self._prefill_write_stats.record(submit, wait, success)
+
+    def take_prefill_write_stats(self) -> LayerwiseTransferStats | None:
+        with self._prefill_write_stats_lock:
+            stats = self._prefill_write_stats
+            if stats.is_empty():
+                return None
+            self._prefill_write_stats = LayerwiseTransferStats(data={})
+            return stats
+
+    def stop_prefill_control(self) -> None:
+        if hasattr(self, "_prefill_control_thread"):
+            self._prefill_slots.abort("Prefill worker is shutting down")
+            self._prefill_control_stop.set()
+            self._prefill_control_thread.join()
+
+    def _emit_prefill_layer(self, layer_name: str, *, restored: bool = False) -> None:
+        if not self._prefill_batch or self.current_layer >= len(self._prefill_layer_order):
+            return
+        layer = self._prefill_layer_order[self.current_layer]
+        if layer_name and self._prefill_layers_by_name.get(layer_name) != layer:
+            raise RuntimeError(f"Layerwise Prefill observed {layer_name} while expecting layer {layer}")
+        if layer in self._prefill_emitted:
+            return
+        epoch = self._prefill_slots.epoch(layer) if self.prefill_store_bound else self._prefill_slots.begin_write(layer)
+        # Store publishes the ready epoch after returning from its synchronous GET.
+        wait_ready = None if restored else torch.npu.current_stream().record_event().synchronize
+        for sender, chunk in self._prefill_batch:
+            sources = {key: (view, chunk.blocks[group]) for key, (view, group) in self._prefill_sources[layer].items()}
+            if job := sender.reserve_layer(chunk.allocation.target, epoch, chunk.span, sources, wait_ready):
+                self.kv_send_layer_thread.send_queue.put(partial(sender.execute, job))
+        if not self.prefill_store_bound:
+            self._prefill_slots.seal(epoch)
+        self._prefill_emitted.add(layer)
+
+    def finish_prefill_step(self) -> None:
+        if not self._prefill_batch:
+            return
+        native = self.kv_send_layer_thread
+        native.send_queue.join()
+        if native.native_error is not None:
+            raise RuntimeError("Prefill source may still be in use by native transfer") from native.native_error
+        self._prefill_slots.raise_if_failed()
+        if self._prefill_emitted != self._prefill_sources.keys():
+            self._prefill_control.finish(
+                tuple(chunk.allocation.target for _, chunk in self._prefill_batch), cancel=True
+            )
+            self._prefill_slots.abort("Prefill forward missed a layerwise KV-ready hook")
+            raise RuntimeError("Prefill forward missed a layerwise KV-ready hook")
+        self._prefill_control.finish(
+            tuple(chunk.allocation.target for _, chunk in self._prefill_batch if chunk.finished)
+        )
+        self._prefill_batch = ()
+
+    def _register_decode_targets(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+            get_layerwise_physical_layer_index,
+        )
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.layerwise_receive import (
+            DecodeTargets,
+            register_model_targets,
+        )
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+            get_sparse_kv_offload_manager,
+        )
+
+        if self.vllm_config.parallel_config.pipeline_parallel_size != 1 or self.pcp_size != 1 or self.dcp_size != 1:
+            raise ValueError("Host layerwise target geometry requires unsharded Decode layers")
+        registered, registration_epoch = (), None
+
+        def register(ptrs, lengths, locations):
+            nonlocal registered, registration_epoch
+            validate_register_region_count(RegisterRegions(ptrs=ptrs, lengths=lengths))
+            registration_epoch = global_te.register_buffer(ptrs, lengths, locations, require_exact=True)
+            registered = tuple(zip(ptrs, lengths, locations, strict=True))
+
+        frame, error = None, None
+        try:
+            manager = get_sparse_kv_offload_manager()
+            pool = manager.get_mooncake_host_pool()
+            layers = {
+                name: (
+                    get_layerwise_physical_layer_index(name, self.total_layers),
+                    group,
+                    spec.kv_cache_spec.block_size,
+                )
+                for group, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                for name in spec.layer_names
+                if name in kv_caches
+            }
+            catalog, bases = register_model_targets(
+                CatalogRef(uuid4().hex, 0, self.tp_rank),
+                f"{self.side_channel_host}:{self.te_rpc_port}",
+                f"{self.engine_id}:dp{self.dp_rank}:host",
+                manager,
+                kv_caches,
+                layers,
+                self.kv_cache_config.num_blocks,
+                register,
+            )
+            frame = encode_catalog(catalog)
+        except Exception as exc:
+            error = str(exc)
+        reports = [(frame, error)]
+        if self.tp_size > 1:
+            reports = [None] * self.tp_size
+            torch.distributed.all_gather_object(reports, (frame, error), group=self.tp_group.cpu_group)
+        for rank, (_, failure) in enumerate(reports):
+            if failure is not None:
+                raise RuntimeError(f"Layerwise Host registration failed on rank {rank}: {failure}")
+        assert frame is not None and registration_epoch is not None
+
+        parallel_main = self.vllm_config.kv_transfer_config.get_from_extra_config("parallel_main_writers", False)
+        layout = RegisteredLayout(
+            tuple(decode_catalog(peer_frame) for peer_frame, _ in reports),
+            self.tp_size,
+            parallel_main=parallel_main,
+        )
+        decode_stream = torch.npu.current_stream()
+
+        def install_visibility(_allocation):
+            # This callback runs only after the required native write receipts
+            # reach the owner. Join that evidence to the actual decode stream.
+            with torch.npu.device(pool.topology.device_id), torch.npu.stream(decode_stream):
+                event = decode_stream.record_event()
+
+            def wait_visible():
+                consumer = torch.npu.current_stream()
+                if consumer != decode_stream:
+                    consumer.wait_event(event)
+
+            return wait_visible
+
+        targets = DecodeTargets(
+            layout,
+            self.tp_rank,
+            bases,
+            lambda: global_te.validate_registration(registered, registration_epoch),
+            install_visibility,
+        )
+        self._decode_manager = manager
+        ready = threading.Event()
+        self.kv_recv_layer_thread = KVCacheRecvingLayerThread(
+            self.tp_rank,
+            self.side_channel_port,
+            self.tp_size,
+            self.pd_head_ratio,
+            self.engine_id,
+            MooncakeAgentMetadata(te_rpc_port=self.te_rpc_port, layer_metadata={}),
+            ready,
+            targets,
+        )
+        self.kv_recv_layer_thread.start()
+        ready.wait()
+        self.decode_handshake = LayerwiseDecodeHandshake(
+            frame, make_zmq_path("tcp", self.side_channel_host, self.handshake_port), parallel_main
+        )
+
+    def bind_decode_uses(self, scheduled: tuple[TargetId, ...]) -> None:
+        targets = self.kv_recv_layer_thread.layerwise_targets
+        if targets is None or self._decode_uses:
+            raise RuntimeError("Layerwise Decode batch bound without an idle target registry")
+        targets.reap_decode_completions()
+        uses = []
+        try:
+            for target in scheduled:
+                uses.append((target, targets.acquire_decode(target)))
+        except Exception:
+            for target, use in uses:
+                targets.finish_decode(target, use)
+            raise
+        self._decode_uses = tuple(uses)
+
+    def finish_decode_uses(self) -> None:
+        if not self._decode_uses:
+            return
+        manager = self._decode_manager
+        compute = torch.npu.current_stream()
+        streams = dict.fromkeys(
+            (compute, getattr(manager, "current_kv_save_stream", None), getattr(manager, "fused_plan_stream", None))
+        )
+        events = tuple(stream.record_event() for stream in streams if stream is not None)
+
+        def completed():
+            with torch.npu.device(compute.device):
+                return all(event.query() for event in events)
+
+        self.kv_recv_layer_thread.layerwise_targets.defer_decode_completion(self._decode_uses, completed)
+        self._decode_uses = ()
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_recving = (
@@ -1788,6 +2398,22 @@ class MooncakeLayerwiseConnectorWorker:
     def prepare_layerwise_step(self, metadata: MooncakeLayerwiseConnectorMetadata) -> None:
         """Prepare layerwise hooks once, when metadata is bound before forward."""
         self.current_layer = 0
+        if self.layerwise_host_prefill:
+            if self._prefill_batch:
+                raise RuntimeError("Previous Prefill step did not drain its native transfers")
+            self._prefill_control.finish(metadata.prefill_cancelled, cancel=True)
+            self._prefill_batch = self._prefill_control.prepare(metadata.prefill_chunks)
+            if metadata.prefill_restores:
+                attached = {chunk.allocation.target for _, chunk in self._prefill_batch}
+                restores = set(metadata.prefill_restores.values())
+                if any(
+                    chunk.allocation.target in restores and chunk.allocation.target not in attached
+                    for chunk in metadata.prefill_chunks
+                    if self.tp_rank < len(chunk.refs)
+                ):
+                    raise RuntimeError("Restore-only Prefill could not attach its Decode target")
+            self._prefill_emitted.clear()
+            return
         self._cache_write_events = [None] * self.total_layers
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             # update trans info
@@ -1865,6 +2491,9 @@ class MooncakeLayerwiseConnectorWorker:
                     send_task.group_seq_start_tensor[i] = torch.tensor([0], dtype=torch.int32, device=device)
 
     def on_kv_cache_written(self, layer_name: str) -> None:
+        if self.layerwise_host_prefill:
+            self._emit_prefill_layer(layer_name)
+            return
         if self.current_layer >= self.total_layers:
             return
         layer_names = self.index_to_name[self.current_layer]
@@ -1888,6 +2517,10 @@ class MooncakeLayerwiseConnectorWorker:
         **kwargs,
     ) -> None:
         """MooncakeLayerwiseConnector does not save explicitly."""
+        if self.layerwise_host_prefill:
+            self._emit_prefill_layer(layer_name)
+            self.current_layer += 1
+            return
         if self.vllm_config.kv_transfer_config.is_kv_producer and connector_metadata.requests.keys():
             if self.current_layer >= self.total_layers:
                 self.current_layer += 1
@@ -2181,7 +2814,13 @@ class MooncakeLayerwiseConnectorWorker:
             )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        if not self.prefill_store_bound:
+            return
+        if (
+            self.current_layer >= len(self._prefill_layer_order)
+            or self._prefill_layers_by_name.get(layer_name) != self._prefill_layer_order[self.current_layer]
+        ):
+            raise RuntimeError(f"Unexpected Prefill KV load at {layer_name!r}, step layer {self.current_layer}")
 
 
 @contextlib.contextmanager

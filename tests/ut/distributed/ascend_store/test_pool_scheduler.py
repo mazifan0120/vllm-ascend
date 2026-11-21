@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import KVConnectorOutput
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreConnector
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -46,6 +47,107 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler imp
     LookupKeyClient,
     get_zmq_rpc_path_lookup,
 )
+
+
+def test_prefill_restore_requires_an_internal_full_store_hit():
+    scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+    scheduler.prefill_restore = scheduler.prefill_snapshots = True
+    scheduler.load_specs = {}
+    scheduler.kv_role = "kv_producer"
+    scheduler.use_block_key_layerwise = scheduler.use_layerwise = True
+    scheduler.use_eagle = scheduler.load_async = False
+    scheduler.layerwise_offload = False
+    scheduler.vllm_config = SimpleNamespace(speculative_config=None)
+    scheduler.cache_transfer_granularity = scheduler.lcm_block_size = 4
+    scheduler.cacheable_group_ids = [0]
+    scheduler.original_block_size = [4]
+    scheduler._get_block_key_layerwise_hit_tokens = MagicMock(return_value=8)
+    request = SimpleNamespace(
+        request_id="full",
+        block_hashes=[b"first", b"second"],
+        prompt_token_ids=list(range(8)),
+        num_tokens=8,
+        num_prompt_tokens=8,
+        kv_transfer_params={"do_remote_decode": True, "layerwise_allocation": ["target"]},
+        sampling_params=SimpleNamespace(prompt_logprobs=None),
+        max_tokens=1,
+        has_encoder_inputs=False,
+        num_output_tokens=0,
+        num_preemptions=0,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (8, True)
+    assert scheduler.load_specs["full"].restore_only
+    scheduler._request_trackers = {}
+    scheduler._block_size = scheduler.hash_block_size = 4
+    scheduler.grouped_block_size = [4]
+    scheduler.kv_cache_group_families = ["default"]
+    scheduler.num_speculative_blocks_by_group = {}
+    scheduler._discard_partial_chunks = True
+    metadata = scheduler._process_async_load_request("full", request, [[5, 6]])
+    assert metadata.prefill_history == metadata.target_token_len == 8
+    assert metadata.is_last_chunk and not metadata.can_save
+    assert metadata.prefill_snapshot_id is None
+
+    request.sampling_params.prompt_logprobs = 1
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (7, False)
+    assert not scheduler.load_specs["full"].restore_only
+    request.sampling_params.prompt_logprobs = None
+    scheduler._get_block_key_layerwise_hit_tokens.return_value = 4
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4, False)
+    assert not scheduler.load_specs["full"].restore_only
+
+
+def test_prefill_private_versions_are_minted_only_for_steps_that_save_a_snapshot():
+    scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+    scheduler.prefill_snapshots = True
+    scheduler.cache_transfer_granularity = scheduler.hash_block_size = 4
+    scheduler.original_block_size = [4]
+    scheduler.kv_cache_group_families = ["default"]
+    scheduler.layerwise_offload = scheduler._discard_partial_chunks = False
+
+    def prepare(extent, tracker=None):
+        tracker = tracker or RequestTracker("same-id", extent, allocated_block_ids=[1, 2])
+        tracker.token_len = extent
+        return scheduler._build_req_meta(tracker, [b"block", b"tail"], None, list(range(8)), False)
+
+    first, duplicate_extent, final = prepare(2), prepare(2), prepare(8)
+    assert first.prefill_snapshot_id
+    assert duplicate_extent.prefill_snapshot_id and first.prefill_snapshot_id != duplicate_extent.prefill_snapshot_id
+    assert final.prefill_snapshot_id is None
+    assert first.prefill_request_instance != duplicate_extent.prefill_request_instance
+    tracker = RequestTracker("same-id", 2, allocated_block_ids=[1, 2])
+    assert prepare(2, tracker).prefill_request_instance == prepare(8, tracker).prefill_request_instance
+
+
+def test_prefill_mtp_lookup_requires_readable_successor_identity_and_never_counts_tail():
+    scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+    scheduler.prefill_snapshots = scheduler.use_eagle = True
+    scheduler._block_size = scheduler.hash_block_size = 4
+    scheduler._make_layerwise_hit_check_keys = lambda group, identity: [f"{group}:{identity}"]
+    readable = {f"0:prefill_mtp1:0:{b'second'.hex()}", f"0:{b'first'.hex()}", f"0:{b'different'.hex()}"}
+    scheduler._query_layerwise_block_hits = lambda keys: [all(key in readable for key in group) for group in keys]
+    request = SimpleNamespace(request_id="mtp", block_hashes=[b"first", b"second", b"generated"])
+
+    assert scheduler._lookup_block_key_contiguous(request, 8, 0) == 4
+    request.block_hashes[1] = b"different"
+    assert scheduler._lookup_block_key_contiguous(request, 8, 0) == 0
+    scheduler.prefill_snapshots = False
+    assert scheduler._lookup_block_key_contiguous(request, 8, 0) == 8
+
+
+def test_prefill_snapshot_mtp_requires_synchronous_cpu_next_token_path():
+    spec = SimpleNamespace(method="mtp", num_speculative_tokens=1, disable_padded_drafter_batch=True)
+    config = SimpleNamespace(speculative_config=spec, scheduler_config=SimpleNamespace(async_scheduling=False))
+    AscendStoreConnector._validate_prefill_snapshot_spec(config)
+
+    spec.disable_padded_drafter_batch = False
+    with pytest.raises(ValueError, match="CPU next-token IDs"):
+        AscendStoreConnector._validate_prefill_snapshot_spec(config)
+    spec.disable_padded_drafter_batch = True
+    config.scheduler_config.async_scheduling = True
+    with pytest.raises(ValueError, match="synchronous"):
+        AscendStoreConnector._validate_prefill_snapshot_spec(config)
 
 
 @pytest.fixture(autouse=True)

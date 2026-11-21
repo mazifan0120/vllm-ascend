@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -eo pipefail
+source /root/pd/settings.sh
+if pgrep -x mooncake_master > /dev/null; then
+  exit 0
+fi
+exec mooncake_master --max_threads 32 --eviction_high_watermark_ratio 0.8 \
+  --eviction_ratio 0.05 --default_kv_lease_ttl 60000 \
+  --metrics_port 52163 --port 50163 -v=1 \
+  > "$LOG_PATH/kvmaster.log" 2>&1

@@ -54,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler imp
     get_zmq_rpc_path_lookup,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import SlotBarrier
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
@@ -306,6 +307,52 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def bind_prefill_slots(self, provider: Callable[[], SlotBarrier]) -> bool:
+        worker = self.connector_worker
+        if worker is None or not worker.use_block_key_layerwise:
+            return False
+        if not is_kv_save_role(worker.kv_role, worker.consumer_is_to_put):
+            raise ValueError("The Prefill Store must be configured to save KV")
+        if (
+            worker.use_mamba
+            or len(worker.cacheable_group_ids) != worker.num_kv_cache_groups
+            or any(family not in ("default", "c1") for family in worker.kv_cache_group_families)
+        ):
+            raise ValueError("Prefill snapshot ranges require dense, uncompressed token pages in every group")
+        self._validate_prefill_snapshot_spec(worker.vllm_config)
+        writers = worker._extra_config.get("layerwise_prefill_put_writers", 1)
+        if type(writers) is not int or not 1 <= writers <= worker.tp_size:
+            raise ValueError("layerwise_prefill_put_writers must be an integer between 1 and Prefill TP")
+        if writers > 1 and (
+            not worker.use_mla
+            or worker.hf_config.model_type != "glm_moe_dsa"
+            or worker.put_step != worker.tp_size
+            or (worker.pp_size, worker.pcp_size, worker.dcp_size) != (1, 1, 1)
+        ):
+            raise ValueError("Multiple Prefill Store PUT writers require replicated GLM DSA KV without PP or CP")
+        worker.layerwise_prefill_put_writers = writers
+        worker.prefill_slot_provider = provider
+        return True
+
+    def configure_prefill_snapshots(self) -> None:
+        scheduler = self.connector_scheduler
+        if scheduler is not None and scheduler.use_block_key_layerwise:
+            self._validate_prefill_snapshot_spec(scheduler.vllm_config)
+            scheduler.prefill_snapshots = True
+
+    @staticmethod
+    def _validate_prefill_snapshot_spec(config: VllmConfig) -> None:
+        # The CPU drafter takes the token immediately after a partial chunk.
+        # The padded backup can instead select the end of the request.
+        spec = config.speculative_config
+        if spec is not None and (
+            spec.method != "mtp"
+            or spec.num_speculative_tokens != 1
+            or not spec.disable_padded_drafter_batch
+            or config.scheduler_config.async_scheduling
+        ):
+            raise ValueError("Prefill snapshots with MTP require one synchronous draft step and CPU next-token IDs")
+
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
         """Fence only the saves of requests whose blocks this step may reuse.
 
@@ -350,6 +397,20 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             ],
         )
         self.connector_worker.start_load_kv(metadata)
+
+    def restore_prefill_step(self, request_ids: Iterable[str], send_layer: Callable[[int], None]) -> None:
+        assert self.connector_worker is not None
+        metadata = self._get_connector_metadata()
+        covered = {
+            request.req_id
+            for request in metadata.requests
+            if request.load_spec
+            and request.load_spec.restore_only
+            and request.prefill_history == request.target_token_len
+        }
+        if covered != set(request_ids) or len(covered) != len(metadata.requests):
+            raise RuntimeError("Restore-only Prefill requires complete Store coverage for every request")
+        self.connector_worker.restore_prefill_step(send_layer)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:

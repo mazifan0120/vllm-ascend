@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -eo pipefail
+source /root/pd/settings.sh
+pids=()
+for local_rank in $(seq 0 0); do
+  rank=$((0 * 1 + local_rank))
+  port=$((8410 + local_rank))
+  devices=$(seq -s, $((local_rank * 16)) $(((local_rank + 1) * 16 - 1)))
+  bash /root/pd/engine.sh "$rank" "$port" "$devices" > "$LOG_PATH/vllm_prefill_dp$rank.log" 2>&1 &
+  pids+=("$!")
+done
+# A failed engine terminates this node's launcher, making partial startup visible.
+wait -n "${pids[@]}"
+exit 1

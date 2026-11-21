@@ -66,6 +66,55 @@ class TestAscendStoreKVEvents(unittest.TestCase):
 
 
 class TestAscendStoreConnector(unittest.TestCase):
+    def test_prefill_put_writers_require_replicated_glm_dsa_slots(self):
+        def worker():
+            return types.SimpleNamespace(
+                use_block_key_layerwise=True,
+                kv_role="kv_producer",
+                consumer_is_to_put=False,
+                use_mamba=False,
+                cacheable_group_ids=[0],
+                num_kv_cache_groups=1,
+                kv_cache_group_families=["default"],
+                vllm_config=types.SimpleNamespace(speculative_config=None),
+                _extra_config={"layerwise_prefill_put_writers": 2},
+                use_mla=True,
+                hf_config=types.SimpleNamespace(model_type="glm_moe_dsa"),
+                put_step=4,
+                tp_size=4,
+                pp_size=1,
+                pcp_size=1,
+                dcp_size=1,
+            )
+
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.connector_worker = worker()
+        provider = object()
+        self.assertTrue(connector.bind_prefill_slots(provider))
+        self.assertEqual(connector.connector_worker.layerwise_prefill_put_writers, 2)
+        self.assertIs(connector.connector_worker.prefill_slot_provider, provider)
+        for count in (True, 0, 5, 1.5):
+            with self.subTest(count=count):
+                connector.connector_worker = worker()
+                connector.connector_worker._extra_config["layerwise_prefill_put_writers"] = count
+                with self.assertRaisesRegex(ValueError, "integer between"):
+                    connector.bind_prefill_slots(provider)
+                self.assertFalse(hasattr(connector.connector_worker, "prefill_slot_provider"))
+        for field, value in (("use_mla", False), ("put_step", 2), ("pp_size", 2), ("pcp_size", 2), ("dcp_size", 2)):
+            with self.subTest(field=field):
+                connector.connector_worker = worker()
+                setattr(connector.connector_worker, field, value)
+                with self.assertRaisesRegex(ValueError, "replicated GLM DSA"):
+                    connector.bind_prefill_slots(provider)
+                self.assertFalse(hasattr(connector.connector_worker, "prefill_slot_provider"))
+        connector.connector_worker = worker()
+        connector.connector_worker.hf_config.model_type = "another_model"
+        with self.assertRaisesRegex(ValueError, "replicated GLM DSA"):
+            connector.bind_prefill_slots(provider)
+        connector.connector_worker._extra_config.clear()
+        self.assertTrue(connector.bind_prefill_slots(provider))
+        self.assertEqual(connector.connector_worker.layerwise_prefill_put_writers, 1)
+
     def test_bind_metadata_prepares_only_layerwise_workers(self):
         for use_layerwise in (False, True):
             with self.subTest(use_layerwise=use_layerwise):

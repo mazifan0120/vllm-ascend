@@ -627,6 +627,14 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "returned 0 results for 1 keys"):
             b.batch_get_start(["k"])
 
+    def test_layerwise_range_get_rejects_malformed_results(self):
+        backend = self._make_backend()
+        for value, error in (([], "returned 0 results for 1 keys"), ([False], "non-integer batch results")):
+            with self.subTest(value=value):
+                backend.store.batch_get_into_multi_buffer_ranges.return_value = value
+                with self.assertRaisesRegex(RuntimeError, error):
+                    backend.batch_copy_get(["key"], [[200]], [[16]], [[32]])
+
     def test_register_buffer_with_store_independent_te(self):
         b = self._make_backend()
         b._use_store_independent_te = True

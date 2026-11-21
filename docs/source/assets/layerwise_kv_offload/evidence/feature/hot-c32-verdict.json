@@ -1,0 +1,203 @@
+{
+  "arm": "p90-gc-c32",
+  "completed": 112,
+  "metrics": {
+    "172.168.4.237:8410": {
+      "request_success_total": 49.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 2427264.0,
+      "request_prefill_time_seconds_sum": 84.2442191131413,
+      "request_prefill_time_seconds_count": 49.0,
+      "request_queue_time_seconds_sum": 71.95275989780203,
+      "time_to_first_token_seconds_sum": 202.9071261882782
+    },
+    "172.168.4.31:8410": {
+      "request_success_total": 63.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 3120768.0,
+      "request_prefill_time_seconds_sum": 92.76985111134127,
+      "request_prefill_time_seconds_count": 63.0,
+      "request_queue_time_seconds_sum": 58.517555684782565,
+      "time_to_first_token_seconds_sum": 197.49604487419128
+    },
+    "172.168.4.230:8420": {
+      "request_success_total": 8.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 440000.0,
+      "request_prefill_time_seconds_sum": 1.7754881926812232,
+      "request_prefill_time_seconds_count": 8.0,
+      "request_queue_time_seconds_sum": 26.706767527386546,
+      "time_to_first_token_seconds_sum": 29.860888719558716
+    },
+    "172.168.4.230:8421": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4596322271972895,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 27.110225456301123,
+      "time_to_first_token_seconds_sum": 29.841804265975952
+    },
+    "172.168.4.230:8422": {
+      "request_success_total": 8.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 440000.0,
+      "request_prefill_time_seconds_sum": 1.6227998798713088,
+      "request_prefill_time_seconds_count": 8.0,
+      "request_queue_time_seconds_sum": 29.04506579460576,
+      "time_to_first_token_seconds_sum": 32.30619430541992
+    },
+    "172.168.4.230:8423": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4379448019899428,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 21.24978967476636,
+      "time_to_first_token_seconds_sum": 24.003734588623047
+    },
+    "172.168.4.230:8424": {
+      "request_success_total": 8.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 440000.0,
+      "request_prefill_time_seconds_sum": 1.6609541797079146,
+      "request_prefill_time_seconds_count": 8.0,
+      "request_queue_time_seconds_sum": 21.73589702229947,
+      "time_to_first_token_seconds_sum": 24.826759338378906
+    },
+    "172.168.4.230:8425": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.459234612993896,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 21.786892211064696,
+      "time_to_first_token_seconds_sum": 24.654647827148438
+    },
+    "172.168.4.230:8426": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4335440257564187,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 24.098838592879474,
+      "time_to_first_token_seconds_sum": 26.898822784423828
+    },
+    "172.168.4.230:8427": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4332474246621132,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 20.32393154827878,
+      "time_to_first_token_seconds_sum": 23.070980548858643
+    },
+    "172.168.4.226:8428": {
+      "request_success_total": 6.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 330000.0,
+      "request_prefill_time_seconds_sum": 1.265421454794705,
+      "request_prefill_time_seconds_count": 6.0,
+      "request_queue_time_seconds_sum": 30.455930377356708,
+      "time_to_first_token_seconds_sum": 32.91563677787781
+    },
+    "172.168.4.226:8429": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.3952682185918093,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 22.72474197903648,
+      "time_to_first_token_seconds_sum": 25.414047718048096
+    },
+    "172.168.4.226:8430": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4472559606656432,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 29.17986683920026,
+      "time_to_first_token_seconds_sum": 31.869446516036987
+    },
+    "172.168.4.226:8431": {
+      "request_success_total": 6.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 330000.0,
+      "request_prefill_time_seconds_sum": 1.2528787036426365,
+      "request_prefill_time_seconds_count": 6.0,
+      "request_queue_time_seconds_sum": 29.883617083076388,
+      "time_to_first_token_seconds_sum": 32.395851135253906
+    },
+    "172.168.4.226:8432": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4308105795644224,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 30.790013194084167,
+      "time_to_first_token_seconds_sum": 33.601640462875366
+    },
+    "172.168.4.226:8433": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4454393740743399,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 25.748130798339844,
+      "time_to_first_token_seconds_sum": 28.566985845565796
+    },
+    "172.168.4.226:8434": {
+      "request_success_total": 6.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 330000.0,
+      "request_prefill_time_seconds_sum": 1.2180418292991817,
+      "request_prefill_time_seconds_count": 6.0,
+      "request_queue_time_seconds_sum": 29.103025744203478,
+      "time_to_first_token_seconds_sum": 31.561330556869507
+    },
+    "172.168.4.226:8435": {
+      "request_success_total": 7.0,
+      "num_preemptions_total": 0.0,
+      "prefix_cache_hits_total": 0.0,
+      "external_prefix_cache_hits_total": 385000.0,
+      "request_prefill_time_seconds_sum": 1.4623944968916476,
+      "request_prefill_time_seconds_count": 7.0,
+      "request_queue_time_seconds_sum": 29.17686109058559,
+      "time_to_first_token_seconds_sum": 31.923993587493896
+    }
+  },
+  "ttft_s": {
+    "mean": 4.216283179557649,
+    "p50": 2.182568878866732,
+    "p90": 12.162635758891701,
+    "p99": 15.774138827440328
+  },
+  "tpot_ms": 28.30889512277148,
+  "output_toks_s": 821.1212075163141,
+  "pft_s": 1.5804827698614514,
+  "p_queue_s": 1.1649135319873625,
+  "local_hit": 0.0,
+  "external_hit": 0.9006545454545455,
+  "prefill_counts": {
+    "172.168.4.237:8410": 49.0,
+    "172.168.4.31:8410": 63.0
+  },
+  "passed": true
+}

@@ -1,0 +1,11 @@
+{
+  "passed": 48,
+  "cases_per_type": 16,
+  "decode_engines": 16,
+  "tp_receipts": 2,
+  "input_token_range": [
+    537,
+    33659
+  ],
+  "scope": "Independent semantic regression after performance and near-1M request; same P/D 1M TP2/MTP5 configuration"
+}

@@ -1,0 +1,12 @@
+{
+  "source_document": "24 issue 69 口径复测 — DCP2 基线 vs layerwise 特性四档.md",
+  "source_sha256": "08d4e7adcffacc83ef490ef8be1eb18a2c007ee11674b573e9204691092f86d6",
+  "source_date": "2026-11-20",
+  "report_adopted_date": "2026-11-21",
+  "provenance": "User supplied measurement report; values transcribed at its published precision; not a new benchmark run",
+  "raw_data_paths": [
+    "/mnt/sfs_turbo/yy/bench-perf/logs/issue-method/",
+    "/mnt/sfs_turbo/yy/bench-perf/logs/issue-method-lw/"
+  ],
+  "previous_independent_measurements": "Existing evidence/feature and evidence/dcp retain prior independent runs and do not supply the current main performance tables"
+}

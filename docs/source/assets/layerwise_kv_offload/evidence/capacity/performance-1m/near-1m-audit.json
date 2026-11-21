@@ -1,0 +1,7 @@
+{
+  "passed": 1,
+  "decode_engines": [
+    "/mnt/sfs_turbo/g00832294/feature-1m-tp2-20261121/d0/logs/vllm_decode_dp0.log"
+  ],
+  "tp_receipts": 2
+}

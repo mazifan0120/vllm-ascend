@@ -4,6 +4,7 @@ import pytest
 
 pytest.importorskip("vllm")
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import LayerwiseTransferStats  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (  # noqa: E402
     GlobalTE,
 )
@@ -12,6 +13,25 @@ _GLM_LAYER_BYTES = 1_300_234_240
 _GLM_FIRST_REGION_LAYER_COUNT = 52
 _GLM_SECOND_REGION_LAYER_COUNT = 27
 _TE_REGISTRATION_LIMIT_BYTES = 64 * 1024 * 1024 * 1024
+
+
+def test_layerwise_write_stats_aggregate_worker_totals():
+    first = LayerwiseTransferStats()
+    first.record(0.25, None, False)
+    second = LayerwiseTransferStats()
+    second.record(0.5, 1.5, True)
+    second.record(0.25, 0.5, False)
+
+    assert first.aggregate(second).reduce() == {
+        "batches": 3,
+        "waits": 2,
+        "failures": 2,
+        "submit_seconds": 1.0,
+        "wait_seconds": 2.0,
+    }
+    first.reset()
+    assert first.is_empty()
+    assert second.data["waits"] == 2
 
 
 def _manager_with_engine(engine: object) -> GlobalTE:
@@ -71,7 +91,7 @@ def test_glm_split_regions_register_and_unregister_in_order():
 
 def test_split_registration_failure_rolls_back_prior_regions():
     engine = MagicMock()
-    engine.register_memory.side_effect = [0, -1]
+    engine.register_memory.side_effect = [0, -1, -1]
     engine.unregister_memory.return_value = 0
     manager = _manager_with_engine(engine)
     first_ptr = 0x400000
@@ -89,6 +109,7 @@ def test_split_registration_failure_rolls_back_prior_regions():
     assert engine.register_memory.call_args_list == [
         call(first_ptr, first_size, "npu:0"),
         call(second_ptr, second_size, "npu:0"),
+        call(second_ptr, second_size, "*"),
     ]
     engine.unregister_memory.assert_called_once_with(first_ptr)
     assert manager._registered_regions == []
@@ -104,6 +125,24 @@ def test_register_buffer_only_registers_once():
     manager.register_buffer([200], [20])
 
     engine.register_memory.assert_called_once_with(100, 10, "*")
+
+
+def test_layerwise_registration_must_match_the_engine_owned_regions():
+    engine = MagicMock()
+    engine.register_memory.return_value = 0
+    engine.unregister_memory.return_value = 0
+    manager = _manager_with_engine(engine)
+    epoch = manager.register_buffer([100], [10], require_exact=True)
+    assert manager.register_buffer([100], [10], require_exact=True) == epoch
+    with pytest.raises(RuntimeError, match="already has a different registration"):
+        manager.register_buffer([200], [10], require_exact=True)
+    manager.validate_registration(((100, 10, "*"),), epoch)
+    manager.unregister_buffer()
+    new_epoch = manager.register_buffer([100], [10], require_exact=True)
+    with pytest.raises(RuntimeError, match="changed after publication"):
+        manager.validate_registration(((100, 10, "*"),), epoch)
+    manager.validate_registration(((100, 10, "*"),), new_epoch)
+    assert engine.register_memory.call_args_list == [call(100, 10, "*"), call(100, 10, "*")]
 
 
 def test_register_buffer_raises_when_registration_fails():

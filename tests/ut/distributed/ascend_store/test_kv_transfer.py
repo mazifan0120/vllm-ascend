@@ -48,6 +48,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVTransferThread,
     LayerBatchBuilder,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.prefill_reuse import (
+    ReadOutcome,
+    SlotBarrier,
+)
 
 
 class FakeStore:
@@ -94,7 +98,176 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
         return block_idx < len(masks[kv_cache_group_id]) and masks[kv_cache_group_id][block_idx]
 
 
+class TestPrefillSlotReuse(unittest.TestCase):
+    def setUp(self):
+        self.store = MagicMock()
+        self.slots = SlotBarrier(((0, 1),))
+        self.save_events = [threading.Event(), threading.Event()]
+        database = FakeTokenDatabase()
+        database.set_group_buffers({0: [1000, 2000]}, {0: [30, 30]}, {0: [300, 300]}, group_num_layers={0: 2})
+        options = dict(
+            m_store=self.store,
+            token_database=database,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=self.save_events,
+            sync_save_events=[MagicMock(), MagicMock()],
+        )
+        self.send = KVCacheStoreLayerSendingThread(**options)
+        self.recv = KVCacheStoreLayerRecvingThread(
+            **options,
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event(), threading.Event()],
+        )
+        self.recv.prefill_slot_provider = lambda: self.slots
+
+    def test_prefill_empty_load_can_rotate_after_reads_and_before_commit(self):
+        slots, store, send, recv = self.slots, self.store, self.send, self.recv
+        record = MagicMock()
+        send.record_prefill_operation = recv.record_prefill_operation = record
+        old = slots.begin_write(0)
+        pd_read = slots.register(old, "transfer", "r1")
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[], is_last_chunk=True)
+        request.save_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+            final_group_layer=True,
+        )
+        task.shared_block_data = send.build_shared_data(task)
+        send.add_stored_request("r1")
+        send.add_prefill_save([task], slots, 0)
+        attention_done = MagicMock()
+        slots.seal(old, attention_done)
+
+        def copy(*_):
+            with self.assertRaises(TimeoutError):
+                slots.begin_write(1, timeout=0)
+            return [30]
+
+        def commit(_):
+            attention_done.assert_called_once()
+            with self.assertRaises(TimeoutError):
+                slots.begin_write(1, timeout=0)
+            slots.complete(pd_read, ReadOutcome(True))
+            self.assertFalse(self.save_events[0].is_set())
+            recv.add_request(LayerLoadTask(None, [], 1))
+            begin_write = slots.begin_write
+            with patch.object(slots, "begin_write", side_effect=lambda layer, _: begin_write(layer, timeout=0)):
+                recv._handle_request(recv.request_queue.get_nowait())
+            self.assertEqual(slots.epoch(1).generation, 2)
+            self.assertTrue(recv.layer_load_finished_events[1].is_set())
+            store.batch_copy_get.assert_not_called()
+            return [0]
+
+        store.batch_copy_put.side_effect = copy
+        store.batch_commit.side_effect = commit
+        send._handle_request(send.request_queue.get_nowait())
+        store.batch_commit.assert_called_once_with(["key"])
+        self.assertTrue(self.save_events[0].is_set())
+        self.assertEqual(
+            [(call.args[0], call.args[2]) for call in record.call_args_list],
+            [
+                ("range_put", 1),
+                ("slot_acquire", 0),
+            ],
+        )
+
+    def test_failed_prefill_get_cannot_admit_attention_or_overwrite_slot(self):
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[])
+        request.load_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+        task.shared_block_data = self.recv.build_shared_data(task)
+        self.store.batch_copy_get.return_value = [-1]
+        self.recv.validate_range_get_results = False
+        self.recv.record_prefill_operation = record = MagicMock()
+        self.recv.add_request(LayerLoadTask(None, [task], 0))
+
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.require_aligned_batch_results",
+                side_effect=AssertionError("Mooncake backend already validated this batch"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"),
+        ):
+            self.recv._handle_request(self.recv.request_queue.get_nowait())
+        self.assertTrue(self.recv.layer_load_finished_events[0].is_set())
+        self.assertEqual(
+            [(call.args[0], call.args[2]) for call in record.call_args_list],
+            [
+                ("slot_acquire", 0),
+                ("range_get", 1),
+            ],
+        )
+        with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
+            self.slots.epoch(0)
+        with self.assertRaisesRegex(RuntimeError, "Prefill Store GET failed"):
+            self.slots.begin_write(1, timeout=0)
+
+    def test_failed_range_receiver_escalates_only_with_prefill_slots(self):
+        for shared_slots in (False, True):
+            with self.subTest(shared_slots=shared_slots):
+                self.setUp()
+                if not shared_slots:
+                    self.recv.prefill_slot_provider = None
+                self.recv.add_request(LayerLoadTask(None, [], 0))
+                with (
+                    patch.object(self.recv, "_set_os_thread_name"),
+                    patch.object(self.recv, "_handle_request", side_effect=RuntimeError("in-doubt Store read")),
+                    patch("os._exit") as stop_process,
+                ):
+                    self.recv.run()
+                self.assertEqual(str(self.recv._fatal_error), "in-doubt Store read")
+                if shared_slots:
+                    stop_process.assert_called_once_with(1)
+                else:
+                    stop_process.assert_not_called()
+
+
 class TestLayerBatchBuilderOffsets(unittest.TestCase):
+    def test_prefill_get_broadcast_keeps_partial_strided_ranges(self):
+        database = FakeTokenDatabase()
+        database.set_group_buffers(
+            {0: [1000, 2000, 3000]},
+            {0: [16, 16, 32]},
+            {0: [64, 96, 128]},
+            group_num_layers={0: 2},
+            group_layer_cache_entry_offsets={0: [0, 2, 3]},
+            group_cache_entry_segments={0: [(0, 2), (1, 2), (0, 1)]},
+        )
+        builder = LayerBatchBuilder(database, page_size_bytes=64, num_layers=2)
+        shared = SharedBlockData(
+            block_ids_arr=np.asarray([7, 3, 1, 11]),
+            block_gvas_arr=None,
+            req_ids=["r1"],
+            is_last_chunks=[False],
+            block_keys=["full", "short", "crosses-page", "another-full"],
+            range_tokens=[None, 5, 11, None],
+        )
+        for layer in (0, 1):
+            with self.subTest(layer=layer):
+                result = builder.build_addrs(shared, layer, prefill_get=True)
+                ordinary = builder.build_addrs(shared, layer)
+                self.assertEqual(result, ordinary)
+                for get_rows, ordinary_rows in (
+                    (result.all_sizes, ordinary.all_sizes),
+                    (result.all_offsets, ordinary.all_offsets),
+                ):
+                    self.assertIs(get_rows[0], get_rows[3])
+                    self.assertIsNot(get_rows[0], get_rows[1])
+                    self.assertIsNot(get_rows[0], get_rows[2])
+                    self.assertIsNot(ordinary_rows[0], ordinary_rows[3])
+
     def test_uses_real_offsets_for_variable_cache_entries_per_layer(self):
         database = FakeTokenDatabase()
         database.set_group_buffers(

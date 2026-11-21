@@ -4,8 +4,9 @@
 
 from collections import OrderedDict
 from collections.abc import Hashable
-from dataclasses import dataclass
-from math import gcd
+from dataclasses import dataclass, replace
+from itertools import pairwise
+from math import gcd, prod
 
 import numpy as np
 
@@ -28,6 +29,31 @@ class DsaCacheLayout:
     capacity: int = 0
 
 
+def tensor_cache_layout(name: str, position: int, tensor, num_blocks: int, block_tokens: int) -> DsaCacheLayout:
+    shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+    if len(shape) < 2 or min(shape) <= 0 or num_blocks <= 0 or shape[0] % num_blocks:
+        raise ValueError(f"Invalid layerwise tensor shape for {name}")
+    scale = shape[0] // num_blocks
+    if (
+        block_tokens <= 0
+        or block_tokens % scale
+        or any(strides[i] != prod(shape[i + 1 :]) for i in range(1, len(shape)))
+    ):
+        raise ValueError(f"Invalid layerwise page geometry for {name}")
+    item_size = tensor.element_size()
+    return DsaCacheLayout(
+        name,
+        position,
+        int(tensor.data_ptr()),
+        prod(shape[1:]) * item_size,
+        strides[0] * item_size,
+        scale,
+        block_tokens,
+        str(tensor.dtype).removeprefix("torch."),
+        num_blocks,
+    )
+
+
 @dataclass(frozen=True)
 class DsaRegisterAtom:
     """One transfer component that must not straddle registered regions."""
@@ -36,6 +62,28 @@ class DsaRegisterAtom:
     end: int
     location: str
     allocation: Hashable
+
+
+def prefill_source_atoms(
+    main: dict[int, list[tuple[DsaCacheLayout, DsaRegisterAtom]]],
+    indexers: list[DsaRegisterAtom],
+    slots: tuple[tuple[int, ...], ...],
+) -> list[DsaRegisterAtom]:
+    if set(main) != {layer for slot in slots for layer in slot} or not slots:
+        raise ValueError("Registered Prefill layers differ from the Main slot plan")
+    atoms = list(indexers)
+    for owner, *aliases in slots:
+        source = main[owner]
+        expected = [(replace(layout, layer_name=""), atom) for layout, atom in source]
+        for layer in aliases:
+            actual = [(replace(layout, layer_name=""), atom) for layout, atom in main[layer]]
+            if actual != expected:
+                raise ValueError(f"Prefill Main cache for layer {layer} does not alias its planned slot owner {owner}")
+        atoms.extend(atom for _, atom in source)
+    ordered = sorted(atoms, key=lambda atom: atom.start)
+    if any(left.end > right.start for left, right in pairwise(ordered)):
+        raise ValueError("Distinct Prefill Main slots and Indexer caches must be disjoint")
+    return ordered
 
 
 @dataclass(frozen=True)

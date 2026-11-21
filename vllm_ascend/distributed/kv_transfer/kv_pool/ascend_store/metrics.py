@@ -31,6 +31,7 @@ LOAD_GET_HISTOGRAM_BUCKETS = (
     3.0,
     4.0,
 )
+_PREFILL_PHASES = {"slot_acquire", "range_get", "range_put"}
 
 
 @dataclass
@@ -48,6 +49,8 @@ class AscendStoreKVConnectorStats(KVConnectorStats):
             self.data.setdefault("load_get_duration_seconds", []).extend(durations)
         if num_keys := other.data.get("load_get_keys"):
             self.data["load_get_keys"] = self.data.get("load_get_keys", 0) + num_keys
+        for phase, (calls, seconds) in other.data.get("prefill_phases", {}).items():
+            self._add_prefill_phase(phase, calls, seconds)
         if "delayed_release_requests" in other.data:
             self.data["delayed_release_requests"] = other.data["delayed_release_requests"]
             self.data["delayed_release_blocks"] = other.data["delayed_release_blocks"]
@@ -62,13 +65,22 @@ class AscendStoreKVConnectorStats(KVConnectorStats):
             reduced["ascend_store_load_get_count"] = len(durations)
             reduced["ascend_store_load_get_avg_ms"] = round(fmean(durations) * 1e3, 3)
             reduced["ascend_store_load_get_keys"] = self.data.get("load_get_keys", 0)
+        for phase, (calls, seconds) in self.data.get("prefill_phases", {}).items():
+            reduced[f"ascend_store_prefill_{phase}_count"] = calls
+            reduced[f"ascend_store_prefill_{phase}_avg_ms"] = round(seconds * 1e3 / calls, 3)
         return reduced
 
     def record_operation(self, operation: str, duration_seconds: float, num_keys: int) -> None:
-        if operation != "load_get":
-            return
-        self.data.setdefault("load_get_duration_seconds", []).append(duration_seconds)
-        self.data["load_get_keys"] = self.data.get("load_get_keys", 0) + num_keys
+        if operation == "load_get":
+            self.data.setdefault("load_get_duration_seconds", []).append(duration_seconds)
+            self.data["load_get_keys"] = self.data.get("load_get_keys", 0) + num_keys
+        elif operation in _PREFILL_PHASES:
+            self._add_prefill_phase(operation, 1, duration_seconds)
+
+    def _add_prefill_phase(self, phase: str, calls: int, seconds: float) -> None:
+        phases = self.data.setdefault("prefill_phases", {})
+        previous_calls, previous_seconds = phases.get(phase, (0, 0.0))
+        phases[phase] = (previous_calls + calls, previous_seconds + seconds)
 
     def set_delayed_release(self, num_requests: int, num_blocks: int) -> None:
         self.data["delayed_release_requests"] = num_requests
@@ -123,6 +135,16 @@ class AscendStorePromMetrics(KVConnectorPromMetrics):
             ),
             per_engine_labelvalues,
         )
+        self._prefill_operations = self._counter_cls(
+            name="vllm:ascend_store_prefill_operations_total",
+            documentation="Number of completed P layerwise slot acquisitions or returned Store range calls.",
+            labelnames=[*labelnames, "phase"],
+        )
+        self._prefill_seconds = self._counter_cls(
+            name="vllm:ascend_store_prefill_operation_seconds_total",
+            documentation="Total worker time in P layerwise slot acquisition or Store range calls.",
+            labelnames=[*labelnames, "phase"],
+        )
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
         metric = self._load_get_duration.get(engine_idx)
@@ -140,3 +162,7 @@ class AscendStorePromMetrics(KVConnectorPromMetrics):
         if metric is not None:
             if "delayed_release_blocks" in transfer_stats_data:
                 metric.set(transfer_stats_data["delayed_release_blocks"])
+        for phase, (calls, seconds) in transfer_stats_data.get("prefill_phases", {}).items():
+            labels = (*self.per_engine_labelvalues[engine_idx], phase)
+            self._prefill_operations.labels(*labels).inc(calls)
+            self._prefill_seconds.labels(*labels).inc(seconds)
