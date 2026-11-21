@@ -1,5 +1,9 @@
 # GLM-5.2 Layerwise KV Offloading 特性报告
 
+代码分支：[mc-layerwise-rewrite](https://github.com/mazifan0120/vllm-ascend/tree/mc-layerwise-rewrite) · [PR #4](https://github.com/mazifan0120/vllm-ascend/pull/4)
+
+镜像地址：`swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119`
+
 日期：2026-11-21
 对象：A3 集群上的最新特性实现；测试数据截至 2026-11-21。
 生产代码：`43e124eb5ba11cec16360748c111f8066549c816`。
