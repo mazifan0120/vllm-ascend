@@ -46,14 +46,11 @@ bash run-node.sh engines   # every node
 bash run-node.sh proxy     # p0 only, after every engine API is healthy
 ```
 
-Use `/healthcheck` on the proxy to verify 2 P / 8 D (performance) or 4 P / 16 D
-(capacity). Logs remain in the rendered node directory's `logs/`. Stop requests,
-check running/waiting are zero, and use `bash run-node.sh stop` on every host to
-stop only this labelled deployment. No container or log removal is automatic.
-
-For the independent capacity profile, render with `--profile capacity` to a new
-output directory and repeat on idle nodes. The profiles share devices and some
-API ports, so they cannot run concurrently.
+The documented deployment sets both P and D `max_model_len` to 1,048,576.
+Use `/healthcheck` on the proxy to verify 2 P / 8 D. Logs remain in each rendered
+node directory's `logs/`. Stop requests, check running/waiting are zero, and use
+`bash run-node.sh stop` on every host to stop only this labelled deployment.
+No container or log removal is automatic.
 
 `tools/http_bench.py` reads prepared prompt JSONL and performs closed-loop SSE
 requests without extra Python packages. It checks completion, token counts and

@@ -13,7 +13,7 @@
 
 55K 输入、700 输出、每档 112 条正式请求，四档均为 112/112 成功。本特性四档 TTFT 均值降低 **14.4%–37.4%**，TPOT 降低 **26.6%–40.5%**，输出吞吐提高 **31.4%–59.4%**。高命中 C64 的平均 TTFT 优势收窄为 **14.4%**（10.49s 对 12.26s）。
 
-基本功能与近 1M 的证据另来自同一特性镜像的独立配置：TP2/DP16、MTP5、P/D 均为 1M 下，语义回归 **48/48 通过**，实际 **1,047,257 tokens** 请求正确返回 MAPLE，TTFT **360.94s**。这些功能结果与第 7 节性能数据分属不同启动配置。
+本特性按 **P/D 均为 1M 上下文**部署，功能、长上下文与性能作为不同测试项目验证。基本语义回归 **48/48 通过**；实际 **1,047,257 tokens** 请求正确返回 MAPLE，TTFT **360.94s**。各项实测的 TP/DP、MTP 等参数随结果列出。
 
 ## 2. 特性设计
 
@@ -182,7 +182,7 @@ sequenceDiagram
 | 性能图绘制工具 | 1 | 59 | 0 | 59 |
 | 代码、测试与脚本总计 | **87** | **8,190** | **170** | **8,020** |
 
-小计行不与明细行重复累加。启动模板中的重复参数行也计入脚本行数；这部分是两档四节点的配置展开，不是 40 个独立功能模块。另有 9 个运行配置 JSON，共 91 行，按配置数据单独统计。
+小计行不与明细行重复累加。启动模板中的重复参数行也计入脚本行数；这部分是统计快照中各节点的配置展开，不是 40 个独立功能模块。另有 9 个运行配置 JSON，共 91 行，按配置数据单独统计。
 
 推理包生产代码按职责拆分如下，分组不重叠：
 
@@ -234,7 +234,7 @@ git diff --numstat 4234a1f1815252e8b52c75d6956d0bdf9ae80cc0 \
 |---|---|
 | 特性镜像归档 | `glm52-layerwise-kv-image.tar`，由特性提供方另行交付，约 21GB；本报告附件不包含大体积镜像 |
 | 模型权重 | 完整 `GLM-5.2-w4a8c8` checkpoint，由使用方准备；各节点可放在不同的本地目录 |
-| 运行与测试工具 | 本报告附件中的 `runtime/`：两档参数模板、标准库配置生成器、Docker 启动脚本和 HTTP 测试客户端 |
+| 运行与测试工具 | 本报告附件中的 `runtime/`：部署参数模板、标准库配置生成器、Docker 启动脚本和 HTTP 测试客户端 |
 | 主机基础环境 | 4 台 A3，每台 16 个 NPU 设备，已安装匹配驱动和 Docker；通信 IP、网卡与 RoCE 网络可用 |
 
 镜像已经包含推理代码、CANN 9.2 用户态运行环境和所需原生库，不要求读者准备开发源码目录。主机驱动仍需与该镜像环境匹配。
@@ -252,36 +252,36 @@ docker image inspect --format '{{.Id}}' glm52-layerwise-kv:20261119
 
 上面的内容 ID 是本报告实际验证镜像的 ID；`glm52-layerwise-kv:20261119` 是本文约定的本地别名，不是公开镜像仓库地址。没有获得对应镜像 tar 时，可以阅读与审核报告，但无法完整部署本特性。
 
-### 4.2 性能档与容量档配置
+### 4.2 1M 部署配置
 
-| 参数 | 性能档 | 近 1M 容量档 |
-|---|---|---|
-| P TP / DP | 16 / 2 | 8 / 4 |
-| D TP / DP | 4 / 8 | 2 / 16 |
-| P / D MTP speculative tokens | 1 / 5 | 1 / 3 |
-| P 图模式 | eager | eager |
-| D 图模式 | target FULL_DECODE_ONLY，draft eager | target/draft eager |
-| P / D max_model_len | 1048576 / 1048576 | 1048576 / 1048576 |
-| P / D max_num_batched_tokens | 16384 / 192 | 16384 / 32 |
-| P / D max_num_seqs | 64 / 8 | 8 / 8 |
-| P / D 显存利用率参数 | 0.90 / 0.92 | 0.75 / 0.88 |
-| P shared buffers / prefetch | 5 / 3 | 2 / 1 |
-| Store segment / 注册 rank | 40GiB | 20GiB |
-| D Host backing / D 实例 | 100GiB | 100GiB |
-| D top-k / LRU threads | 4096 / 16 | 4096 / 16 |
-| 代理端口 | 8496 | 8497 |
-| 独立 Master / metrics | 50163 / 52163 | 50164 / 52164 |
+| 参数 | 配置值 |
+| --- | --- |
+| P TP / DP | 16 / 2 |
+| D TP / DP | 4 / 8 |
+| P / D MTP speculative tokens | 1 / 5 |
+| P 图模式 | eager |
+| D 图模式 | target FULL_DECODE_ONLY，draft eager |
+| P / D max_model_len | 1048576 / 1048576 |
+| P / D max_num_batched_tokens | 16384 / 192 |
+| P / D max_num_seqs | 64 / 8 |
+| P / D 显存利用率参数 | 0.90 / 0.92 |
+| P shared buffers / prefetch | 5 / 3 |
+| Store segment / 注册 rank | 40GiB |
+| D Host backing / D 实例 | 100GiB |
+| D top-k / LRU threads | 4096 / 16 |
+| 代理端口 | 8496 |
+| Master / metrics | 50163 / 52163 |
 
-性能档 D 图捕获 sizes 为 `[1,2,4,6,12,18,24,30,36,42,48]`，compilation mode=3；P 侧 GET 采用整层模式，`layerwise_get_max_transfer_blocks=0`。这些是本次测量的固定值，不表示每个场景的全局最优参数。
+D 图捕获 sizes 为 `[1,2,4,6,12,18,24,30,36,42,48]`，compilation mode=3；P 侧 GET 采用整层模式，`layerwise_get_max_transfer_blocks=0`。这些是本次测量的固定值，不表示每个场景的全局最优参数。
 
 节点分工和 API（地址由使用方填写）：
 
-| 节点 | 地址配置项 | 性能档 API | 容量档 API |
-|---|---|---|---|
-| p0 | P0_IP | 8410 | 8410–8411 |
-| p1 | P1_IP | 8410 | 8412–8413 |
-| d0 | D0_IP | 8420–8423 | 8420–8427 |
-| d1 | D1_IP | 8424–8427 | 8428–8435 |
+| 节点 | 地址配置项 | API |
+| --- | --- | --- |
+| p0 | P0_IP | 8410 |
+| p1 | P1_IP | 8410 |
+| d0 | D0_IP | 8420–8423 |
+| d1 | D1_IP | 8424–8427 |
 
 ### 4.3 生成本地配置
 
@@ -306,7 +306,7 @@ cp cluster.example.json cluster.json
 }
 ```
 
-生成性能档：
+生成部署脚本（P/D 长度上限均为 1M）：
 
 ```bash
 python3 render.py --config cluster.json --profile performance --output launch-performance
@@ -347,7 +347,7 @@ curl -fsS http://<P0_IP>:52163/metrics > /dev/null
 bash run-node.sh engines
 ```
 
-等待所有引擎 `/health` 返回 200：性能档为两个 P API 和八个 D API，地址/端口见第 4.2 节。全部就绪后，在 p0 执行：
+等待所有引擎 `/health` 返回 200：本配置为两个 P API 和八个 D API，地址/端口见第 4.2 节。全部就绪后，在 p0 执行：
 
 ```bash
 # 3. 仅 p0：启动 D-first 代理。
@@ -358,15 +358,7 @@ curl -fsS http://<P0_IP>:8496/healthcheck
 
 引擎、代理和 Store 参数直接由随包 shell 提供，不需要现场安装开发分支或额外挂载源码。不要重复执行 `engines` 启动第二组进程；启动失败应先查看日志。
 
-### 4.5 容量档、日志与停止
-
-近 1M 档独立生成：
-
-```bash
-python3 render.py --config cluster.json --profile capacity --output launch-capacity
-```
-
-将四个目录分发到各节点的新工作目录，按相同的 `create → master → engines → proxy` 顺序启动。容量档容器名为 `glm52-layerwise-capacity`，Master/metrics 为 50164/52164，代理为 8497，健康检查应显示 4P/16D。两档占用同一批 NPU、部分 API 端口相同，切换前必须停止上一档，不能同时运行。
+### 4.5 日志与停止
 
 每个节点工作目录下的 `logs/` 保存本节点引擎日志；p0 另有 `proxy.log` 和 `kvmaster.log`。不要求共享盘。功能测试如需汇总审计日志，可将四个节点的 `logs/` 分别收集到 `<AUDIT_ROOT>/{p0,p1,d0,d1}/logs/`。
 
@@ -376,17 +368,17 @@ python3 render.py --config cluster.json --profile capacity --output launch-capac
 bash run-node.sh stop
 ```
 
-脚本只停止本档有匹配标签的容器，不停止其它容器、不自动删除日志。容器已存在时 `create` 会失败，避免覆盖旧实验；新一轮应使用新的工作目录并显式管理旧容器。
+脚本只停止当前部署中有匹配标签的容器，不停止其它容器、不自动删除日志。容器已存在时 `create` 会失败，避免覆盖旧实验；新一轮应使用新的工作目录并显式管理旧容器。
 
-**验证状态：**性能档参数按本报告引用的复测记录提供；功能与容量档的独立实机证据见第 5 节。面向不同地址、模型目录整理的通用容器封装已做本地生成和 shell 校验，尚未在另一套主机上重跑；它不构成对任意驱动安装布局的额外验证。
+**验证状态：**部署参数按本报告引用的复测记录提供；功能与长上下文验证证据见第 5 节。面向不同地址、模型目录整理的通用容器封装已做本地生成和 shell 校验，尚未在另一套主机上重跑；它不构成对任意驱动安装布局的额外验证。
 
 ## 5. 功能验证
 
-### 5.1 独立 TP2 配置的语义回归
+### 5.1 基本输入输出与前缀复用
 
-本节使用独立功能配置：P TP16/DP2、D TP2/DP16、MTP1/5，P/D 长度上限均为 1M；D 显存比例 0.88、seq8、batch192、draft eager、target FULL。该配置与第 7 节的 TP4/DP8 性能配置分别记录。
+本项测试参数：P TP16/DP2、D TP2/DP16、MTP1/5，P/D 长度上限均为 1M；D 显存比例 0.88、seq8、batch192、draft eager、target FULL。
 
-性能矩阵结束后独立运行一轮，使用新的 nonce，包含三组各 16 条请求：
+功能检查单独计数，运行一轮，使用新的 nonce，包含三组各 16 条请求：
 
 | 场景 | 输入与断言 | 结果 |
 |---|---|---|
@@ -397,7 +389,7 @@ bash run-node.sh stop
 
 本轮覆盖全部 16 个 D 引擎，所有请求均有 TP2 Ready/Closed；长前缀复用检查通过。最后全部 18 个引擎健康，running、waiting、KV 使用量均为零。
 
-随包 `runtime/tools/smoke.py` 可发起独立语义检查。以下命令对应第 4 节 TP4/8D 性能档（每轮 24 条检查请求）；上表 48 条结果来自独立 TP2/16D 配置。需要完整日志审计时，在用例完成后提供收集到的四节点日志；在线使用则需将 `--logs` 指向能看到四节点日志的目录：
+随包 `runtime/tools/smoke.py` 可发起独立语义检查。以下命令对应第 4 节 TP4/8D 部署参数（每轮 24 条检查请求）；上表记录的 TP2/16D 测试每轮为 48 条。需要完整日志审计时，在用例完成后提供收集到的四节点日志；在线使用则需将 `--logs` 指向能看到四节点日志的目录：
 
 ```bash
 python3 runtime/tools/smoke.py \
@@ -414,9 +406,9 @@ python3 runtime/tools/smoke.py \
 
 这是一组带明确答案的基本语义和生命周期回归，不是通用精度基准。性能测试中的随机文本响应成功率另行统计，不计入语义通过数。
 
-### 5.2 独立 TP2 配置的实际近 1M 验证
+### 5.2 实际近 1M 上下文验证
 
-沿用第 5.1 节功能配置：P TP16/DP2、D TP2/DP16、MTP1/5，D target FULL、draft eager，两侧 max_model_len=1048576。在该独立配置下发起长请求：
+本项测试参数与第 5.1 节相同：P TP16/DP2、D TP2/DP16、MTP1/5，D target FULL、draft eager，两侧 max_model_len=1048576。经 tokenize 确认实际输入长度后发起长请求：
 
 | 项目 | 实测 |
 |---|---|
@@ -430,39 +422,11 @@ python3 runtime/tools/smoke.py \
 
 ```bash
 python3 runtime/tools/long_probe.py \
-  --proxy http://<P0_IP>:8499 --tokenize http://<P0_IP>:8410 \
-  --output near-1m-performance-result.jsonl
-```
-
-这证明同一特性镜像在上述 TP2 配置下可以实际处理近 1M 请求。它不是近 1M 并发或长输出测试，也不是通用长文精度评测。单次延迟不构成稳态 SLA。原始响应与审计见 `results/capacity/performance-1m/`。
-
-### 5.3 同一镜像另一套容量配置的近 1M 验证
-
-采用独立容量档。实际请求带新的文档 nonce，在很长的填充文本首部放置 MAPLE，尾部放置 QUARTZ，要求只回答首部标记；先调用服务 `/tokenize` 校验真实长度，再经 D-first 代理发流式请求。
-
-| 项目 | 实测 |
-|---|---|
-| 实际输入 | **1,047,256 tokens**；tokenize 与响应 usage 一致 |
-| 外部缓存 | **0/8180** 完整块，冷前缀 |
-| 输出 | **MAPLE**，3 completion tokens，finish_reason=stop |
-| TTFT | **488.5746s** |
-| E2E | **488.5870s** |
-| 接收与回收 | TP2 Ready/Closed 完整 |
-| 后续短请求 | **4/4** 答案正确，各有 Ready/Closed |
-| D 生命周期计数增量 | prepare、ready、close_started、close 各 5 |
-| 最终状态 | **20/20 引擎健康**，running/waiting/KV 均归零 |
-
-启动容量档后，使用随包近 1M 探针：
-
-```bash
-python3 runtime/tools/long_probe.py \
-  --proxy http://<P0_IP>:8497 --tokenize http://<P0_IP>:8410 \
+  --proxy http://<P0_IP>:8496 --tokenize http://<P0_IP>:8410 \
   --output near-1m-result.jsonl
 ```
 
-工具先校验实际 tokenize 数，再提交流式请求并保存首 token、答案、usage 和结束状态。输出文件必须是新文件，避免覆盖已有结果。
-
-本项证明最新镜像在已验证容量配置下能完成接近 1,048,576 上限的实际请求，不只是配置项或启动日志显示 1M。它没有测试满额 1,048,576 输入、近 1M 并发或长输出，也没有覆盖复杂长文推理质量。488.6s 是一次容量验证观测值，不能当成稳态 1M 性能 SLA。
+本项验证使用实际接近 1M 的输入，而非仅检查启动参数或容量日志。它不是近 1M 并发或长输出测试，也不是通用长文精度评测。单次延迟不构成稳态 SLA。原始响应与审计见 `results/capacity/performance-1m/`。
 
 ## 6. 性能测试方法与观测
 
@@ -629,7 +593,7 @@ DCP2 冷 C32 有 0.13% 外部命中；其它冷档为 0。热档为 88.66%–89.
 
 冷档从 C32 到 C64，两边输出吞吐基本不变，TTFT 则明显增长，表现为吞吐达到瓶颈后排队增加。当前来源没有这组实验逐请求的 P queue/prefill 分解，不能把差值精确归因于某个算子、GET 或 HCCL。
 
-每档只跑一次、112 条正式请求，无置信区间。thinking 未显式关闭，实际输入长度和命中率有小幅波动；这些条件应随结果一起保留。功能与近 1M 证据来自第 5 节独立配置，不与本节性能结果混算。结果仅覆盖这组 55K/700、C32/C64、0%/约90% 外部命中，不能外推为生产 SLA。
+每档只跑一次、112 条正式请求，无置信区间。thinking 未显式关闭，实际输入长度和命中率有小幅波动；这些条件应随结果一起保留。功能、长上下文和性能测试分别计数，实测参数见各节。结果仅覆盖这组 55K/700、C32/C64、0%/约90% 外部命中，不能外推为生产 SLA。
 
 ## 8. 交付内容与结论边界
 
@@ -639,7 +603,7 @@ DCP2 冷 C32 有 0.13% 外部命中；其它冷档为 0。热档为 88.66%–89.
 |---|---|
 | `report.md` | 本报告，包含完整设计、部署参数、测试协议和结果，不需要其它设计文档 |
 | `figures/` | 性能图 PNG/SVG、精确数值 JSON 和绘图脚本 |
-| `runtime/` | 两档参数模板、地址配置生成器、Docker 启动脚本和 HTTP/语义/近 1M 工具 |
+| `runtime/` | 部署参数模板、地址配置生成器、Docker 启动脚本和 HTTP/语义/近 1M 工具 |
 | `results/issue69/` | 本报告采用的复测来源全文、转录表格和来源 SHA256 |
 | `results/feature/`、`results/dcp/` | 此前独立实验留档，不作为本版第 7 节性能表的数据来源 |
 | `results/functional/`、`results/capacity/` | 语义回归、实际近 1M 响应、接收/关闭和资源收尾证据 |
@@ -649,4 +613,4 @@ DCP2 冷 C32 有 0.13% 外部命中；其它冷档为 0。热档为 88.66%–89.
 
 当前证据支持描述本模型、硬件与固定配置下的实际功能和四档性能。有限标记检索不等于完整精度评测；此前实验中曾记录个别短请求异常输出，本轮全部通过不能替代其根因分析。native 失败后若无法证明读写静止，安全策略会继续持有相关资源，必要时需要 worker 重启，不能宣称所有异常均自动恢复。
 
-性能比较是每档一次的有限闭环测试，不是消除软件栈与所有参数差异后的单变量实验。同一镜像的独立配置已通过单请求近 1M 验证；该结果不承诺性能档的近 1M 并发能力或生产 SLA。
+性能比较是每档一次的有限闭环测试，不是消除软件栈与所有参数差异后的单变量实验。本特性已通过实际近 1M 单请求验证；55K 性能测试与近 1M 功能测试分别说明对应场景，不据此承诺近 1M 并发能力或生产 SLA。
