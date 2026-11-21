@@ -232,29 +232,26 @@ git diff --numstat 4234a1f1815252e8b52c75d6956d0bdf9ae80cc0 \
 
 ### 4.1 交付物与环境准备
 
-复现需要三类交付物：**包含本特性的推理镜像、模型权重、运行脚本包**。普通官方镜像不包含本文特性，不能仅替换启动参数来复现。
+部署需要**本特性推理镜像、模型权重和运行脚本**。镜像使用文档开头给出的仓库地址，运行脚本可从附件或开头的代码分支获取。
 
 | 交付物 | 内容与获得方式 |
 |---|---|
-| 特性镜像归档 | `glm52-layerwise-kv-image.tar`，由特性提供方另行交付，约 21GB；本报告附件不包含大体积镜像 |
+| 特性推理镜像 | `swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119`，在每台节点执行 `docker pull` 获取 |
 | 模型权重 | 完整 `GLM-5.2-w4a8c8` checkpoint，由使用方准备；各节点可放在不同的本地目录 |
-| 运行与测试工具 | 本报告附件中的 `runtime/`：部署参数模板、标准库配置生成器、Docker 启动脚本和 HTTP 测试客户端 |
+| 运行与测试工具 | 附件 `runtime/`，或代码仓的 `examples/disaggregated_prefill_v1/layerwise_kv_offload/`：部署模板、配置生成器、Docker 启动脚本和 HTTP 测试客户端 |
 | 主机基础环境 | 4 台 A3，每台 16 个 NPU 设备，已安装匹配驱动和 Docker；通信 IP、网卡与 RoCE 网络可用 |
 
 镜像已经包含推理代码、CANN 9.2 用户态运行环境和所需原生库，不要求读者准备开发源码目录。主机驱动仍需与该镜像环境匹配。
 
-每台节点导入收到的镜像，并设置便于使用的本地别名：
+每台节点拉取镜像，并校验内容 ID。仓库需要鉴权时，先使用已授权账号登录对应仓库。
 
 ```bash
-docker load -i glm52-layerwise-kv-image.tar
-docker tag \
-  sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44 \
-  glm52-layerwise-kv:20261119
-
-docker image inspect --format '{{.Id}}' glm52-layerwise-kv:20261119
+docker pull swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119
+docker image inspect --format '{{.Id}}' \
+  swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119
 ```
 
-上面的内容 ID 是本报告实际验证镜像的 ID；`glm52-layerwise-kv:20261119` 是本文约定的本地别名，不是公开镜像仓库地址。没有获得对应镜像 tar 时，可以阅读与审核报告，但无法完整部署本特性。
+本报告验证过的镜像内容 ID 为 `sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44`，与随包 `cluster.example.json` 中的 `image_id` 一致。启动脚本会按该 ID 检查镜像内容。
 
 ### 4.2 1M 部署配置
 
@@ -289,7 +286,7 @@ D 图捕获 sizes 为 `[1,2,4,6,12,18,24,30,36,42,48]`，compilation mode=3；P 
 
 ### 4.3 生成本地配置
 
-解压附件后进入 `runtime/`，只需要 Python 3.9+ 标准库和 Bash，无需额外编排工具。
+使用附件时进入 `runtime/`；使用代码仓时进入 `examples/disaggregated_prefill_v1/layerwise_kv_offload/`，执行相同命令。以下以附件目录为例，只需要 Python 3.9+ 标准库和 Bash。
 
 ```bash
 cd runtime
@@ -300,7 +297,7 @@ cp cluster.example.json cluster.json
 
 ```json
 {
-  "image": "glm52-layerwise-kv:20261119",
+  "image": "swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119",
   "image_id": "sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44",
   "nic": "<通信网卡名>",
   "nodes": {
@@ -613,7 +610,7 @@ DCP2 冷 C32 有 0.13% 外部命中；其它冷档为 0。热档为 88.66%–89.
 | `results/functional/`、`results/capacity/` | 语义回归、实际近 1M 响应、接收/关闭和资源收尾证据 |
 | `MANIFEST.sha256` | 附件完整性校验 |
 
-特性镜像 tar 与模型权重体积较大，**不在本报告附件中**，需由提供方另行交付。通用运行脚本无法把普通官方镜像变成本特性镜像；报告中的本地别名也不代表公开可下载地址。
+特性镜像按第 4.1 节从仓库拉取，模型权重由使用方准备。报告附件提供部署脚本、配置、图表和测试记录；代码分支、PR 与镜像地址均列在文档开头。
 
 当前证据支持描述本模型、硬件与固定配置下的实际功能和四档性能。有限标记检索不等于完整精度评测；此前实验中曾记录个别短请求异常输出，本轮全部通过不能替代其根因分析。native 失败后若无法证明读写静止，安全策略会继续持有相关资源，必要时需要 worker 重启，不能宣称所有异常均自动恢复。
 

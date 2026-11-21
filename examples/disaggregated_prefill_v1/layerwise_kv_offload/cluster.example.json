@@ -1,5 +1,5 @@
 {
-  "image": "glm52-layerwise-kv:20261119",
+  "image": "swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119",
   "image_id": "sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44",
   "nic": "CHANGE_ME",
   "nodes": {

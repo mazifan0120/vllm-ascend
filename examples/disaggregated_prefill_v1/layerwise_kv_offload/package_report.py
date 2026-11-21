@@ -31,8 +31,9 @@ def main():
     files["README.txt"] = (
         b"Read report.md first. Mermaid renders the design diagrams; PNG/SVG performance figures are included.\n"
         b"runtime/ contains standalone Python/Bash/Docker configuration and test tools; read runtime/README.md.\n"
-        b"The feature image archive and model weights must be supplied separately. "
-        b"The local image alias is not a public download URL.\n"
+        b"Pull the feature image from "
+        b"swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119. "
+        b"Prepare the model weights separately; see report.md section 4.1.\n"
         b"results/ contains compact original measurement evidence. "
         b"Portable wrappers and the reference HTTP client have local checks only, as documented.\n"
     )

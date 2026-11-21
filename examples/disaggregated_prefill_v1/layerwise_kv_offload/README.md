@@ -5,22 +5,20 @@ Docker and Python 3.9+ standard library. No deployment repository, predecessor
 container, private benchmark image, external design PDF or orchestration runtime
 is needed.
 
-You must obtain the **feature inference image tar** separately from its provider,
-and prepare the complete GLM-5.2-w4a8c8 checkpoint on each A3 node. The ordinary
-upstream image does not contain this feature. Model weights and the large image
-archive are not included here.
-
-The measured image content ID is:
+Pull the feature inference image on every A3 node and prepare the complete
+GLM-5.2-w4a8c8 checkpoint. Authenticate to the registry with your authorized
+account if required. The measured image content ID is:
 
 ```
 sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44
 ```
 
-After loading it, assign the local alias used in `cluster.example.json`:
+The example configuration uses the registry address directly:
 
 ```bash
-docker load -i glm52-layerwise-kv-image.tar
-docker tag sha256:3de4ba4a2801ea65b97a7d32b02bf837abb7a5744e0b82605efa293cec5ada44 glm52-layerwise-kv:20261119
+docker pull swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119
+docker image inspect --format '{{.Id}}' \
+  swr.cn-southwest-2.myhuaweicloud.com/ott9-didi/vllm-ascend-kvoffloading:v1119
 cp cluster.example.json cluster.json
 # Fill the four communication IPv4 addresses and the NIC name.
 python3 render.py --config cluster.json --profile performance --output launch-performance
@@ -81,5 +79,5 @@ python3 examples/disaggregated_prefill_v1/layerwise_kv_offload/package_report.py
 The tracked report is `docs/source/user_guide/feature_guide/layerwise_kv_offload.md`.
 Figures and compact measurement evidence are under `docs/source/assets/layerwise_kv_offload/`.
 The ZIP and checksum are generated under `build/reports/`; `--output PATH` overrides this.
-All report/runtime/evidence inputs are tracked in this repository; model weights and
-the large inference image tar are supplied separately.
+All report/runtime/evidence inputs are tracked in this repository. Pull the feature
+image from the registry address above and prepare the model weights separately.
