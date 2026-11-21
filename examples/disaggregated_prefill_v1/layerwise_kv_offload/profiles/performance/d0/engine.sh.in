@@ -32,13 +32,13 @@ exec vllm serve /models/GLM-5.2-w4a8c8 \
   --host @D0_IP@ --port "$port" --api-server-count 1 \
   --trust-remote-code --served-model-name glm-52 \
   --distributed-executor-backend mp --enable-expert-parallel \
-  --data-parallel-size 16 --data-parallel-rank "$rank" \
+  --data-parallel-size 8 --data-parallel-rank "$rank" \
   --data-parallel-address @D0_IP@ \
-  --data-parallel-rpc-port 17660 --tensor-parallel-size 2 \
+  --data-parallel-rpc-port 17660 --tensor-parallel-size 4 \
   --prefill-context-parallel-size 1 --decode-context-parallel-size 1 \
   --max-model-len 1048576 --block-size 128 \
   --max-num-batched-tokens 192 --max-num-seqs 8 \
-  --gpu-memory-utilization 0.88 \
+  --gpu-memory-utilization 0.92 \
   --kv-cache-dtype auto --attention_config.indexer_kv_dtype int8 \
   --quantization ascend \
   --compilation-config '{"mode": 3, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 6, 12, 18, 24, 30, 36, 42, 48], "max_cudagraph_capture_size": 48}' \

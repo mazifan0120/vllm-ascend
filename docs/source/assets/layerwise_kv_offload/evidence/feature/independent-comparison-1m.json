@@ -1,0 +1,206 @@
+[
+  {
+    "arm": "p0-matrix-c32",
+    "concurrency": 32,
+    "cache_target_pct": 0,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 39.67465568990364,
+        "p50": 38.2325636530295,
+        "p90": 52.23891472974793,
+        "p99": 69.93214048711117
+      },
+      "tpot_ms": 25.798819291833592,
+      "output_toks_s": 342.0494363311774,
+      "pft_s": 4.680640622536885,
+      "p_queue_s": 31.73812223765916,
+      "local_hit": 0.0,
+      "external_hit": 0.0,
+      "prefill_counts": {
+        "172.168.4.237:8410": 56.0,
+        "172.168.4.31:8410": 56.0
+      },
+      "decode_local_hit": 0.0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 43.22743742333426,
+        "p50": 40.867045546649024,
+        "p90": 58.63053403855303,
+        "p99": 77.72144354519435
+      },
+      "tpot_ms": 27.738752470460913,
+      "output_toks_s": 313.16909489484476,
+      "pft_s": 5.116705237305723,
+      "p_queue_s": 33.76162553632249,
+      "local_hit": 0.0,
+      "external_hit": 0.0,
+      "prefill_counts": {
+        "172.168.4.237:9081": 56.0,
+        "172.168.4.31:9081": 56.0
+      },
+      "decode_local_hit": 0.0
+    },
+    "relative_pct": {
+      "ttft_mean": -8.218811813056536,
+      "tpot": -6.993584807727604,
+      "throughput": 9.221964078553157
+    },
+    "comparison_status": "customer_DCP2_vs_feature_TP2_actual_deployments_not_single_variable_ablation"
+  },
+  {
+    "arm": "p0-matrix-c64",
+    "concurrency": 64,
+    "cache_target_pct": 0,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 74.8176362549171,
+        "p50": 92.98362190951593,
+        "p90": 98.24372879308649,
+        "p99": 112.97891874740365
+      },
+      "tpot_ms": 23.87694658176418,
+      "output_toks_s": 371.6296666706821,
+      "pft_s": 4.488656972950723,
+      "p_queue_s": 68.18478628416779,
+      "local_hit": 0.0,
+      "external_hit": 0.0,
+      "prefill_counts": {
+        "172.168.4.237:8410": 56.0,
+        "172.168.4.31:8410": 56.0
+      },
+      "decode_local_hit": 0.0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 85.32846251032814,
+        "p50": 105.90341132576577,
+        "p90": 112.63522890554741,
+        "p99": 128.1381986372592
+      },
+      "tpot_ms": 28.787760254950296,
+      "output_toks_s": 310.71863764417174,
+      "pft_s": 5.158058175580144,
+      "p_queue_s": 75.68639505589297,
+      "local_hit": 0.0,
+      "external_hit": 0.0,
+      "prefill_counts": {
+        "172.168.4.237:9081": 56.0,
+        "172.168.4.31:9081": 56.0
+      },
+      "decode_local_hit": 0.0
+    },
+    "relative_pct": {
+      "ttft_mean": -12.31807763340258,
+      "tpot": -17.058686155834792,
+      "throughput": 19.603275004141985
+    },
+    "comparison_status": "customer_DCP2_vs_feature_TP2_actual_deployments_not_single_variable_ablation"
+  },
+  {
+    "arm": "p90-gc-c32",
+    "concurrency": 32,
+    "cache_target_pct": 90,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 4.216283179557649,
+        "p50": 2.182568878866732,
+        "p90": 12.162635758891701,
+        "p99": 15.774138827440328
+      },
+      "tpot_ms": 28.30889512277148,
+      "output_toks_s": 821.1212075163141,
+      "pft_s": 1.5804827698614514,
+      "p_queue_s": 1.1649135319873625,
+      "local_hit": 0.0,
+      "external_hit": 0.9006545454545455,
+      "prefill_counts": {
+        "172.168.4.237:8410": 49.0,
+        "172.168.4.31:8410": 63.0
+      },
+      "decode_local_hit": 0.0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 4.775066355817087,
+        "p50": 2.4842397845350206,
+        "p90": 12.992564450809732,
+        "p99": 15.597215268053114
+      },
+      "tpot_ms": 31.262394025346143,
+      "output_toks_s": 727.2243664892989,
+      "pft_s": 1.2647881442971993,
+      "p_queue_s": 1.0109603084898222,
+      "local_hit": 0.0,
+      "external_hit": 0.8936727272727273,
+      "prefill_counts": {
+        "172.168.4.237:9081": 56.0,
+        "172.168.4.31:9081": 56.0
+      },
+      "decode_local_hit": 0.024062337662337663
+    },
+    "relative_pct": {
+      "ttft_mean": -11.702102853057017,
+      "tpot": -9.44744954650657,
+      "throughput": 12.911674216900293
+    },
+    "comparison_status": "customer_DCP2_vs_feature_TP2_actual_deployments_not_single_variable_ablation"
+  },
+  {
+    "arm": "p90-rewarm-c64",
+    "concurrency": 64,
+    "cache_target_pct": 90,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 11.772580407231414,
+        "p50": 9.257091869134456,
+        "p90": 25.51980815110728,
+        "p99": 30.545634706662966
+      },
+      "tpot_ms": 36.081528019256346,
+      "output_toks_s": 1017.2686052563504,
+      "pft_s": 2.744310514560701,
+      "p_queue_s": 6.349032309122516,
+      "local_hit": 0.0,
+      "external_hit": 0.9006545454545455,
+      "prefill_counts": {
+        "172.168.4.237:8410": 56.0,
+        "172.168.4.31:8410": 56.0
+      },
+      "decode_local_hit": 0.0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 8.206624957067627,
+        "p50": 5.640080996090546,
+        "p90": 17.95553182545118,
+        "p99": 20.753095706994646
+      },
+      "tpot_ms": 36.61208645930615,
+      "output_toks_s": 1042.1548182627419,
+      "pft_s": 1.497257905463422,
+      "p_queue_s": 2.2875654276410518,
+      "local_hit": 0.0,
+      "external_hit": 0.8936727272727273,
+      "prefill_counts": {
+        "172.168.4.237:9081": 56.0,
+        "172.168.4.31:9081": 56.0
+      },
+      "decode_local_hit": 0.07085714285714285
+    },
+    "relative_pct": {
+      "ttft_mean": 43.45215565252256,
+      "tpot": -1.4491346748006562,
+      "throughput": -2.387957390810369
+    },
+    "comparison_status": "customer_DCP2_vs_feature_TP2_actual_deployments_not_single_variable_ablation"
+  }
+]

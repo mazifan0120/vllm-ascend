@@ -1,4 +1,4 @@
-"""Render report figures from the archived, full precision request verdicts."""
+"""Render report figures from the adopted, published issue-method results."""
 
 import json
 from pathlib import Path
@@ -25,7 +25,7 @@ def bars(ax, selected, field, title, unit):
             values,
             width=0.36,
             color=colors[key],
-            label="KV offload (1M)" if key == "feature" else "Customer DCP2 (512K)",
+            label="KV offload (1M)" if key == "feature" else "DCP2 v0.30 (512K)",
         )
         ax.bar_label(rects, fmt="%.2f", fontsize=8, padding=3)
     ax.set_xticks(x, [f"C{r['concurrency']} / {r['cache_target_pct']}%" for r in selected])
@@ -42,12 +42,12 @@ bars(axes[0, 1], rows[2:], "ttft", "Mean TTFT: ~90% external hits (lower is bett
 bars(axes[1, 0], rows, "tpot_ms", "Mean TPOT (lower is better)", "Milliseconds / token")
 bars(axes[1, 1], rows, "output_toks_s", "Output throughput (higher is better)", "Tokens / second")
 axes[0, 0].legend(frameon=False, fontsize=9)
-fig.suptitle("GLM-5.2 / A3: 55,000 input + 700 output tokens, 112 requests per case", fontsize=14)
+fig.suptitle("GLM-5.2 / A3: ~55,000 input + 700 output tokens, 112 requests per case", fontsize=14)
 fig.get_layout_engine().set(rect=(0, 0.055, 1, 0.945))
 fig.text(
     0.5,
     0.018,
-    "D TP2/DP16/MTP5 aligned; feature 1M vs customer 512K; software, P settings and KV paths differ.",
+    "Source: supplied issue-method rerun. Feature D TP4/DP8; DCP2 D TP2/DP16; thinking default.",
     ha="center",
     fontsize=9,
     color="#444444",

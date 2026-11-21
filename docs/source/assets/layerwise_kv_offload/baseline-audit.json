@@ -131,5 +131,6 @@
     "p": 593920,
     "d": 524288
   },
-  "feature_512k_result_status": "superseded by feature P/D 1M rerun; historical commit retains evidence"
+  "feature_512k_result_status": "superseded by feature P/D 1M rerun; historical commit retains evidence",
+  "report_role": "Archived audit of prior independent measurements; current performance tables use evidence/issue69/source.md"
 }

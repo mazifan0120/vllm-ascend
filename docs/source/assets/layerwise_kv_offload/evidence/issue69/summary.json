@@ -1,0 +1,158 @@
+[
+  {
+    "cache_target_pct": 0,
+    "concurrency": 32,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 47.89,
+        "p50": 51.1,
+        "p99": 68.28
+      },
+      "tpot_ms": 22.1,
+      "output_toks_s": 307.4,
+      "requests_s": 0.439,
+      "duration_s": 255.0,
+      "external_hit": 0,
+      "local_hit": 0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 74.88,
+        "p50": 79.64,
+        "p99": 107.74
+      },
+      "tpot_ms": 36.7,
+      "output_toks_s": 192.9,
+      "requests_s": 0.276,
+      "duration_s": 406.3,
+      "external_hit": 0.0013,
+      "local_hit": 0
+    },
+    "relative_pct": {
+      "ttft_mean": -36.0,
+      "tpot": -39.8,
+      "throughput": 59.4
+    },
+    "source": "evidence/issue69/source.md",
+    "precision": "Published rounded values; improvement percentages retained from source"
+  },
+  {
+    "cache_target_pct": 0,
+    "concurrency": 64,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 90.85,
+        "p50": 113.52,
+        "p99": 134.87
+      },
+      "tpot_ms": 23.5,
+      "output_toks_s": 307.3,
+      "requests_s": 0.439,
+      "duration_s": 255.1,
+      "external_hit": 0,
+      "local_hit": 0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 145.21,
+        "p50": 181.99,
+        "p99": 216.28
+      },
+      "tpot_ms": 39.5,
+      "output_toks_s": 192.8,
+      "requests_s": 0.275,
+      "duration_s": 406.7,
+      "external_hit": 0,
+      "local_hit": 0
+    },
+    "relative_pct": {
+      "ttft_mean": -37.4,
+      "tpot": -40.5,
+      "throughput": 59.4
+    },
+    "source": "evidence/issue69/source.md",
+    "precision": "Published rounded values; improvement percentages retained from source"
+  },
+  {
+    "cache_target_pct": 90,
+    "concurrency": 32,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 3.88,
+        "p50": 2.1,
+        "p99": 13.96
+      },
+      "tpot_ms": 33.0,
+      "output_toks_s": 743.6,
+      "requests_s": 1.062,
+      "duration_s": 105.4,
+      "external_hit": 0.8891,
+      "local_hit": 0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 5.59,
+        "p50": 3.99,
+        "p99": 15.89
+      },
+      "tpot_ms": 49.7,
+      "output_toks_s": 489.4,
+      "requests_s": 0.699,
+      "duration_s": 160.2,
+      "external_hit": 0.8909,
+      "local_hit": 0
+    },
+    "relative_pct": {
+      "ttft_mean": -30.6,
+      "tpot": -33.6,
+      "throughput": 51.9
+    },
+    "source": "evidence/issue69/source.md",
+    "precision": "Published rounded values; improvement percentages retained from source"
+  },
+  {
+    "cache_target_pct": 90,
+    "concurrency": 64,
+    "feature": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 10.49,
+        "p50": 6.46,
+        "p99": 28.14
+      },
+      "tpot_ms": 43.8,
+      "output_toks_s": 902.9,
+      "requests_s": 1.29,
+      "duration_s": 86.8,
+      "external_hit": 0.8952,
+      "local_hit": 0
+    },
+    "dcp": {
+      "completed": 112,
+      "ttft_s": {
+        "mean": 12.26,
+        "p50": 8.42,
+        "p99": 31.25
+      },
+      "tpot_ms": 59.7,
+      "output_toks_s": 687.2,
+      "requests_s": 0.982,
+      "duration_s": 114.1,
+      "external_hit": 0.8866,
+      "local_hit": 0
+    },
+    "relative_pct": {
+      "ttft_mean": -14.4,
+      "tpot": -26.6,
+      "throughput": 31.4
+    },
+    "source": "evidence/issue69/source.md",
+    "precision": "Published rounded values; improvement percentages retained from source"
+  }
+]
